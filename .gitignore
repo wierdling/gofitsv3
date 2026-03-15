@@ -1,0 +1,37 @@
+# --- Go build artifacts ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+
+# Common local build folders
+bin/
+dist/
+build/
+.gocache/
+.gomodcache/
+.gopath/
+TestImages/
+# --- Go workspace ---
+# Ignore these only if they are local-only
+go.work
+go.work.sum
+
+# --- Dependencies ---
+# Ignore vendor only if you do not commit vendored deps
+vendor/
+
+# --- IDEs/editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+*.zip
