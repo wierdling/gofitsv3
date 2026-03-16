@@ -23,13 +23,15 @@ import (
 )
 
 type loadedImage struct {
-	Path     string
-	HDU      fitsio.HDU
-	Mode     stretch.Mode
-	Black    float64
-	White    float64
-	Scale    float64
-	ShowClip bool
+	Path       string
+	HDU        fitsio.HDU
+	Mode       stretch.Mode
+	Black      float64
+	White      float64
+	Background float64
+	Peak       float64
+	ScaledPeak float64
+	ShowClip   bool
 }
 
 type viewport struct {
@@ -38,6 +40,8 @@ type viewport struct {
 	zoomLabel *widget.Select
 	zoomOut   *widget.Button
 	zoomIn    *widget.Button
+	blackBox  *widget.Entry
+	whiteBox  *widget.Entry
 	container fyne.CanvasObject
 	zoom      float64
 	origW     int
@@ -57,6 +61,12 @@ func newViewport() *viewport {
 	vp.scroll = container.NewScroll(img)
 	vp.scroll.SetMinSize(fyne.NewSize(500, 500))
 
+	vp.blackBox = widget.NewEntry()
+	vp.blackBox.SetPlaceHolder("000000")
+	vp.blackBox.SetText("--")
+	vp.whiteBox = widget.NewEntry()
+	vp.whiteBox.SetPlaceHolder("000000")
+	vp.whiteBox.SetText("--")
 	vp.zoomLabel = widget.NewSelect([]string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}, func(s string) {
 		vp.setZoomFromSelect(s)
 	})
@@ -65,7 +75,17 @@ func newViewport() *viewport {
 
 	header := container.NewVBox(
 		vp.histogram,
-		container.NewHBox(layout.NewSpacer(), vp.zoomOut, vp.zoomLabel, vp.zoomIn),
+		container.NewHBox(
+			layout.NewSpacer(),
+			widget.NewLabel("Black"),
+			container.New(layout.NewGridWrapLayout(fyne.NewSize(110, vp.blackBox.MinSize().Height)), vp.blackBox),
+			vp.zoomOut,
+			vp.zoomLabel,
+			vp.zoomIn,
+			widget.NewLabel("White"),
+			container.New(layout.NewGridWrapLayout(fyne.NewSize(110, vp.whiteBox.MinSize().Height)), vp.whiteBox),
+			layout.NewSpacer(),
+		),
 	)
 	vp.container = container.NewBorder(header, nil, nil, nil, vp.scroll)
 
@@ -182,7 +202,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				hdu = sci[0]
 			}
 			minV, maxV := autoLevels(hdu.Data.Pixels)
-			imgs[idx] = &loadedImage{Path: path, HDU: hdu, Mode: stretch.Linear, Black: minV, White: maxV, Scale: 1}
+			imgs[idx] = &loadedImage{Path: path, HDU: hdu, Mode: stretch.Linear, Black: minV, White: maxV, Background: minV, Peak: maxV, ScaledPeak: maxV}
 			app.Preferences().SetString("lastDir", filepath.Dir(path))
 			refresh()
 		}, win)
@@ -233,9 +253,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		widget.NewButton("Load Channel 3", func() { loadChannel(2) }),
 		widget.NewSeparator(),
 		widget.NewLabel("Per-channel controls"),
-		channelControls("Channel 1", 0, imgs, refresh),
-		channelControls("Channel 2", 1, imgs, refresh),
-		channelControls("Channel 3", 2, imgs, refresh),
+		channelControls("Channel 1", 0, imgs, viewports, refresh),
+		channelControls("Channel 2", 1, imgs, viewports, refresh),
+		channelControls("Channel 3", 2, imgs, viewports, refresh),
 		exportBtn,
 	)
 
@@ -249,7 +269,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	return split
 }
 
-func channelControls(label string, idx int, imgs []*loadedImage, refresh func()) fyne.CanvasObject {
+func channelControls(label string, idx int, imgs []*loadedImage, views []*viewport, refresh func()) fyne.CanvasObject {
 	selectBox := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
 		if imgs[idx] == nil {
 			return
@@ -270,12 +290,14 @@ func channelControls(label string, idx int, imgs []*loadedImage, refresh func())
 	})
 	selectBox.SetSelected("Linear")
 
-	blackEntry := widget.NewEntry()
-	whiteEntry := widget.NewEntry()
-	scaleEntry := widget.NewEntry()
-	blackEntry.SetText("0")
-	whiteEntry.SetText("1")
-	scaleEntry.SetText("1")
+	backgroundEntry := widget.NewEntry()
+	peakEntry := widget.NewEntry()
+	scaledPeakEntry := widget.NewEntry()
+
+	backgroundEntry.SetText("0")
+	peakEntry.SetText("1")
+	scaledPeakEntry.SetText("1")
+
 	showClip := widget.NewCheck("Show clipped (blue/green/red)", func(v bool) {
 		if imgs[idx] == nil {
 			return
@@ -283,19 +305,26 @@ func channelControls(label string, idx int, imgs []*loadedImage, refresh func())
 		imgs[idx].ShowClip = v
 		refresh()
 	})
+	showClip.SetChecked(true)
 
 	apply := widget.NewButton("Apply values", func() {
 		if imgs[idx] == nil {
 			return
 		}
-		if v, err := parseFloat(blackEntry.Text); err == nil {
+		if v, err := parseFloat(backgroundEntry.Text); err == nil {
+			imgs[idx].Background = v
+		}
+		if v, err := parseFloat(peakEntry.Text); err == nil {
+			imgs[idx].Peak = v
+		}
+		if v, err := parseFloat(scaledPeakEntry.Text); err == nil {
+			imgs[idx].ScaledPeak = v
+		}
+		if v, err := parseFloat(views[idx].blackBox.Text); err == nil {
 			imgs[idx].Black = v
 		}
-		if v, err := parseFloat(whiteEntry.Text); err == nil {
+		if v, err := parseFloat(views[idx].whiteBox.Text); err == nil {
 			imgs[idx].White = v
-		}
-		if v, err := parseFloat(scaleEntry.Text); err == nil {
-			imgs[idx].Scale = v
 		}
 		refresh()
 	})
@@ -305,12 +334,16 @@ func channelControls(label string, idx int, imgs []*loadedImage, refresh func())
 			return
 		}
 		minV, maxV := autoLevels(imgs[idx].HDU.Data.Pixels)
-		imgs[idx].Black = minV
+		imgs[idx].Background = minV
+		imgs[idx].Peak = maxV
+		imgs[idx].ScaledPeak = 10
 		imgs[idx].White = maxV
-		imgs[idx].Scale = 1
-		blackEntry.SetText(fmt.Sprintf("%.2f", minV))
-		whiteEntry.SetText(fmt.Sprintf("%.2f", maxV))
-		scaleEntry.SetText("1")
+		imgs[idx].Black = 0
+		views[idx].blackBox.SetText("0")
+		views[idx].whiteBox.SetText(fmt.Sprintf("%.2f", maxV))
+		backgroundEntry.SetText(fmt.Sprintf("%.2f", minV))
+		peakEntry.SetText(fmt.Sprintf("%.2f", maxV))
+		scaledPeakEntry.SetText("10")
 		refresh()
 	})
 
@@ -318,9 +351,9 @@ func channelControls(label string, idx int, imgs []*loadedImage, refresh func())
 		widget.NewLabel(label),
 		selectBox,
 		widget.NewForm(
-			widget.NewFormItem("Black level", blackEntry),
-			widget.NewFormItem("White level", whiteEntry),
-			widget.NewFormItem("Scaled peak", scaleEntry),
+			widget.NewFormItem("Background level", backgroundEntry),
+			widget.NewFormItem("Peak level", peakEntry),
+			widget.NewFormItem("Scaled peak level", scaledPeakEntry),
 		),
 		showClip,
 		container.NewHBox(auto, apply),
@@ -333,6 +366,8 @@ func updatePreviews(imgs []*loadedImage, views []*viewport) {
 		if imgs[i] == nil {
 			views[i].image.Image = blankImg()
 			views[i].bins = [256]int{}
+			views[i].blackBox.SetText("--")
+			views[i].whiteBox.SetText("--")
 			views[i].histogram.Refresh()
 			views[i].image.Refresh()
 			continue
@@ -341,6 +376,8 @@ func updatePreviews(imgs []*loadedImage, views []*viewport) {
 		views[i].image.Image = toGrayRGBA(stretched, mask)
 		views[i].origW, views[i].origH = stretched.Width, stretched.Height
 		views[i].bins, _, _ = histogram(stretched.Pixels)
+		views[i].blackBox.SetText(fmt.Sprintf("%.3f", imgs[i].Black))
+		views[i].whiteBox.SetText(fmt.Sprintf("%.3f", imgs[i].White))
 		views[i].histogram.Refresh()
 		if views[i].zoomLabel.Selected == "fit in preview" {
 			views[i].zoom = views[i].fitZoom()
@@ -353,6 +390,8 @@ func updatePreviews(imgs []*loadedImage, views []*viewport) {
 	if buf == nil {
 		views[3].image.Image = blankImg()
 		views[3].bins = [256]int{}
+		views[3].blackBox.SetText("--")
+		views[3].whiteBox.SetText("--")
 		views[3].histogram.Refresh()
 		views[3].image.Refresh()
 		return
@@ -362,6 +401,8 @@ func updatePreviews(imgs []*loadedImage, views []*viewport) {
 	views[3].image.Image = img
 	views[3].origW, views[3].origH = w, h
 	views[3].bins = [256]int{}
+	views[3].blackBox.SetText("--")
+	views[3].whiteBox.SetText("--")
 	views[3].histogram.Refresh()
 	if views[3].zoomLabel.Selected == "fit in preview" {
 		views[3].zoom = views[3].fitZoom()
@@ -384,32 +425,66 @@ func composeRGB(imgs []*loadedImage) ([]byte, int, int) {
 }
 
 func applyStretch(img *loadedImage) (fitsio.ImageData, []byte) {
-	norm := img.HDU.Data.Normalize()
-	pixels := make([]float64, len(norm.Pixels))
-	mask := make([]byte, len(norm.Pixels)) // 1=black,2=white,3=nan
-	for i, v := range norm.Pixels {
+	data := img.HDU.Data // raw pixels
+	pixels := make([]float64, len(data.Pixels))
+	mask := make([]byte, len(data.Pixels)) // 1=black,2=white,3=nan
+
+	denom := img.Peak - img.Background
+	if denom == 0 {
+		denom = 1
+	}
+	if img.ScaledPeak <= 0 {
+		img.ScaledPeak = 1
+	}
+	stretchMul := img.ScaledPeak / denom
+
+	for i, v := range data.Pixels {
 		if math.IsNaN(v) {
-			mask[i] = 3
-			v = 0
+			if img.ShowClip {
+				mask[i] = 3
+			}
+			pixels[i] = 0
+			continue
 		}
 		if v < img.Black {
+			if img.ShowClip {
+				mask[i] = 1
+			}
 			v = img.Black
-			mask[i] = 1
 		}
 		if v > img.White {
+			if img.ShowClip {
+				mask[i] = 2
+			}
 			v = img.White
-			mask[i] = 2
 		}
-		if img.White != img.Black {
-			v = (v - img.Black) / (img.White - img.Black)
+
+		val := (v - img.Background) * stretchMul
+		if val < 0 {
+			val = 0
 		}
-		pixels[i] = clamp01(v)
+		switch img.Mode {
+		case stretch.Log:
+			val = math.Log1p(val) / math.Log1p(img.ScaledPeak)
+		case stretch.Asinh:
+			val = math.Asinh(val) / math.Asinh(img.ScaledPeak)
+		case stretch.Sqrt:
+			val = math.Sqrt(val) / math.Sqrt(img.ScaledPeak)
+		case stretch.HistEq:
+			val = clamp01(val / img.ScaledPeak)
+		case stretch.Linear:
+			val = val / img.ScaledPeak
+		}
+
+		pixels[i] = clamp01(val)
 	}
-	stretched := stretch.Apply(pixels, img.Mode)
-	for i, v := range stretched {
-		stretched[i] = clamp01(v * img.Scale)
+
+	if img.Mode == stretch.HistEq {
+		stretched := stretch.Apply(pixels, img.Mode)
+		return fitsio.ImageData{Width: data.Width, Height: data.Height, Pixels: stretched}, mask
 	}
-	return fitsio.ImageData{Width: norm.Width, Height: norm.Height, Pixels: stretched}, mask
+
+	return fitsio.ImageData{Width: data.Width, Height: data.Height, Pixels: pixels}, mask
 }
 
 func toGrayRGBA(data fitsio.ImageData, mask []byte) *image.RGBA {
