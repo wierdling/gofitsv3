@@ -12,6 +12,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
@@ -35,20 +36,23 @@ type loadedImage struct {
 }
 
 type viewport struct {
-	image     *canvas.Image
-	histogram *canvas.Raster
-	zoomLabel *widget.Select
-	zoomOut   *widget.Button
-	zoomIn    *widget.Button
-	blackBox  *widget.Entry
-	whiteBox  *widget.Entry
-	container fyne.CanvasObject
-	zoom      float64
-	origW     int
-	origH     int
-	scroll    *container.Scroll
-	bins      [256]int
+	image      *canvas.Image
+	histogram  *canvas.Raster
+	zoomLabel  *widget.Select
+	zoomOut    *widget.Button
+	zoomIn     *widget.Button
+	blackBox   *widget.Entry
+	whiteBox   *widget.Entry
+	container  fyne.CanvasObject
+	zoom       float64
+	origW      int
+	origH      int
+	scroll     *container.Scroll
+	bins       [256]int
+	customZoom string
 }
+
+var presetZoomOptions = []string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}
 
 func newViewport() *viewport {
 	img := canvas.NewImageFromImage(blankImg())
@@ -58,7 +62,9 @@ func newViewport() *viewport {
 	vp.histogram = canvas.NewRaster(vp.drawHist)
 	vp.histogram.SetMinSize(fyne.NewSize(200, 80))
 
-	vp.scroll = container.NewScroll(img)
+	drag := newDragLayer(nil, img)
+	vp.scroll = container.NewScroll(container.NewMax(img, drag))
+	drag.scroll = vp.scroll
 	vp.scroll.SetMinSize(fyne.NewSize(500, 500))
 
 	vp.blackBox = widget.NewEntry()
@@ -93,6 +99,31 @@ func newViewport() *viewport {
 	return vp
 }
 
+func isPresetZoom(option string) bool {
+	for _, o := range presetZoomOptions {
+		if o == option {
+			return true
+		}
+	}
+	return false
+}
+
+func (vp *viewport) setZoomLabelValue(option string) {
+	if !isPresetZoom(option) {
+		if vp.customZoom != "" {
+			var opts []string
+			for _, o := range vp.zoomLabel.Options {
+				if o != vp.customZoom {
+					opts = append(opts, o)
+				}
+			}
+			vp.zoomLabel.Options = opts
+		}
+		vp.customZoom = option
+		vp.zoomLabel.Options = append(vp.zoomLabel.Options, option)
+	}
+	vp.zoomLabel.SetSelected(option)
+}
 func (vp *viewport) setZoomFromSelect(sel string) {
 	switch sel {
 	case "fit in preview":
@@ -112,7 +143,7 @@ func (vp *viewport) stepZoom(factor float64) {
 		vp.zoom = vp.fitZoom()
 	}
 	vp.zoom *= factor
-	vp.zoomLabel.SetSelected(fmt.Sprintf("%d%%", int(math.Round(vp.zoom*100))))
+	vp.setZoomLabelValue(fmt.Sprintf("%d%%", int(math.Round(vp.zoom*100))))
 	vp.applyZoom()
 }
 
@@ -617,4 +648,59 @@ func flipRGBA(buf []byte, w, h int) []byte {
 		copy(out[y*row:(y+1)*row], buf[(h-1-y)*row:(h-y)*row])
 	}
 	return out
+}
+
+type dragLayer struct {
+	widget.BaseWidget
+	scroll  *container.Scroll
+	content fyne.CanvasObject
+}
+
+func newDragLayer(scroll *container.Scroll, content fyne.CanvasObject) *dragLayer {
+	d := &dragLayer{scroll: scroll, content: content}
+	d.ExtendBaseWidget(d)
+	return d
+}
+
+func (d *dragLayer) Dragged(e *fyne.DragEvent) {
+	if d.scroll == nil || d.content == nil {
+		return
+	}
+	sz := d.content.Size()
+	viewport := d.scroll.Size()
+	maxX := float32(math.Max(0, float64(sz.Width-viewport.Width)))
+	maxY := float32(math.Max(0, float64(sz.Height-viewport.Height)))
+	nx := d.scroll.Offset.X - e.Dragged.DX
+	ny := d.scroll.Offset.Y - e.Dragged.DY
+	if nx < 0 {
+		nx = 0
+	}
+	if ny < 0 {
+		ny = 0
+	}
+	if nx > maxX {
+		nx = maxX
+	}
+	if ny > maxY {
+		ny = maxY
+	}
+	d.scroll.Offset = fyne.NewPos(nx, ny)
+	d.scroll.Refresh()
+}
+
+func (d *dragLayer) DragEnd() {}
+
+func (d *dragLayer) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(d.content)
+}
+
+func (d *dragLayer) Cursor() desktop.Cursor {
+	return desktop.PointerCursor
+}
+
+func (d *dragLayer) MinSize() fyne.Size {
+	if d.content == nil {
+		return fyne.NewSize(10, 10)
+	}
+	return d.content.MinSize()
 }
