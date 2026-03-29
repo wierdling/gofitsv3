@@ -10,6 +10,7 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
+	"gofitsv3/internal/badpix"
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/mosaic"
 	"gofitsv3/internal/stretch"
@@ -41,6 +42,9 @@ func newMosaicWorkspace(win fyne.Window) fyne.CanvasObject {
 			hdu := file.HDUs[0]
 			if len(sci) > 0 {
 				hdu = sci[0]
+			}
+			if cleaned, err := cleanHDUWithDQ(hdu, file); err == nil {
+				hdu = cleaned
 			}
 			state.sources = append(state.sources, hdu)
 			redrawMosaic(preview, state)
@@ -92,4 +96,18 @@ func redrawMosaic(preview *canvas.Image, state *mosaicState) {
 	}
 	preview.Image = img
 	preview.Refresh()
+}
+
+// cleanHDUWithDQ runs bad-pixel masking using the file's DQ extension when available.
+func cleanHDUWithDQ(hdu fitsio.HDU, file *fitsio.File) (fitsio.HDU, error) {
+	dq := file.SelectDQ()
+	if dq == nil {
+		return hdu, fmt.Errorf("DQ not found")
+	}
+	mask, err := badpix.MaskFromDQ(hdu, *dq, 0)
+	if err != nil {
+		return hdu, err
+	}
+	hdu.Data = badpix.InterpolateBicubic(hdu.Data, mask)
+	return hdu, nil
 }

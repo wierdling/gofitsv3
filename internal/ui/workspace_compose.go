@@ -1,12 +1,17 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
 	"image"
+	"io"
 	"math"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -26,6 +31,7 @@ import (
 type loadedImage struct {
 	Path       string
 	HDU        fitsio.HDU
+	Primary    fitsio.Header
 	Mode       stretch.Mode
 	Black      float64
 	White      float64
@@ -33,6 +39,31 @@ type loadedImage struct {
 	Peak       float64
 	ScaledPeak float64
 	ShowClip   bool
+}
+
+type channelState struct {
+	Path       string  `json:"path"`
+	Mode       string  `json:"mode"`
+	Black      float64 `json:"black"`
+	White      float64 `json:"white"`
+	Background float64 `json:"background"`
+	Peak       float64 `json:"peak"`
+	ScaledPeak float64 `json:"scaledPeak"`
+	ShowClip   bool    `json:"showClip"`
+}
+
+type composeProject struct {
+	Channels [3]channelState `json:"channels"`
+	Flip     bool            `json:"flip"`
+}
+
+type channelControl struct {
+	content         fyne.CanvasObject
+	modeSelect      *widget.Select
+	backgroundEntry *widget.Entry
+	peakEntry       *widget.Entry
+	scaledPeakEntry *widget.Entry
+	showClip        *widget.Check
 }
 
 type viewport struct {
@@ -52,6 +83,20 @@ type viewport struct {
 	customZoom string
 }
 
+type rgbLevels struct {
+	Min [3]float64
+	Max [3]float64
+}
+
+type rgbLevelsWindow struct {
+	win        fyne.Window
+	levels     *rgbLevels
+	bins       [3][256]int
+	hists      [3]*canvas.Raster
+	minEntries [3]*widget.Entry
+	maxEntries [3]*widget.Entry
+}
+
 var presetZoomOptions = []string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}
 
 func newViewport() *viewport {
@@ -60,12 +105,13 @@ func newViewport() *viewport {
 
 	vp := &viewport{image: img, zoom: 1}
 	vp.histogram = canvas.NewRaster(vp.drawHist)
-	vp.histogram.SetMinSize(fyne.NewSize(200, 80))
+	vp.histogram.SetMinSize(fyne.NewSize(200, 48))
 
 	drag := newDragLayer(nil, img)
 	vp.scroll = container.NewScroll(container.NewMax(img, drag))
 	drag.scroll = vp.scroll
-	vp.scroll.SetMinSize(fyne.NewSize(500, 500))
+	// Keep the previews compact so the compose form fits on smaller screens.
+	vp.scroll.SetMinSize(fyne.NewSize(260, 180))
 
 	vp.blackBox = widget.NewEntry()
 	vp.blackBox.SetPlaceHolder("000000")
@@ -207,14 +253,182 @@ func (vp *viewport) drawHist(w, h int) image.Image {
 	return img
 }
 
+func defaultRGBLevels() *rgbLevels {
+	return &rgbLevels{
+		Min: [3]float64{0, 0, 0},
+		Max: [3]float64{255, 255, 255},
+	}
+}
+
+func newRGBLevelsWindow(app fyne.App, levels *rgbLevels, onApply func()) *rgbLevelsWindow {
+	w := &rgbLevelsWindow{levels: levels}
+	colorBars := [3][3]uint8{
+		{200, 60, 60},
+		{60, 160, 60},
+		{60, 100, 200},
+	}
+	labels := []string{"Red", "Green", "Blue"}
+	var rows []fyne.CanvasObject
+	for i := 0; i < 3; i++ {
+		w.minEntries[i] = widget.NewEntry()
+		w.maxEntries[i] = widget.NewEntry()
+		w.hists[i] = canvas.NewRaster(w.drawHistFunc(i, colorBars[i]))
+		w.hists[i].SetMinSize(fyne.NewSize(260, 70))
+		rows = append(rows,
+			widget.NewLabel(labels[i]),
+			w.hists[i],
+			container.NewGridWithColumns(4,
+				widget.NewLabel("Min"),
+				w.minEntries[i],
+				widget.NewLabel("Max"),
+				w.maxEntries[i],
+			),
+		)
+	}
+	w.updateEntries()
+	applyBtn := widget.NewButton("Apply", func() {
+		w.applyLevels(onApply)
+	})
+	info := widget.NewLabel("Levels operate on the composed RGB image (0-255).")
+	content := container.NewVBox(rows...)
+	w.win = app.NewWindow("RGB Levels")
+	w.win.SetContent(container.NewBorder(nil, container.NewVBox(info, applyBtn), nil, nil, container.NewVScroll(content)))
+	w.win.Resize(fyne.NewSize(380, 480))
+	return w
+}
+
+func (w *rgbLevelsWindow) drawHistFunc(channel int, color [3]uint8) func(int, int) image.Image {
+	return func(width, height int) image.Image {
+		img := image.NewRGBA(image.Rect(0, 0, width, height))
+		for i := range img.Pix {
+			img.Pix[i] = 255
+		}
+		maxCount := 0
+		for _, c := range w.bins[channel] {
+			if c > maxCount {
+				maxCount = c
+			}
+		}
+		if maxCount == 0 {
+			return img
+		}
+		for i, c := range w.bins[channel] {
+			x := i * width / len(w.bins[channel])
+			barH := int(float64(c) / float64(maxCount) * float64(height))
+			for y := height - 1; y >= height-barH; y-- {
+				idx := (y*img.Stride + x*4)
+				img.Pix[idx] = color[0]
+				img.Pix[idx+1] = color[1]
+				img.Pix[idx+2] = color[2]
+				img.Pix[idx+3] = 255
+			}
+		}
+		return img
+	}
+}
+
+func (w *rgbLevelsWindow) setHistogram(bins [3][256]int) {
+	w.bins = bins
+	for _, h := range w.hists {
+		if h != nil {
+			h.Refresh()
+		}
+	}
+}
+
+func (w *rgbLevelsWindow) updateEntries() {
+	for i := 0; i < 3; i++ {
+		w.minEntries[i].SetText(fmt.Sprintf("%.0f", w.levels.Min[i]))
+		w.maxEntries[i].SetText(fmt.Sprintf("%.0f", w.levels.Max[i]))
+	}
+}
+
+func (w *rgbLevelsWindow) applyLevels(onApply func()) {
+	changed := false
+	for i := 0; i < 3; i++ {
+		minVal := w.levels.Min[i]
+		maxVal := w.levels.Max[i]
+		if v, err := parseFloat(w.minEntries[i].Text); err == nil {
+			minVal = clampLevel(v)
+		}
+		if v, err := parseFloat(w.maxEntries[i].Text); err == nil {
+			maxVal = clampLevel(v)
+		}
+		if maxVal <= minVal {
+			maxVal = minVal + 1
+		}
+		if minVal != w.levels.Min[i] || maxVal != w.levels.Max[i] {
+			changed = true
+		}
+		w.levels.Min[i] = minVal
+		w.levels.Max[i] = maxVal
+	}
+	w.updateEntries()
+	if changed && onApply != nil {
+		onApply()
+	}
+}
+
 func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	imgs := make([]*loadedImage, 3)
 	viewports := []*viewport{newViewport(), newViewport(), newViewport(), newViewport()}
+	headerWins := make([]fyne.Window, 3)
+	levels := defaultRGBLevels()
+	var levelsWin *rgbLevelsWindow
+	var latestRGBHist [3][256]int
 
 	flipCheck := widget.NewCheck("Flip image vertically", func(bool) {})
 	flipCheck.SetChecked(true)
 
-	refresh := func() { updatePreviews(imgs, viewports, flipCheck.Checked) }
+	pushRGBHist := func(bins [3][256]int) {
+		latestRGBHist = bins
+		if levelsWin != nil {
+			levelsWin.setHistogram(bins)
+		}
+	}
+
+	refresh := func() { updatePreviews(imgs, viewports, flipCheck.Checked, levels, pushRGBHist) }
+
+	closeHeaderWindow := func(idx int) {
+		if headerWins[idx] != nil {
+			headerWins[idx].SetCloseIntercept(nil)
+			headerWins[idx].Close()
+			headerWins[idx] = nil
+		}
+	}
+
+	showHeader := func(idx int) {
+		if imgs[idx] == nil {
+			return
+		}
+		closeHeaderWindow(idx)
+		lines := formatHeadersLines(imgs[idx].Primary, imgs[idx].HDU.Header)
+		list := widget.NewList(
+			func() int { return len(lines) },
+			func() fyne.CanvasObject {
+				lbl := widget.NewLabel("")
+				lbl.Wrapping = fyne.TextWrapOff
+				lbl.TextStyle = fyne.TextStyle{Monospace: true}
+				return lbl
+			},
+			func(id widget.ListItemID, co fyne.CanvasObject) {
+				lbl := co.(*widget.Label)
+				lbl.SetText(lines[id])
+			},
+		)
+		w := app.NewWindow(fmt.Sprintf("Channel %d Headers", idx+1))
+		w.SetContent(list)
+		w.Resize(fyne.NewSize(700, 500))
+		w.SetCloseIntercept(func() {
+			w.SetCloseIntercept(nil)
+			w.Close()
+			headerWins[idx] = nil
+		})
+		headerWins[idx] = w
+		w.Show()
+	}
+
+	var updateMenus func()
 
 	loadChannel := func(idx int) {
 		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
@@ -222,22 +436,18 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				return
 			}
 			path := r.URI().Path()
-			file, err := fitsio.LoadFile(path)
+			img, err := loadImageFromPath(path)
 			if err != nil {
 				dialog.ShowError(err, win)
 				return
 			}
-			sci := file.SelectSCI()
-			hdu := file.HDUs[0]
-			if len(sci) == 1 {
-				hdu = sci[0]
-			} else if len(sci) > 1 {
-				hdu = sci[0]
-			}
-			minV, maxV := autoLevels(hdu.Data.Pixels)
-			imgs[idx] = &loadedImage{Path: path, HDU: hdu, Mode: stretch.Linear, Black: minV, White: maxV, Background: minV, Peak: maxV, ScaledPeak: maxV, ShowClip: true}
+			imgs[idx] = img
 			app.Preferences().SetString("lastDir", filepath.Dir(path))
 			refresh()
+			closeHeaderWindow(idx)
+			if updateMenus != nil {
+				updateMenus()
+			}
 		}, win)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
 		if last := app.Preferences().String("lastDir"); last != "" {
@@ -249,20 +459,188 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		fd.Show()
 	}
 
+	controlSets := []*channelControl{
+		channelControls("Channel 1", 0, imgs, viewports, refresh, flipCheck),
+		channelControls("Channel 2", 1, imgs, viewports, refresh, flipCheck),
+		channelControls("Channel 3", 2, imgs, viewports, refresh, flipCheck),
+	}
+
+	copySettings := func() {
+		if imgs[0] == nil {
+			dialog.ShowInformation("Missing", "Load Channel 1 first", win)
+			return
+		}
+		missing := make([]string, 0, 2)
+		for _, idx := range []int{1, 2} {
+			if imgs[idx] == nil {
+				missing = append(missing, fmt.Sprintf("Channel %d", idx+1))
+			}
+		}
+		if len(missing) == 2 {
+			dialog.ShowInformation("Missing", "Load Channel 2 and Channel 3 to copy settings", win)
+			return
+		}
+		if len(missing) == 1 {
+			dialog.ShowInformation("Missing", fmt.Sprintf("Load %s to copy settings", missing[0]), win)
+		}
+		src := imgs[0]
+		for _, idx := range []int{1, 2} {
+			if imgs[idx] == nil {
+				continue
+			}
+			dst := imgs[idx]
+			dst.Mode = src.Mode
+			dst.Black = src.Black
+			dst.White = src.White
+			dst.Background = src.Background
+			dst.Peak = src.Peak
+			dst.ScaledPeak = src.ScaledPeak
+			dst.ShowClip = src.ShowClip
+
+			controlSets[idx].modeSelect.SetSelected(modeToLabel(src.Mode))
+			controlSets[idx].backgroundEntry.SetText(fmt.Sprintf("%.3f", src.Background))
+			controlSets[idx].peakEntry.SetText(fmt.Sprintf("%.3f", src.Peak))
+			controlSets[idx].scaledPeakEntry.SetText(fmt.Sprintf("%.3f", src.ScaledPeak))
+			controlSets[idx].showClip.SetChecked(src.ShowClip)
+			viewports[idx].blackBox.SetText(fmt.Sprintf("%.3f", src.Black))
+			viewports[idx].whiteBox.SetText(fmt.Sprintf("%.3f", src.White))
+		}
+		refresh()
+	}
+
+	saveProject := func() {
+		hasChannel := false
+		project := composeProject{Flip: flipCheck.Checked}
+		for i := 0; i < 3; i++ {
+			if imgs[i] == nil {
+				continue
+			}
+			hasChannel = true
+			project.Channels[i] = channelState{
+				Path:       imgs[i].Path,
+				Mode:       modeToLabel(imgs[i].Mode),
+				Black:      imgs[i].Black,
+				White:      imgs[i].White,
+				Background: imgs[i].Background,
+				Peak:       imgs[i].Peak,
+				ScaledPeak: imgs[i].ScaledPeak,
+				ShowClip:   imgs[i].ShowClip,
+			}
+		}
+		if !hasChannel {
+			dialog.ShowInformation("Nothing to save", "Load at least one channel before saving", win)
+			return
+		}
+		save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
+			if err != nil || uc == nil {
+				return
+			}
+			defer uc.Close()
+			data, err := json.MarshalIndent(project, "", "  ")
+			if err != nil {
+				dialog.ShowError(err, win)
+				return
+			}
+			if _, err := uc.Write(data); err != nil {
+				dialog.ShowError(err, win)
+				return
+			}
+		}, win)
+		save.SetFileName("project.gofits.json")
+		save.SetFilter(storage.NewExtensionFileFilter([]string{".json", ".gofits"}))
+		save.Show()
+	}
+
+	loadProject := func() {
+		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+			if err != nil || r == nil {
+				return
+			}
+			defer r.Close()
+			data, err := io.ReadAll(r)
+			if err != nil {
+				dialog.ShowError(err, win)
+				return
+			}
+			var project composeProject
+			if err := json.Unmarshal(data, &project); err != nil {
+				dialog.ShowError(err, win)
+				return
+			}
+			for i := 0; i < 3; i++ {
+				state := project.Channels[i]
+				if state.Path == "" {
+					imgs[i] = nil
+					continue
+				}
+				img, err := loadImageFromPath(state.Path)
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("channel %d: %w", i+1, err), win)
+					continue
+				}
+				imgs[i] = img
+				applyChannelState(i, state, imgs, viewports, controlSets)
+			}
+			flipCheck.SetChecked(project.Flip)
+			refresh()
+			for idx := range headerWins {
+				closeHeaderWindow(idx)
+			}
+			if updateMenus != nil {
+				updateMenus()
+			}
+		}, win)
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".json", ".gofits"}))
+		fd.Show()
+	}
+
+	saveProjectItem := fyne.NewMenuItem("Save Project", saveProject)
+	loadProjectItem := fyne.NewMenuItem("Load Project", loadProject)
 	fileMenu := fyne.NewMenu("File",
+		loadProjectItem,
+		saveProjectItem,
+		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Load Channel 1", func() { loadChannel(0) }),
 		fyne.NewMenuItem("Load Channel 2", func() { loadChannel(1) }),
 		fyne.NewMenuItem("Load Channel 3", func() { loadChannel(2) }),
 	)
-	win.SetMainMenu(fyne.NewMainMenu(fileMenu))
+	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 settings to 2 & 3", copySettings)
+	channelsMenu := fyne.NewMenu("Channels", copySettingsItem)
+
+	headerItems := []*fyne.MenuItem{
+		fyne.NewMenuItem("Channel 1", func() { showHeader(0) }),
+		fyne.NewMenuItem("Channel 2", func() { showHeader(1) }),
+		fyne.NewMenuItem("Channel 3", func() { showHeader(2) }),
+	}
+	headersMenu := fyne.NewMenu("Headers", headerItems...)
+	openLevels := func() {
+		if levelsWin == nil {
+			levelsWin = newRGBLevelsWindow(app, levels, refresh)
+		}
+		levelsWin.setHistogram(latestRGBHist)
+		levelsWin.updateEntries()
+		levelsWin.win.Show()
+		levelsWin.win.RequestFocus()
+	}
+	viewMenu := fyne.NewMenu("View", fyne.NewMenuItem("RGB Levels...", openLevels))
+	updateMenus = func() {
+		for i, item := range headerItems {
+			item.Disabled = imgs[i] == nil
+		}
+		copySettingsItem.Disabled = imgs[0] == nil
+		saveProjectItem.Disabled = imgs[0] == nil && imgs[1] == nil && imgs[2] == nil
+		win.SetMainMenu(fyne.NewMainMenu(fileMenu, headersMenu, channelsMenu, viewMenu))
+	}
+	updateMenus()
 
 	exportBtn := widget.NewButton("Export RGB", func() {
 
-		buf, w, h := composeRGB(imgs)
+		buf, w, h, _ := composeRGB(imgs)
 		if buf == nil {
 			dialog.ShowInformation("Missing", "Load three FITS first", win)
 			return
 		}
+		finalBuf := applyRGBLevels(buf, levels)
 		save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
 			if err != nil || uc == nil {
 				return
@@ -283,7 +661,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 					format = export.JPEG
 				}
 			}
-			_ = export.FromRGBABytes(path, buf, w, h, format, export.Options{Quality: 92})
+			_ = export.FromRGBABytes(path, finalBuf, w, h, format, export.Options{Quality: 92})
 		}, win)
 		save.SetFileName("composite.png")
 		save.Show()
@@ -294,23 +672,100 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		flipCheck,
 		widget.NewSeparator(),
 		widget.NewLabel("Per-channel controls"),
-		channelControls("Channel 1", 0, imgs, viewports, refresh, flipCheck),
-		channelControls("Channel 2", 1, imgs, viewports, refresh, flipCheck),
-		channelControls("Channel 3", 2, imgs, viewports, refresh, flipCheck),
+		controlSets[0].content,
+		controlSets[1].content,
+		controlSets[2].content,
 		exportBtn,
 	)
+
+	controlsScroll := container.NewVScroll(controls)
+	controlsScroll.SetMinSize(fyne.NewSize(260, 200))
 
 	grid := container.NewGridWithColumns(2,
 		viewports[0].container, viewports[1].container,
 		viewports[2].container, viewports[3].container,
 	)
 
-	split := container.NewHSplit(controls, grid)
+	split := container.NewHSplit(controlsScroll, grid)
 	split.SetOffset(0.32)
 	return split
 }
 
-func channelControls(label string, idx int, imgs []*loadedImage, views []*viewport, refresh func(), flipCheck *widget.Check) fyne.CanvasObject {
+func modeToLabel(m stretch.Mode) string {
+	switch m {
+	case stretch.Linear:
+		return "Linear"
+	case stretch.Log:
+		return "Log"
+	case stretch.Asinh:
+		return "Asinh"
+	case stretch.Sqrt:
+		return "Sqrt"
+	case stretch.HistEq:
+		return "HistEq"
+	default:
+		return "Linear"
+	}
+}
+
+func labelToMode(label string) stretch.Mode {
+	switch strings.ToLower(label) {
+	case "log":
+		return stretch.Log
+	case "asinh":
+		return stretch.Asinh
+	case "sqrt":
+		return stretch.Sqrt
+	case "histeq":
+		return stretch.HistEq
+	default:
+		return stretch.Linear
+	}
+}
+
+func loadImageFromPath(path string) (*loadedImage, error) {
+	file, err := fitsio.LoadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	sci := file.SelectSCI()
+	hdu := file.HDUs[0]
+	if len(sci) == 1 {
+		hdu = sci[0]
+	} else if len(sci) > 1 {
+		hdu = sci[0]
+	}
+	if cleaned, err := cleanHDUWithDQ(hdu, file); err == nil {
+		hdu = cleaned
+	}
+	minV, maxV := autoLevels(hdu.Data.Pixels)
+	return &loadedImage{Path: path, HDU: hdu, Primary: file.HDUs[0].Header, Mode: stretch.Linear, Black: minV, White: maxV, Background: minV, Peak: maxV, ScaledPeak: maxV, ShowClip: true}, nil
+}
+
+func applyChannelState(idx int, state channelState, imgs []*loadedImage, views []*viewport, controls []*channelControl) {
+	img := imgs[idx]
+	if img == nil {
+		return
+	}
+	img.Mode = labelToMode(state.Mode)
+	img.Black = state.Black
+	img.White = state.White
+	img.Background = state.Background
+	img.Peak = state.Peak
+	img.ScaledPeak = state.ScaledPeak
+	img.ShowClip = state.ShowClip
+
+	controls[idx].modeSelect.SetSelected(modeToLabel(img.Mode))
+	controls[idx].backgroundEntry.SetText(fmt.Sprintf("%.3f", img.Background))
+	controls[idx].peakEntry.SetText(fmt.Sprintf("%.3f", img.Peak))
+	controls[idx].scaledPeakEntry.SetText(fmt.Sprintf("%.3f", img.ScaledPeak))
+	controls[idx].showClip.SetChecked(img.ShowClip)
+
+	views[idx].blackBox.SetText(fmt.Sprintf("%.3f", img.Black))
+	views[idx].whiteBox.SetText(fmt.Sprintf("%.3f", img.White))
+}
+
+func channelControls(label string, idx int, imgs []*loadedImage, views []*viewport, refresh func(), flipCheck *widget.Check) *channelControl {
 	selectBox := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
 		if imgs[idx] == nil {
 			return
@@ -397,21 +852,28 @@ func channelControls(label string, idx int, imgs []*loadedImage, views []*viewpo
 		refresh()
 	})
 
-	return container.NewVBox(
-		widget.NewLabel(label),
-		selectBox,
-		widget.NewForm(
-			widget.NewFormItem("Background level", backgroundEntry),
-			widget.NewFormItem("Peak level", peakEntry),
-			widget.NewFormItem("Scaled peak level", scaledPeakEntry),
+	return &channelControl{
+		content: container.NewVBox(
+			widget.NewLabel(label),
+			selectBox,
+			widget.NewForm(
+				widget.NewFormItem("Background level", backgroundEntry),
+				widget.NewFormItem("Peak level", peakEntry),
+				widget.NewFormItem("Scaled peak level", scaledPeakEntry),
+			),
+			showClip,
+			container.NewHBox(auto, apply),
+			widget.NewSeparator(),
 		),
-		showClip,
-		container.NewHBox(auto, apply),
-		widget.NewSeparator(),
-	)
+		modeSelect:      selectBox,
+		backgroundEntry: backgroundEntry,
+		peakEntry:       peakEntry,
+		scaledPeakEntry: scaledPeakEntry,
+		showClip:        showClip,
+	}
 }
 
-func updatePreviews(imgs []*loadedImage, views []*viewport, flip bool) {
+func updatePreviews(imgs []*loadedImage, views []*viewport, flip bool, levels *rgbLevels, pushHist func([3][256]int)) {
 	for i := 0; i < 3; i++ {
 		if imgs[i] == nil {
 			views[i].image.Image = blankImg()
@@ -422,7 +884,7 @@ func updatePreviews(imgs []*loadedImage, views []*viewport, flip bool) {
 			views[i].image.Refresh()
 			continue
 		}
-		stretched, mask := applyStretch(imgs[i])
+		stretched, mask := applyStretchParallel(imgs[i])
 		if flip {
 			stretched = flipImageData(stretched)
 			mask = flipMask(mask, stretched.Width, stretched.Height)
@@ -440,8 +902,11 @@ func updatePreviews(imgs []*loadedImage, views []*viewport, flip bool) {
 		views[i].image.Refresh()
 	}
 
-	buf, w, h := composeRGB(imgs)
+	buf, w, h, rgbHist := composeRGB(imgs)
 	if buf == nil {
+		if pushHist != nil {
+			pushHist([3][256]int{})
+		}
 		views[3].image.Image = blankImg()
 		views[3].bins = [256]int{}
 		views[3].blackBox.SetText("--")
@@ -450,6 +915,10 @@ func updatePreviews(imgs []*loadedImage, views []*viewport, flip bool) {
 		views[3].image.Refresh()
 		return
 	}
+	if pushHist != nil {
+		pushHist(rgbHist)
+	}
+	buf = applyRGBLevels(buf, levels)
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	if flip {
 		buf = flipRGBA(buf, w, h)
@@ -468,26 +937,93 @@ func updatePreviews(imgs []*loadedImage, views []*viewport, flip bool) {
 	views[3].image.Refresh()
 }
 
-func composeRGB(imgs []*loadedImage) ([]byte, int, int) {
+func composeRGB(imgs []*loadedImage) ([]byte, int, int, [3][256]int) {
 	if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
-		return nil, 0, 0
+		return nil, 0, 0, [3][256]int{}
 	}
-	w := imgs[0].HDU.Data.Width
-	h := imgs[0].HDU.Data.Height
-	rData, _ := applyStretch(imgs[0])
-	gData, _ := applyStretch(imgs[1])
-	bData, _ := applyStretch(imgs[2])
-	buf := render.ComposeRGB(rData.Pixels, gData.Pixels, bData.Pixels, w, h, imgs[0].Mode, imgs[1].Mode, imgs[2].Mode)
-	return buf, w, h
+	w := imgs[2].HDU.Data.Width
+	h := imgs[2].HDU.Data.Height
+	// Channel mapping: 3->R, 2->G, 1->B
+	rData, _ := applyStretchParallel(imgs[2])
+	gData, _ := applyStretchParallel(imgs[1])
+	bData, _ := applyStretchParallel(imgs[0])
+	buf := render.ComposeRGB(rData.Pixels, gData.Pixels, bData.Pixels, w, h, imgs[2].Mode, imgs[1].Mode, imgs[0].Mode)
+	return buf, w, h, histogramRGB(buf)
 }
 
-func applyStretch(img *loadedImage) (fitsio.ImageData, []byte) {
-	data := img.HDU.Data // raw pixels
-	pixels := make([]float64, len(data.Pixels))
-	mask := make([]byte, len(data.Pixels)) // 1=black,2=white,3=nan
+func applyRGBLevels(buf []byte, levels *rgbLevels) []byte {
+	if buf == nil || levels == nil {
+		return buf
+	}
+	out := make([]byte, len(buf))
+	for i := 0; i+3 < len(buf); i += 4 {
+		for c := 0; c < 3; c++ {
+			val := float64(buf[i+c])
+			minV := levels.Min[c]
+			maxV := levels.Max[c]
+			if maxV <= minV {
+				out[i+c] = clampByte(maxV)
+				continue
+			}
+			if val < minV {
+				val = minV
+			}
+			if val > maxV {
+				val = maxV
+			}
+			scaled := (val - minV) / (maxV - minV) * 255
+			out[i+c] = clampByte(scaled)
+		}
+		out[i+3] = 255
+	}
+	return out
+}
 
+func histogramRGB(buf []byte) [3][256]int {
+	var bins [3][256]int
+	if len(buf) == 0 {
+		return bins
+	}
+	for i := 0; i+3 < len(buf); i += 4 {
+		bins[0][buf[i]]++
+		bins[1][buf[i+1]]++
+		bins[2][buf[i+2]]++
+	}
+	return bins
+}
+
+func clampLevel(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return v
+}
+
+func clampByte(v float64) byte {
+	if v < 0 {
+		v = 0
+	}
+	if v > 255 {
+		v = 255
+	}
+	return byte(math.Round(v))
+}
+
+func applyStretchParallel(img *loadedImage) (fitsio.ImageData, []byte) {
+	data := img.HDU.Data
+	numPixels := len(data.Pixels)
+	pixels := make([]float64, numPixels)
+	var mask []byte
+	if img.ShowClip {
+		mask = make([]byte, numPixels)
+	}
+
+	// 1. Pre-calculate constants (same as before)
 	denom := img.Peak - img.Background
-	if denom == 0 {
+	if denom <= 0 {
 		denom = 1
 	}
 	if img.ScaledPeak <= 0 {
@@ -495,50 +1031,86 @@ func applyStretch(img *loadedImage) (fitsio.ImageData, []byte) {
 	}
 	stretchMul := img.ScaledPeak / denom
 
-	for i, v := range data.Pixels {
-		if math.IsNaN(v) {
-			if img.ShowClip {
-				mask[i] = 3
-			}
-			pixels[i] = 0
-			continue
+	invLogPeak := 1.0 / math.Log1p(img.ScaledPeak)
+	invAsinhPeak := 1.0 / math.Asinh(img.ScaledPeak)
+	invSqrtPeak := 1.0 / math.Sqrt(img.ScaledPeak)
+	invLinearPeak := 1.0 / img.ScaledPeak
+
+	// 2. Setup Parallelism
+	numWorkers := runtime.NumCPU()
+	chunkSize := (numPixels + numWorkers - 1) / numWorkers
+	var wg sync.WaitGroup
+
+	for w := 0; w < numWorkers; w++ {
+		start := w * chunkSize
+		end := start + chunkSize
+		if start >= numPixels {
+			break
 		}
-		if v < img.Black {
-			if img.ShowClip {
-				mask[i] = 1
-			}
-			v = img.Black
-		}
-		if v > img.White {
-			if img.ShowClip {
-				mask[i] = 2
-			}
-			v = img.White
+		if end > numPixels {
+			end = numPixels
 		}
 
-		val := (v - img.Background) * stretchMul
-		if val < 0 {
-			val = 0
-		}
-		switch img.Mode {
-		case stretch.Log:
-			val = math.Log1p(val) / math.Log1p(img.ScaledPeak)
-		case stretch.Asinh:
-			val = math.Asinh(val) / math.Asinh(img.ScaledPeak)
-		case stretch.Sqrt:
-			val = math.Sqrt(val) / math.Sqrt(img.ScaledPeak)
-		case stretch.HistEq:
-			val = clamp01(val / img.ScaledPeak)
-		case stretch.Linear:
-			val = val / img.ScaledPeak
-		}
+		wg.Add(1)
+		go func(s, e int) {
+			defer wg.Done()
+			for i := s; i < e; i++ {
+				v := data.Pixels[i]
 
-		pixels[i] = clamp01(val)
+				// Handle NaN
+				if math.IsNaN(v) {
+					if mask != nil {
+						mask[i] = 3
+					}
+					pixels[i] = 0
+					continue
+				}
+
+				// Clipping
+				if v < img.Black {
+					if mask != nil {
+						mask[i] = 1
+					}
+					v = img.Black
+				} else if v > img.White {
+					if mask != nil {
+						mask[i] = 2
+					}
+					v = img.White
+				}
+
+				val := (v - img.Background) * stretchMul
+				if val < 0 {
+					val = 0
+				}
+
+				// Stretch logic
+				var result float64
+				switch img.Mode {
+				case stretch.Log:
+					result = math.Log1p(val) * invLogPeak
+				case stretch.Asinh:
+					result = math.Asinh(val) * invAsinhPeak
+				case stretch.Sqrt:
+					result = math.Sqrt(val) * invSqrtPeak
+				default: // Linear and HistEq pre-pass
+					result = val * invLinearPeak
+				}
+
+				// Final Clamp and Assignment
+				if result > 1.0 {
+					result = 1.0
+				}
+				pixels[i] = result
+			}
+		}(start, end)
 	}
 
+	wg.Wait()
+
+	// 3. Post-process Histogram Equalization if needed
 	if img.Mode == stretch.HistEq {
-		stretched := stretch.Apply(pixels, img.Mode)
-		return fitsio.ImageData{Width: data.Width, Height: data.Height, Pixels: stretched}, mask
+		pixels = stretch.Apply(pixels, img.Mode)
 	}
 
 	return fitsio.ImageData{Width: data.Width, Height: data.Height, Pixels: pixels}, mask
@@ -703,4 +1275,27 @@ func (d *dragLayer) MinSize() fyne.Size {
 		return fyne.NewSize(10, 10)
 	}
 	return d.content.MinSize()
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func formatHeadersLines(primary, sci fitsio.Header) []string {
+	lines := make([]string, 0, len(primary.Cards)+len(sci.Cards)+4)
+	lines = append(lines, "Primary header")
+	for _, key := range sortedKeys(primary.Cards) {
+		lines = append(lines, fmt.Sprintf("%-8s = %s", key, primary.Cards[key]))
+	}
+	lines = append(lines, "")
+	lines = append(lines, "SCI header")
+	for _, key := range sortedKeys(sci.Cards) {
+		lines = append(lines, fmt.Sprintf("%-8s = %s", key, sci.Cards[key]))
+	}
+	return lines
 }

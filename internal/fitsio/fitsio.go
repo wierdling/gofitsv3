@@ -87,6 +87,22 @@ func (f *File) SelectSCI() []HDU {
 	return sci
 }
 
+// GetHDU returns the first HDU whose EXTNAME matches name (case-insensitive).
+func (f *File) GetHDU(name string) *HDU {
+	target := strings.ToUpper(name)
+	for i := range f.HDUs {
+		if strings.ToUpper(f.HDUs[i].ExtName) == target {
+			return &f.HDUs[i]
+		}
+	}
+	return nil
+}
+
+// SelectDQ returns the first HDU named DQ (case-insensitive) if present.
+func (f *File) SelectDQ() *HDU {
+	return f.GetHDU("DQ")
+}
+
 // readHeader parses the FITS header cards and consumes padding to the 2880-byte boundary.
 func readHeader(r *bufio.Reader) (Header, int, error) {
 	cards := make(map[string]string)

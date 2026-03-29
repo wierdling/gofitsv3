@@ -2,7 +2,10 @@ module gofitsv3
 
 go 1.26
 
-require fyne.io/fyne/v2 v2.4.5
+require (
+	fyne.io/fyne/v2 v2.4.5
+	golang.org/x/image v0.11.0
+)
 
 require (
 	fyne.io/systray v1.10.1-0.20231115130155-104f5ef7839e // indirect
@@ -25,7 +28,6 @@ require (
 	github.com/stretchr/testify v1.8.4 // indirect
 	github.com/tevino/abool v1.2.0 // indirect
 	github.com/yuin/goldmark v1.5.5 // indirect
-	golang.org/x/image v0.11.0 // indirect
 	golang.org/x/mobile v0.0.0-20230531173138-3c911d8e3eda // indirect
 	golang.org/x/net v0.17.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect
