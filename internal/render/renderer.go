@@ -7,9 +7,9 @@ func ComposeRGB(r, g, b []float64, width, height int, modeR, modeG, modeB stretc
 	total := width * height
 	buf := make([]byte, total*4)
 	for i := 0; i < total; i++ {
-		pr := apply(r, i, modeR)
-		pg := apply(g, i, modeG)
-		pb := apply(b, i, modeB)
+		pr := apply(r, i)
+		pg := apply(g, i)
+		pb := apply(b, i)
 		buf[i*4] = toByte(pr)
 		buf[i*4+1] = toByte(pg)
 		buf[i*4+2] = toByte(pb)
@@ -18,7 +18,7 @@ func ComposeRGB(r, g, b []float64, width, height int, modeR, modeG, modeB stretc
 	return buf
 }
 
-func apply(arr []float64, idx int, mode stretch.Mode) float64 {
+func apply(arr []float64, idx int) float64 {
 	if idx >= len(arr) {
 		return 0
 	}
