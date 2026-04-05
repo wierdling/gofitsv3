@@ -6,8 +6,6 @@ import (
 	"gofitsv3/internal/fitsio"
 )
 
-// MaskFromDQ builds a boolean mask from a science HDU and its matching DQ HDU.
-// Pixels are marked bad when (dq & badBits) != 0. If badBits is 0, any non-zero DQ marks bad.
 func MaskFromDQ(sci fitsio.HDU, dq fitsio.HDU, badBits uint16) ([]bool, error) {
 	if sci.Data.Width != dq.Data.Width || sci.Data.Height != dq.Data.Height {
 		return nil, fmt.Errorf("dimension mismatch: sci %dx%d vs dq %dx%d", sci.Data.Width, sci.Data.Height, dq.Data.Width, dq.Data.Height)
@@ -17,7 +15,7 @@ func MaskFromDQ(sci fitsio.HDU, dq fitsio.HDU, badBits uint16) ([]bool, error) {
 	useBits := badBits != 0
 	for i := 0; i < total; i++ {
 		v := dq.Data.Pixels[i]
-		bits := uint32(int64(v)) // preserve raw bit pattern even if originally signed
+		bits := uint32(int64(v))
 		if (!useBits && bits != 0) || (useBits && (bits&uint32(badBits)) != 0) {
 			mask[i] = true
 		}
@@ -25,14 +23,12 @@ func MaskFromDQ(sci fitsio.HDU, dq fitsio.HDU, badBits uint16) ([]bool, error) {
 	return mask, nil
 }
 
-// InterpolateBicubic fills masked pixels using bicubic interpolation on surrounding valid pixels.
-// Unmasked pixels are copied through unchanged.
 func InterpolateBicubic(img fitsio.ImageData, mask []bool) fitsio.ImageData {
 	if len(mask) != len(img.Pixels) {
 		return img
 	}
 	w, h := img.Width, img.Height
-	out := make([]float64, len(img.Pixels))
+	out := make([]float32, len(img.Pixels))
 	copy(out, img.Pixels)
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
@@ -46,10 +42,7 @@ func InterpolateBicubic(img fitsio.ImageData, mask []bool) fitsio.ImageData {
 	return fitsio.ImageData{Width: w, Height: h, Pixels: out}
 }
 
-// --- helpers ---
-
-func bicubicAt(img fitsio.ImageData, mask []bool, x, y int) float64 {
-	// Use half-pixel offset to avoid relying on the missing center sample.
+func bicubicAt(img fitsio.ImageData, mask []bool, x, y int) float32 {
 	fx, fy := 0.5, 0.5
 	row := [4]float64{}
 	for j := -1; j <= 2; j++ {
@@ -59,7 +52,7 @@ func bicubicAt(img fitsio.ImageData, mask []bool, x, y int) float64 {
 		p3 := sample(img, mask, x+2, y+j)
 		row[j+1] = cubic(p0, p1, p2, p3, fx)
 	}
-	return cubic(row[0], row[1], row[2], row[3], fy)
+	return float32(cubic(row[0], row[1], row[2], row[3], fy))
 }
 
 func sample(img fitsio.ImageData, mask []bool, x, y int) float64 {
@@ -68,9 +61,8 @@ func sample(img fitsio.ImageData, mask []bool, x, y int) float64 {
 	y = mirror(y, h)
 	idx := y*w + x
 	if !mask[idx] {
-		return img.Pixels[idx]
+		return float64(img.Pixels[idx])
 	}
-	// Find nearest valid pixel in expanding square.
 	for r := 1; r <= 5; r++ {
 		for dy := -r; dy <= r; dy++ {
 			for dx := -r; dx <= r; dx++ {
@@ -78,13 +70,12 @@ func sample(img fitsio.ImageData, mask []bool, x, y int) float64 {
 				ny := mirror(y+dy, h)
 				nidx := ny*w + nx
 				if !mask[nidx] {
-					return img.Pixels[nidx]
+					return float64(img.Pixels[nidx])
 				}
 			}
 		}
 	}
-	// Fallback: return original value even if masked.
-	return img.Pixels[idx]
+	return float64(img.Pixels[idx])
 }
 
 func mirror(v, max int) int {
@@ -102,7 +93,6 @@ func mirror(v, max int) int {
 }
 
 func cubic(p0, p1, p2, p3, t float64) float64 {
-	// Catmull-Rom spline with a = -0.5
 	a := -0.5*p0 + 1.5*p1 - 1.5*p2 + 0.5*p3
 	b := p0 - 2.5*p1 + 2*p2 - 0.5*p3
 	c := -0.5*p0 + 0.5*p2

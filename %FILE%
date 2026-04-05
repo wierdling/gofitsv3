@@ -1,0 +1,4 @@
+='D:\goSource\GoFitsV3\.gocache' 
+='D:\goSource\GoFitsV3\.gomodcache' 
+Set-Location 'D:\goSource\GoFitsV3' 
+go test ./... 

@@ -8,8 +8,8 @@ import (
 )
 
 func TestMaskFromDQ(t *testing.T) {
-	sci := fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 2, Pixels: []float64{0, 1, 2, 3, 4, 5}}}
-	dq := fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 2, Pixels: []float64{0, 1, 2, 0, 4, 0}}}
+	sci := fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 2, Pixels: []float32{0, 1, 2, 3, 4, 5}}}
+	dq := fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 2, Pixels: []float32{0, 1, 2, 0, 4, 0}}}
 
 	mask, err := MaskFromDQ(sci, dq, 0)
 	if err != nil {
@@ -24,7 +24,7 @@ func TestMaskFromDQ(t *testing.T) {
 	}
 
 	// badBits filtering
-	dq.Data.Pixels = []float64{2, 0, 4, 0, 0, 0}
+	dq.Data.Pixels = []float32{2, 0, 4, 0, 0, 0}
 	mask, err = MaskFromDQ(sci, dq, 0x1)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -44,10 +44,10 @@ func TestMaskFromDQ(t *testing.T) {
 
 func TestInterpolateBicubic(t *testing.T) {
 	w, h := 5, 5
-	pixels := make([]float64, w*h)
+	pixels := make([]float32, w*h)
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
-			pixels[y*w+x] = float64(y*w + x)
+			pixels[y*w+x] = float32(y*w + x)
 		}
 	}
 	mask := make([]bool, len(pixels))
@@ -56,7 +56,7 @@ func TestInterpolateBicubic(t *testing.T) {
 
 	out := InterpolateBicubic(img, mask)
 	got := out.Pixels[2*w+2]
-	if math.IsNaN(got) || math.IsInf(got, 0) {
+	if math.IsNaN(float64(got)) || math.IsInf(float64(got), 0) {
 		t.Fatalf("interpolated value is invalid: %v", got)
 	}
 	if got == img.Pixels[2*w+2] {
@@ -71,11 +71,11 @@ func TestInterpolateBicubic(t *testing.T) {
 }
 
 func TestInterpolateEdge(t *testing.T) {
-	img := fitsio.ImageData{Width: 3, Height: 3, Pixels: []float64{1, 2, 3, 4, 5, 6, 7, 8, 9}}
+	img := fitsio.ImageData{Width: 3, Height: 3, Pixels: []float32{1, 2, 3, 4, 5, 6, 7, 8, 9}}
 	mask := make([]bool, len(img.Pixels))
 	mask[0] = true // top-left corner
 	out := InterpolateBicubic(img, mask)
-	if math.IsNaN(out.Pixels[0]) || out.Pixels[0] == img.Pixels[0] {
+	if math.IsNaN(float64(out.Pixels[0])) || out.Pixels[0] == img.Pixels[0] {
 		t.Fatalf("edge interpolation failed: %v", out.Pixels[0])
 	}
 }

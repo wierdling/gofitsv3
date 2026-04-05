@@ -1,3 +1,0 @@
--- Add code to align image before combining.
--- Add code to allow manual alignment (offsets) for green and red
--- Add code to despeckle

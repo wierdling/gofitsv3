@@ -34,6 +34,11 @@ func FromRGBABytes(path string, buf []byte, width, height int, format Format, op
 	return saveImage(path, img, format, opt)
 }
 
+// FromImage saves any Go image using the requested format.
+func FromImage(path string, img image.Image, format Format, opt Options) error {
+	return saveImage(path, img, format, opt)
+}
+
 func saveImage(path string, img image.Image, format Format, opt Options) error {
 	f, err := os.Create(path)
 	if err != nil {

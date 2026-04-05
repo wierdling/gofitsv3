@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 
+	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/utils"
 
@@ -89,8 +90,13 @@ func (w *rgbLevelsWindow) drawHistFunc(channel int, color [3]uint8) func(int, in
 	}
 }
 
-func (w *rgbLevelsWindow) setHistogram(bins [3][256]int) {
-	w.bins = bins
+// Updated to ingest [3]histogram.Stats instead of the raw 256-int arrays
+func (w *rgbLevelsWindow) setHistogram(stats [3]histogram.Stats) {
+	// Extract the histogram arrays from the new stats structs
+	for i := 0; i < 3; i++ {
+		w.bins[i] = stats[i].Hist
+	}
+
 	for _, h := range w.hists {
 		if h != nil {
 			h.Refresh()

@@ -2,8 +2,7 @@ package render
 
 import "gofitsv3/internal/stretch"
 
-// ComposeRGB combines three normalized grayscale images into RGBA buffer.
-func ComposeRGB(r, g, b []float64, width, height int, modeR, modeG, modeB stretch.Mode) []byte {
+func ComposeRGB(r, g, b []float32, width, height int, modeR, modeG, modeB stretch.Mode) []byte {
 	total := width * height
 	buf := make([]byte, total*4)
 	for i := 0; i < total; i++ {
@@ -18,11 +17,10 @@ func ComposeRGB(r, g, b []float64, width, height int, modeR, modeG, modeB stretc
 	return buf
 }
 
-func apply(arr []float64, idx int) float64 {
+func apply(arr []float32, idx int) float32 {
 	if idx >= len(arr) {
 		return 0
 	}
-	// mode applied beforehand; just clamp
 	v := arr[idx]
 	if v < 0 {
 		return 0
@@ -33,7 +31,7 @@ func apply(arr []float64, idx int) float64 {
 	return v
 }
 
-func toByte(v float64) byte {
+func toByte(v float32) byte {
 	if v < 0 {
 		v = 0
 	}

@@ -49,6 +49,7 @@ func newMosaicWorkspace(win fyne.Window) fyne.CanvasObject {
 			state.sources = append(state.sources, hdu)
 			redrawMosaic(preview, state)
 		}, win)
+		fd.SetView(dialog.ListView)
 		fd.Show()
 	})
 

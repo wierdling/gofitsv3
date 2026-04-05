@@ -37,11 +37,11 @@ func TestCleanWithDQ(t *testing.T) {
 	if !mask[center] {
 		t.Fatalf("expected center pixel masked")
 	}
-	if cleaned.Pixels[center] == float64(sci[center]) {
+	if cleaned.Pixels[center] == sci[center] {
 		t.Fatalf("center pixel was not changed")
 	}
 	// good pixel unchanged
-	if cleaned.Pixels[0] != float64(sci[0]) {
+	if cleaned.Pixels[0] != sci[0] {
 		t.Fatalf("good pixel changed")
 	}
 }

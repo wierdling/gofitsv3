@@ -23,11 +23,11 @@ type HDU struct {
 	ExtName string
 }
 
-// ImageData stores the raw pixel data normalized to float64.
+// ImageData stores the raw pixel data normalized to float32.
 type ImageData struct {
 	Width  int
 	Height int
-	Pixels []float64
+	Pixels []float32
 }
 
 // File holds all HDUs read from a FITS file.
@@ -54,7 +54,7 @@ func LoadFile(path string) (*File, error) {
 			}
 			return nil, err
 		}
-		_ = headerBytes // reserved for future validation
+		_ = headerBytes
 
 		hdu, dataBytes, err := readImage(reader, hdr)
 		if err != nil {
@@ -62,7 +62,6 @@ func LoadFile(path string) (*File, error) {
 		}
 		hdus = append(hdus, hdu)
 
-		// Align to next 2880-byte block after data.
 		if err := skipPadding(reader, dataBytes); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
@@ -76,7 +75,6 @@ func LoadFile(path string) (*File, error) {
 	return &File{HDUs: hdus}, nil
 }
 
-// SelectSCI returns HDUs whose EXTNAME starts with SCI (case-insensitive).
 func (f *File) SelectSCI() []HDU {
 	var sci []HDU
 	for _, h := range f.HDUs {
@@ -87,7 +85,6 @@ func (f *File) SelectSCI() []HDU {
 	return sci
 }
 
-// GetHDU returns the first HDU whose EXTNAME matches name (case-insensitive).
 func (f *File) GetHDU(name string) *HDU {
 	target := strings.ToUpper(name)
 	for i := range f.HDUs {
@@ -98,12 +95,10 @@ func (f *File) GetHDU(name string) *HDU {
 	return nil
 }
 
-// SelectDQ returns the first HDU named DQ (case-insensitive) if present.
 func (f *File) SelectDQ() *HDU {
 	return f.GetHDU("DQ")
 }
 
-// readHeader parses the FITS header cards and consumes padding to the 2880-byte boundary.
 func readHeader(r *bufio.Reader) (Header, int, error) {
 	cards := make(map[string]string)
 	cardCount := 0
@@ -147,7 +142,7 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 	height := parseInt(hdr.Cards["NAXIS2"])
 
 	total := width * height
-	pixels := make([]float64, total)
+	pixels := make([]float32, total)
 	dataBytes := 0
 
 	switch bitpix {
@@ -158,7 +153,7 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 		}
 		dataBytes = len(buf)
 		for i, b := range buf {
-			pixels[i] = float64(b)
+			pixels[i] = float32(b)
 		}
 	case 16:
 		buf := make([]int16, total)
@@ -167,7 +162,7 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 		}
 		dataBytes = len(buf) * 2
 		for i, v := range buf {
-			pixels[i] = float64(v)
+			pixels[i] = float32(v)
 		}
 	case 32:
 		buf := make([]int32, total)
@@ -176,7 +171,7 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 		}
 		dataBytes = len(buf) * 4
 		for i, v := range buf {
-			pixels[i] = float64(v)
+			pixels[i] = float32(v)
 		}
 	case -32:
 		buf := make([]float32, total)
@@ -184,16 +179,16 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 			return HDU{}, 0, err
 		}
 		dataBytes = len(buf) * 4
-		for i, v := range buf {
-			pixels[i] = float64(v)
-		}
+		copy(pixels, buf)
 	case -64:
 		buf := make([]float64, total)
 		if err := binary.Read(r, binary.BigEndian, buf); err != nil {
 			return HDU{}, 0, err
 		}
 		dataBytes = len(buf) * 8
-		copy(pixels, buf)
+		for i, v := range buf {
+			pixels[i] = float32(v)
+		}
 	default:
 		return HDU{}, 0, fmt.Errorf("unsupported BITPIX %d", bitpix)
 	}
@@ -226,33 +221,32 @@ func parseInt(val string) int {
 	return i
 }
 
-// Normalize scales data to 0..1 range.
 func (img ImageData) Normalize() ImageData {
 	min, max := math.MaxFloat64, -math.MaxFloat64
 	for _, v := range img.Pixels {
-		if v < min {
-			min = v
+		fv := float64(v)
+		if fv < min {
+			min = fv
 		}
-		if v > max {
-			max = v
+		if fv > max {
+			max = fv
 		}
 	}
 	span := max - min
 	if span == 0 {
 		span = 1
 	}
-	out := make([]float64, len(img.Pixels))
+	out := make([]float32, len(img.Pixels))
 	for i, v := range img.Pixels {
-		out[i] = (v - min) / span
+		out[i] = float32((float64(v) - min) / span)
 	}
 	return ImageData{Width: img.Width, Height: img.Height, Pixels: out}
 }
 
-// ToRGBA converts normalized pixels to 8-bit RGBA buffer for preview.
 func (img ImageData) ToRGBA() []byte {
 	buf := make([]byte, img.Width*img.Height*4)
 	for i, v := range img.Pixels {
-		b := byte(clamp01(v) * 255)
+		b := byte(clamp01(float64(v)) * 255)
 		idx := i * 4
 		buf[idx] = b
 		buf[idx+1] = b

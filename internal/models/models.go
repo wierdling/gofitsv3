@@ -9,17 +9,16 @@ import (
 )
 
 type LoadedImage struct {
-	Path           string
-	HDU            fitsio.HDU
-	Primary        fitsio.Header
-	Mode           stretch.Mode
-	Black          float64
-	White          float64
-	Background     float64
-	Peak           float64
-	ScaledPeak     float64
-	ShowClip       bool
-	OriginalPixels []float64
+	Path       string
+	HDU        fitsio.HDU
+	Primary    fitsio.Header
+	Mode       stretch.Mode
+	Black      float64
+	White      float64
+	Background float64
+	Peak       float64
+	ScaledPeak float64
+	ShowClip   bool
 }
 
 type ChannelState struct {

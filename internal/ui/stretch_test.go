@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/models"
+	"gofitsv3/internal/processing"
 	"gofitsv3/internal/stretch"
 )
 
@@ -16,8 +18,8 @@ func almostEqual(a, b, tol float64) bool {
 }
 
 func TestApplyStretchLinear(t *testing.T) {
-	img := &loadedImage{
-		HDU:        fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 1, Pixels: []float64{0, 0.5, 1}}},
+	img := &models.LoadedImage{
+		HDU:        fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 1, Pixels: []float32{0, 0.5, 1}}},
 		Mode:       stretch.Linear,
 		Black:      0,
 		White:      1,
@@ -26,13 +28,13 @@ func TestApplyStretchLinear(t *testing.T) {
 		ScaledPeak: 1,
 		ShowClip:   true,
 	}
-	out, mask := applyStretch(img)
+	out, mask := processing.ApplyStretchParallel(img)
 	if len(mask) != 3 {
 		t.Fatalf("expected mask len 3")
 	}
 	want := []float64{0, 0.5, 1}
 	for i, v := range want {
-		if !almostEqual(out.Pixels[i], v, 1e-6) {
+		if !almostEqual(float64(out.Pixels[i]), v, 1e-6) {
 			t.Fatalf("linear pixel %d got %f want %f", i, out.Pixels[i], v)
 		}
 	}
@@ -42,8 +44,8 @@ func TestApplyStretchLinear(t *testing.T) {
 }
 
 func TestApplyStretchLog(t *testing.T) {
-	img := &loadedImage{
-		HDU:        fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 1, Pixels: []float64{0, 0.5, 1}}},
+	img := &models.LoadedImage{
+		HDU:        fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 1, Pixels: []float32{0, 0.5, 1}}},
 		Mode:       stretch.Log,
 		Black:      0,
 		White:      1,
@@ -51,19 +53,19 @@ func TestApplyStretchLog(t *testing.T) {
 		Peak:       1,
 		ScaledPeak: 10,
 	}
-	out, _ := applyStretch(img)
+	out, _ := processing.ApplyStretchParallel(img)
 	want0 := 0.0
 	want1 := math.Log1p(5) / math.Log1p(10)
 	want2 := 1.0
 	got := out.Pixels
-	if !almostEqual(got[0], want0, 1e-6) || !almostEqual(got[1], want1, 1e-6) || !almostEqual(got[2], want2, 1e-6) {
+	if !almostEqual(float64(got[0]), want0, 1e-6) || !almostEqual(float64(got[1]), want1, 1e-6) || !almostEqual(float64(got[2]), want2, 1e-6) {
 		t.Fatalf("log stretch got %v want [%f %f %f]", got, want0, want1, want2)
 	}
 }
 
 func TestApplyStretchMasking(t *testing.T) {
-	img := &loadedImage{
-		HDU:        fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 1, Pixels: []float64{0.1, math.NaN(), 0.9}}},
+	img := &models.LoadedImage{
+		HDU:        fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 1, Pixels: []float32{0.1, float32(math.NaN()), 0.9}}},
 		Mode:       stretch.Linear,
 		Black:      0.2,
 		White:      0.8,
@@ -72,7 +74,7 @@ func TestApplyStretchMasking(t *testing.T) {
 		ScaledPeak: 1,
 		ShowClip:   true,
 	}
-	_, mask := applyStretch(img)
+	_, mask := processing.ApplyStretchParallel(img)
 	if mask[0] != 1 {
 		t.Fatalf("expected mask 1 for low pixel, got %d", mask[0])
 	}

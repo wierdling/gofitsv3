@@ -29,6 +29,7 @@ type viewport struct {
 	scroll     *container.Scroll
 	bins       [256]int
 	customZoom string
+	StatsLabel *widget.Label
 }
 
 var presetZoomOptions = []string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}
@@ -58,8 +59,14 @@ func newViewport() *viewport {
 	vp.zoomOut = widget.NewButton("-", func() { vp.stepZoom(0.95) })
 	vp.zoomIn = widget.NewButton("+", func() { vp.stepZoom(1.05) })
 
+	// Instantiate the label before building the layout
+	vp.StatsLabel = widget.NewLabel("Mean: -- | Std: --")
+	vp.StatsLabel.TextStyle = fyne.TextStyle{Monospace: true}
+	vp.StatsLabel.Alignment = fyne.TextAlignCenter
+
 	header := container.NewVBox(
 		vp.histogram,
+		vp.StatsLabel, // Inject into the UI tree right below the histogram
 		container.NewHBox(
 			layout.NewSpacer(),
 			widget.NewLabel("Black"),
@@ -75,6 +82,7 @@ func newViewport() *viewport {
 	vp.container = container.NewBorder(header, nil, nil, nil, vp.scroll)
 
 	vp.zoomLabel.SetSelected("fit in preview")
+
 	return vp
 }
 
