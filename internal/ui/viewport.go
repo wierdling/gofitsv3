@@ -14,22 +14,29 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+type imagePoint struct {
+	X int
+	Y int
+}
+
 type viewport struct {
-	image      *canvas.Image
-	histogram  *canvas.Raster
-	zoomLabel  *widget.Select
-	zoomOut    *widget.Button
-	zoomIn     *widget.Button
-	blackBox   *widget.Entry
-	whiteBox   *widget.Entry
-	container  fyne.CanvasObject
-	zoom       float64
-	origW      int
-	origH      int
-	scroll     *container.Scroll
-	bins       [256]int
-	customZoom string
-	StatsLabel *widget.Label
+	image         *canvas.Image
+	histogram     *canvas.Raster
+	zoomLabel     *widget.Select
+	zoomOut       *widget.Button
+	zoomIn        *widget.Button
+	blackBox      *widget.Entry
+	whiteBox      *widget.Entry
+	container     fyne.CanvasObject
+	zoom          float64
+	origW         int
+	origH         int
+	scroll        *container.Scroll
+	overlay       *viewerInteractionLayer
+	bins          [256]int
+	customZoom    string
+	StatsLabel    *widget.Label
+	onViewChanged func()
 }
 
 var presetZoomOptions = []string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}
@@ -42,9 +49,10 @@ func newViewport() *viewport {
 	vp.histogram = canvas.NewRaster(vp.drawHist)
 	vp.histogram.SetMinSize(fyne.NewSize(200, 48))
 
-	drag := newDragLayer(nil, img)
-	vp.scroll = container.NewScroll(container.NewMax(img, drag))
-	drag.scroll = vp.scroll
+	overlay := newViewerInteractionLayer()
+	vp.overlay = overlay
+	vp.scroll = container.NewScroll(container.NewMax(img, overlay))
+	overlay.scroll = vp.scroll
 	vp.scroll.SetMinSize(fyne.NewSize(260, 180))
 
 	vp.blackBox = widget.NewEntry()
@@ -59,14 +67,13 @@ func newViewport() *viewport {
 	vp.zoomOut = widget.NewButton("-", func() { vp.stepZoom(0.95) })
 	vp.zoomIn = widget.NewButton("+", func() { vp.stepZoom(1.05) })
 
-	// Instantiate the label before building the layout
 	vp.StatsLabel = widget.NewLabel("Mean: -- | Std: --")
 	vp.StatsLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.StatsLabel.Alignment = fyne.TextAlignCenter
 
 	header := container.NewVBox(
 		vp.histogram,
-		vp.StatsLabel, // Inject into the UI tree right below the histogram
+		vp.StatsLabel,
 		container.NewHBox(
 			layout.NewSpacer(),
 			widget.NewLabel("Black"),
@@ -148,12 +155,24 @@ func (vp *viewport) applyZoom() {
 	if vp.origW == 0 || vp.origH == 0 {
 		vp.image.SetMinSize(avail)
 		vp.image.Refresh()
+		if vp.overlay != nil {
+			vp.overlay.Refresh()
+		}
+		if vp.onViewChanged != nil {
+			vp.onViewChanged()
+		}
 		return
 	}
 	w := float32(vp.origW) * float32(vp.zoom)
 	h := float32(vp.origH) * float32(vp.zoom)
 	vp.image.SetMinSize(fyne.NewSize(w, h))
 	vp.image.Refresh()
+	if vp.overlay != nil {
+		vp.overlay.Refresh()
+	}
+	if vp.onViewChanged != nil {
+		vp.onViewChanged()
+	}
 }
 
 func (vp *viewport) fitZoom() float64 {
@@ -197,4 +216,25 @@ func (vp *viewport) drawHist(w, h int) image.Image {
 
 func blankImg() *image.RGBA {
 	return image.NewRGBA(image.Rect(0, 0, 10, 10))
+}
+
+func (vp *viewport) imagePointAtPosition(pos fyne.Position, flipped bool) (imagePoint, bool) {
+	return mapViewportPositionToImage(pos, fyne.NewPos(0, 0), vp.zoom, vp.origW, vp.origH, flipped)
+}
+
+func (vp *viewport) setMeasurementOverlay(first *imagePoint, second *imagePoint, flipped bool) {
+	if vp == nil || vp.overlay == nil {
+		return
+	}
+	var start *fyne.Position
+	var end *fyne.Position
+	if first != nil {
+		pos := imagePointToCanvasPosition(*first, vp.zoom, vp.origH, flipped)
+		start = &pos
+	}
+	if second != nil {
+		pos := imagePointToCanvasPosition(*second, vp.zoom, vp.origH, flipped)
+		end = &pos
+	}
+	vp.overlay.setMeasurement(start, end)
 }

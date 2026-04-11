@@ -25,35 +25,9 @@ func AlignChannelUsingWCS(targetPixels []float32, targetWidth, targetHeight int,
 		return nil, AffineTransform{}, fmt.Errorf("invalid image dimensions (target: %dx%d, ref: %dx%d)", targetWidth, targetHeight, refWidth, refHeight)
 	}
 
-	targetWCS, err := parseLinearWCS(targetHeader)
+	transform, err := ComputeWCSTransform(targetHeader, refHeader)
 	if err != nil {
 		return nil, AffineTransform{}, err
-	}
-	refWCS, err := parseLinearWCS(refHeader)
-	if err != nil {
-		return nil, AffineTransform{}, err
-	}
-
-	x00, y00, err := mapRefPixelToTargetPixel(0, 0, refWCS, targetWCS)
-	if err != nil {
-		return nil, AffineTransform{}, err
-	}
-	x10, y10, err := mapRefPixelToTargetPixel(1, 0, refWCS, targetWCS)
-	if err != nil {
-		return nil, AffineTransform{}, err
-	}
-	x01, y01, err := mapRefPixelToTargetPixel(0, 1, refWCS, targetWCS)
-	if err != nil {
-		return nil, AffineTransform{}, err
-	}
-
-	transform := AffineTransform{
-		A: x10 - x00,
-		B: x01 - x00,
-		C: x00,
-		D: y10 - y00,
-		E: y01 - y00,
-		F: y00,
 	}
 
 	alignedPixels := WarpImageToSize(targetPixels, targetWidth, targetHeight, refWidth, refHeight, transform)
@@ -61,6 +35,39 @@ func AlignChannelUsingWCS(targetPixels []float32, targetWidth, targetHeight int,
 		return nil, AffineTransform{}, fmt.Errorf("unexpected aligned pixel count: got %d want %d", len(alignedPixels), refWidth*refHeight)
 	}
 	return alignedPixels, transform, nil
+}
+
+func ComputeWCSTransform(targetHeader fitsio.Header, refHeader fitsio.Header) (AffineTransform, error) {
+	targetWCS, err := parseLinearWCS(targetHeader)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+	refWCS, err := parseLinearWCS(refHeader)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+
+	x00, y00, err := mapRefPixelToTargetPixel(0, 0, refWCS, targetWCS)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+	x10, y10, err := mapRefPixelToTargetPixel(1, 0, refWCS, targetWCS)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+	x01, y01, err := mapRefPixelToTargetPixel(0, 1, refWCS, targetWCS)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+
+	return AffineTransform{
+		A: x10 - x00,
+		B: x01 - x00,
+		C: x00,
+		D: y10 - y00,
+		E: y01 - y00,
+		F: y00,
+	}, nil
 }
 
 func parseLinearWCS(header fitsio.Header) (linearWCS, error) {

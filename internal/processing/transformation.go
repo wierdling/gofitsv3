@@ -12,6 +12,30 @@ type AffineTransform struct {
 	D, E, F float64
 }
 
+func IdentityTransform() AffineTransform {
+	return AffineTransform{A: 1, E: 1}
+}
+
+func ApplyAffineTransform(t AffineTransform, x, y float64) (float64, float64) {
+	return t.A*x + t.B*y + t.C, t.D*x + t.E*y + t.F
+}
+
+func InvertAffineTransform(t AffineTransform) (AffineTransform, error) {
+	det := t.A*t.E - t.B*t.D
+	if math.Abs(det) < 1e-18 {
+		return AffineTransform{}, errors.New("singular affine transform")
+	}
+
+	return AffineTransform{
+		A: t.E / det,
+		B: -t.B / det,
+		C: (t.B*t.F - t.C*t.E) / det,
+		D: -t.D / det,
+		E: t.A / det,
+		F: (t.C*t.D - t.A*t.F) / det,
+	}, nil
+}
+
 func SolveTransformation(pairs []MatchedPair) (AffineTransform, error) {
 	n := len(pairs)
 	if n < 3 {

@@ -17,15 +17,16 @@ func Run() error {
 	win := a.NewWindow("GoFitsV3 - " + version.Version)
 
 	compose := newComposeWorkspace(a, win)
-	mosaic := newMosaicWorkspace(win)
+	examine := newExamineWorkspace(a, win)
+	mosaic := newMosaicWorkspace(a, win)
 
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Compose", compose),
 		container.NewTabItem("Mosaic", mosaic),
+		container.NewTabItem("Examine", examine),
 	)
 
 	win.SetContent(tabs)
-	// Smaller default size to better fit shorter displays; still resizable by the user.
 	win.Resize(fyne.NewSize(980, 620))
 	win.Show()
 
