@@ -12,9 +12,10 @@ import (
 // Run starts the Fyne application.
 func Run() error {
 	a := app.NewWithID("gofitsv3")
+	a.SetIcon(fyne.NewStaticResource("icon.png", iconBytes))
 	a.Settings().SetTheme(theme.DarkTheme())
 
-	win := a.NewWindow("GoFitsV3 - " + version.Version)
+	win := a.NewWindow("Go Fits V3 - " + version.Version)
 
 	compose := newComposeWorkspace(a, win)
 	examine := newExamineWorkspace(a, win)
