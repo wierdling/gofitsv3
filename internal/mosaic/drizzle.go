@@ -177,6 +177,44 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 	return results, nil
 }
 
+// AlignInputsBySelectedStars is like AlignInputsByStars but uses manually
+// selected reference star positions (in the reference image's pixel space).
+func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]StarAlignmentResult, error) {
+	if len(inputs) == 0 {
+		return nil, fmt.Errorf("no FITS inputs selected")
+	}
+	if len(refStars) == 0 {
+		return nil, fmt.Errorf("no reference stars provided")
+	}
+	results := make([]StarAlignmentResult, len(inputs))
+	results[0] = StarAlignmentResult{OffsetX: inputs[0].OffsetX, OffsetY: inputs[0].OffsetY, Applied: true}
+	ref := inputs[0]
+	for i := 1; i < len(inputs); i++ {
+		dx, dy, err := processing.EstimateTranslationFromRefStars(
+			refStars,
+			inputs[i].HDU.Data.Pixels,
+			inputs[i].HDU.Data.Width,
+			inputs[i].HDU.Data.Height,
+			inputs[i].HDU.Header,
+			ref.HDU.Data.Width,
+			ref.HDU.Data.Height,
+			ref.HDU.Header,
+			inputs[i].OffsetX,
+			inputs[i].OffsetY,
+		)
+		if err != nil {
+			results[i] = StarAlignmentResult{OffsetX: inputs[i].OffsetX, OffsetY: inputs[i].OffsetY, Error: err.Error()}
+			continue
+		}
+		results[i] = StarAlignmentResult{
+			OffsetX: inputs[i].OffsetX + dx,
+			OffsetY: inputs[i].OffsetY + dy,
+			Applied: true,
+		}
+	}
+	return results, nil
+}
+
 func SaveResultFITS(path string, result *Result) error {
 	if result == nil {
 		return fmt.Errorf("no drizzle result available")

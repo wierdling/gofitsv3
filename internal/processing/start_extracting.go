@@ -116,3 +116,104 @@ func EstimateBackground(pixels []float32) (float64, float64) {
 	}
 	return median, sigma
 }
+
+// CentroidNear returns the flux-weighted centroid of the star nearest to (x, y).
+// It searches for the brightest pixel within searchRadius, then computes a
+// flux-weighted centroid in a 7-pixel window around that peak.
+// Returns the refined position and true on success; (x, y, false) if nothing
+// bright enough is found.
+func CentroidNear(pixels []float32, width, height int, x, y float64, searchRadius int) (float64, float64, bool) {
+	cx := int(math.Round(x))
+	cy := int(math.Round(y))
+
+	// Clamp search box.
+	sx0 := cx - searchRadius
+	sx1 := cx + searchRadius
+	sy0 := cy - searchRadius
+	sy1 := cy + searchRadius
+	if sx0 < 0 {
+		sx0 = 0
+	}
+	if sx1 >= width {
+		sx1 = width - 1
+	}
+	if sy0 < 0 {
+		sy0 = 0
+	}
+	if sy1 >= height {
+		sy1 = height - 1
+	}
+
+	// Find the peak pixel in the search box.
+	peakX, peakY := cx, cy
+	peakVal := math.Inf(-1)
+	for py := sy0; py <= sy1; py++ {
+		for px := sx0; px <= sx1; px++ {
+			v := float64(pixels[py*width+px])
+			if math.IsNaN(v) {
+				continue
+			}
+			if v > peakVal {
+				peakVal = v
+				peakX, peakY = px, py
+			}
+		}
+	}
+	if math.IsInf(peakVal, -1) {
+		return x, y, false
+	}
+
+	// Compute local background as the median of pixels in the centroid window.
+	const centRadius = 7
+	c0x := peakX - centRadius
+	c1x := peakX + centRadius
+	c0y := peakY - centRadius
+	c1y := peakY + centRadius
+	if c0x < 0 {
+		c0x = 0
+	}
+	if c1x >= width {
+		c1x = width - 1
+	}
+	if c0y < 0 {
+		c0y = 0
+	}
+	if c1y >= height {
+		c1y = height - 1
+	}
+
+	var localSample []float64
+	for py := c0y; py <= c1y; py++ {
+		for px := c0x; px <= c1x; px++ {
+			v := float64(pixels[py*width+px])
+			if !math.IsNaN(v) {
+				localSample = append(localSample, v)
+			}
+		}
+	}
+	var bg float64
+	if len(localSample) > 0 {
+		sorted := make([]float64, len(localSample))
+		copy(sorted, localSample)
+		sort.Float64s(sorted)
+		bg = sorted[len(sorted)/4] // lower quartile as background estimate
+	}
+
+	// Flux-weighted centroid around peak.
+	var sumX, sumY, sumF float64
+	for py := c0y; py <= c1y; py++ {
+		for px := c0x; px <= c1x; px++ {
+			v := float64(pixels[py*width+px]) - bg
+			if v <= 0 || math.IsNaN(v) {
+				continue
+			}
+			sumX += float64(px) * v
+			sumY += float64(py) * v
+			sumF += v
+		}
+	}
+	if sumF <= 0 {
+		return x, y, false
+	}
+	return sumX / sumF, sumY / sumF, true
+}

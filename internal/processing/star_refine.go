@@ -61,6 +61,71 @@ func EstimateTranslationAfterWCS(targetPixels []float32, targetWidth, targetHeig
 	return medianFloat64(dxs), medianFloat64(dys), nil
 }
 
+// EstimateTranslationFromRefStars is like EstimateTranslationAfterWCS but uses
+// manually provided reference star positions instead of auto-detecting them.
+// refStars are positions in the reference image's pixel space.
+func EstimateTranslationFromRefStars(
+	refStars []Star,
+	targetPixels []float32, targetWidth, targetHeight int, targetHeader fitsio.Header,
+	refWidth, refHeight int, refHeader fitsio.Header,
+	initialOffsetX, initialOffsetY float64,
+) (float64, float64, error) {
+	if len(refStars) == 0 {
+		return 0, 0, fmt.Errorf("no reference stars provided")
+	}
+
+	transform, err := ComputeWCSTransform(targetHeader, refHeader)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	transform.C = transform.C - (transform.A * initialOffsetX) - (transform.B * initialOffsetY)
+	transform.F = transform.F - (transform.D * initialOffsetX) - (transform.E * initialOffsetY)
+
+	warpedTarget, validMask := WarpImageToSizeWithMask(targetPixels, targetWidth, targetHeight, refWidth, refHeight, transform)
+	maskedTarget := make([]float32, len(warpedTarget))
+	for i := range warpedTarget {
+		v := float64(warpedTarget[i])
+		if !validMask[i] || math.IsNaN(v) || math.IsInf(v, 0) {
+			maskedTarget[i] = float32(math.NaN())
+		} else {
+			maskedTarget[i] = warpedTarget[i]
+		}
+	}
+
+	targetStars := ExtractStars(maskedTarget, refWidth, refHeight, 4.0, 3)
+	if len(targetStars) == 0 {
+		return 0, 0, fmt.Errorf("no stars detected in warped target image")
+	}
+
+	// For each selected reference star, find the nearest auto-detected target star.
+	const searchRadius = 30.0
+	var dxs, dys []float64
+	for _, rs := range refStars {
+		bestDist := math.MaxFloat64
+		var bestDx, bestDy float64
+		for _, ts := range targetStars {
+			dx := rs.X - ts.X
+			dy := rs.Y - ts.Y
+			dist := math.Sqrt(dx*dx + dy*dy)
+			if dist < bestDist {
+				bestDist = dist
+				bestDx = dx
+				bestDy = dy
+			}
+		}
+		if bestDist <= searchRadius {
+			dxs = append(dxs, bestDx)
+			dys = append(dys, bestDy)
+		}
+	}
+
+	if len(dxs) == 0 {
+		return 0, 0, fmt.Errorf("no selected stars matched in target image (search radius: %.0f px)", searchRadius)
+	}
+	return medianFloat64(dxs), medianFloat64(dys), nil
+}
+
 func medianFloat64(values []float64) float64 {
 	if len(values) == 0 {
 		return 0
