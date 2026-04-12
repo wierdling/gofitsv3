@@ -155,7 +155,6 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		}
 	}
 
-
 	syncStatusOffsets := func() {
 		for i := range state.statuses {
 			if i >= len(state.inputs) {
@@ -464,20 +463,19 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			warnings := 0
 
 			for _, path := range paths {
-				imgs, err := loadImagesFromPath(path)
+				input, err := mosaic.LoadInputFromPath(path)
 				if err != nil {
 					newStatuses = append(newStatuses, mosaic.InputStatus{Path: path, Status: "failed", Error: err.Error()})
 					continue
 				}
 
+				newInputs = append(newInputs, input)
 				status := mosaic.InputStatus{Path: path, Included: true, Status: "loaded"}
 				if !mosaic.LooksLikeFLC(path) {
 					status.Status = "loaded (warning: not _flc)"
 					warnings++
 				}
-				for _, img := range imgs {
-					newInputs = append(newInputs, mosaic.Input{Path: path, PrimaryHeader: img.Primary, HDU: img.HDU})
-				}
+
 				newStatuses = append(newStatuses, status)
 			}
 
