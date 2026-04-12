@@ -737,7 +737,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	return split
 }
 
-func loadImageFromPath(path string) (result *models.LoadedImage, err error) {
+// loadImagesFromPath loads all SCI extensions from a FITS file as separate LoadedImage values.
+// For multi-chip files (e.g. HST FLC), this returns one entry per SCI extension.
+// Falls back to the first HDU if no SCI extensions are found.
+func loadImagesFromPath(path string) (results []*models.LoadedImage, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("fatal crash intercepted: %v", r)
@@ -749,34 +752,39 @@ func loadImageFromPath(path string) (result *models.LoadedImage, err error) {
 		return nil, loadErr
 	}
 
-	sci := file.SelectSCI()
-	hdu := file.HDUs[0]
-	if len(sci) == 1 {
-		hdu = sci[0]
-	} else if len(sci) > 1 {
-		hdu = sci[0]
+	sciHDUs := file.SelectSCI()
+	if len(sciHDUs) == 0 {
+		sciHDUs = []fitsio.HDU{file.HDUs[0]}
 	}
 
-	if cleaned, cleanErr := cleanHDUWithDQ(hdu, file); cleanErr == nil {
-		hdu = cleaned
+	primary := file.HDUs[0].Header
+	for _, hdu := range sciHDUs {
+		if cleaned, cleanErr := cleanHDUWithDQ(hdu, file); cleanErr == nil {
+			hdu = cleaned
+		}
+		minV, maxV := processing.AutoLevels(hdu.Data.Pixels)
+		results = append(results, &models.LoadedImage{
+			Path:       path,
+			HDU:        hdu,
+			Primary:    primary,
+			Mode:       stretch.Linear,
+			Black:      minV,
+			White:      maxV,
+			Background: minV,
+			Peak:       maxV,
+			ScaledPeak: maxV,
+			ShowClip:   true,
+		})
 	}
+	return results, nil
+}
 
-	minV, maxV := processing.AutoLevels(hdu.Data.Pixels)
-
-	result = &models.LoadedImage{
-		Path:       path,
-		HDU:        hdu,
-		Primary:    file.HDUs[0].Header,
-		Mode:       stretch.Linear,
-		Black:      minV,
-		White:      maxV,
-		Background: minV,
-		Peak:       maxV,
-		ScaledPeak: maxV,
-		ShowClip:   true,
+func loadImageFromPath(path string) (*models.LoadedImage, error) {
+	imgs, err := loadImagesFromPath(path)
+	if err != nil {
+		return nil, err
 	}
-
-	return result, nil
+	return imgs[0], nil
 }
 
 func channelStateFromImage(img *models.LoadedImage) models.ChannelState {

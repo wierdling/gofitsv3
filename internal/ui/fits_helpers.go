@@ -8,8 +8,10 @@ import (
 )
 
 // cleanHDUWithDQ runs bad-pixel masking using the file's DQ extension when available.
+// It matches the DQ extension by EXTVER when the SCI HDU has one.
 func cleanHDUWithDQ(hdu fitsio.HDU, file *fitsio.File) (fitsio.HDU, error) {
-	dq := file.SelectDQ()
+	extver := hdu.Header.Cards["EXTVER"]
+	dq := file.GetHDUByExtVer("DQ", extver)
 	if dq == nil {
 		return hdu, fmt.Errorf("DQ not found")
 	}

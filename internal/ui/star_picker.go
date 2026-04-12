@@ -34,7 +34,7 @@ func newStarPickerWidget(img image.Image, imageW, imageH int) *starPickerWidget 
 		refImage: img,
 		imageW:   imageW,
 		imageH:   imageH,
-		MaxStars: 10,
+		MaxStars: 50,
 	}
 	w.ExtendBaseWidget(w)
 	return w

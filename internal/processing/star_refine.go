@@ -99,9 +99,15 @@ func EstimateTranslationFromRefStars(
 	}
 
 	// For each selected reference star, find the nearest auto-detected target star.
+	// Skip stars whose position in ref space is not covered by the target image.
 	const searchRadius = 30.0
 	var dxs, dys []float64
 	for _, rs := range refStars {
+		px := int(math.Round(rs.X))
+		py := int(math.Round(rs.Y))
+		if px < 0 || px >= refWidth || py < 0 || py >= refHeight || !validMask[py*refWidth+px] {
+			continue
+		}
 		bestDist := math.MaxFloat64
 		var bestDx, bestDy float64
 		for _, ts := range targetStars {
