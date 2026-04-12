@@ -99,6 +99,25 @@ func (f *File) SelectDQ() *HDU {
 	return f.GetHDU("DQ")
 }
 
+// GetHDUByExtVer returns the first HDU matching name and EXTVER card value.
+// If extver is empty, it falls back to the first HDU matching name.
+func (f *File) GetHDUByExtVer(name, extver string) *HDU {
+	target := strings.ToUpper(name)
+	for i := range f.HDUs {
+		h := &f.HDUs[i]
+		if strings.ToUpper(h.ExtName) != target {
+			continue
+		}
+		if extver == "" {
+			return h
+		}
+		if v, ok := h.Header.Cards["EXTVER"]; ok && strings.TrimSpace(v) == strings.TrimSpace(extver) {
+			return h
+		}
+	}
+	return nil
+}
+
 func readHeader(r *bufio.Reader) (Header, int, error) {
 	cards := make(map[string]string)
 	cardCount := 0

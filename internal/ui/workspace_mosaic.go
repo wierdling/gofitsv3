@@ -376,7 +376,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			return processing.CentroidNear(centPixels, centW, centH, x, y, 15)
 		}
 
-		starCountLabel.SetText("Selected: 0 / 10 stars")
+		starCountLabel.SetText("Selected: 0 / 50 stars")
 
 		pickerScroll.Content = activePicker
 		pickerScroll.Refresh()
@@ -464,17 +464,19 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			warnings := 0
 
 			for _, path := range paths {
-				img, err := loadImageFromPath(path)
+				imgs, err := loadImagesFromPath(path)
 				if err != nil {
 					newStatuses = append(newStatuses, mosaic.InputStatus{Path: path, Status: "failed", Error: err.Error()})
 					continue
 				}
 
-				newInputs = append(newInputs, mosaic.Input{Path: path, PrimaryHeader: img.Primary, HDU: img.HDU})
 				status := mosaic.InputStatus{Path: path, Included: true, Status: "loaded"}
 				if !mosaic.LooksLikeFLC(path) {
 					status.Status = "loaded (warning: not _flc)"
 					warnings++
+				}
+				for _, img := range imgs {
+					newInputs = append(newInputs, mosaic.Input{Path: path, PrimaryHeader: img.Primary, HDU: img.HDU})
 				}
 				newStatuses = append(newStatuses, status)
 			}
@@ -549,12 +551,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				applyBtn.Disable()
 				name += " (reference)"
 			}
-			row := container.NewVBox(
-				widget.NewLabel(name),
-				container.NewGridWithColumns(5,
+			row := container.NewBorder(nil, nil, widget.NewLabel(name), applyBtn,
+				container.NewGridWithColumns(4,
 					widget.NewLabel("X"), xEntry,
 					widget.NewLabel("Y"), yEntry,
-					applyBtn,
 				),
 			)
 			offsetControls.Add(row)
@@ -600,18 +600,30 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 
 				options := mosaic.FilterOptions(groups)
 				filterSelect := widget.NewSelect(options, nil)
-				filesLabel := widget.NewLabel("")
-				filesLabel.Wrapping = fyne.TextWrapWord
-				filesScroll := container.NewVScroll(filesLabel)
+
+				type fileCheck struct {
+					path    string
+					checked bool
+				}
+				var fileChecks []fileCheck
+				checkContainer := container.NewVBox()
+				filesScroll := container.NewVScroll(checkContainer)
 				filesScroll.SetMinSize(fyne.NewSize(420, 220))
+
 				updateSelectedFiles := func(option string) {
 					paths := mosaic.PathsForFilterOption(groups, option)
-					labels := make([]string, 0, len(paths)+1)
-					labels = append(labels, fmt.Sprintf("%d files will be loaded:", len(paths)))
-					for _, path := range paths {
-						labels = append(labels, filepath.Base(path))
+					fileChecks = make([]fileCheck, len(paths))
+					checkContainer.Objects = nil
+					for i, path := range paths {
+						i, path := i, path
+						fileChecks[i] = fileCheck{path: path, checked: true}
+						chk := widget.NewCheck(filepath.Base(path), func(v bool) {
+							fileChecks[i].checked = v
+						})
+						chk.SetChecked(true)
+						checkContainer.Add(chk)
 					}
-					filesLabel.SetText(strings.Join(labels, "\n"))
+					checkContainer.Refresh()
 				}
 				filterSelect.OnChanged = updateSelectedFiles
 				filterSelect.SetSelected(options[0])
@@ -632,7 +644,15 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 					}
 					activeFilter = selected
 					loadLevelPrefsAndMode(activeFilter)
-					paths := mosaic.PathsForFilterOption(groups, filterSelect.Selected)
+					var paths []string
+					for _, fc := range fileChecks {
+						if fc.checked {
+							paths = append(paths, fc.path)
+						}
+					}
+					if len(paths) == 0 {
+						return
+					}
 					loadPaths(paths, "Loading Filter Batch")
 				}, win)
 				confirm.Resize(fyne.NewSize(540, 420))
@@ -837,6 +857,15 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		dialog.ShowInformation("Loaded", fmt.Sprintf("Applied %d saved offsets from %s.", applied, filepath.Base(path)), win)
 	}
 
+	clearOffsetsBtn := widget.NewButton("Clear Offsets", func() {
+		for i := range state.inputs {
+			state.inputs[i].OffsetX = 0
+			state.inputs[i].OffsetY = 0
+		}
+		resetPreview()
+		rebuildOffsetControls()
+	})
+
 	clearBtn := widget.NewButton("Clear", func() {
 		state.inputs = nil
 		state.statuses = nil
@@ -933,6 +962,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		buildBtn,
 		saveBtn,
 		container.NewGridWithColumns(2, saveOffsetsBtn, loadOffsetsBtn),
+		clearOffsetsBtn,
 		clearBtn,
 		widget.NewSeparator(),
 		widget.NewLabel("Per-Image Offsets (pixels)"),

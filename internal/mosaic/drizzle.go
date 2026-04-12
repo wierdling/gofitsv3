@@ -11,6 +11,10 @@ import (
 	"gofitsv3/internal/processing"
 )
 
+// edgeTrim is the number of pixels to exclude from each edge of every input
+// image before drizzling, to avoid border artifacts.
+const edgeTrim = 20
+
 type Input struct {
 	Path          string
 	PrimaryHeader fitsio.Header
@@ -90,11 +94,43 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	dropSize := options.Scale * options.DropShrinkFactor
 	includedCount := 0
 
+	// Build per-frame cosmic ray masks using multi-frame comparison.
+	// Falls back to single-image detection when only one frame is available.
+	var crMasks [][]bool
+	if options.CleanCosmicRays && len(planned) > 1 {
+		frameInfos := make([]processing.FrameInfo, len(planned))
+		for i := range planned {
+			refToSource, err := processing.InvertAffineTransform(planned[i].sourceToRef)
+			if err != nil {
+				refToSource = processing.IdentityTransform()
+			}
+			_, sigma := processing.EstimateBackground(planned[i].input.HDU.Data.Pixels)
+			frameInfos[i] = processing.FrameInfo{
+				Pixels:      planned[i].input.HDU.Data.Pixels,
+				Width:       planned[i].input.HDU.Data.Width,
+				Height:      planned[i].input.HDU.Data.Height,
+				SourceToRef: planned[i].sourceToRef,
+				RefToSource: refToSource,
+				OffsetX:     planned[i].input.OffsetX,
+				OffsetY:     planned[i].input.OffsetY,
+				Sigma:       sigma,
+			}
+		}
+		crMasks = processing.BuildCosmicRayMasks(frameInfos, 5.0, 2.0)
+	}
+
 	for i := range planned {
 		pixels := planned[i].input.HDU.Data.Pixels
+		var crMask []bool
+
 		if options.CleanCosmicRays {
-			_, sigma := processing.EstimateBackground(pixels)
-			pixels = processing.RemoveCosmicRays(pixels, planned[i].input.HDU.Data.Width, planned[i].input.HDU.Data.Height, sigma, 2, nil)
+			if crMasks != nil {
+				crMask = crMasks[i]
+			} else {
+				// Single image fallback: replace CR pixels in-place.
+				_, sigma := processing.EstimateBackground(pixels)
+				pixels = processing.RemoveCosmicRays(pixels, planned[i].input.HDU.Data.Width, planned[i].input.HDU.Data.Height, sigma, 2, nil)
+			}
 			statuses[planned[i].statusIndex].Cleaned = true
 			statuses[planned[i].statusIndex].Status = "cleaned and drizzled"
 		} else if statuses[planned[i].statusIndex].Status == "reference" {
@@ -104,9 +140,12 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 		includedCount++
 
-		for y := 0; y < planned[i].input.HDU.Data.Height; y++ {
-			for x := 0; x < planned[i].input.HDU.Data.Width; x++ {
+		for y := edgeTrim; y < planned[i].input.HDU.Data.Height-edgeTrim; y++ {
+			for x := edgeTrim; x < planned[i].input.HDU.Data.Width-edgeTrim; x++ {
 				idx := y*planned[i].input.HDU.Data.Width + x
+				if crMask != nil && crMask[idx] {
+					continue
+				}
 				val := float64(pixels[idx])
 				if math.IsNaN(val) || math.IsInf(val, 0) {
 					continue
@@ -266,7 +305,11 @@ func planInputs(inputs []Input) ([]plannedInput, []InputStatus, float64, float64
 		statuses[idx].Included = true
 		planned = append(planned, plannedInput{input: input, sourceToRef: transform, statusIndex: idx})
 
-		corners := imageCorners(input.HDU.Data.Width, input.HDU.Data.Height)
+		corners := imageCorners(input.HDU.Data.Width-edgeTrim*2, input.HDU.Data.Height-edgeTrim*2)
+		for ci := range corners {
+			corners[ci][0] += edgeTrim
+			corners[ci][1] += edgeTrim
+		}
 		for _, corner := range corners {
 			x, y := processing.ApplyAffineTransform(transform, corner[0], corner[1])
 			x += input.OffsetX

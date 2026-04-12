@@ -127,21 +127,34 @@ func mapRefPixelToTargetPixel(refX, refY float64, refWCS, targetWCS linearWCS) (
 	return worldToPixelLinear(world1, world2, targetWCS)
 }
 
+// pixelToWorldLinear converts 0-indexed pixel (x, y) to sky (RA, Dec) in degrees.
+// The CD matrix maps pixel offsets to intermediate world coordinates (IWC) in the
+// tangent plane, where xi ≈ (RA - CRVAL1) * cos(CRVAL2). Dividing by cos(CRVAL2)
+// recovers the true RA difference from the IWC.
 func pixelToWorldLinear(x, y float64, w linearWCS) (float64, float64) {
 	dx := (x + 1) - w.crpix1
 	dy := (y + 1) - w.crpix2
-	world1 := w.crval1 + w.cd11*dx + w.cd12*dy
-	world2 := w.crval2 + w.cd21*dx + w.cd22*dy
-	return world1, world2
+	xi := w.cd11*dx + w.cd12*dy
+	eta := w.cd21*dx + w.cd22*dy
+	cosDec := math.Cos(w.crval2 * math.Pi / 180)
+	if math.Abs(cosDec) < 1e-9 {
+		cosDec = 1e-9
+	}
+	return w.crval1 + xi/cosDec, w.crval2 + eta
 }
 
-func worldToPixelLinear(world1, world2 float64, w linearWCS) (float64, float64, error) {
+// worldToPixelLinear converts sky (RA, Dec) in degrees to 0-indexed pixel (x, y).
+func worldToPixelLinear(ra, dec float64, w linearWCS) (float64, float64, error) {
 	det := w.cd11*w.cd22 - w.cd12*w.cd21
 	if math.Abs(det) < 1e-18 {
 		return 0, 0, fmt.Errorf("singular WCS matrix")
 	}
-	d1 := normalizeAngleDelta(world1 - w.crval1)
-	d2 := world2 - w.crval2
+	cosDec := math.Cos(w.crval2 * math.Pi / 180)
+	if math.Abs(cosDec) < 1e-9 {
+		cosDec = 1e-9
+	}
+	d1 := normalizeAngleDelta(ra-w.crval1) * cosDec
+	d2 := dec - w.crval2
 	dx := (w.cd22*d1 - w.cd12*d2) / det
 	dy := (-w.cd21*d1 + w.cd11*d2) / det
 	return dx + w.crpix1 - 1, dy + w.crpix2 - 1, nil
