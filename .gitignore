@@ -35,3 +35,4 @@ vendor/
 .DS_Store
 Thumbs.db
 *.zip
+.claude/

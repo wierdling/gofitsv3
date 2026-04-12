@@ -11,6 +11,10 @@ import (
 	"gofitsv3/internal/processing"
 )
 
+// edgeTrim is the number of pixels to exclude from each edge of every input
+// image before drizzling, to avoid border artifacts.
+const edgeTrim = 20
+
 type Input struct {
 	Path          string
 	PrimaryHeader fitsio.Header
@@ -90,11 +94,43 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	dropSize := options.Scale * options.DropShrinkFactor
 	includedCount := 0
 
+	// Build per-frame cosmic ray masks using multi-frame comparison.
+	// Falls back to single-image detection when only one frame is available.
+	var crMasks [][]bool
+	if options.CleanCosmicRays && len(planned) > 1 {
+		frameInfos := make([]processing.FrameInfo, len(planned))
+		for i := range planned {
+			refToSource, err := processing.InvertAffineTransform(planned[i].sourceToRef)
+			if err != nil {
+				refToSource = processing.IdentityTransform()
+			}
+			_, sigma := processing.EstimateBackground(planned[i].input.HDU.Data.Pixels)
+			frameInfos[i] = processing.FrameInfo{
+				Pixels:      planned[i].input.HDU.Data.Pixels,
+				Width:       planned[i].input.HDU.Data.Width,
+				Height:      planned[i].input.HDU.Data.Height,
+				SourceToRef: planned[i].sourceToRef,
+				RefToSource: refToSource,
+				OffsetX:     planned[i].input.OffsetX,
+				OffsetY:     planned[i].input.OffsetY,
+				Sigma:       sigma,
+			}
+		}
+		crMasks = processing.BuildCosmicRayMasks(frameInfos, 5.0, 2.0)
+	}
+
 	for i := range planned {
 		pixels := planned[i].input.HDU.Data.Pixels
+		var crMask []bool
+
 		if options.CleanCosmicRays {
-			_, sigma := processing.EstimateBackground(pixels)
-			pixels = processing.RemoveCosmicRays(pixels, planned[i].input.HDU.Data.Width, planned[i].input.HDU.Data.Height, sigma, 2, nil)
+			if crMasks != nil {
+				crMask = crMasks[i]
+			} else {
+				// Single image fallback: replace CR pixels in-place.
+				_, sigma := processing.EstimateBackground(pixels)
+				pixels = processing.RemoveCosmicRays(pixels, planned[i].input.HDU.Data.Width, planned[i].input.HDU.Data.Height, sigma, 2, nil)
+			}
 			statuses[planned[i].statusIndex].Cleaned = true
 			statuses[planned[i].statusIndex].Status = "cleaned and drizzled"
 		} else if statuses[planned[i].statusIndex].Status == "reference" {
@@ -104,9 +140,12 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 		includedCount++
 
-		for y := 0; y < planned[i].input.HDU.Data.Height; y++ {
-			for x := 0; x < planned[i].input.HDU.Data.Width; x++ {
+		for y := edgeTrim; y < planned[i].input.HDU.Data.Height-edgeTrim; y++ {
+			for x := edgeTrim; x < planned[i].input.HDU.Data.Width-edgeTrim; x++ {
 				idx := y*planned[i].input.HDU.Data.Width + x
+				if crMask != nil && crMask[idx] {
+					continue
+				}
 				val := float64(pixels[idx])
 				if math.IsNaN(val) || math.IsInf(val, 0) {
 					continue
@@ -150,35 +189,89 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 	}
 	results := make([]StarAlignmentResult, len(inputs))
 	results[0] = StarAlignmentResult{OffsetX: inputs[0].OffsetX, OffsetY: inputs[0].OffsetY, Applied: true}
-	ref := inputs[0]
-	for i := 1; i < len(inputs); i++ {
-		dx, dy, err := processing.EstimateTranslationAfterWCS(
-			inputs[i].HDU.Data.Pixels,
-			inputs[i].HDU.Data.Width,
-			inputs[i].HDU.Data.Height,
-			inputs[i].HDU.Header,
-			ref.HDU.Data.Pixels,
-			ref.HDU.Data.Width,
-			ref.HDU.Data.Height,
-			ref.HDU.Header,
-			inputs[i].OffsetX,
-			inputs[i].OffsetY,
-		)
-		if err != nil {
-			results[i] = StarAlignmentResult{OffsetX: inputs[i].OffsetX, OffsetY: inputs[i].OffsetY, Error: err.Error()}
-			continue
-		}
-		results[i] = StarAlignmentResult{
-			OffsetX: inputs[i].OffsetX + dx,
-			OffsetY: inputs[i].OffsetY + dy,
-			Applied: true,
+
+	aligned := make([]bool, len(inputs))
+	aligned[0] = true
+	queue := []int{0}
+
+	for len(queue) > 0 {
+		refIdx := queue[0]
+		queue = queue[1:]
+
+		for i := 0; i < len(inputs); i++ {
+			if aligned[i] {
+				continue
+			}
+
+			// When aligning against the original reference, use existing offsets
+			// as the initial guess. For intermediates, pass 0,0 because existing
+			// offsets are in the original reference frame, not the intermediate's.
+			var initOx, initOy float64
+			if refIdx == 0 {
+				initOx = inputs[i].OffsetX
+				initOy = inputs[i].OffsetY
+			}
+
+			dx, dy, err := processing.EstimateTranslationAfterWCS(
+				inputs[i].HDU.Data.Pixels,
+				inputs[i].HDU.Data.Width,
+				inputs[i].HDU.Data.Height,
+				inputs[i].HDU.Header,
+				inputs[refIdx].HDU.Data.Pixels,
+				inputs[refIdx].HDU.Data.Width,
+				inputs[refIdx].HDU.Data.Height,
+				inputs[refIdx].HDU.Header,
+				initOx, initOy,
+			)
+			if err != nil {
+				continue
+			}
+
+			if refIdx == 0 {
+				results[i] = StarAlignmentResult{
+					OffsetX: inputs[i].OffsetX + dx,
+					OffsetY: inputs[i].OffsetY + dy,
+					Applied: true,
+				}
+			} else {
+				// Convert correction from intermediate's pixel space to
+				// the original reference (inputs[0]) pixel space.
+				bToA, err := processing.ComputeWCSTransform(
+					inputs[refIdx].HDU.Header, inputs[0].HDU.Header)
+				if err != nil {
+					continue
+				}
+				results[i] = StarAlignmentResult{
+					OffsetX: bToA.A*dx + bToA.B*dy + results[refIdx].OffsetX,
+					OffsetY: bToA.D*dx + bToA.E*dy + results[refIdx].OffsetY,
+					Applied: true,
+				}
+			}
+
+			aligned[i] = true
+			queue = append(queue, i)
 		}
 	}
+
+	// Mark remaining unaligned images with an error.
+	for i := 1; i < len(inputs); i++ {
+		if !aligned[i] {
+			results[i] = StarAlignmentResult{
+				OffsetX: inputs[i].OffsetX,
+				OffsetY: inputs[i].OffsetY,
+				Error:   "no overlapping aligned image found",
+			}
+		}
+	}
+
 	return results, nil
 }
 
 // AlignInputsBySelectedStars is like AlignInputsByStars but uses manually
 // selected reference star positions (in the reference image's pixel space).
+// For images that don't overlap with the reference, it transitively aligns
+// through intermediate images, transforming the selected stars into each
+// intermediate's pixel space (falling back to auto-star detection).
 func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]StarAlignmentResult, error) {
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
@@ -188,31 +281,144 @@ func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]S
 	}
 	results := make([]StarAlignmentResult, len(inputs))
 	results[0] = StarAlignmentResult{OffsetX: inputs[0].OffsetX, OffsetY: inputs[0].OffsetY, Applied: true}
-	ref := inputs[0]
-	for i := 1; i < len(inputs); i++ {
-		dx, dy, err := processing.EstimateTranslationFromRefStars(
-			refStars,
-			inputs[i].HDU.Data.Pixels,
-			inputs[i].HDU.Data.Width,
-			inputs[i].HDU.Data.Height,
-			inputs[i].HDU.Header,
-			ref.HDU.Data.Width,
-			ref.HDU.Data.Height,
-			ref.HDU.Header,
-			inputs[i].OffsetX,
-			inputs[i].OffsetY,
-		)
-		if err != nil {
-			results[i] = StarAlignmentResult{OffsetX: inputs[i].OffsetX, OffsetY: inputs[i].OffsetY, Error: err.Error()}
-			continue
-		}
-		results[i] = StarAlignmentResult{
-			OffsetX: inputs[i].OffsetX + dx,
-			OffsetY: inputs[i].OffsetY + dy,
-			Applied: true,
+
+	aligned := make([]bool, len(inputs))
+	aligned[0] = true
+	queue := []int{0}
+
+	for len(queue) > 0 {
+		refIdx := queue[0]
+		queue = queue[1:]
+
+		for i := 0; i < len(inputs); i++ {
+			if aligned[i] {
+				continue
+			}
+
+			var dx, dy float64
+			var err error
+
+			if refIdx == 0 {
+				// Direct alignment against the original reference using
+				// the user's selected stars.
+				dx, dy, err = processing.EstimateTranslationFromRefStars(
+					refStars,
+					inputs[i].HDU.Data.Pixels,
+					inputs[i].HDU.Data.Width,
+					inputs[i].HDU.Data.Height,
+					inputs[i].HDU.Header,
+					inputs[0].HDU.Data.Width,
+					inputs[0].HDU.Data.Height,
+					inputs[0].HDU.Header,
+					inputs[i].OffsetX,
+					inputs[i].OffsetY,
+				)
+				if err == nil {
+					results[i] = StarAlignmentResult{
+						OffsetX: inputs[i].OffsetX + dx,
+						OffsetY: inputs[i].OffsetY + dy,
+						Applied: true,
+					}
+					aligned[i] = true
+					queue = append(queue, i)
+				}
+			} else {
+				// Transitive alignment through an intermediate image.
+				// First try transforming the user's refStars into the
+				// intermediate's pixel space.
+				dx, dy, err = alignViaIntermediate(
+					inputs, refStars, i, refIdx, results)
+				if err != nil {
+					// Fall back to auto-star detection.
+					dx, dy, err = processing.EstimateTranslationAfterWCS(
+						inputs[i].HDU.Data.Pixels,
+						inputs[i].HDU.Data.Width,
+						inputs[i].HDU.Data.Height,
+						inputs[i].HDU.Header,
+						inputs[refIdx].HDU.Data.Pixels,
+						inputs[refIdx].HDU.Data.Width,
+						inputs[refIdx].HDU.Data.Height,
+						inputs[refIdx].HDU.Header,
+						0, 0,
+					)
+				}
+				if err == nil {
+					bToA, bErr := processing.ComputeWCSTransform(
+						inputs[refIdx].HDU.Header, inputs[0].HDU.Header)
+					if bErr != nil {
+						continue
+					}
+					results[i] = StarAlignmentResult{
+						OffsetX: bToA.A*dx + bToA.B*dy + results[refIdx].OffsetX,
+						OffsetY: bToA.D*dx + bToA.E*dy + results[refIdx].OffsetY,
+						Applied: true,
+					}
+					aligned[i] = true
+					queue = append(queue, i)
+				}
+			}
 		}
 	}
+
+	// Mark remaining unaligned images with an error.
+	for i := 1; i < len(inputs); i++ {
+		if !aligned[i] {
+			results[i] = StarAlignmentResult{
+				OffsetX: inputs[i].OffsetX,
+				OffsetY: inputs[i].OffsetY,
+				Error:   "no overlapping aligned image found",
+			}
+		}
+	}
+
 	return results, nil
+}
+
+// alignViaIntermediate transforms the user's reference stars from the original
+// reference image (inputs[0]) into the intermediate image's pixel space, then
+// aligns the target against the intermediate using those transformed stars.
+func alignViaIntermediate(
+	inputs []Input,
+	refStars []processing.Star,
+	targetIdx, intermediateIdx int,
+	results []StarAlignmentResult,
+) (float64, float64, error) {
+	// Transform refStars from inputs[0]'s pixel space to the intermediate's
+	// pixel space, accounting for the intermediate's computed offset.
+	aToB, err := processing.ComputeWCSTransform(
+		inputs[0].HDU.Header, inputs[intermediateIdx].HDU.Header)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	bStars := make([]processing.Star, 0, len(refStars))
+	bW := float64(inputs[intermediateIdx].HDU.Data.Width)
+	bH := float64(inputs[intermediateIdx].HDU.Data.Height)
+	for _, rs := range refStars {
+		// Remove the intermediate's offset (which is in A's space) before
+		// converting from A's pixel coords to B's pixel coords.
+		adjX := rs.X - results[intermediateIdx].OffsetX
+		adjY := rs.Y - results[intermediateIdx].OffsetY
+		bx, by := processing.ApplyAffineTransform(aToB, adjX, adjY)
+		if bx >= 0 && bx < bW && by >= 0 && by < bH {
+			bStars = append(bStars, processing.Star{X: bx, Y: by, Flux: rs.Flux})
+		}
+	}
+	if len(bStars) == 0 {
+		return 0, 0, fmt.Errorf("no reference stars fall within intermediate image")
+	}
+
+	return processing.EstimateTranslationFromRefStars(
+		bStars,
+		inputs[targetIdx].HDU.Data.Pixels,
+		inputs[targetIdx].HDU.Data.Width,
+		inputs[targetIdx].HDU.Data.Height,
+		inputs[targetIdx].HDU.Header,
+		inputs[intermediateIdx].HDU.Data.Width,
+		inputs[intermediateIdx].HDU.Data.Height,
+		inputs[intermediateIdx].HDU.Header,
+		0, 0,
+	)
 }
 
 func SaveResultFITS(path string, result *Result) error {
@@ -266,7 +472,11 @@ func planInputs(inputs []Input) ([]plannedInput, []InputStatus, float64, float64
 		statuses[idx].Included = true
 		planned = append(planned, plannedInput{input: input, sourceToRef: transform, statusIndex: idx})
 
-		corners := imageCorners(input.HDU.Data.Width, input.HDU.Data.Height)
+		corners := imageCorners(input.HDU.Data.Width-edgeTrim*2, input.HDU.Data.Height-edgeTrim*2)
+		for ci := range corners {
+			corners[ci][0] += edgeTrim
+			corners[ci][1] += edgeTrim
+		}
 		for _, corner := range corners {
 			x, y := processing.ApplyAffineTransform(transform, corner[0], corner[1])
 			x += input.OffsetX

@@ -154,3 +154,140 @@ func estimateWideBackground(pixels []float32, width, height int, cx, cy int) flo
 	sort.Float64s(bg)
 	return bg[len(bg)/2]
 }
+
+// FrameInfo holds the data needed for multi-frame cosmic ray detection.
+type FrameInfo struct {
+	Pixels      []float32
+	Width       int
+	Height      int
+	SourceToRef AffineTransform
+	RefToSource AffineTransform
+	OffsetX     float64
+	OffsetY     float64
+	Sigma       float64
+}
+
+// BuildCosmicRayMasks detects cosmic rays by comparing each pixel across
+// multiple aligned frames. A pixel that is significantly brighter than the
+// corresponding position in other frames is flagged as a seed, then grown
+// into adjacent above-threshold pixels. Returns one boolean mask per frame
+// (true = cosmic ray, skip during drizzle).
+func BuildCosmicRayMasks(frames []FrameInfo, seedMultiplier, growMultiplier float64) [][]bool {
+	n := len(frames)
+	masks := make([][]bool, n)
+
+	for i := range frames {
+		f := &frames[i]
+		npix := f.Width * f.Height
+
+		if f.Sigma <= 0 {
+			masks[i] = make([]bool, npix)
+			continue
+		}
+
+		excess := make([]float64, npix)
+		compared := make([]bool, npix)
+		samples := make([]float64, 0, n-1)
+
+		for y := 0; y < f.Height; y++ {
+			for x := 0; x < f.Width; x++ {
+				idx := y*f.Width + x
+				val := float64(f.Pixels[idx])
+				if math.IsNaN(val) || val <= 0 {
+					continue
+				}
+
+				// Transform to reference space
+				refX, refY := ApplyAffineTransform(f.SourceToRef, float64(x), float64(y))
+				refX += f.OffsetX
+				refY += f.OffsetY
+
+				// Sample corresponding position in other frames
+				samples = samples[:0]
+				for j := 0; j < n; j++ {
+					if j == i {
+						continue
+					}
+					g := &frames[j]
+					sx, sy := ApplyAffineTransform(g.RefToSource, refX-g.OffsetX, refY-g.OffsetY)
+					s := bilinearSample(g.Pixels, g.Width, g.Height, sx, sy)
+					if !math.IsNaN(s) && s >= 0 {
+						samples = append(samples, s)
+					}
+				}
+
+				if len(samples) == 0 {
+					continue
+				}
+
+				sort.Float64s(samples)
+				median := samples[len(samples)/2]
+				excess[idx] = val - median
+				compared[idx] = true
+			}
+		}
+
+		// Identify seeds: pixels far brighter than corresponding pixels in other frames.
+		seedThreshold := seedMultiplier * f.Sigma
+		growThreshold := growMultiplier * f.Sigma
+		mask := make([]bool, npix)
+		q := make([]int, 0, 256)
+
+		for idx := 0; idx < npix; idx++ {
+			if compared[idx] && excess[idx] > seedThreshold {
+				mask[idx] = true
+				q = append(q, idx)
+			}
+		}
+
+		// Flood-fill from seeds into neighbors that also show excess.
+		dirs := [][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
+		for len(q) > 0 {
+			currIdx := q[0]
+			q = q[1:]
+			cx := currIdx % f.Width
+			cy := currIdx / f.Width
+
+			for _, d := range dirs {
+				nx, ny := cx+d[0], cy+d[1]
+				if nx < 0 || nx >= f.Width || ny < 0 || ny >= f.Height {
+					continue
+				}
+				nIdx := ny*f.Width + nx
+				if mask[nIdx] {
+					continue
+				}
+				if compared[nIdx] && excess[nIdx] > growThreshold {
+					mask[nIdx] = true
+					q = append(q, nIdx)
+				}
+			}
+		}
+
+		masks[i] = mask
+	}
+
+	return masks
+}
+
+// bilinearSample returns the bilinear-interpolated value at (x, y).
+// Returns NaN if the position is out of bounds or touches a NaN pixel.
+func bilinearSample(pixels []float32, width, height int, x, y float64) float64 {
+	x0 := int(math.Floor(x))
+	y0 := int(math.Floor(y))
+	x1 := x0 + 1
+	y1 := y0 + 1
+	if x0 < 0 || x1 >= width || y0 < 0 || y1 >= height {
+		return math.NaN()
+	}
+	wx := x - float64(x0)
+	wy := y - float64(y0)
+	p00 := float64(pixels[y0*width+x0])
+	p10 := float64(pixels[y0*width+x1])
+	p01 := float64(pixels[y1*width+x0])
+	p11 := float64(pixels[y1*width+x1])
+	if math.IsNaN(p00) || math.IsNaN(p10) || math.IsNaN(p01) || math.IsNaN(p11) {
+		return math.NaN()
+	}
+	return p00*(1-wx)*(1-wy) + p10*wx*(1-wy) + p01*(1-wx)*wy + p11*wx*wy
+}
