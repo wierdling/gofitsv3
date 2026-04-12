@@ -94,8 +94,6 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	dropSize := options.Scale * options.DropShrinkFactor
 	includedCount := 0
 
-	// Build per-frame cosmic ray masks using multi-frame comparison.
-	// Falls back to single-image detection when only one frame is available.
 	var crMasks [][]bool
 	if options.CleanCosmicRays && len(planned) > 1 {
 		frameInfos := make([]processing.FrameInfo, len(planned))
@@ -127,7 +125,6 @@ func Build(inputs []Input, options Options) (*Result, error) {
 			if crMasks != nil {
 				crMask = crMasks[i]
 			} else {
-				// Single image fallback: replace CR pixels in-place.
 				_, sigma := processing.EstimateBackground(pixels)
 				pixels = processing.RemoveCosmicRays(pixels, planned[i].input.HDU.Data.Width, planned[i].input.HDU.Data.Height, sigma, 2, nil)
 			}
@@ -140,8 +137,10 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 		includedCount++
 
-		for y := edgeTrim; y < planned[i].input.HDU.Data.Height-edgeTrim; y++ {
-			for x := edgeTrim; x < planned[i].input.HDU.Data.Width-edgeTrim; x++ {
+		trimX := effectiveEdgeTrim(planned[i].input.HDU.Data.Width)
+		trimY := effectiveEdgeTrim(planned[i].input.HDU.Data.Height)
+		for y := trimY; y < planned[i].input.HDU.Data.Height-trimY; y++ {
+			for x := trimX; x < planned[i].input.HDU.Data.Width-trimX; x++ {
 				idx := y*planned[i].input.HDU.Data.Width + x
 				if crMask != nil && crMask[idx] {
 					continue
@@ -203,9 +202,6 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 				continue
 			}
 
-			// When aligning against the original reference, use existing offsets
-			// as the initial guess. For intermediates, pass 0,0 because existing
-			// offsets are in the original reference frame, not the intermediate's.
 			var initOx, initOy float64
 			if refIdx == 0 {
 				initOx = inputs[i].OffsetX
@@ -234,8 +230,6 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 					Applied: true,
 				}
 			} else {
-				// Convert correction from intermediate's pixel space to
-				// the original reference (inputs[0]) pixel space.
 				bToA, err := processing.ComputeWCSTransform(
 					inputs[refIdx].HDU.Header, inputs[0].HDU.Header)
 				if err != nil {
@@ -253,7 +247,6 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 		}
 	}
 
-	// Mark remaining unaligned images with an error.
 	for i := 1; i < len(inputs); i++ {
 		if !aligned[i] {
 			results[i] = StarAlignmentResult{
@@ -267,11 +260,6 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 	return results, nil
 }
 
-// AlignInputsBySelectedStars is like AlignInputsByStars but uses manually
-// selected reference star positions (in the reference image's pixel space).
-// For images that don't overlap with the reference, it transitively aligns
-// through intermediate images, transforming the selected stars into each
-// intermediate's pixel space (falling back to auto-star detection).
 func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]StarAlignmentResult, error) {
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
@@ -299,8 +287,6 @@ func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]S
 			var err error
 
 			if refIdx == 0 {
-				// Direct alignment against the original reference using
-				// the user's selected stars.
 				dx, dy, err = processing.EstimateTranslationFromRefStars(
 					refStars,
 					inputs[i].HDU.Data.Pixels,
@@ -323,13 +309,8 @@ func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]S
 					queue = append(queue, i)
 				}
 			} else {
-				// Transitive alignment through an intermediate image.
-				// First try transforming the user's refStars into the
-				// intermediate's pixel space.
-				dx, dy, err = alignViaIntermediate(
-					inputs, refStars, i, refIdx, results)
+				dx, dy, err = alignViaIntermediate(inputs, refStars, i, refIdx, results)
 				if err != nil {
-					// Fall back to auto-star detection.
 					dx, dy, err = processing.EstimateTranslationAfterWCS(
 						inputs[i].HDU.Data.Pixels,
 						inputs[i].HDU.Data.Width,
@@ -360,7 +341,6 @@ func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]S
 		}
 	}
 
-	// Mark remaining unaligned images with an error.
 	for i := 1; i < len(inputs); i++ {
 		if !aligned[i] {
 			results[i] = StarAlignmentResult{
@@ -374,17 +354,12 @@ func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]S
 	return results, nil
 }
 
-// alignViaIntermediate transforms the user's reference stars from the original
-// reference image (inputs[0]) into the intermediate image's pixel space, then
-// aligns the target against the intermediate using those transformed stars.
 func alignViaIntermediate(
 	inputs []Input,
 	refStars []processing.Star,
 	targetIdx, intermediateIdx int,
 	results []StarAlignmentResult,
 ) (float64, float64, error) {
-	// Transform refStars from inputs[0]'s pixel space to the intermediate's
-	// pixel space, accounting for the intermediate's computed offset.
 	aToB, err := processing.ComputeWCSTransform(
 		inputs[0].HDU.Header, inputs[intermediateIdx].HDU.Header)
 	if err != nil {
@@ -395,8 +370,6 @@ func alignViaIntermediate(
 	bW := float64(inputs[intermediateIdx].HDU.Data.Width)
 	bH := float64(inputs[intermediateIdx].HDU.Data.Height)
 	for _, rs := range refStars {
-		// Remove the intermediate's offset (which is in A's space) before
-		// converting from A's pixel coords to B's pixel coords.
 		adjX := rs.X - results[intermediateIdx].OffsetX
 		adjY := rs.Y - results[intermediateIdx].OffsetY
 		bx, by := processing.ApplyAffineTransform(aToB, adjX, adjY)
@@ -472,10 +445,12 @@ func planInputs(inputs []Input) ([]plannedInput, []InputStatus, float64, float64
 		statuses[idx].Included = true
 		planned = append(planned, plannedInput{input: input, sourceToRef: transform, statusIndex: idx})
 
-		corners := imageCorners(input.HDU.Data.Width-edgeTrim*2, input.HDU.Data.Height-edgeTrim*2)
+		trimX := effectiveEdgeTrim(input.HDU.Data.Width)
+		trimY := effectiveEdgeTrim(input.HDU.Data.Height)
+		corners := imageCorners(input.HDU.Data.Width-trimX*2, input.HDU.Data.Height-trimY*2)
 		for ci := range corners {
-			corners[ci][0] += edgeTrim
-			corners[ci][1] += edgeTrim
+			corners[ci][0] += float64(trimX)
+			corners[ci][1] += float64(trimY)
 		}
 		for _, corner := range corners {
 			x, y := processing.ApplyAffineTransform(transform, corner[0], corner[1])
@@ -579,6 +554,13 @@ func imageCorners(width, height int) [][2]float64 {
 	maxX := float64(width - 1)
 	maxY := float64(height - 1)
 	return [][2]float64{{0, 0}, {maxX, 0}, {0, maxY}, {maxX, maxY}}
+}
+
+func effectiveEdgeTrim(size int) int {
+	if size <= edgeTrim*2 {
+		return 0
+	}
+	return edgeTrim
 }
 
 func drizzlePixel(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32) {

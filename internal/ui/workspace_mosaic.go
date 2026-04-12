@@ -475,9 +475,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 					status.Status = "loaded (warning: not _flc)"
 					warnings++
 				}
-				for _, img := range imgs {
-					newInputs = append(newInputs, mosaic.Input{Path: path, PrimaryHeader: img.Primary, HDU: img.HDU})
-				}
+
 				newStatuses = append(newStatuses, status)
 			}
 
