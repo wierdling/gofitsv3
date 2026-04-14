@@ -33,30 +33,33 @@ func EstimateTranslationAfterWCS(targetPixels []float32, targetWidth, targetHeig
 		maskedTarget[i] = warpedTarget[i]
 	}
 
-	refStars := ExtractStars(maskedRef, refWidth, refHeight, 4.0, 3)
-	targetStars := ExtractStars(maskedTarget, refWidth, refHeight, 4.0, 3)
+	// Filter stars within 15 px of a NaN boundary (chip gap, chip edge).
+	// Those stars have truncated PSFs whose flux-weighted centroids are biased
+	// toward the chip interior; they give inconsistent displacements between
+	// exposures and degrade the alignment estimate.
+	const nanGuard = 15
+	refStars := filterStarsNearNaN(
+		ExtractStars(maskedRef, refWidth, refHeight, 4.0, 3),
+		maskedRef, refWidth, refHeight, nanGuard,
+	)
+	targetStars := filterStarsNearNaN(
+		ExtractStars(maskedTarget, refWidth, refHeight, 4.0, 3),
+		maskedTarget, refWidth, refHeight, nanGuard,
+	)
 	if len(refStars) < 3 || len(targetStars) < 3 {
 		return 0, 0, fmt.Errorf("insufficient stars in shared region (ref: %d, target: %d)", len(refStars), len(targetStars))
 	}
 
-	pairs := MatchStars(refStars, targetStars, 40, 0.02)
-	if len(pairs) < 3 {
-		return 0, 0, fmt.Errorf("failed to match enough stars in shared region (found %d)", len(pairs))
-	}
-
-	dxs := make([]float64, 0, len(pairs))
-	dys := make([]float64, 0, len(pairs))
-	for _, pair := range pairs {
-		dx := pair.RefX - pair.TargetX
-		dy := pair.RefY - pair.TargetY
-		if math.Abs(dx) > 10 || math.Abs(dy) > 10 {
-			continue
-		}
-		dxs = append(dxs, dx)
-		dys = append(dys, dy)
-	}
-	if len(dxs) < 3 || len(dys) < 3 {
-		return 0, 0, fmt.Errorf("insufficient close star matches within 10 pixels")
+	// After WCS warping both images are in the same coordinate space.
+	// Use nearest-neighbour matching: for each ref star find the closest target
+	// star within maxResidual pixels.  Triangle-invariant matching is intentionally
+	// avoided here because it is designed to be translation/rotation agnostic —
+	// when star fields nearly overlap it frequently maps stars to wrong neighbours
+	// that happen to form similar triangles, producing large spurious displacements.
+	const maxResidual = 50.0
+	dxs, dys, err := nearestNeighbourOffsets(refStars, targetStars, maxResidual)
+	if err != nil {
+		return 0, 0, err
 	}
 	return medianFloat64(dxs), medianFloat64(dys), nil
 }
@@ -130,6 +133,194 @@ func EstimateTranslationFromRefStars(
 		return 0, 0, fmt.Errorf("no selected stars matched in target image (search radius: %.0f px)", searchRadius)
 	}
 	return medianFloat64(dxs), medianFloat64(dys), nil
+}
+
+// EstimateAffineFromRefStars solves a corrective affine transform using
+// manually selected reference-image star positions.
+//
+// All stars in the target image are extracted once.  For each user-selected ref
+// star the function back-projects through the inverse of the current placement
+// transform to find the expected position in target pixel space, then picks the
+// nearest extracted target star within centroidSearchRadius pixels.  The matched
+// target star is forward-mapped back to ref space to form a matched pair.
+// RANSAC is run on all pairs to fit the ManualTransform.
+//
+// Matching by proximity (nearest star) rather than brightness avoids false
+// matches in crowded fields where a brighter but unrelated star happens to lie
+// inside the search box.
+func EstimateAffineFromRefStars(
+	refStars []Star,
+	targetPixels []float32, targetWidth, targetHeight int, targetHeader fitsio.Header,
+	refHeader fitsio.Header,
+	initialOffsetX, initialOffsetY float64,
+	initialRefinement *AffineTransform,
+) (AffineTransform, error) {
+	if len(refStars) < 3 {
+		return AffineTransform{}, fmt.Errorf("at least 3 reference stars are required")
+	}
+
+	refToTarget, err := ComputeWCSTransform(targetHeader, refHeader)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+	sourceToRef, err := InvertAffineTransform(refToTarget)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+
+	// current: complete source→ref transform including offset and any prior refinement.
+	current := ComposeAffineTransforms(translationTransform(initialOffsetX, initialOffsetY), sourceToRef)
+	if initialRefinement != nil {
+		current = ComposeAffineTransforms(*initialRefinement, current)
+	}
+
+	// refToSource: maps ref positions back to source/target pixel space.
+	refToSource, err := InvertAffineTransform(current)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+
+	// Extract all stars from the target image once.
+	targetStars := ExtractStars(targetPixels, targetWidth, targetHeight, 4.0, 3)
+	if len(targetStars) == 0 {
+		return AffineTransform{}, fmt.Errorf("no stars detected in target image")
+	}
+
+	// Search radius for matching in target pixel space.  Large enough to handle
+	// typical WCS rotation errors (50 px ≈ several arcseconds for HST).
+	const centroidSearchRadius = 200.0
+
+	var pairs []MatchedPair
+	for _, rs := range refStars {
+		// Expected target position under the current (possibly wrong) transform.
+		tx, ty := ApplyAffineTransform(refToSource, rs.X, rs.Y)
+		if tx < 0 || tx >= float64(targetWidth) || ty < 0 || ty >= float64(targetHeight) {
+			continue // ref star has no coverage in target
+		}
+
+		// Find the nearest extracted target star within the search radius.
+		// Proximity (not brightness) is the right criterion here: the WCS predicts
+		// where the star should be, so we want the closest detected source, not
+		// the brightest one in the neighbourhood.
+		bestDist := centroidSearchRadius
+		var bestStar Star
+		found := false
+		for _, ts := range targetStars {
+			d := math.Hypot(ts.X-tx, ts.Y-ty)
+			if d < bestDist {
+				bestDist = d
+				bestStar = ts
+				found = true
+			}
+		}
+		if !found {
+			continue
+		}
+
+		// Forward-map the matched target-star position to "current ref space".
+		// The pair tells RANSAC: at this position in current-ref space (wx,wy),
+		// ManualTransform should predict the user-selected ref position (rs.X,rs.Y).
+		wx, wy := ApplyAffineTransform(current, bestStar.X, bestStar.Y)
+		pairs = append(pairs, MatchedPair{
+			RefX: wx, RefY: wy,
+			TargetX: rs.X, TargetY: rs.Y,
+		})
+	}
+
+	if len(pairs) < 3 {
+		return AffineTransform{}, fmt.Errorf("only %d of %d reference stars found in target image (need 3)", len(pairs), len(refStars))
+	}
+
+	// SolveTransformationRANSAC fits T where T(RefX,RefY) ≈ TargetX,TargetY,
+	// i.e. T maps (current ref space) → (true ref space) = ManualTransform.
+	refinement, err := SolveTransformationRANSAC(pairs, 2000, 2.0)
+	if err != nil {
+		return AffineTransform{}, fmt.Errorf("affine solve failed: %w", err)
+	}
+	return refinement, nil
+}
+
+// filterStarsNearNaN removes stars whose PSF region overlaps a NaN pixel.
+// Stars within nanRadius of a NaN have truncated PSFs; their centroids are
+// biased toward the chip interior and give unreliable displacement estimates.
+func filterStarsNearNaN(stars []Star, pixels []float32, width, height, nanRadius int) []Star {
+	out := stars[:0:0]
+	for _, s := range stars {
+		cx := int(math.Round(s.X))
+		cy := int(math.Round(s.Y))
+		x0 := cx - nanRadius
+		if x0 < 0 {
+			x0 = 0
+		}
+		x1 := cx + nanRadius
+		if x1 >= width {
+			x1 = width - 1
+		}
+		y0 := cy - nanRadius
+		if y0 < 0 {
+			y0 = 0
+		}
+		y1 := cy + nanRadius
+		if y1 >= height {
+			y1 = height - 1
+		}
+		hasNaN := false
+		for y := y0; y <= y1 && !hasNaN; y++ {
+			for x := x0; x <= x1 && !hasNaN; x++ {
+				if math.IsNaN(float64(pixels[y*width+x])) {
+					hasNaN = true
+				}
+			}
+		}
+		if !hasNaN {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// nearestNeighbourOffsets matches each refStar to the closest targetStar within
+// searchRadius pixels and returns the per-pair (dx, dy) displacement lists.
+// Each target star is used at most once (greedy, sorted by distance).
+func nearestNeighbourOffsets(refStars, targetStars []Star, searchRadius float64) ([]float64, []float64, error) {
+	type candidate struct {
+		rIdx, tIdx int
+		dx, dy     float64
+		dist       float64
+	}
+	var cands []candidate
+	for ri, rs := range refStars {
+		for ti, ts := range targetStars {
+			dx := rs.X - ts.X
+			dy := rs.Y - ts.Y
+			d := math.Sqrt(dx*dx + dy*dy)
+			if d <= searchRadius {
+				cands = append(cands, candidate{ri, ti, dx, dy, d})
+			}
+		}
+	}
+	sort.Slice(cands, func(a, b int) bool { return cands[a].dist < cands[b].dist })
+
+	usedRef := make(map[int]bool)
+	usedTarget := make(map[int]bool)
+	var dxs, dys []float64
+	for _, c := range cands {
+		if usedRef[c.rIdx] || usedTarget[c.tIdx] {
+			continue
+		}
+		usedRef[c.rIdx] = true
+		usedTarget[c.tIdx] = true
+		dxs = append(dxs, c.dx)
+		dys = append(dys, c.dy)
+	}
+	if len(dxs) < 3 {
+		return nil, nil, fmt.Errorf("insufficient star matches within %.0f pixels after WCS correction (found %d)", searchRadius, len(dxs))
+	}
+	return dxs, dys, nil
+}
+
+func translationTransform(dx, dy float64) AffineTransform {
+	return AffineTransform{A: 1, E: 1, C: dx, F: dy}
 }
 
 func medianFloat64(values []float64) float64 {

@@ -31,7 +31,7 @@ func HeaderString(header Header, keys ...string) string {
 		if idx := strings.Index(val, "/"); idx >= 0 {
 			val = val[:idx]
 		}
-		val = strings.TrimSpace(strings.Trim(val, "'"))
+		val = strings.TrimSpace(strings.Trim(strings.TrimSpace(val), "'"))
 		if val != "" {
 			return val
 		}

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/processing"
 )
 
 func TestBuildSingleImageIdentity(t *testing.T) {
@@ -213,6 +214,88 @@ func filledPixels(width, height int, value float32) []float32 {
 	return pixels
 }
 
+func TestAlignInputsBySelectedStarsAppliesAffineRefinement(t *testing.T) {
+	// 400×400 image; stars are >130 px apart so CentroidNear (radius 50) never
+	// confuses one star for another even after a small rotation+translation.
+	refStars := []processing.Star{
+		{X: 60, Y: 60},
+		{X: 220, Y: 60},
+		{X: 380, Y: 60},
+		{X: 140, Y: 220},
+		{X: 300, Y: 220},
+		{X: 220, Y: 340},
+	}
+	refPixels := makeTestStarField(400, 400, refStars)
+	targetStars := transformStarsAroundCenter(refStars, 200, 200, 3*math.Pi/180, 2.5, -1.75)
+	targetPixels := makeTestStarField(400, 400, targetStars)
+
+	// Use tiny CD scale (1e-4 deg/pix) so corner pixels stay within 0.02° of
+	// CRVAL, well inside the normalizeAngleDelta range.  Both images share the
+	// same header so ComputeWCSTransform returns the identity pixel→pixel map.
+	wcsHdr := func() fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "200", "CRPIX2": "200",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "0.0001", "CD1_2": "0", "CD2_1": "0", "CD2_2": "0.0001",
+		}}
+	}
+	inputs := []Input{
+		makeInput("ref_flc.fits", 400, 400, refPixels, wcsHdr()),
+		makeInput("target_flc.fits", 400, 400, targetPixels, wcsHdr()),
+	}
+
+	results, err := AlignInputsBySelectedStars(inputs, refStars)
+	if err != nil {
+		t.Fatalf("AlignInputsBySelectedStars returned error: %v", err)
+	}
+	if !results[1].Applied {
+		t.Fatalf("target alignment was not applied")
+	}
+	if !results[1].HasManualTransform {
+		t.Fatalf("expected affine refinement to be recorded")
+	}
+
+	for i, ts := range targetStars {
+		x, y := processing.ApplyAffineTransform(results[1].ManualTransform, ts.X, ts.Y)
+		if math.Hypot(x-refStars[i].X, y-refStars[i].Y) > 2.0 {
+			t.Fatalf("star %d remapped to (%.2f, %.2f), want near (%.2f, %.2f)", i, x, y, refStars[i].X, refStars[i].Y)
+		}
+	}
+}
+
+func makeTestStarField(width, height int, stars []processing.Star) []float32 {
+	pixels := make([]float32, width*height)
+	for _, star := range stars {
+		cx := int(math.Round(star.X))
+		cy := int(math.Round(star.Y))
+		for dy := -2; dy <= 2; dy++ {
+			for dx := -2; dx <= 2; dx++ {
+				x := cx + dx
+				y := cy + dy
+				if x < 0 || x >= width || y < 0 || y >= height {
+					continue
+				}
+				dist2 := dx*dx + dy*dy
+				pixels[y*width+x] = float32(200 - 20*dist2)
+			}
+		}
+	}
+	return pixels
+}
+
+func transformStarsAroundCenter(stars []processing.Star, cx, cy, angle, dx, dy float64) []processing.Star {
+	sinA, cosA := math.Sin(angle), math.Cos(angle)
+	out := make([]processing.Star, len(stars))
+	for i, star := range stars {
+		sx := star.X - cx
+		sy := star.Y - cy
+		out[i] = processing.Star{
+			X: cx + (sx*cosA - sy*sinA) + dx,
+			Y: cy + (sx*sinA + sy*cosA) + dy,
+		}
+	}
+	return out
+}
 func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }

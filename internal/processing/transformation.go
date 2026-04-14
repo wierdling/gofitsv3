@@ -20,6 +20,17 @@ func ApplyAffineTransform(t AffineTransform, x, y float64) (float64, float64) {
 	return t.A*x + t.B*y + t.C, t.D*x + t.E*y + t.F
 }
 
+// ComposeAffineTransforms returns after(before(x, y)).
+func ComposeAffineTransforms(after, before AffineTransform) AffineTransform {
+	return AffineTransform{
+		A: after.A*before.A + after.B*before.D,
+		B: after.A*before.B + after.B*before.E,
+		C: after.A*before.C + after.B*before.F + after.C,
+		D: after.D*before.A + after.E*before.D,
+		E: after.D*before.B + after.E*before.E,
+		F: after.D*before.C + after.E*before.F + after.F,
+	}
+}
 func InvertAffineTransform(t AffineTransform) (AffineTransform, error) {
 	det := t.A*t.E - t.B*t.D
 	if math.Abs(det) < 1e-18 {

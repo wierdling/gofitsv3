@@ -1,11 +1,13 @@
 package mosaic
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/processing"
 )
 
 func TestNormalizeFilterName(t *testing.T) {
@@ -39,6 +41,39 @@ func TestSaveLoadOffsetsRoundTrip(t *testing.T) {
 	}
 	if records["a_flc.fits"].OffsetX != 1.5 || records["a_flc.fits"].OffsetY != -2 {
 		t.Fatalf("unexpected record for a_flc.fits: %+v", records["a_flc.fits"])
+	}
+}
+
+func TestSaveLoadOffsetsRoundTripWithAffine(t *testing.T) {
+	theta := 0.5 * math.Pi / 180
+	affine := processing.AffineTransform{
+		A: math.Cos(theta), B: -math.Sin(theta), C: 1.5,
+		D: math.Sin(theta), E: math.Cos(theta), F: -0.7,
+	}
+	inputs := []Input{
+		{Path: filepath.Join(t.TempDir(), "a_flc.fits"), PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F502N'"}},
+			OffsetX: 1.5, OffsetY: -2, ManualTransform: affine, HasManualTransform: true},
+		{Path: filepath.Join(t.TempDir(), "b_flc.fits"), PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F502N'"}},
+			OffsetX: -0.25, OffsetY: 3.75},
+	}
+	path := filepath.Join(t.TempDir(), OffsetFileName("F502N"))
+	if err := SaveOffsetsForInputs(path, "F502N", inputs); err != nil {
+		t.Fatalf("SaveOffsetsForInputs error: %v", err)
+	}
+	_, records, err := LoadOffsets(path)
+	if err != nil {
+		t.Fatalf("LoadOffsets error: %v", err)
+	}
+	rec := records["a_flc.fits"]
+	if !rec.HasManualTransform {
+		t.Fatalf("expected HasManualTransform=true for a_flc.fits")
+	}
+	if math.Abs(rec.ManualTransform.A-affine.A) > 1e-9 || math.Abs(rec.ManualTransform.D-affine.D) > 1e-9 {
+		t.Fatalf("affine mismatch: got %+v, want %+v", rec.ManualTransform, affine)
+	}
+	rec2 := records["b_flc.fits"]
+	if rec2.HasManualTransform {
+		t.Fatalf("expected HasManualTransform=false for b_flc.fits")
 	}
 }
 

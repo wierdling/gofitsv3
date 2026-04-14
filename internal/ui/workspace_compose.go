@@ -25,6 +25,11 @@ import (
 	"gofitsv3/internal/utils"
 )
 
+// globalSendToChannel is registered by newComposeWorkspace and called by the
+// preview window to load an image directly into a compose channel with all
+// stretch settings already applied.
+var globalSendToChannel func(channelIdx int, img *models.LoadedImage)
+
 func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	imgs := make([]*models.LoadedImage, 3)
 	viewports := []*viewport{newViewport(), newViewport(), newViewport(), newViewport()}
@@ -713,6 +718,19 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		win.SetMainMenu(fyne.NewMainMenu(fileMenu, headersMenu, channelsMenu, processMenu, viewMenu))
 	}
 	updateMenus()
+
+	// Register package-level callback so the preview window can inject an image
+	// into any channel with its current stretch settings.
+	globalSendToChannel = func(channelIdx int, img *models.LoadedImage) {
+		if channelIdx < 0 || channelIdx >= 3 {
+			return
+		}
+		imgs[channelIdx] = img
+		refresh()
+		if updateMenus != nil {
+			updateMenus()
+		}
+	}
 
 	controls := container.NewVBox(
 		widget.NewLabel("Options"),

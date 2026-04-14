@@ -40,7 +40,7 @@ func TestCombineSCIHDUsPlacesExtensionsOnSharedCanvas(t *testing.T) {
 		ExtName: "SCI",
 	}
 
-	combined, err := combineSCIHDUs("test_flc.fits", primary, []fitsio.HDU{ref, shifted}, &fitsio.File{HDUs: []fitsio.HDU{ref, shifted}})
+	combined, _, err := combineSCIHDUs("test_flc.fits", primary, []fitsio.HDU{ref, shifted}, &fitsio.File{HDUs: []fitsio.HDU{ref, shifted}})
 	if err != nil {
 		t.Fatalf("combineSCIHDUs returned error: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestCombineSCIHDUsShiftsCRPIXForExpandedCanvas(t *testing.T) {
 		ExtName: "SCI",
 	}
 
-	combined, err := combineSCIHDUs("test_flc.fits", primary, []fitsio.HDU{ref, left}, &fitsio.File{HDUs: []fitsio.HDU{ref, left}})
+	combined, _, err := combineSCIHDUs("test_flc.fits", primary, []fitsio.HDU{ref, left}, &fitsio.File{HDUs: []fitsio.HDU{ref, left}})
 	if err != nil {
 		t.Fatalf("combineSCIHDUs returned error: %v", err)
 	}

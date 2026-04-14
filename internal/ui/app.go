@@ -28,7 +28,9 @@ func Run() error {
 	)
 
 	win.SetContent(tabs)
-	win.Resize(fyne.NewSize(980, 620))
+	// Use a very large size so the OS/Fyne caps it to the screen bounds,
+	// which effectively starts the window maximized.
+	win.Resize(fyne.NewSize(10000, 10000))
 	win.Show()
 
 	a.Run()

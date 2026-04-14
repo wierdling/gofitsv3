@@ -171,6 +171,37 @@ func buildPreviewTabs(img *models.LoadedImage) fyne.CanvasObject {
 		refresh()
 	})
 
+	// Send to Compose channel
+	channelSelect := widget.NewSelect([]string{"Channel 1", "Channel 2", "Channel 3"}, nil)
+	channelSelect.SetSelectedIndex(0)
+	sendToChannelBtn := widget.NewButton("Send to Channel", func() {
+		if globalSendToChannel == nil {
+			return
+		}
+		// Snapshot current UI values into the image before sending.
+		imgCopy := *img
+		if v, err := utils.ParseFloat(vp.blackBox.Text); err == nil {
+			imgCopy.Black = v
+		}
+		if v, err := utils.ParseFloat(vp.whiteBox.Text); err == nil {
+			imgCopy.White = v
+		}
+		if v, err := utils.ParseFloat(bgEntry.Text); err == nil {
+			imgCopy.Background = v
+		}
+		if v, err := utils.ParseFloat(peakEntry.Text); err == nil {
+			imgCopy.Peak = v
+		}
+		if v, err := utils.ParseFloat(sPeakEntry.Text); err == nil {
+			imgCopy.ScaledPeak = v
+		}
+		idx := channelSelect.SelectedIndex()
+		if idx < 0 {
+			idx = 0
+		}
+		globalSendToChannel(idx, &imgCopy)
+	})
+
 	controlsBox := container.NewVBox(
 		widget.NewLabel("Stretch Controls"),
 		modeSelect,
@@ -182,6 +213,10 @@ func buildPreviewTabs(img *models.LoadedImage) fyne.CanvasObject {
 		showClip,
 		flipCheck,
 		container.NewHBox(autoBtn, applyBtn),
+		widget.NewSeparator(),
+		widget.NewLabel("Send to Compose"),
+		channelSelect,
+		sendToChannelBtn,
 	)
 
 	previewSplit := container.NewHSplit(

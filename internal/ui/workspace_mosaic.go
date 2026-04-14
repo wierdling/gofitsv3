@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/color"
 	"math"
 	"os"
 	"path/filepath"
@@ -162,6 +163,13 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			}
 			state.statuses[i].OffsetX = state.inputs[i].OffsetX
 			state.statuses[i].OffsetY = state.inputs[i].OffsetY
+			state.statuses[i].HasAffine = state.inputs[i].HasManualTransform
+			if state.inputs[i].HasManualTransform {
+				t := state.inputs[i].ManualTransform
+				state.statuses[i].AffineRotDeg = math.Atan2(t.D, t.A) * 180 / math.Pi
+			} else {
+				state.statuses[i].AffineRotDeg = 0
+			}
 		}
 	}
 	currentFilterAndDir := func() (string, string, bool) {
@@ -218,6 +226,35 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	applyStarsBtn := widget.NewButton("Apply", nil)
 	cancelStarsBtn := widget.NewButton("Cancel", nil)
 
+	// pickerToRefPixels converts stars from the picker's image-pixel space to
+	// canonical raw-reference-pixel space.  When the picker is showing a drizzle
+	// output the displayed image has a scale and an origin offset; we undo those
+	// here so that saved star files are stable across re-drizzles.
+	pickerToRefPixels := func(stars []processing.Star) []processing.Star {
+		r := starModeRefResult
+		if r == nil || r.Scale <= 0 {
+			return stars
+		}
+		out := make([]processing.Star, len(stars))
+		for i, s := range stars {
+			out[i] = processing.Star{X: s.X/r.Scale + r.OriginX, Y: s.Y/r.Scale + r.OriginY}
+		}
+		return out
+	}
+
+	// refPixelsToPicker is the inverse: raw-ref-pixel → current picker image pixel.
+	refPixelsToPicker := func(stars []processing.Star) []processing.Star {
+		r := starModeRefResult
+		if r == nil || r.Scale <= 0 {
+			return stars
+		}
+		out := make([]processing.Star, len(stars))
+		for i, s := range stars {
+			out[i] = processing.Star{X: (s.X - r.OriginX) * r.Scale, Y: (s.Y - r.OriginY) * r.Scale}
+		}
+		return out
+	}
+
 	saveStarsBtn := widget.NewButton("Save Stars...", func() {
 		if activePicker == nil || len(activePicker.Stars) == 0 {
 			dialog.ShowInformation("No Stars", "Select at least one star before saving.", win)
@@ -232,10 +269,12 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			if filepath.Ext(path) == "" {
 				path += ".json"
 			}
+			// Save in raw reference-pixel space so the file is stable across
+			// re-drizzles that change scale/origin.
 			type starFile struct {
 				Stars []processing.Star `json:"stars"`
 			}
-			data, jsonErr := json.MarshalIndent(starFile{Stars: activePicker.Stars}, "", "  ")
+			data, jsonErr := json.MarshalIndent(starFile{Stars: pickerToRefPixels(activePicker.Stars)}, "", "  ")
 			if jsonErr != nil {
 				dialog.ShowError(jsonErr, win)
 				return
@@ -287,7 +326,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				dialog.ShowInformation("Not in Star Mode", "Open the Select Stars dialog before loading.", win)
 				return
 			}
-			activePicker.Stars = sf.Stars
+			activePicker.Stars = refPixelsToPicker(sf.Stars)
 			if activePicker.OnChanged != nil {
 				activePicker.OnChanged()
 			}
@@ -430,6 +469,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				if results[i].Applied {
 					state.inputs[i].OffsetX = results[i].OffsetX
 					state.inputs[i].OffsetY = results[i].OffsetY
+					state.inputs[i].ManualTransform = results[i].ManualTransform
+					state.inputs[i].HasManualTransform = results[i].HasManualTransform
 					if i == 0 {
 						state.statuses[i].Status = "reference"
 					} else {
@@ -454,6 +495,24 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	// ---- File loading -------------------------------------------------------
 
 	loadPaths := func(paths []string, title string) {
+		// Filter out paths already loaded.
+		existingPaths := make(map[string]bool, len(state.inputs))
+		for _, inp := range state.inputs {
+			existingPaths[inp.Path] = true
+		}
+		filtered := paths[:0:0]
+		for _, p := range paths {
+			if !existingPaths[p] {
+				filtered = append(filtered, p)
+			}
+		}
+		if len(filtered) == 0 {
+			dialog.ShowInformation("Already Added", "All selected files are already in the mosaic.", win)
+			return
+		}
+		skipped := len(paths) - len(filtered)
+		paths = filtered
+
 		progressDialog := dialog.NewCustom(title, "Reading FITS data...", widget.NewProgressBarInfinite(), win)
 		progressDialog.Show()
 
@@ -461,6 +520,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			newInputs := make([]mosaic.Input, 0, len(paths))
 			newStatuses := make([]mosaic.InputStatus, 0, len(paths))
 			warnings := 0
+			_ = skipped // available for future status reporting
 
 			for _, path := range paths {
 				input, err := mosaic.LoadInputFromPath(path)
@@ -526,33 +586,57 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			xEntry.SetText(fmt.Sprintf("%.2f", state.inputs[idx].OffsetX))
 			yEntry := widget.NewEntry()
 			yEntry.SetText(fmt.Sprintf("%.2f", state.inputs[idx].OffsetY))
-			applyBtn := widget.NewButton("Apply", func(index int, xBox, yBox *widget.Entry) func() {
+			// Rotation: extract current angle from ManualTransform if present.
+			rotEntry := widget.NewEntry()
+			currentRot := 0.0
+			if state.inputs[idx].HasManualTransform {
+				t := state.inputs[idx].ManualTransform
+				currentRot = math.Atan2(t.D, t.A) * 180 / math.Pi
+			}
+			rotEntry.SetText(fmt.Sprintf("%.4f", currentRot))
+
+			applyBtn := widget.NewButton("Apply", func(index int, xBox, yBox, rotBox *widget.Entry) func() {
 				return func() {
 					xVal, errX := strconv.ParseFloat(strings.TrimSpace(xBox.Text), 64)
 					yVal, errY := strconv.ParseFloat(strings.TrimSpace(yBox.Text), 64)
+					rotVal, errR := strconv.ParseFloat(strings.TrimSpace(rotBox.Text), 64)
 					if errX != nil || errY != nil {
 						dialog.ShowInformation("Invalid Offset", "Offsets must be valid numbers in pixels.", win)
 						return
 					}
+					if errR != nil {
+						rotVal = 0
+					}
 					state.inputs[index].OffsetX = xVal
 					state.inputs[index].OffsetY = yVal
+					if rotVal != 0 {
+						rad := rotVal * math.Pi / 180
+						c, s := math.Cos(rad), math.Sin(rad)
+						state.inputs[index].ManualTransform = processing.AffineTransform{A: c, B: -s, D: s, E: c}
+						state.inputs[index].HasManualTransform = true
+					} else {
+						state.inputs[index].ManualTransform = processing.IdentityTransform()
+						state.inputs[index].HasManualTransform = false
+					}
 					if index < len(state.statuses) && state.statuses[index].Status == "loaded" {
 						state.statuses[index].Status = "manual offset set"
 					}
 					resetPreview()
 					updateStatus()
 				}
-			}(idx, xEntry, yEntry))
+			}(idx, xEntry, yEntry, rotEntry))
 			if idx == 0 {
 				xEntry.Disable()
 				yEntry.Disable()
+				rotEntry.Disable()
 				applyBtn.Disable()
 				name += " (reference)"
 			}
 			row := container.NewBorder(nil, nil, widget.NewLabel(name), applyBtn,
-				container.NewGridWithColumns(4,
+				container.NewGridWithColumns(6,
 					widget.NewLabel("X"), xEntry,
 					widget.NewLabel("Y"), yEntry,
+					widget.NewLabel("Rot°"), rotEntry,
 				),
 			)
 			offsetControls.Add(row)
@@ -703,6 +787,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				if results[i].Applied {
 					state.inputs[i].OffsetX = results[i].OffsetX
 					state.inputs[i].OffsetY = results[i].OffsetY
+					state.inputs[i].ManualTransform = results[i].ManualTransform
+					state.inputs[i].HasManualTransform = results[i].HasManualTransform
 					if i == 0 {
 						state.statuses[i].Status = "reference"
 					} else {
@@ -859,6 +945,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		for i := range state.inputs {
 			state.inputs[i].OffsetX = 0
 			state.inputs[i].OffsetY = 0
+			state.inputs[i].ManualTransform = processing.IdentityTransform()
+			state.inputs[i].HasManualTransform = false
 		}
 		resetPreview()
 		rebuildOffsetControls()
@@ -997,8 +1085,14 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			activePicker.SetZoom(zoomLevel)
 			pickerScroll.Refresh()
 		} else {
-			w := float32(600 * zoomLevel)
-			h := float32(500 * zoomLevel)
+			var w, h float32
+			if state.result != nil {
+				w = float32(float64(state.result.Width) * zoomLevel)
+				h = float32(float64(state.result.Height) * zoomLevel)
+			} else {
+				w = float32(600 * zoomLevel)
+				h = float32(500 * zoomLevel)
+			}
 			preview.SetMinSize(fyne.NewSize(w, h))
 			preview.Refresh()
 			previewScroll.Refresh()
@@ -1053,7 +1147,51 @@ func buildMosaicPreviewImageWithLevels(result *mosaic.Result, black, white, back
 	if mask == nil {
 		mask = make([]byte, len(stretched.Pixels))
 	}
-	return processing.ToGrayRGBA(stretched, mask)
+	rgba := processing.ToGrayRGBA(stretched, mask)
+	drawInputBorders(rgba, result.InputFootprints)
+	return rgba
+}
+
+// drawInputBorders draws a 5-pixel pure-white border around each input image
+// footprint so the seam between images is visible in the preview.
+// corners order: TL, TR, BL, BR (matching mosaic.imageCorners).
+func drawInputBorders(img *image.RGBA, footprints [][4][2]float64) {
+	white := color.RGBA{R: 255, G: 255, B: 255, A: 255}
+	for _, fp := range footprints {
+		// Draw edges: TL→TR, TR→BR, BR→BL, BL→TL
+		pairs := [4][2]int{{0, 1}, {1, 3}, {3, 2}, {2, 0}}
+		for _, p := range pairs {
+			drawThickLine(img, fp[p[0]], fp[p[1]], 5, white)
+		}
+	}
+}
+
+// drawThickLine draws a line from a to b with the given thickness (in pixels)
+// using a simple perpendicular offset approach.
+func drawThickLine(img *image.RGBA, a, b [2]float64, thickness int, c color.RGBA) {
+	dx := b[0] - a[0]
+	dy := b[1] - a[1]
+	length := math.Sqrt(dx*dx + dy*dy)
+	if length == 0 {
+		return
+	}
+	// Perpendicular unit vector.
+	px := -dy / length
+	py := dx / length
+	half := float64(thickness) / 2.0
+	steps := int(length) + 1
+	for s := 0; s <= steps; s++ {
+		t := float64(s) / float64(steps)
+		cx := a[0] + t*dx
+		cy := a[1] + t*dy
+		for d := -half; d <= half; d += 0.5 {
+			ix := int(math.Round(cx + d*px))
+			iy := int(math.Round(cy + d*py))
+			if ix >= 0 && iy >= 0 && ix < img.Bounds().Max.X && iy < img.Bounds().Max.Y {
+				img.SetRGBA(ix, iy, c)
+			}
+		}
+	}
 }
 
 func modeNameForMode(m stretch.Mode) string {

@@ -10,12 +10,15 @@ import (
 	"strings"
 
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/processing"
 )
 
 type OffsetRecord struct {
-	FileName string
-	OffsetX  float64
-	OffsetY  float64
+	FileName           string
+	OffsetX            float64
+	OffsetY            float64
+	ManualTransform    processing.AffineTransform
+	HasManualTransform bool
 }
 
 func FilterNameForInput(input Input) string {
@@ -46,8 +49,17 @@ func SaveOffsetsForInputs(path string, filter string, inputs []Input) error {
 		return err
 	}
 	for _, input := range inputs {
-		if _, err := fmt.Fprintf(w, "%s\t%.6f\t%.6f\n", filepath.Base(input.Path), input.OffsetX, input.OffsetY); err != nil {
-			return err
+		if input.HasManualTransform {
+			t := input.ManualTransform
+			if _, err := fmt.Fprintf(w, "%s\t%.6f\t%.6f\t%.12g\t%.12g\t%.12g\t%.12g\t%.12g\t%.12g\n",
+				filepath.Base(input.Path), input.OffsetX, input.OffsetY,
+				t.A, t.B, t.C, t.D, t.E, t.F); err != nil {
+				return err
+			}
+		} else {
+			if _, err := fmt.Fprintf(w, "%s\t%.6f\t%.6f\n", filepath.Base(input.Path), input.OffsetX, input.OffsetY); err != nil {
+				return err
+			}
 		}
 	}
 	return w.Flush()
@@ -80,6 +92,37 @@ func LoadOffsets(path string) (string, map[string]OffsetRecord, error) {
 		if len(parts) < 3 {
 			return "", nil, fmt.Errorf("invalid offset file line %d", lineNo)
 		}
+		// Try 9-column format first: name ox oy A B C D E F
+		if len(parts) >= 9 {
+			affineVals := make([]float64, 6)
+			affineOk := true
+			for k := 0; k < 6; k++ {
+				v, err := strconv.ParseFloat(parts[len(parts)-6+k], 64)
+				if err != nil {
+					affineOk = false
+					break
+				}
+				affineVals[k] = v
+			}
+			if affineOk {
+				ox, errX := strconv.ParseFloat(parts[len(parts)-8], 64)
+				oy, errY := strconv.ParseFloat(parts[len(parts)-7], 64)
+				if errX != nil || errY != nil {
+					return "", nil, fmt.Errorf("invalid offsets on line %d", lineNo)
+				}
+				name := strings.Join(parts[:len(parts)-8], " ")
+				records[name] = OffsetRecord{
+					FileName: name, OffsetX: ox, OffsetY: oy,
+					ManualTransform: processing.AffineTransform{
+						A: affineVals[0], B: affineVals[1], C: affineVals[2],
+						D: affineVals[3], E: affineVals[4], F: affineVals[5],
+					},
+					HasManualTransform: true,
+				}
+				continue
+			}
+		}
+		// Fall back to 3-column format: name ox oy
 		ox, errX := strconv.ParseFloat(parts[len(parts)-2], 64)
 		oy, errY := strconv.ParseFloat(parts[len(parts)-1], 64)
 		if errX != nil || errY != nil {
@@ -104,6 +147,8 @@ func ApplyOffsetsToInputs(inputs []Input, filter string, records map[string]Offs
 		if rec, ok := records[filepath.Base(inputs[i].Path)]; ok {
 			inputs[i].OffsetX = rec.OffsetX
 			inputs[i].OffsetY = rec.OffsetY
+			inputs[i].ManualTransform = rec.ManualTransform
+			inputs[i].HasManualTransform = rec.HasManualTransform
 			applied++
 		}
 	}
@@ -149,6 +194,8 @@ func AutoLoadOffsets(inputs []Input) (int, []string) {
 			if rec, ok := records[filepath.Base(inputs[idx].Path)]; ok {
 				inputs[idx].OffsetX = rec.OffsetX
 				inputs[idx].OffsetY = rec.OffsetY
+				inputs[idx].ManualTransform = rec.ManualTransform
+				inputs[idx].HasManualTransform = rec.HasManualTransform
 				applied++
 			}
 		}

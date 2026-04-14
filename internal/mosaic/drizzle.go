@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -16,11 +17,17 @@ import (
 const edgeTrim = 20
 
 type Input struct {
-	Path          string
-	PrimaryHeader fitsio.Header
-	HDU           fitsio.HDU
-	OffsetX       float64
-	OffsetY       float64
+	Path               string
+	PrimaryHeader      fitsio.Header
+	HDU                fitsio.HDU
+	OffsetX            float64
+	OffsetY            float64
+	ManualTransform    processing.AffineTransform
+	HasManualTransform bool
+	// ChipFootprints holds the 4 trimmed corners (TL, TR, BL, BR) of each
+	// individual SCI chip in combined-canvas pixel coordinates. Set only when
+	// multiple SCI extensions were merged. Empty means use the full image bounds.
+	ChipFootprints [][4][2]float64
 }
 
 type Options struct {
@@ -30,32 +37,39 @@ type Options struct {
 }
 
 type InputStatus struct {
-	Path     string
-	Status   string
-	Error    string
-	Included bool
-	Cleaned  bool
-	OffsetX  float64
-	OffsetY  float64
+	Path        string
+	Status      string
+	Error       string
+	Included    bool
+	Cleaned     bool
+	OffsetX     float64
+	OffsetY     float64
+	HasAffine   bool
+	AffineRotDeg float64
 }
 
 type Result struct {
-	Pixels       []float32
-	Weights      []float32
-	Width        int
-	Height       int
-	OriginX      float64
-	OriginY      float64
-	Scale        float64
-	OutputHeader fitsio.Header
-	Inputs       []InputStatus
+	Pixels           []float32
+	Weights          []float32
+	Width            int
+	Height           int
+	OriginX          float64
+	OriginY          float64
+	Scale            float64
+	OutputHeader     fitsio.Header
+	Inputs           []InputStatus
+	// InputFootprints holds the 4 output-space corners (TL, TR, BL, BR) for
+	// each successfully drizzled input, in [x, y] order.
+	InputFootprints  [][4][2]float64
 }
 
 type StarAlignmentResult struct {
-	OffsetX float64
-	OffsetY float64
-	Error   string
-	Applied bool
+	OffsetX            float64
+	OffsetY            float64
+	ManualTransform    processing.AffineTransform
+	HasManualTransform bool
+	Error              string
+	Applied            bool
 }
 
 type plannedInput struct {
@@ -109,8 +123,8 @@ func Build(inputs []Input, options Options) (*Result, error) {
 				Height:      planned[i].input.HDU.Data.Height,
 				SourceToRef: planned[i].sourceToRef,
 				RefToSource: refToSource,
-				OffsetX:     planned[i].input.OffsetX,
-				OffsetY:     planned[i].input.OffsetY,
+				OffsetX:     0,
+				OffsetY:     0,
 				Sigma:       sigma,
 			}
 		}
@@ -151,8 +165,6 @@ func Build(inputs []Input, options Options) (*Result, error) {
 				}
 
 				refX, refY := processing.ApplyAffineTransform(planned[i].sourceToRef, float64(x), float64(y))
-				refX += planned[i].input.OffsetX
-				refY += planned[i].input.OffsetY
 				outX := (refX - minX) * options.Scale
 				outY := (refY - minY) * options.Scale
 				drizzlePixel(sums, weights, width, height, outX, outY, dropSize, float32(val))
@@ -169,17 +181,81 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		out[i] = sums[i] / weights[i]
 	}
 
+	// Compute output-space footprints for preview border drawing.
+	// If the input had multiple SCI chips merged, expand one footprint per chip;
+	// otherwise use the trimmed bounds of the whole combined image.
+	var footprints [][4][2]float64
+	for _, p := range planned {
+		chipCorners := p.input.ChipFootprints
+		if len(chipCorners) == 0 {
+			trimX := float64(effectiveEdgeTrim(p.input.HDU.Data.Width))
+			trimY := float64(effectiveEdgeTrim(p.input.HDU.Data.Height))
+			w := float64(p.input.HDU.Data.Width)
+			h := float64(p.input.HDU.Data.Height)
+			chipCorners = [][4][2]float64{{
+				{trimX, trimY},
+				{w - trimX - 1, trimY},
+				{trimX, h - trimY - 1},
+				{w - trimX - 1, h - trimY - 1},
+			}}
+		}
+		for _, chip := range chipCorners {
+			var fp [4][2]float64
+			for ci, sc := range chip {
+				rx, ry := processing.ApplyAffineTransform(p.sourceToRef, sc[0], sc[1])
+				fp[ci] = [2]float64{
+					(rx - minX) * options.Scale,
+					(ry - minY) * options.Scale,
+				}
+			}
+			footprints = append(footprints, fp)
+		}
+	}
+
 	return &Result{
-		Pixels:       out,
-		Weights:      weights,
-		Width:        width,
-		Height:       height,
-		OriginX:      minX,
-		OriginY:      minY,
-		Scale:        options.Scale,
-		OutputHeader: buildOutputHeader(inputs[0], width, height, minX, minY, options.Scale, includedCount),
-		Inputs:       statuses,
+		Pixels:          out,
+		Weights:         weights,
+		Width:           width,
+		Height:          height,
+		OriginX:         minX,
+		OriginY:         minY,
+		Scale:           options.Scale,
+		OutputHeader:    buildOutputHeader(inputs[0], width, height, minX, minY, options.Scale, includedCount),
+		Inputs:          statuses,
+		InputFootprints: footprints,
 	}, nil
+}
+
+// sortedByDistFromRef returns indices 1..len(inputs)-1 sorted by ascending
+// distance of each input's image center from the reference image center (index 0),
+// computed via WCS projection.  Inputs whose WCS cannot be parsed sort last.
+func sortedByDistFromRef(inputs []Input) []int {
+	ref := inputs[0]
+	type entry struct {
+		idx  int
+		dist float64
+	}
+	entries := make([]entry, len(inputs)-1)
+	for i := 1; i < len(inputs); i++ {
+		d, err := processing.CenterDistInRefPixels(
+			inputs[i].HDU.Header,
+			inputs[i].HDU.Data.Width,
+			inputs[i].HDU.Data.Height,
+			ref.HDU.Header,
+			ref.HDU.Data.Width,
+			ref.HDU.Data.Height,
+		)
+		if err != nil {
+			d = math.MaxFloat64
+		}
+		entries[i-1] = entry{idx: i, dist: d}
+	}
+	sort.Slice(entries, func(a, b int) bool { return entries[a].dist < entries[b].dist })
+	out := make([]int, len(entries))
+	for i, e := range entries {
+		out[i] = e.idx
+	}
+	return out
 }
 
 func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
@@ -187,17 +263,27 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 		return nil, fmt.Errorf("no FITS inputs selected")
 	}
 	results := make([]StarAlignmentResult, len(inputs))
-	results[0] = StarAlignmentResult{OffsetX: inputs[0].OffsetX, OffsetY: inputs[0].OffsetY, Applied: true}
+	results[0] = StarAlignmentResult{
+		OffsetX:            inputs[0].OffsetX,
+		OffsetY:            inputs[0].OffsetY,
+		ManualTransform:    inputs[0].ManualTransform,
+		HasManualTransform: inputs[0].HasManualTransform,
+		Applied:            true,
+	}
 
 	aligned := make([]bool, len(inputs))
 	aligned[0] = true
 	queue := []int{0}
+	// Track the last error per image so users see the real failure reason.
+	lastErr := make([]string, len(inputs))
+	// Process closest-to-reference images first for better chain alignment.
+	ordered := sortedByDistFromRef(inputs)
 
 	for len(queue) > 0 {
 		refIdx := queue[0]
 		queue = queue[1:]
 
-		for i := 0; i < len(inputs); i++ {
+		for _, i := range ordered {
 			if aligned[i] {
 				continue
 			}
@@ -220,25 +306,31 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 				initOx, initOy,
 			)
 			if err != nil {
+				lastErr[i] = err.Error()
 				continue
 			}
 
 			if refIdx == 0 {
 				results[i] = StarAlignmentResult{
-					OffsetX: inputs[i].OffsetX + dx,
-					OffsetY: inputs[i].OffsetY + dy,
-					Applied: true,
+					OffsetX:            inputs[i].OffsetX + dx,
+					OffsetY:            inputs[i].OffsetY + dy,
+					ManualTransform:    processing.IdentityTransform(),
+					HasManualTransform: false,
+					Applied:            true,
 				}
 			} else {
 				bToA, err := processing.ComputeWCSTransform(
 					inputs[refIdx].HDU.Header, inputs[0].HDU.Header)
 				if err != nil {
+					lastErr[i] = err.Error()
 					continue
 				}
 				results[i] = StarAlignmentResult{
-					OffsetX: bToA.A*dx + bToA.B*dy + results[refIdx].OffsetX,
-					OffsetY: bToA.D*dx + bToA.E*dy + results[refIdx].OffsetY,
-					Applied: true,
+					OffsetX:            bToA.A*dx + bToA.B*dy + results[refIdx].OffsetX,
+					OffsetY:            bToA.D*dx + bToA.E*dy + results[refIdx].OffsetY,
+					ManualTransform:    processing.IdentityTransform(),
+					HasManualTransform: false,
+					Applied:            true,
 				}
 			}
 
@@ -249,10 +341,16 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 
 	for i := 1; i < len(inputs); i++ {
 		if !aligned[i] {
+			errMsg := "no overlapping aligned image found"
+			if lastErr[i] != "" {
+				errMsg = lastErr[i]
+			}
 			results[i] = StarAlignmentResult{
-				OffsetX: inputs[i].OffsetX,
-				OffsetY: inputs[i].OffsetY,
-				Error:   "no overlapping aligned image found",
+				OffsetX:            inputs[i].OffsetX,
+				OffsetY:            inputs[i].OffsetY,
+				ManualTransform:    inputs[i].ManualTransform,
+				HasManualTransform: inputs[i].HasManualTransform,
+				Error:              errMsg,
 			}
 		}
 	}
@@ -267,133 +365,75 @@ func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]S
 	if len(refStars) == 0 {
 		return nil, fmt.Errorf("no reference stars provided")
 	}
+
 	results := make([]StarAlignmentResult, len(inputs))
-	results[0] = StarAlignmentResult{OffsetX: inputs[0].OffsetX, OffsetY: inputs[0].OffsetY, Applied: true}
-
-	aligned := make([]bool, len(inputs))
-	aligned[0] = true
-	queue := []int{0}
-
-	for len(queue) > 0 {
-		refIdx := queue[0]
-		queue = queue[1:]
-
-		for i := 0; i < len(inputs); i++ {
-			if aligned[i] {
-				continue
-			}
-
-			var dx, dy float64
-			var err error
-
-			if refIdx == 0 {
-				dx, dy, err = processing.EstimateTranslationFromRefStars(
-					refStars,
-					inputs[i].HDU.Data.Pixels,
-					inputs[i].HDU.Data.Width,
-					inputs[i].HDU.Data.Height,
-					inputs[i].HDU.Header,
-					inputs[0].HDU.Data.Width,
-					inputs[0].HDU.Data.Height,
-					inputs[0].HDU.Header,
-					inputs[i].OffsetX,
-					inputs[i].OffsetY,
-				)
-				if err == nil {
-					results[i] = StarAlignmentResult{
-						OffsetX: inputs[i].OffsetX + dx,
-						OffsetY: inputs[i].OffsetY + dy,
-						Applied: true,
-					}
-					aligned[i] = true
-					queue = append(queue, i)
-				}
-			} else {
-				dx, dy, err = alignViaIntermediate(inputs, refStars, i, refIdx, results)
-				if err != nil {
-					dx, dy, err = processing.EstimateTranslationAfterWCS(
-						inputs[i].HDU.Data.Pixels,
-						inputs[i].HDU.Data.Width,
-						inputs[i].HDU.Data.Height,
-						inputs[i].HDU.Header,
-						inputs[refIdx].HDU.Data.Pixels,
-						inputs[refIdx].HDU.Data.Width,
-						inputs[refIdx].HDU.Data.Height,
-						inputs[refIdx].HDU.Header,
-						0, 0,
-					)
-				}
-				if err == nil {
-					bToA, bErr := processing.ComputeWCSTransform(
-						inputs[refIdx].HDU.Header, inputs[0].HDU.Header)
-					if bErr != nil {
-						continue
-					}
-					results[i] = StarAlignmentResult{
-						OffsetX: bToA.A*dx + bToA.B*dy + results[refIdx].OffsetX,
-						OffsetY: bToA.D*dx + bToA.E*dy + results[refIdx].OffsetY,
-						Applied: true,
-					}
-					aligned[i] = true
-					queue = append(queue, i)
-				}
-			}
-		}
+	results[0] = StarAlignmentResult{
+		OffsetX:            inputs[0].OffsetX,
+		OffsetY:            inputs[0].OffsetY,
+		ManualTransform:    inputs[0].ManualTransform,
+		HasManualTransform: inputs[0].HasManualTransform,
+		Applied:            true,
 	}
 
-	for i := 1; i < len(inputs); i++ {
-		if !aligned[i] {
+	// Align closest images first so results are more stable across runs.
+	for _, i := range sortedByDistFromRef(inputs) {
+		refinement, err := processing.EstimateAffineFromRefStars(
+			refStars,
+			inputs[i].HDU.Data.Pixels,
+			inputs[i].HDU.Data.Width,
+			inputs[i].HDU.Data.Height,
+			inputs[i].HDU.Header,
+			inputs[0].HDU.Header,
+			inputs[i].OffsetX,
+			inputs[i].OffsetY,
+			manualTransformPtr(inputs[i]),
+		)
+		if err != nil {
 			results[i] = StarAlignmentResult{
-				OffsetX: inputs[i].OffsetX,
-				OffsetY: inputs[i].OffsetY,
-				Error:   "no overlapping aligned image found",
+				OffsetX:            inputs[i].OffsetX,
+				OffsetY:            inputs[i].OffsetY,
+				ManualTransform:    inputs[i].ManualTransform,
+				HasManualTransform: inputs[i].HasManualTransform,
+				Error:              err.Error(),
+				Applied:            false,
 			}
+			continue
+		}
+
+		storedT := refinement
+		if inputs[i].HasManualTransform {
+			storedT = processing.ComposeAffineTransforms(refinement, inputs[i].ManualTransform)
+		}
+
+		results[i] = StarAlignmentResult{
+			OffsetX:            inputs[i].OffsetX,
+			OffsetY:            inputs[i].OffsetY,
+			ManualTransform:    storedT,
+			HasManualTransform: true,
+			Applied:            true,
 		}
 	}
 
 	return results, nil
 }
 
-func alignViaIntermediate(
-	inputs []Input,
-	refStars []processing.Star,
-	targetIdx, intermediateIdx int,
-	results []StarAlignmentResult,
-) (float64, float64, error) {
-	aToB, err := processing.ComputeWCSTransform(
-		inputs[0].HDU.Header, inputs[intermediateIdx].HDU.Header)
-	if err != nil {
-		return 0, 0, err
+func manualTransformPtr(input Input) *processing.AffineTransform {
+	if !input.HasManualTransform {
+		return nil
 	}
-
-	bStars := make([]processing.Star, 0, len(refStars))
-	bW := float64(inputs[intermediateIdx].HDU.Data.Width)
-	bH := float64(inputs[intermediateIdx].HDU.Data.Height)
-	for _, rs := range refStars {
-		adjX := rs.X - results[intermediateIdx].OffsetX
-		adjY := rs.Y - results[intermediateIdx].OffsetY
-		bx, by := processing.ApplyAffineTransform(aToB, adjX, adjY)
-		if bx >= 0 && bx < bW && by >= 0 && by < bH {
-			bStars = append(bStars, processing.Star{X: bx, Y: by, Flux: rs.Flux})
-		}
-	}
-	if len(bStars) == 0 {
-		return 0, 0, fmt.Errorf("no reference stars fall within intermediate image")
-	}
-
-	return processing.EstimateTranslationFromRefStars(
-		bStars,
-		inputs[targetIdx].HDU.Data.Pixels,
-		inputs[targetIdx].HDU.Data.Width,
-		inputs[targetIdx].HDU.Data.Height,
-		inputs[targetIdx].HDU.Header,
-		inputs[intermediateIdx].HDU.Data.Width,
-		inputs[intermediateIdx].HDU.Data.Height,
-		inputs[intermediateIdx].HDU.Header,
-		0, 0,
-	)
+	return &input.ManualTransform
 }
 
+func composePlacementTransform(base processing.AffineTransform, input Input) processing.AffineTransform {
+	placed := processing.ComposeAffineTransforms(
+		processing.AffineTransform{A: 1, E: 1, C: input.OffsetX, F: input.OffsetY},
+		base,
+	)
+	if input.HasManualTransform {
+		placed = processing.ComposeAffineTransforms(input.ManualTransform, placed)
+	}
+	return placed
+}
 func SaveResultFITS(path string, result *Result) error {
 	if result == nil {
 		return fmt.Errorf("no drizzle result available")
@@ -409,7 +449,8 @@ func planInputs(inputs []Input) ([]plannedInput, []InputStatus, float64, float64
 	ref := inputs[0]
 	statuses := make([]InputStatus, len(inputs))
 	for i, input := range inputs {
-		statuses[i] = InputStatus{Path: input.Path, Status: "loaded", OffsetX: input.OffsetX, OffsetY: input.OffsetY}
+		statuses[i] = InputStatus{Path: input.Path, Status: "loaded", OffsetX: input.OffsetX, OffsetY: input.OffsetY,
+			HasAffine: input.HasManualTransform, AffineRotDeg: affineRotationDeg(input.ManualTransform)}
 	}
 
 	if _, err := processing.ComputeWCSTransform(ref.HDU.Header, ref.HDU.Header); err != nil {
@@ -442,6 +483,8 @@ func planInputs(inputs []Input) ([]plannedInput, []InputStatus, float64, float64
 			statuses[idx].Status = "aligned"
 		}
 
+		transform = composePlacementTransform(transform, input)
+
 		statuses[idx].Included = true
 		planned = append(planned, plannedInput{input: input, sourceToRef: transform, statusIndex: idx})
 
@@ -454,8 +497,6 @@ func planInputs(inputs []Input) ([]plannedInput, []InputStatus, float64, float64
 		}
 		for _, corner := range corners {
 			x, y := processing.ApplyAffineTransform(transform, corner[0], corner[1])
-			x += input.OffsetX
-			y += input.OffsetY
 			if !boundsInitialized {
 				minX, maxX = x, x
 				minY, maxY = y, y
@@ -623,6 +664,9 @@ func FormatStatusLines(inputs []InputStatus) []string {
 		}
 		line := fmt.Sprintf("%d. %s - %s", idx+1, name, input.Status)
 		line += fmt.Sprintf(" | dX=%+.2f dY=%+.2f", input.OffsetX, input.OffsetY)
+		if input.HasAffine {
+			line += fmt.Sprintf(" | affine(rot=%.4f°)", input.AffineRotDeg)
+		}
 		if input.Cleaned {
 			line += " (cleaned)"
 		}
@@ -644,6 +688,10 @@ func formatFloat(v float64) string {
 
 func quotedString(v string) string {
 	return "'" + v + "'"
+}
+
+func affineRotationDeg(t processing.AffineTransform) float64 {
+	return math.Atan2(t.D, t.A) * 180 / math.Pi
 }
 
 func firstNonEmpty(values ...string) string {

@@ -107,14 +107,15 @@ func parseLinearWCS(header fitsio.Header) (linearWCS, error) {
 	pc21, ok21 := tryHeaderFloat(header, "PC2_1")
 	pc22, ok22 := tryHeaderFloat(header, "PC2_2")
 	if ok11 && ok12 && ok21 && ok22 {
+		// FITS standard: CD_ij = PC_ij * CDELT_i (row index selects CDELT).
 		return linearWCS{
 			crpix1: crpix1,
 			crpix2: crpix2,
 			crval1: crval1,
 			crval2: crval2,
 			cd11:   pc11 * cdelt1,
-			cd12:   pc12 * cdelt2,
-			cd21:   pc21 * cdelt1,
+			cd12:   pc12 * cdelt1,
+			cd21:   pc21 * cdelt2,
 			cd22:   pc22 * cdelt2,
 		}, nil
 	}
@@ -195,4 +196,32 @@ func normalizeAngleDelta(delta float64) float64 {
 		delta += 360
 	}
 	return delta
+}
+
+// CenterDistInRefPixels returns the distance (in reference image pixels) between
+// the center of the input image and the center of the reference image, using WCS
+// to project the input center into reference pixel space.  Returns an error if
+// either header lacks usable WCS keywords.
+func CenterDistInRefPixels(
+	inputHeader fitsio.Header, inputWidth, inputHeight int,
+	refHeader fitsio.Header, refWidth, refHeight int,
+) (float64, error) {
+	inputWCS, err := parseLinearWCS(inputHeader)
+	if err != nil {
+		return 0, err
+	}
+	refWCS, err := parseLinearWCS(refHeader)
+	if err != nil {
+		return 0, err
+	}
+	// Convert input center pixel → sky.
+	ra, dec := pixelToWorldLinear(float64(inputWidth)/2.0, float64(inputHeight)/2.0, inputWCS)
+	// Convert sky → reference pixel space.
+	rx, ry, err := worldToPixelLinear(ra, dec, refWCS)
+	if err != nil {
+		return 0, err
+	}
+	rcx := float64(refWidth) / 2.0
+	rcy := float64(refHeight) / 2.0
+	return math.Sqrt((rx-rcx)*(rx-rcx) + (ry-rcy)*(ry-rcy)), nil
 }

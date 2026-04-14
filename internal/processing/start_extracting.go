@@ -61,6 +61,40 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 				continue
 			}
 
+			// Compute bounding box to reject highly elongated sources
+			// (CCD bleed columns, cosmic-ray streaks, diffraction spikes).
+			// A real star PSF is roughly circular; bleeds have extreme aspect ratios.
+			minBX, minBY := blob[0][0], blob[0][1]
+			maxBX, maxBY := minBX, minBY
+			for _, p := range blob {
+				if p[0] < minBX {
+					minBX = p[0]
+				}
+				if p[0] > maxBX {
+					maxBX = p[0]
+				}
+				if p[1] < minBY {
+					minBY = p[1]
+				}
+				if p[1] > maxBY {
+					maxBY = p[1]
+				}
+			}
+			bboxW := maxBX - minBX + 1
+			bboxH := maxBY - minBY + 1
+			longer := bboxW
+			if bboxH > longer {
+				longer = bboxH
+			}
+			shorter := bboxW
+			if bboxH < shorter {
+				shorter = bboxH
+			}
+			// Reject blobs whose bounding box is more than 4:1 elongated.
+			if shorter == 0 || longer/shorter > 4 {
+				continue
+			}
+
 			var centerX, centerY float64
 			for _, p := range blob {
 				bx, by := p[0], p[1]

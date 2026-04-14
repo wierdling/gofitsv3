@@ -33,14 +33,14 @@ func LoadInputFromPath(path string) (Input, error) {
 		return Input{Path: path, PrimaryHeader: primary, HDU: hdu}, nil
 	}
 
-	hdu, err := combineSCIHDUs(path, primary, sci, file)
+	hdu, chipFootprints, err := combineSCIHDUs(path, primary, sci, file)
 	if err != nil {
 		return Input{}, err
 	}
-	return Input{Path: path, PrimaryHeader: primary, HDU: hdu}, nil
+	return Input{Path: path, PrimaryHeader: primary, HDU: hdu, ChipFootprints: chipFootprints}, nil
 }
 
-func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *fitsio.File) (fitsio.HDU, error) {
+func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *fitsio.File) (fitsio.HDU, [][4][2]float64, error) {
 	cleaned := make([]fitsio.HDU, len(sci))
 	for i := range sci {
 		cleaned[i] = cleanSCIWithMatchingDQ(sci[i], file)
@@ -57,11 +57,11 @@ func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *
 	for i := 1; i < len(cleaned); i++ {
 		refToSCI, err := processing.ComputeWCSTransform(cleaned[i].Header, ref.Header)
 		if err != nil {
-			return fitsio.HDU{}, fmt.Errorf("combine %s SCI[%d]: %w", filepath.Base(path), i+1, err)
+			return fitsio.HDU{}, nil, fmt.Errorf("combine %s SCI[%d]: %w", filepath.Base(path), i+1, err)
 		}
 		sciToRef, err := processing.InvertAffineTransform(refToSCI)
 		if err != nil {
-			return fitsio.HDU{}, fmt.Errorf("combine %s SCI[%d]: %w", filepath.Base(path), i+1, err)
+			return fitsio.HDU{}, nil, fmt.Errorf("combine %s SCI[%d]: %w", filepath.Base(path), i+1, err)
 		}
 		transforms[i] = sciToRef
 
@@ -91,12 +91,20 @@ func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *
 		height = 1
 	}
 
+	// chipInnerTrim is how many pixels to exclude from every edge of each
+	// individual SCI chip before merging them onto the shared canvas.
+	// This widens the inter-chip gap and removes the hot/ringing pixels that
+	// appear at chip boundaries in the drizzled output.  The outer edges are
+	// also trimmed, but those are already handled by edgeTrim during drizzle,
+	// so a small value here is fine.
+	const chipInnerTrim = 10
+
 	sums := make([]float32, width*height)
 	weights := make([]float32, width*height)
 	for i := range cleaned {
 		hdu := cleaned[i]
-		for y := 0; y < hdu.Data.Height; y++ {
-			for x := 0; x < hdu.Data.Width; x++ {
+		for y := chipInnerTrim; y < hdu.Data.Height-chipInnerTrim; y++ {
+			for x := chipInnerTrim; x < hdu.Data.Width-chipInnerTrim; x++ {
 				idx := y*hdu.Data.Width + x
 				val := float64(hdu.Data.Pixels[idx])
 				if math.IsNaN(val) || math.IsInf(val, 0) {
@@ -117,11 +125,31 @@ func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *
 		pixels[i] = sums[i] / weights[i]
 	}
 
+	// Compute chip footprints in combined-canvas coords so the preview can
+	// draw a border around each chip (making the inter-chip gap visible).
+	chipFootprints := make([][4][2]float64, len(cleaned))
+	for i, hdu := range cleaned {
+		t := float64(chipInnerTrim)
+		w := float64(hdu.Data.Width)
+		h := float64(hdu.Data.Height)
+		// corners: TL, TR, BL, BR (matching imageCorners order)
+		srcCorners := [4][2]float64{
+			{t, t},
+			{w - t - 1, t},
+			{t, h - t - 1},
+			{w - t - 1, h - t - 1},
+		}
+		for ci, sc := range srcCorners {
+			rx, ry := processing.ApplyAffineTransform(transforms[i], sc[0], sc[1])
+			chipFootprints[i][ci] = [2]float64{rx - minX, ry - minY}
+		}
+	}
+
 	return fitsio.HDU{
 		Header:  buildCombinedInputHeader(path, primary, ref.Header, width, height, minX, minY, len(cleaned)),
 		Data:    fitsio.ImageData{Width: width, Height: height, Pixels: pixels},
 		ExtName: "SCI",
-	}, nil
+	}, chipFootprints, nil
 }
 
 func buildCombinedInputHeader(path string, primary, ref fitsio.Header, width, height int, originX, originY float64, combinedCount int) fitsio.Header {

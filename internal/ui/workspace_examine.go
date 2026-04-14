@@ -335,6 +335,37 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		loadFitsFromPath(state.img.Path, true)
 	}
 
+	// Send to Compose channel
+	channelSelect := widget.NewSelect([]string{"Channel 1", "Channel 2", "Channel 3"}, nil)
+	channelSelect.SetSelectedIndex(0)
+	sendToChannelBtn := widget.NewButton("Send to Channel", func() {
+		if globalSendToChannel == nil || state.img == nil {
+			return
+		}
+		// Snapshot the current UI values into a copy of the image.
+		imgCopy := *state.img
+		if v, err := utils.ParseFloat(vp.blackBox.Text); err == nil {
+			imgCopy.Black = v
+		}
+		if v, err := utils.ParseFloat(vp.whiteBox.Text); err == nil {
+			imgCopy.White = v
+		}
+		if v, err := utils.ParseFloat(bgEntry.Text); err == nil {
+			imgCopy.Background = v
+		}
+		if v, err := utils.ParseFloat(peakEntry.Text); err == nil {
+			imgCopy.Peak = v
+		}
+		if v, err := utils.ParseFloat(sPeakEntry.Text); err == nil {
+			imgCopy.ScaledPeak = v
+		}
+		idx := channelSelect.SelectedIndex()
+		if idx < 0 {
+			idx = 0
+		}
+		globalSendToChannel(idx, &imgCopy)
+	})
+
 	controls := container.NewVBox(
 		widget.NewButton("Load FITS", loadFits),
 		reloadBtn,
@@ -356,6 +387,10 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		coordLabel,
 		measureLabel,
 		widget.NewButton("Clear Measurement", clearMeasurement),
+		widget.NewSeparator(),
+		widget.NewLabel("Send to Compose"),
+		channelSelect,
+		sendToChannelBtn,
 	)
 	controlsScroll := container.NewVScroll(controls)
 	controlsScroll.SetMinSize(fyne.NewSize(280, 220))
