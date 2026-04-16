@@ -726,6 +726,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			return
 		}
 		imgs[channelIdx] = img
+		applyChannelState(channelIdx, channelStateFromImage(img), imgs, viewports, controlSets)
 		refresh()
 		if updateMenus != nil {
 			updateMenus()

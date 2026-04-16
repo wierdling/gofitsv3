@@ -28,11 +28,32 @@ type Input struct {
 	// individual SCI chip in combined-canvas pixel coordinates. Set only when
 	// multiple SCI extensions were merged. Empty means use the full image bounds.
 	ChipFootprints [][4][2]float64
+	// ReferenceOnly marks this input as a WCS anchor only. It participates in
+	// alignment and coordinate-system setup but its pixels are not drizzled into
+	// the output. Use this to align a new filter to a previously drizzled baseline.
+	ReferenceOnly bool
 }
+
+// CRMethod selects the cosmic-ray removal algorithm used during drizzle.
+type CRMethod int
+
+const (
+	// CRMethodNone disables cosmic-ray removal.
+	CRMethodNone CRMethod = iota
+	// CRMethodLegacy uses the single-frame Laplacian detector (original method).
+	CRMethodLegacy
+	// CRMethodDrizzle uses the AstroDrizzle-style multi-frame model/blot/flag
+	// pipeline.  Requires ≥ 2 aligned exposures; falls back to CRMethodLegacy
+	// when only one frame is available.
+	CRMethodDrizzle
+)
 
 type Options struct {
 	Scale            float64
+	// CleanCosmicRays is kept for backwards compatibility; it selects CRMethodLegacy
+	// when CRMethod is CRMethodNone.  Prefer setting CRMethod directly.
 	CleanCosmicRays  bool
+	CRMethod         CRMethod
 	DropShrinkFactor float64
 }
 
@@ -108,37 +129,78 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	dropSize := options.Scale * options.DropShrinkFactor
 	includedCount := 0
 
+	// Resolve effective CR method: honour CRMethod if set, otherwise fall back
+	// to CleanCosmicRays for backwards compatibility.
+	effectiveCR := options.CRMethod
+	if effectiveCR == CRMethodNone && options.CleanCosmicRays {
+		effectiveCR = CRMethodLegacy
+	}
+
+	// Build the list of data-only planned inputs (excluding reference-only
+	// frames) that will actually contribute pixels. CR detection only makes
+	// sense when at least two such frames overlap; comparing against a
+	// reference-only baseline (different filter) would produce false positives.
+	dataPlanned := make([]int, 0, len(planned))
+	for i := range planned {
+		if !planned[i].input.ReferenceOnly {
+			dataPlanned = append(dataPlanned, i)
+		}
+	}
+
 	var crMasks [][]bool
-	if options.CleanCosmicRays && len(planned) > 1 {
-		frameInfos := make([]processing.FrameInfo, len(planned))
-		for i := range planned {
-			refToSource, err := processing.InvertAffineTransform(planned[i].sourceToRef)
+	// crMaskIndex[plannedIdx] = index into crMasks; -1 if not included.
+	crMaskIndex := make([]int, len(planned))
+	for i := range crMaskIndex {
+		crMaskIndex[i] = -1
+	}
+	if effectiveCR != CRMethodNone && len(dataPlanned) > 1 {
+		frameInfos := make([]processing.FrameInfo, len(dataPlanned))
+		for slot, pi := range dataPlanned {
+			refToSource, err := processing.InvertAffineTransform(planned[pi].sourceToRef)
 			if err != nil {
 				refToSource = processing.IdentityTransform()
 			}
-			_, sigma := processing.EstimateBackground(planned[i].input.HDU.Data.Pixels)
-			frameInfos[i] = processing.FrameInfo{
-				Pixels:      planned[i].input.HDU.Data.Pixels,
-				Width:       planned[i].input.HDU.Data.Width,
-				Height:      planned[i].input.HDU.Data.Height,
-				SourceToRef: planned[i].sourceToRef,
+			_, sigma := processing.EstimateBackground(planned[pi].input.HDU.Data.Pixels)
+			frameInfos[slot] = processing.FrameInfo{
+				Pixels:      planned[pi].input.HDU.Data.Pixels,
+				Width:       planned[pi].input.HDU.Data.Width,
+				Height:      planned[pi].input.HDU.Data.Height,
+				SourceToRef: planned[pi].sourceToRef,
 				RefToSource: refToSource,
 				OffsetX:     0,
 				OffsetY:     0,
 				Sigma:       sigma,
 			}
+			crMaskIndex[pi] = slot
 		}
-		crMasks = processing.BuildCosmicRayMasks(frameInfos, 5.0, 2.0)
+		switch effectiveCR {
+		case CRMethodDrizzle:
+			crMasks = processing.BuildDrizzleStyleCRMasks(
+				frameInfos, width, height, minX, minY, options.Scale,
+				processing.DrizzleStyleCROptions{SeedSNR: 4.0, DerivScale: 1.2},
+			)
+		default: // CRMethodLegacy
+			crMasks = processing.BuildCosmicRayMasks(frameInfos, 5.0, 2.0)
+		}
 	}
 
 	for i := range planned {
+		if planned[i].input.ReferenceOnly {
+			continue
+		}
 		pixels := planned[i].input.HDU.Data.Pixels
 		var crMask []bool
 
-		if options.CleanCosmicRays {
-			if crMasks != nil {
-				crMask = crMasks[i]
+		if effectiveCR != CRMethodNone {
+			slot := crMaskIndex[i]
+			if slot >= 0 && crMasks != nil {
+				crMask = crMasks[slot]
+			} else if len(dataPlanned) == 1 {
+				// Only one data frame — no inter-frame comparison possible.
+				// Do not apply any CR removal (a lone frame has no reference to
+				// distinguish a real bright pixel from a cosmic ray).
 			} else {
+				// Single-frame fallback: always use legacy Laplacian detector.
 				_, sigma := processing.EstimateBackground(pixels)
 				pixels = processing.RemoveCosmicRays(pixels, planned[i].input.HDU.Data.Width, planned[i].input.HDU.Data.Height, sigma, 2, nil)
 			}
@@ -186,6 +248,9 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	// otherwise use the trimmed bounds of the whole combined image.
 	var footprints [][4][2]float64
 	for _, p := range planned {
+		if p.input.ReferenceOnly {
+			continue
+		}
 		chipCorners := p.input.ChipFootprints
 		if len(chipCorners) == 0 {
 			trimX := float64(effectiveEdgeTrim(p.input.HDU.Data.Width))
@@ -220,7 +285,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		OriginX:         minX,
 		OriginY:         minY,
 		Scale:           options.Scale,
-		OutputHeader:    buildOutputHeader(inputs[0], width, height, minX, minY, options.Scale, includedCount),
+		OutputHeader:    buildOutputHeader(firstDataInput(inputs), width, height, minX, minY, options.Scale, includedCount),
 		Inputs:          statuses,
 		InputFootprints: footprints,
 	}, nil
@@ -488,6 +553,12 @@ func planInputs(inputs []Input) ([]plannedInput, []InputStatus, float64, float64
 		statuses[idx].Included = true
 		planned = append(planned, plannedInput{input: input, sourceToRef: transform, statusIndex: idx})
 
+		// Reference-only inputs anchor the coordinate system but don't contribute
+		// pixels, so we skip them when computing the output canvas bounds.
+		if input.ReferenceOnly {
+			continue
+		}
+
 		trimX := effectiveEdgeTrim(input.HDU.Data.Width)
 		trimY := effectiveEdgeTrim(input.HDU.Data.Height)
 		corners := imageCorners(input.HDU.Data.Width-trimX*2, input.HDU.Data.Height-trimY*2)
@@ -692,6 +763,17 @@ func quotedString(v string) string {
 
 func affineRotationDeg(t processing.AffineTransform) float64 {
 	return math.Atan2(t.D, t.A) * 180 / math.Pi
+}
+
+// firstDataInput returns the first input that is not marked ReferenceOnly,
+// falling back to inputs[0] if all are reference-only.
+func firstDataInput(inputs []Input) Input {
+	for _, inp := range inputs {
+		if !inp.ReferenceOnly {
+			return inp
+		}
+	}
+	return inputs[0]
 }
 
 func firstNonEmpty(values ...string) string {

@@ -22,9 +22,9 @@ func Run() error {
 	mosaic := newMosaicWorkspace(a, win)
 
 	tabs := container.NewAppTabs(
-		container.NewTabItem("Compose", compose),
 		container.NewTabItem("Mosaic", mosaic),
 		container.NewTabItem("Examine", examine),
+		container.NewTabItem("Compose", compose),
 	)
 
 	win.SetContent(tabs)

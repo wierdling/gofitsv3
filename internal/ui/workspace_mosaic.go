@@ -27,12 +27,15 @@ import (
 )
 
 type mosaicState struct {
-	inputs      []mosaic.Input
-	statuses    []mosaic.InputStatus
-	result      *mosaic.Result
-	scale       float64
-	clean       bool
-	savePreview bool
+	inputs         []mosaic.Input
+	statuses       []mosaic.InputStatus
+	result         *mosaic.Result
+	scale          float64
+	crMethod       mosaic.CRMethod
+	savePreview    bool
+	// referenceInput is an optional drizzled baseline used as the WCS anchor for
+	// star alignment and drizzle. Its pixels are not included in the output.
+	referenceInput *mosaic.Input
 }
 
 func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
@@ -57,6 +60,22 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	saveOffsetsBtn.Disable()
 	loadOffsetsBtn := widget.NewButton("Load Offsets", func() {})
 	loadOffsetsBtn.Disable()
+
+	// Reference baseline UI elements.
+	refLabel := widget.NewLabel("Reference: none")
+	refLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+	// inputsWithRef returns state.inputs prepended with the reference baseline
+	// (if set). The reference is marked ReferenceOnly so Build() uses it only
+	// for WCS anchoring and excludes its pixels from the output.
+	inputsWithRef := func() []mosaic.Input {
+		if state.referenceInput == nil {
+			return state.inputs
+		}
+		ref := *state.referenceInput
+		ref.ReferenceOnly = true
+		return append([]mosaic.Input{ref}, state.inputs...)
+	}
 
 	// Active star picker (non-nil only while in star-selection mode).
 	var activePicker *starPickerWidget
@@ -207,6 +226,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		statsLabel.SetText("Mean: -- | Std: -- | Size: --")
 	}
 	var rebuildOffsetControls func()
+
+	// buildDrizzlePreview runs a drizzle build and updates the preview UI.
+	// It must only be called from a goroutine (it shows a progress dialog and blocks).
+	var buildDrizzlePreview func()
+
 
 	applyAutoLoadedOffsets := func(inputs []mosaic.Input) []string {
 		_, messages := mosaic.AutoLoadOffsets(inputs)
@@ -456,35 +480,41 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		progressDialog := dialog.NewCustom("Aligning By Selected Stars", "Matching selected stars across images...", widget.NewProgressBarInfinite(), win)
 		progressDialog.Show()
 		go func() {
-			results, err := mosaic.AlignInputsBySelectedStars(state.inputs, refStars)
+			alignInputs := inputsWithRef()
+			results, err := mosaic.AlignInputsBySelectedStars(alignInputs, refStars)
 			progressDialog.Hide()
 			if err != nil {
 				dialog.ShowError(err, win)
 				return
 			}
-			for i := range results {
+			offset := 0
+			if state.referenceInput != nil {
+				offset = 1
+			}
+			for ri := offset; ri < len(results); ri++ {
+				i := ri - offset
 				if i >= len(state.inputs) || i >= len(state.statuses) {
 					continue
 				}
-				if results[i].Applied {
-					state.inputs[i].OffsetX = results[i].OffsetX
-					state.inputs[i].OffsetY = results[i].OffsetY
-					state.inputs[i].ManualTransform = results[i].ManualTransform
-					state.inputs[i].HasManualTransform = results[i].HasManualTransform
-					if i == 0 {
+				if results[ri].Applied {
+					state.inputs[i].OffsetX = results[ri].OffsetX
+					state.inputs[i].OffsetY = results[ri].OffsetY
+					state.inputs[i].ManualTransform = results[ri].ManualTransform
+					state.inputs[i].HasManualTransform = results[ri].HasManualTransform
+					if i == 0 && state.referenceInput == nil {
 						state.statuses[i].Status = "reference"
 					} else {
 						state.statuses[i].Status = "star aligned"
 					}
 					state.statuses[i].Error = ""
-				} else if results[i].Error != "" {
+				} else if results[ri].Error != "" {
 					state.statuses[i].Status = "star align failed"
-					state.statuses[i].Error = results[i].Error
+					state.statuses[i].Error = results[ri].Error
 				}
 			}
-			resetPreview()
 			rebuildOffsetControls()
 			updateStatus()
+			buildDrizzlePreview()
 		}()
 	}
 
@@ -759,9 +789,18 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		}
 	}
 
-	cleanCheck := widget.NewCheck("Clean cosmic rays before drizzle", func(v bool) {
-		state.clean = v
+	crOptions := []string{"No CR Removal", "Legacy (single-frame)", "Drizzle-style (multi-frame)"}
+	crSelect := widget.NewSelect(crOptions, func(selected string) {
+		switch selected {
+		case crOptions[1]:
+			state.crMethod = mosaic.CRMethodLegacy
+		case crOptions[2]:
+			state.crMethod = mosaic.CRMethodDrizzle
+		default:
+			state.crMethod = mosaic.CRMethodNone
+		}
 	})
+	crSelect.SetSelected(crOptions[0])
 	savePreviewCheck := widget.NewCheck("Save Preview", func(v bool) {
 		state.savePreview = v
 	})
@@ -774,35 +813,44 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		progressDialog := dialog.NewCustom("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", widget.NewProgressBarInfinite(), win)
 		progressDialog.Show()
 		go func() {
-			results, err := mosaic.AlignInputsByStars(state.inputs)
+			alignInputs := inputsWithRef()
+			results, err := mosaic.AlignInputsByStars(alignInputs)
 			progressDialog.Hide()
 			if err != nil {
 				dialog.ShowError(err, win)
 				return
 			}
-			for i := range results {
+			// When a reference baseline is set it occupies results[0]; the
+			// actual filter frames start at results[1]. Without a baseline
+			// results map 1:1 to state.inputs.
+			offset := 0
+			if state.referenceInput != nil {
+				offset = 1
+			}
+			for ri := offset; ri < len(results); ri++ {
+				i := ri - offset
 				if i >= len(state.inputs) || i >= len(state.statuses) {
 					continue
 				}
-				if results[i].Applied {
-					state.inputs[i].OffsetX = results[i].OffsetX
-					state.inputs[i].OffsetY = results[i].OffsetY
-					state.inputs[i].ManualTransform = results[i].ManualTransform
-					state.inputs[i].HasManualTransform = results[i].HasManualTransform
-					if i == 0 {
+				if results[ri].Applied {
+					state.inputs[i].OffsetX = results[ri].OffsetX
+					state.inputs[i].OffsetY = results[ri].OffsetY
+					state.inputs[i].ManualTransform = results[ri].ManualTransform
+					state.inputs[i].HasManualTransform = results[ri].HasManualTransform
+					if i == 0 && state.referenceInput == nil {
 						state.statuses[i].Status = "reference"
 					} else {
 						state.statuses[i].Status = "star aligned"
 					}
 					state.statuses[i].Error = ""
-				} else if results[i].Error != "" {
+				} else if results[ri].Error != "" {
 					state.statuses[i].Status = "star align failed"
-					state.statuses[i].Error = results[i].Error
+					state.statuses[i].Error = results[ri].Error
 				}
 			}
-			resetPreview()
 			rebuildOffsetControls()
 			updateStatus()
+			buildDrizzlePreview()
 		}()
 	})
 
@@ -810,56 +858,57 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		enterStarMode()
 	})
 
+	buildDrizzlePreview = func() {
+		progressDialog := dialog.NewCustom("Building Drizzle Preview", "Aligning, cleaning, and drizzling selected inputs...", widget.NewProgressBarInfinite(), win)
+		progressDialog.Show()
+
+		result, err := mosaic.Build(inputsWithRef(), mosaic.Options{
+			Scale:    state.scale,
+			CRMethod: state.crMethod,
+		})
+		progressDialog.Hide()
+		if err != nil {
+			dialog.ShowError(err, win)
+			return
+		}
+
+		state.result = result
+		state.statuses = result.Inputs
+		saveBtn.Enable()
+		rebuildOffsetControls()
+		updateStatus()
+		if !levelsSet {
+			autoLevels(result.Pixels)
+		}
+		black, white, bg, peak, scaledPeak := parseLevelEntries()
+		img := buildMosaicPreviewImageWithLevels(result, black, white, bg, peak, scaledPeak, stretchMode)
+		preview.Image = img
+		preview.Refresh()
+		stats := histogram.Compute(result.Pixels)
+		statsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f | Size: %dx%d", stats.Mean, stats.Std, result.Width, result.Height))
+		updateZoom()
+
+		if state.savePreview {
+			filter, dir, ok := currentFilterAndDir()
+			if !ok {
+				dialog.ShowInformation("Preview Save Skipped", "Automatic preview save requires the loaded files to come from one directory and one filter.", win)
+				return
+			}
+			previewPath := filepath.Join(dir, filter+"_preview.fits")
+			if err := mosaic.SaveResultFITS(previewPath, result); err != nil {
+				dialog.ShowError(err, win)
+				return
+			}
+			dialog.ShowInformation("Preview Saved", fmt.Sprintf("Saved preview FITS to %s.", filepath.Base(previewPath)), win)
+		}
+	}
+
 	buildBtn := widget.NewButton("Build Drizzle Preview", func() {
 		if len(state.inputs) == 0 {
 			dialog.ShowInformation("Missing Inputs", "Add one or more FITS files first.", win)
 			return
 		}
-
-		progressDialog := dialog.NewCustom("Building Drizzle Preview", "Aligning, cleaning, and drizzling selected inputs...", widget.NewProgressBarInfinite(), win)
-		progressDialog.Show()
-
-		go func() {
-			result, err := mosaic.Build(state.inputs, mosaic.Options{
-				Scale:           state.scale,
-				CleanCosmicRays: state.clean,
-			})
-			progressDialog.Hide()
-			if err != nil {
-				dialog.ShowError(err, win)
-				return
-			}
-
-			state.result = result
-			state.statuses = result.Inputs
-			saveBtn.Enable()
-			rebuildOffsetControls()
-			updateStatus()
-			if !levelsSet {
-				autoLevels(result.Pixels)
-			}
-			black, white, bg, peak, scaledPeak := parseLevelEntries()
-			img := buildMosaicPreviewImageWithLevels(result, black, white, bg, peak, scaledPeak, stretchMode)
-			preview.Image = img
-			preview.Refresh()
-			stats := histogram.Compute(result.Pixels)
-			statsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f | Size: %dx%d", stats.Mean, stats.Std, result.Width, result.Height))
-			updateZoom()
-
-			if state.savePreview {
-				filter, dir, ok := currentFilterAndDir()
-				if !ok {
-					dialog.ShowInformation("Preview Save Skipped", "Automatic preview save requires the loaded files to come from one directory and one filter.", win)
-					return
-				}
-				previewPath := filepath.Join(dir, filter+"_preview.fits")
-				if err := mosaic.SaveResultFITS(previewPath, result); err != nil {
-					dialog.ShowError(err, win)
-					return
-				}
-				dialog.ShowInformation("Preview Saved", fmt.Sprintf("Saved preview FITS to %s.", filepath.Base(previewPath)), win)
-			}
-		}()
+		go buildDrizzlePreview()
 	})
 
 	saveBtn.OnTapped = func() {
@@ -1038,12 +1087,47 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		return true
 	}
 
+	setRefBtn := widget.NewButton("Set Reference Baseline...", func() {
+		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+			if err != nil || r == nil {
+				return
+			}
+			path := r.URI().Path()
+			r.Close()
+			app.Preferences().SetString("lastDir", filepath.Dir(path))
+			inp, loadErr := mosaic.LoadInputFromPath(path)
+			if loadErr != nil {
+				dialog.ShowError(loadErr, win)
+				return
+			}
+			inp.ReferenceOnly = true
+			state.referenceInput = &inp
+			refLabel.SetText("Reference: " + filepath.Base(path))
+			resetPreview()
+		}, win)
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
+		configureLastDir(fd)
+		fd.SetView(dialog.ListView)
+		fd.Show()
+	})
+
+	clearRefBtn := widget.NewButton("Clear Reference", func() {
+		state.referenceInput = nil
+		refLabel.SetText("Reference: none")
+		resetPreview()
+	})
+
 	controls := container.NewVBox(
 		widget.NewLabel("Mosaic / Drizzle"),
 		container.NewGridWithColumns(2, loadBtn, batchBtn),
 		widget.NewForm(widget.NewFormItem("Scale", scaleEntry)),
-		cleanCheck,
+		widget.NewForm(widget.NewFormItem("Cosmic Rays", crSelect)),
 		savePreviewCheck,
+		widget.NewSeparator(),
+		widget.NewLabel("Baseline Reference"),
+		refLabel,
+		container.NewGridWithColumns(2, setRefBtn, clearRefBtn),
+		widget.NewSeparator(),
 		container.NewGridWithColumns(2, starAlignBtn, selectStarsBtn),
 		buildBtn,
 		saveBtn,
@@ -1077,10 +1161,13 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	previewSwap = container.NewStack(previewScroll)
 
 	// Zoom controls for the preview pane header.
-	zoomLabel := widget.NewLabel("100%")
+	zoomEntry := widget.NewEntry()
+	zoomEntry.SetText("100")
+	zoomEntry.SetPlaceHolder("100")
+	zoomEntry.Resize(fyne.NewSize(60, zoomEntry.MinSize().Height))
 	updateZoom = func() {
 		pct := int(zoomLevel * 100)
-		zoomLabel.SetText(fmt.Sprintf("%d%%", pct))
+		zoomEntry.SetText(fmt.Sprintf("%d", pct))
 		if activePicker != nil {
 			activePicker.SetZoom(zoomLevel)
 			pickerScroll.Refresh()
@@ -1098,20 +1185,33 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			previewScroll.Refresh()
 		}
 	}
+	zoomEntry.OnSubmitted = func(s string) {
+		s = strings.TrimSuffix(strings.TrimSpace(s), "%")
+		pct, err := strconv.ParseFloat(s, 64)
+		if err != nil || pct <= 0 {
+			updateZoom() // reset to current valid value
+			return
+		}
+		zoomLevel = math.Max(math.Min(pct/100.0, 16), 1.0/16)
+		updateZoom()
+	}
 	zoomInBtn := widget.NewButton("+", func() {
 		zoomLevel = math.Min(zoomLevel*1.5, 16)
 		updateZoom()
 	})
 	zoomOutBtn := widget.NewButton("-", func() {
-		zoomLevel = math.Max(zoomLevel/1.5, 1.0/1.5)
+		zoomLevel = math.Max(zoomLevel/1.5, 1.0/16)
 		updateZoom()
 	})
 	zoomResetBtn := widget.NewButton("1:1", func() {
 		zoomLevel = 1.0
 		updateZoom()
 	})
+	applyZoomBtn := widget.NewButton("Apply", func() {
+		zoomEntry.OnSubmitted(zoomEntry.Text)
+	})
 	zoomRow := container.NewBorder(nil, nil,
-		container.NewHBox(widget.NewLabel("Zoom:"), zoomOutBtn, zoomLabel, zoomInBtn, zoomResetBtn),
+		container.NewHBox(widget.NewLabel("Zoom:"), zoomOutBtn, zoomEntry, widget.NewLabel("%"), applyZoomBtn, zoomInBtn, zoomResetBtn),
 		nil,
 		statsLabel,
 	)
