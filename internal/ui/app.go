@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"image"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
@@ -20,12 +22,20 @@ func Run() error {
 	compose := newComposeWorkspace(a, win)
 	examine := newExamineWorkspace(a, win)
 	mosaic := newMosaicWorkspace(a, win)
+	editContent, setEditImage := newEditWorkspace(a, win)
 
+	editTab := container.NewTabItem("Edit", editContent)
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Mosaic", mosaic),
 		container.NewTabItem("Examine", examine),
 		container.NewTabItem("Compose", compose),
+		editTab,
 	)
+
+	globalExportToEdit = func(img image.Image) {
+		setEditImage(img)
+		tabs.Select(editTab)
+	}
 
 	win.SetContent(tabs)
 	// Use a very large size so the OS/Fyne caps it to the screen bounds,

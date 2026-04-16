@@ -219,6 +219,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	}
 
 	var updateMenus func()
+	var controlSets []*models.ChannelControl
 
 	loadChannel := func(idx int) {
 		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
@@ -247,6 +248,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				}
 
 				imgs[idx] = img
+				if controlSets != nil {
+					applyChannelState(idx, channelStateFromImage(img), imgs, viewports, controlSets)
+				}
 
 				progressDialog.Hide()
 				refresh()
@@ -270,7 +274,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		fd.Show()
 	}
 
-	controlSets := []*models.ChannelControl{
+	controlSets = []*models.ChannelControl{
 		channelControls("Channel 1 (Blue)", 0, imgs, viewports, refresh, saveChannelGray),
 		channelControls("Channel 2 (Green)", 1, imgs, viewports, refresh, saveChannelGray),
 		channelControls("Channel 3 (Red)", 2, imgs, viewports, refresh, saveChannelGray),
@@ -623,20 +627,26 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		save.Show()
 	}
 
-	alignBtn := widget.NewButton("1. Align to Channel 2 (Green)", alignChannels)
-	crossCleanBtn := widget.NewButton("2. Cross-Channel Clean", crossChannelClean)
-
-	previewFITSItem := fyne.NewMenuItem("Preview Single FITS...", func() {
-		OpenPreviewDialog(app, win)
+	exportToEditBtn := widget.NewButton("Export to Edit", func() {
+		if globalExportToEdit == nil {
+			return
+		}
+		img := viewports[3].image.Image
+		if img == nil {
+			dialog.ShowInformation("Nothing to export", "Compose all three channels first.", win)
+			return
+		}
+		globalExportToEdit(img)
 	})
+
+	//alignBtn := widget.NewButton("1. Align to Channel 2 (Green)", alignChannels)
+	//crossCleanBtn := widget.NewButton("2. Cross-Channel Clean", crossChannelClean)
 
 	saveProjectItem := fyne.NewMenuItem("Save Project", saveProject)
 	loadProjectItem := fyne.NewMenuItem("Load Project", loadProject)
 	fileMenu := fyne.NewMenu("File",
 		loadProjectItem,
 		saveProjectItem,
-		fyne.NewMenuItemSeparator(),
-		previewFITSItem,
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Load Channel 1", func() { loadChannel(0) }),
 		fyne.NewMenuItem("Load Channel 2", func() { loadChannel(1) }),
@@ -646,12 +656,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
 	cleanChannelsItem := fyne.NewMenuItem("Cross-Channel Clean", crossChannelClean)
 
-	channelsMenu := fyne.NewMenu("Channels", copySettingsItem, alignChannelsItem, cleanChannelsItem)
+	//channelsMenu := fyne.NewMenu("Channels", copySettingsItem, alignChannelsItem, cleanChannelsItem)
 
 	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
 	resetDataItem := fyne.NewMenuItem("Reset Data (Undo Align & Clean)", resetData)
 	exportRGBItem := fyne.NewMenuItem("Export RGB", exportRGB)
 	processMenu := fyne.NewMenu("Process",
+		copySettingsItem,
 		normalizeScaleItem,
 		alignChannelsItem,
 		cleanChannelsItem,
@@ -706,16 +717,16 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		resetDataItem.Disabled = !allLoaded
 		exportRGBItem.Disabled = !allLoaded
 
-		if allLoaded {
-			alignBtn.Enable()
-			crossCleanBtn.Enable()
-		} else {
-			alignBtn.Disable()
-			crossCleanBtn.Disable()
-		}
+		// if allLoaded {
+		// 	alignBtn.Enable()
+		// 	crossCleanBtn.Enable()
+		// } else {
+		// 	alignBtn.Disable()
+		// 	crossCleanBtn.Disable()
+		// }
 
 		saveProjectItem.Disabled = imgs[0] == nil && imgs[1] == nil && imgs[2] == nil
-		win.SetMainMenu(fyne.NewMainMenu(fileMenu, headersMenu, channelsMenu, processMenu, viewMenu))
+		win.SetMainMenu(fyne.NewMainMenu(fileMenu, headersMenu, processMenu, viewMenu))
 	}
 	updateMenus()
 
@@ -736,6 +747,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	controls := container.NewVBox(
 		widget.NewLabel("Options"),
 		flipCheck,
+		widget.NewSeparator(),
+		//alignBtn,
+		//crossCleanBtn,
+		exportToEditBtn,
 		widget.NewSeparator(),
 		widget.NewLabel("Per-channel controls"),
 		controlSets[0].Content,
@@ -782,6 +797,11 @@ func loadImagesFromPath(path string) (results []*models.LoadedImage, err error) 
 			hdu = cleaned
 		}
 		minV, maxV := processing.AutoLevels(hdu.Data.Pixels)
+		median, sigma := processing.EstimateBackground(hdu.Data.Pixels)
+		peak := median + 10*sigma
+		if peak > maxV {
+			peak = maxV
+		}
 		results = append(results, &models.LoadedImage{
 			Path:       path,
 			HDU:        hdu,
@@ -789,9 +809,9 @@ func loadImagesFromPath(path string) (results []*models.LoadedImage, err error) 
 			Mode:       stretch.Linear,
 			Black:      minV,
 			White:      maxV,
-			Background: minV,
-			Peak:       maxV,
-			ScaledPeak: maxV,
+			Background: median,
+			Peak:       peak,
+			ScaledPeak: 10,
 			ShowClip:   true,
 		})
 	}

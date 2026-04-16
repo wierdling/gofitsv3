@@ -74,3 +74,31 @@ func Compute(pixels []float32) Stats {
 	s.Std = math.Sqrt(variance / float64(validCount))
 	return s
 }
+
+// PercentileClip returns the pixel values at the given low and high percentiles
+// (e.g. 0.1 and 99.9) using the histogram bins. Useful for setting display
+// black/white points that ignore extreme outliers.
+func PercentileClip(s Stats, lowPct, highPct float64) (float64, float64) {
+	if s.Count == 0 || s.Max == s.Min {
+		return s.Min, s.Max
+	}
+	lowTarget := int(math.Round(float64(s.Count) * lowPct / 100.0))
+	highTarget := int(math.Round(float64(s.Count) * highPct / 100.0))
+
+	rangeVal := s.Max - s.Min
+	var cumulative int
+	low := s.Min
+	high := s.Max
+
+	for i, count := range s.Hist {
+		cumulative += count
+		binVal := s.Min + (float64(i)/255.0)*rangeVal
+		if cumulative <= lowTarget {
+			low = binVal
+		}
+		if cumulative <= highTarget {
+			high = binVal
+		}
+	}
+	return low, high
+}
