@@ -38,7 +38,7 @@ func DiscoverFilters(dir string) (map[string][]string, error) {
 		if err != nil {
 			continue
 		}
-		filter := fitsio.HeaderString(header, "FILTER", "FILTER1", "FILTER2")
+		filter := fitsio.FilterString(header)
 		if filter == "" {
 			filter = "Unknown"
 		}

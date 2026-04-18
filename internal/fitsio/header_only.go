@@ -38,3 +38,24 @@ func HeaderString(header Header, keys ...string) string {
 	}
 	return ""
 }
+
+// FilterString resolves the best filter name from FILTER, FILTER1, FILTER2,
+// skipping any value that is empty or contains "CLEAR" (case-insensitive).
+// This handles instruments like Hubble ACS where one wheel may be CLEAR.
+func FilterString(header Header) string {
+	for _, key := range []string{"FILTER", "FILTER1", "FILTER2"} {
+		raw, ok := header.Cards[key]
+		if !ok {
+			continue
+		}
+		val := raw
+		if idx := strings.Index(val, "/"); idx >= 0 {
+			val = val[:idx]
+		}
+		val = strings.TrimSpace(strings.Trim(strings.TrimSpace(val), "'"))
+		if val != "" && !strings.Contains(strings.ToUpper(val), "CLEAR") {
+			return val
+		}
+	}
+	return ""
+}

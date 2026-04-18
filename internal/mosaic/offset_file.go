@@ -22,9 +22,9 @@ type OffsetRecord struct {
 }
 
 func FilterNameForInput(input Input) string {
-	filter := fitsio.HeaderString(input.PrimaryHeader, "FILTER", "FILTER1", "FILTER2")
+	filter := fitsio.FilterString(input.PrimaryHeader)
 	if filter == "" {
-		filter = fitsio.HeaderString(input.HDU.Header, "FILTER", "FILTER1", "FILTER2")
+		filter = fitsio.FilterString(input.HDU.Header)
 	}
 	return normalizeFilterName(filter)
 }

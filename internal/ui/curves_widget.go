@@ -28,9 +28,10 @@ type curvesWidget struct {
 	widget.BaseWidget
 	points   [4][]curvePoint // 0=All, 1=R, 2=G, 3=B
 	active   int             // 0=All, 1=R, 2=G, 3=B
-	dragIdx  int        // index of point being dragged, -1 = none
-	lastSize fyne.Size  // widget size captured during the last Dragged call
-	onChange func()
+	dragIdx   int       // index of point being dragged, -1 = none
+	lastSize  fyne.Size // widget size captured during the last Dragged call
+	onChange  func()
+	onDragEnd func()
 }
 
 var curveChannelColors = [4]color.NRGBA{
@@ -147,15 +148,26 @@ func (cw *curvesWidget) DragEnd() {
 	idx := cw.dragIdx
 	cw.dragIdx = -1
 
+	notify := func() {
+		if cw.onChange != nil {
+			cw.onChange()
+		}
+		if cw.onDragEnd != nil {
+			cw.onDragEnd()
+		}
+	}
+
 	// Only non-endpoint points can be merged or removed.
 	pts := &cw.points[cw.active]
 	if idx <= 0 || idx >= len(*pts)-1 {
+		notify()
 		return
 	}
 
 	sw := float32(cw.lastSize.Width)
 	sh := float32(cw.lastSize.Height)
 	if sw <= 0 || sh <= 0 {
+		notify()
 		return
 	}
 
@@ -172,9 +184,7 @@ func (cw *curvesWidget) DragEnd() {
 		if float32(math.Sqrt(float64(dx*dx+dy*dy))) <= threshPx {
 			*pts = append((*pts)[:idx], (*pts)[idx+1:]...)
 			cw.Refresh()
-			if cw.onChange != nil {
-				cw.onChange()
-			}
+			notify()
 			return
 		}
 	}
@@ -187,12 +197,12 @@ func (cw *curvesWidget) DragEnd() {
 		if float32(math.Sqrt(float64(dx*dx+dy*dy))) <= threshPx {
 			*pts = append((*pts)[:idx], (*pts)[idx+1:]...)
 			cw.Refresh()
-			if cw.onChange != nil {
-				cw.onChange()
-			}
+			notify()
 			return
 		}
 	}
+
+	notify()
 }
 
 func (cw *curvesWidget) DoubleTapped(e *fyne.PointEvent) {

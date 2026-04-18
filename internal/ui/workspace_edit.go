@@ -13,6 +13,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
@@ -60,6 +61,15 @@ type editWorkspaceState struct {
 	// sharpening sliders
 	sharpSlider       *widget.Slider // strength 0-3
 	sharpRadiusSlider *widget.Slider // radius 0.5-10
+
+	loadedName string // base filename of the last loaded image
+
+	// heal tool
+	healOverlay    *healLayer
+	healActive     bool
+	healBrushSlider *widget.Slider
+	healStatusLabel *widget.Label
+	healUndo       *image.RGBA // single-level undo buffer
 }
 
 func (es *editWorkspaceState) applyEdits() {
@@ -85,6 +95,91 @@ func (es *editWorkspaceState) applyEdits() {
 		es.canvasImg.Image = img
 		es.canvasImg.Refresh()
 	}()
+}
+
+// updateHealBrushScreenRadius syncs the overlay's screen-space circle to the current brush size and zoom.
+// The slider value is the brush diameter in image pixels, so screen radius = (diameter/2) * zoom.
+func (es *editWorkspaceState) updateHealBrushScreenRadius() {
+	if es.healOverlay == nil || es.healBrushSlider == nil {
+		return
+	}
+	screenRadius := float32((es.healBrushSlider.Value / 2.0) * es.zoom)
+	if screenRadius < 1 {
+		screenRadius = 1
+	}
+	es.healOverlay.SetBrushRadius(screenRadius)
+}
+
+// screenToImagePt converts an overlay widget position to an image pixel coordinate.
+func (es *editWorkspaceState) screenToImagePt(pos fyne.Position) (image.Point, bool) {
+	if es.zoom <= 0 || es.origW == 0 || es.origH == 0 {
+		return image.Point{}, false
+	}
+	pt, ok := mapViewportPositionToImage(pos, fyne.NewPos(0, 0), es.zoom, es.origW, es.origH, false)
+	return image.Pt(pt.X, pt.Y), ok
+}
+
+// toRGBA returns the image as *image.RGBA, converting if necessary.
+func toRGBA(img image.Image) *image.RGBA {
+	if img == nil {
+		return nil
+	}
+	if r, ok := img.(*image.RGBA); ok {
+		return r
+	}
+	b := img.Bounds()
+	r := image.NewRGBA(b)
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			r.Set(x, y, img.At(x, y))
+		}
+	}
+	return r
+}
+
+// doHealStroke performs the heal for the full destination stroke.
+func (es *editWorkspaceState) doHealStroke(srcScreen fyne.Position, dstScreens []fyne.Position) {
+	rgba := toRGBA(es.canvasImg.Image)
+	if rgba == nil {
+		return
+	}
+	srcPt, srcOK := es.screenToImagePt(srcScreen)
+	if !srcOK {
+		return
+	}
+	dstPts := make([]image.Point, 0, len(dstScreens))
+	for _, ds := range dstScreens {
+		pt, ok := es.screenToImagePt(ds)
+		if ok {
+			dstPts = append(dstPts, pt)
+		}
+	}
+	if len(dstPts) == 0 {
+		return
+	}
+	radius := int(math.Round(es.healBrushSlider.Value / 2.0))
+	if radius < 1 {
+		radius = 1
+	}
+
+	// Save undo snapshot before modifying.
+	undo := image.NewRGBA(rgba.Bounds())
+	copy(undo.Pix, rgba.Pix)
+	es.healUndo = undo
+
+	healed := applyHealStroke(rgba, srcPt, dstPts, radius)
+	es.canvasImg.Image = healed
+	es.canvasImg.Refresh()
+}
+
+// undoHeal rolls back the last heal operation.
+func (es *editWorkspaceState) undoHeal() {
+	if es.healUndo == nil {
+		return
+	}
+	es.canvasImg.Image = es.healUndo
+	es.healUndo = nil
+	es.canvasImg.Refresh()
 }
 
 func (es *editWorkspaceState) refreshHistograms(img *image.RGBA) {
@@ -160,6 +255,7 @@ func (es *editWorkspaceState) applyZoom() {
 	h := float32(es.origH) * float32(es.zoom)
 	es.canvasImg.SetMinSize(fyne.NewSize(w, h))
 	es.canvasImg.Refresh()
+	es.updateHealBrushScreenRadius()
 }
 
 func (es *editWorkspaceState) stepZoom(factor float64) {
@@ -315,7 +411,9 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 	es.canvasImg = canvas.NewImageFromImage(blankImg())
 	es.canvasImg.FillMode = canvas.ImageFillContain
 
-	es.imgScroll = container.NewScroll(es.canvasImg)
+	es.healOverlay = newHealLayer()
+	es.healOverlay.Hide()
+	es.imgScroll = container.NewScroll(container.NewMax(es.canvasImg, es.healOverlay))
 	es.imgScroll.SetMinSize(fyne.NewSize(400, 300))
 
 	// Zoom controls
@@ -394,6 +492,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 				return
 			}
 			app.Preferences().SetString("editLastDir", r.URI().Path())
+			es.loadedName = r.URI().Name()
 			es.setImage(img)
 		}, win)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".png", ".jpg", ".jpeg", ".tif", ".tiff"}))
@@ -407,6 +506,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 	})
 
 	applyBtn := widget.NewButton("Apply", func() { es.applyEdits() })
+	es.curves.onDragEnd = func() { es.applyEdits() }
 	resetBtn := widget.NewButton("Reset", func() {
 		if es.source == nil {
 			return
@@ -459,10 +559,65 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 				dialog.ShowError(err, win)
 			}
 		}, win)
-		save.SetFileName("edited.png")
+		saveName := "edited.png"
+		if es.loadedName != "" {
+			saveName = es.loadedName
+		}
+		save.SetFileName(saveName)
 		save.SetFilter(storage.NewExtensionFileFilter([]string{".png", ".jpg", ".jpeg", ".tif", ".tiff"}))
 		save.Show()
 	})
+
+	// --- Heal tool ---
+	es.healBrushSlider = widget.NewSlider(1, 200)
+	es.healBrushSlider.SetValue(20)
+	es.healBrushSlider.Step = 1
+
+	es.healBrushSlider.OnChanged = func(_ float64) {
+		es.updateHealBrushScreenRadius()
+	}
+
+	es.healStatusLabel = widget.NewLabel("Click to set source point")
+	es.healStatusLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+	healToggleBtn := widget.NewButton("Heal Tool: OFF", nil)
+	healToggleBtn.OnTapped = func() {
+		es.healActive = !es.healActive
+		if es.healActive {
+			healToggleBtn.SetText("Heal Tool: ON")
+			es.healOverlay.Show()
+			es.healOverlay.Reset()
+			es.updateHealBrushScreenRadius()
+			es.healStatusLabel.SetText("Step 1: click source (sample area)")
+		} else {
+			healToggleBtn.SetText("Heal Tool: OFF")
+			es.healOverlay.Hide()
+			es.healOverlay.Reset()
+			es.healStatusLabel.SetText("")
+		}
+	}
+
+	healUndoBtn := widget.NewButton("Undo Heal (Ctrl+Z)", func() {
+		es.undoHeal()
+	})
+
+	es.healOverlay.onHealStroke = func(src fyne.Position, dsts []fyne.Position) {
+		es.doHealStroke(src, dsts)
+		if es.healActive {
+			es.healStatusLabel.SetText("Step 1: click source (sample area)")
+		}
+	}
+	es.healOverlay.onSourceSet = func() {
+		if es.healActive {
+			es.healStatusLabel.SetText("Step 2: click/drag destination to heal")
+		}
+	}
+
+	// Ctrl+Z undo shortcut on the window canvas.
+	win.Canvas().AddShortcut(
+		&desktop.CustomShortcut{KeyName: fyne.KeyZ, Modifier: fyne.KeyModifierControl},
+		func(_ fyne.Shortcut) { es.undoHeal() },
+	)
 
 	// Refresh histograms whenever a level slider changes
 	refreshHists := func(_ float64) {
@@ -498,6 +653,13 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 		widget.NewLabelWithStyle("Sharpen", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		sliderRow("Strength", es.sharpSlider),
 		sliderRow("Radius", es.sharpRadiusSlider),
+
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Heal", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		healToggleBtn,
+		es.healStatusLabel,
+		sliderRow("Brush Size", es.healBrushSlider),
+		healUndoBtn,
 
 		widget.NewSeparator(),
 		container.NewHBox(applyBtn, resetBtn),

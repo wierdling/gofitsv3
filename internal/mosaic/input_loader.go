@@ -7,6 +7,7 @@ import (
 
 	"gofitsv3/internal/badpix"
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/instrument"
 	"gofitsv3/internal/processing"
 )
 
@@ -96,8 +97,11 @@ func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *
 	// This widens the inter-chip gap and removes the hot/ringing pixels that
 	// appear at chip boundaries in the drizzled output.  The outer edges are
 	// also trimmed, but those are already handled by edgeTrim during drizzle,
-	// so a small value here is fine.
-	const chipInnerTrim = 10
+	// so a small value here is fine.  The value is taken from the instrument
+	// metadata so that detectors with wider inter-chip gaps (e.g. ACS/WFC)
+	// get a larger trim.
+	inst, _ := instrument.FromHeader(primary)
+	chipInnerTrim := inst.ChipInnerTrim
 
 	sums := make([]float32, width*height)
 	weights := make([]float32, width*height)

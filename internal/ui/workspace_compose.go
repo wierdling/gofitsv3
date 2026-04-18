@@ -32,6 +32,7 @@ var globalSendToChannel func(channelIdx int, img *models.LoadedImage)
 
 func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	imgs := make([]*models.LoadedImage, 3)
+	var origPixels [3][]float32
 	viewports := []*viewport{newViewport(), newViewport(), newViewport(), newViewport()}
 	headerWins := make([]fyne.Window, 3)
 	levels := defaultRGBLevels()
@@ -50,6 +51,17 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		if levelsWin != nil {
 			levelsWin.setHistogram(stats)
 		}
+	}
+
+	captureOrig := func(idx int) {
+		if imgs[idx] == nil {
+			origPixels[idx] = nil
+			return
+		}
+		src := imgs[idx].HDU.Data.Pixels
+		cp := make([]float32, len(src))
+		copy(cp, src)
+		origPixels[idx] = cp
 	}
 
 	refresh := func() {
@@ -248,6 +260,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				}
 
 				imgs[idx] = img
+				captureOrig(idx)
 				if controlSets != nil {
 					applyChannelState(idx, channelStateFromImage(img), imgs, viewports, controlSets)
 				}
@@ -275,9 +288,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	}
 
 	controlSets = []*models.ChannelControl{
-		channelControls("Channel 1 (Blue)", 0, imgs, viewports, refresh, saveChannelGray),
-		channelControls("Channel 2 (Green)", 1, imgs, viewports, refresh, saveChannelGray),
-		channelControls("Channel 3 (Red)", 2, imgs, viewports, refresh, saveChannelGray),
+		channelControls("Channel 1 (Blue)", 0, imgs, &origPixels, viewports, refresh, saveChannelGray),
+		channelControls("Channel 2 (Green)", 1, imgs, &origPixels, viewports, refresh, saveChannelGray),
+		channelControls("Channel 3 (Red)", 2, imgs, &origPixels, viewports, refresh, saveChannelGray),
 	}
 
 	copySettings := func() {
@@ -430,6 +443,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 							continue
 						}
 						imgs[res.idx] = res.img
+						captureOrig(res.idx)
 						applyChannelState(res.idx, res.state, imgs, viewports, controlSets)
 					}
 					flipCheck.SetChecked(project.Flip)
@@ -470,6 +484,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 					continue
 				}
 				imgs[i] = reloaded
+				captureOrig(i)
 				applyChannelState(i, state, imgs, viewports, controlSets)
 			}
 		})
@@ -737,6 +752,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			return
 		}
 		imgs[channelIdx] = img
+		captureOrig(channelIdx)
 		applyChannelState(channelIdx, channelStateFromImage(img), imgs, viewports, controlSets)
 		refresh()
 		if updateMenus != nil {
@@ -862,7 +878,7 @@ func applyChannelState(idx int, state models.ChannelState, imgs []*models.Loaded
 	views[idx].whiteBox.SetText(fmt.Sprintf("%.3f", img.White))
 }
 
-func channelControls(label string, idx int, imgs []*models.LoadedImage, views []*viewport, refresh func(), saveChannelGray func(int)) *models.ChannelControl {
+func channelControls(label string, idx int, imgs []*models.LoadedImage, origPixels *[3][]float32, views []*viewport, refresh func(), saveChannelGray func(int)) *models.ChannelControl {
 	selectBox := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
 		if imgs[idx] == nil {
 			return
@@ -953,6 +969,44 @@ func channelControls(label string, idx int, imgs []*models.LoadedImage, views []
 		saveChannelGray(idx)
 	})
 
+	xOffsetEntry := widget.NewEntry()
+	xOffsetEntry.SetText("0")
+	yOffsetEntry := widget.NewEntry()
+	yOffsetEntry.SetText("0")
+	rotOffsetEntry := widget.NewEntry()
+	rotOffsetEntry.SetText("0")
+
+	applyOffset := widget.NewButton("Apply Offset", func() {
+		if imgs[idx] == nil || origPixels[idx] == nil {
+			return
+		}
+		dx, errX := utils.ParseFloat(xOffsetEntry.Text)
+		dy, errY := utils.ParseFloat(yOffsetEntry.Text)
+		rot, errR := utils.ParseFloat(rotOffsetEntry.Text)
+		if errX != nil || errY != nil {
+			return
+		}
+		if errR != nil {
+			rot = 0
+		}
+		w := imgs[idx].HDU.Data.Width
+		h := imgs[idx].HDU.Data.Height
+		cx := float64(w) / 2
+		cy := float64(h) / 2
+		rad := rot * math.Pi / 180
+		cosA := math.Cos(rad)
+		sinA := math.Sin(rad)
+		// Inverse transform (output -> source): undo translation then undo rotation
+		t := processing.AffineTransform{
+			A: cosA, B: sinA,
+			C: -cosA*(cx+dx) - sinA*(cy+dy) + cx,
+			D: -sinA, E: cosA,
+			F: sinA*(cx+dx) - cosA*(cy+dy) + cy,
+		}
+		imgs[idx].HDU.Data.Pixels = processing.WarpImage(origPixels[idx], w, h, t)
+		refresh()
+	})
+
 	return &models.ChannelControl{
 		Content: container.NewVBox(
 			widget.NewLabel(label),
@@ -964,6 +1018,13 @@ func channelControls(label string, idx int, imgs []*models.LoadedImage, views []
 			),
 			showClip,
 			container.NewHBox(auto, apply, saveGray),
+			widget.NewLabel("Manual Offset"),
+			container.NewGridWithColumns(6,
+				widget.NewLabel("X"), xOffsetEntry,
+				widget.NewLabel("Y"), yOffsetEntry,
+				widget.NewLabel("Rot°"), rotOffsetEntry,
+			),
+			applyOffset,
 			widget.NewSeparator(),
 		),
 		ModeSelect:      selectBox,
