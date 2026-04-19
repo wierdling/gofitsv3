@@ -16,6 +16,11 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 	median, sigma := EstimateBackground(pixels)
 	threshold := median + (thresholdSigma * sigma)
 
+	// Smooth for detection only; centroids are computed on the original pixels.
+	// This matches TweakReg's Gaussian pre-filter approach: noise peaks that survive
+	// thresholding on the raw image are suppressed on the smoothed image.
+	smoothed := gaussianConvolve(pixels, width, height, 1.5)
+
 	visited := make([]bool, len(pixels))
 	var stars []Star
 	dirs := [][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
@@ -23,7 +28,7 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
 			idx := y*width + x
-			pix := float64(pixels[idx])
+			pix := float64(smoothed[idx])
 			if visited[idx] || pix < threshold || math.IsNaN(pix) {
 				visited[idx] = true
 				continue
@@ -49,7 +54,7 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 					nx, ny := cx+d[0], cy+d[1]
 					if nx >= 0 && nx < width && ny >= 0 && ny < height {
 						nIdx := ny*width + nx
-						if !visited[nIdx] && float64(pixels[nIdx]) >= threshold {
+						if !visited[nIdx] && float64(smoothed[nIdx]) >= threshold {
 							visited[nIdx] = true
 							q = append(q, [2]int{nx, ny})
 						}
@@ -136,19 +141,51 @@ func EstimateBackground(pixels []float32) (float64, float64) {
 		return 0, 1
 	}
 
-	sort.Float64s(sample)
-	median := sample[len(sample)/2]
-	absoluteDeviations := make([]float64, 0, len(sample))
-	for _, v := range sample {
-		absoluteDeviations = append(absoluteDeviations, math.Abs(v-median))
+	// Iterative 3-sigma clipping (3 passes), matching TweakReg sky estimation.
+	for range 3 {
+		var sum float64
+		for _, v := range sample {
+			sum += v
+		}
+		mean := sum / float64(len(sample))
+		var varSum float64
+		for _, v := range sample {
+			d := v - mean
+			varSum += d * d
+		}
+		sigma := math.Sqrt(varSum / float64(len(sample)))
+		if sigma <= 0 {
+			return mean, 1
+		}
+		lo := mean - 3*sigma
+		hi := mean + 3*sigma
+		clipped := sample[:0]
+		for _, v := range sample {
+			if v >= lo && v <= hi {
+				clipped = append(clipped, v)
+			}
+		}
+		if len(clipped) == len(sample) {
+			return mean, sigma
+		}
+		sample = clipped
 	}
-	sort.Float64s(absoluteDeviations)
-	mad := absoluteDeviations[len(absoluteDeviations)/2]
-	sigma := mad * 1.4826
+
+	var sum float64
+	for _, v := range sample {
+		sum += v
+	}
+	mean := sum / float64(len(sample))
+	var varSum float64
+	for _, v := range sample {
+		d := v - mean
+		varSum += d * d
+	}
+	sigma := math.Sqrt(varSum / float64(len(sample)))
 	if sigma <= 0 {
 		sigma = 1
 	}
-	return median, sigma
+	return mean, sigma
 }
 
 // CentroidNear returns the flux-weighted centroid of the star nearest to (x, y).
@@ -250,4 +287,68 @@ func CentroidNear(pixels []float32, width, height int, x, y float64, searchRadiu
 		return x, y, false
 	}
 	return sumX / sumF, sumY / sumF, true
+}
+
+// gaussianConvolve applies a separable Gaussian blur (two 1-D passes).
+// NaN pixels are excluded from kernel sums so chip gaps don't bleed.
+func gaussianConvolve(pixels []float32, width, height int, sigma float64) []float32 {
+	radius := int(math.Ceil(3 * sigma))
+	size := 2*radius + 1
+	kernel := make([]float64, size)
+	var ksum float64
+	for i := range kernel {
+		x := float64(i - radius)
+		kernel[i] = math.Exp(-0.5 * x * x / (sigma * sigma))
+		ksum += kernel[i]
+	}
+	for i := range kernel {
+		kernel[i] /= ksum
+	}
+
+	// Horizontal pass.
+	tmp := make([]float32, width*height)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			var val, wsum float64
+			for ki, w := range kernel {
+				sx := x + ki - radius
+				if sx < 0 || sx >= width {
+					continue
+				}
+				v := float64(pixels[y*width+sx])
+				if math.IsNaN(v) {
+					continue
+				}
+				val += w * v
+				wsum += w
+			}
+			if wsum > 0 {
+				tmp[y*width+x] = float32(val / wsum)
+			}
+		}
+	}
+
+	// Vertical pass.
+	out := make([]float32, width*height)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			var val, wsum float64
+			for ki, w := range kernel {
+				sy := y + ki - radius
+				if sy < 0 || sy >= height {
+					continue
+				}
+				v := float64(tmp[sy*width+x])
+				if math.IsNaN(v) {
+					continue
+				}
+				val += w * v
+				wsum += w
+			}
+			if wsum > 0 {
+				out[y*width+x] = float32(val / wsum)
+			}
+		}
+	}
+	return out
 }

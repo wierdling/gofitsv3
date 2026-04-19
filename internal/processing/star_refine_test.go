@@ -66,6 +66,43 @@ func TestEstimateTranslationAfterWCSRespectsExistingOffset(t *testing.T) {
 	}
 }
 
+func TestEstimateAffineAfterWCSWithRotation(t *testing.T) {
+	// 5° rotation produces ~5 px displacement at the image edges — well above
+	// sub-pixel centroid noise on a 128×128 synthetic star field.
+	const W, H = 128, 128
+	centers := [][2]int{{20, 20}, {100, 20}, {20, 100}, {100, 100}, {60, 60}, {40, 80}, {90, 40}}
+	ref := makeSyntheticStarFieldForRefine(W, H, centers)
+
+	const angleDeg = 5.0
+	rad := angleDeg * math.Pi / 180
+	// rotatePixels with -rad makes source stars appear rotated by -angleDeg
+	// in the output; the corrective ManualTransform should be +angleDeg.
+	target := rotatePixels(ref, W, H, float64(W)/2, float64(H)/2, -rad)
+
+	header := func() fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "64", "CRPIX2": "64",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "1", "CD1_2": "0",
+			"CD2_1": "0", "CD2_2": "1",
+		}}
+	}
+
+	affine, err := EstimateAffineAfterWCS(target, W, H, header(), ref, W, H, header(), 0, 0)
+	if err != nil {
+		t.Fatalf("EstimateAffineAfterWCS returned error: %v", err)
+	}
+
+	gotAngleDeg := math.Atan2(affine.D, affine.A) * 180 / math.Pi
+	if math.Abs(gotAngleDeg-angleDeg) > 1.0 {
+		t.Fatalf("rotation = %.4f°, want ≈ +%.4f°", gotAngleDeg, angleDeg)
+	}
+	scale := math.Sqrt(affine.A*affine.A + affine.D*affine.D)
+	if math.Abs(scale-1) > 0.05 {
+		t.Fatalf("scale = %.4f, want ≈ 1.0", scale)
+	}
+}
+
 func makeSyntheticStarFieldForRefine(width, height int, centers [][2]int) []float32 {
 	pixels := make([]float32, width*height)
 	for _, c := range centers {

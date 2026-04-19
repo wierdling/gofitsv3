@@ -25,12 +25,19 @@ func Run() error {
 	editContent, setEditImage := newEditWorkspace(a, win)
 
 	editTab := container.NewTabItem("Edit", editContent)
+	mosaicTab := container.NewTabItem("Mosaic", mosaic)
 	tabs := container.NewAppTabs(
-		container.NewTabItem("Mosaic", mosaic),
+		mosaicTab,
 		container.NewTabItem("Examine", examine),
 		container.NewTabItem("Compose", compose),
 		editTab,
 	)
+
+	tabs.OnChanged = func(tab *container.TabItem) {
+		if tab == mosaicTab && globalSetMosaicMenu != nil {
+			globalSetMosaicMenu()
+		}
+	}
 
 	globalExportToEdit = func(img image.Image) {
 		setEditImage(img)

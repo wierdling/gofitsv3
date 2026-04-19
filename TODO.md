@@ -1,3 +1,0 @@
-The next thing to create is a new tab to edit the png.  I want a section on the right which is a scrollable container for the image.  It will need to have a control to scroll in and scroll out.  I would like to be able to use actions to scroll in/out (two fingers moving closer, further away, etc).  On the left hand side I want some controls that will allow me to set the rgb levels, and also curves.  I also want to be able to sharpen the image. The new tab should be places after the compose tabe.
-
-I would also like an "Export to Edit" button that is on the compose screen to export the png (save it if needed) to the edit tab.

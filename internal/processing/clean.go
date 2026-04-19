@@ -62,7 +62,8 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 				replacementVal := estimateWideBackground(currentPixels, width, height, x, y)
 				var candidates []int
 				q := []int{idx}
-				localVisited := map[int]bool{idx: true}
+				localVisited := make([]bool, len(currentPixels))
+				localVisited[idx] = true
 				minX, maxX, minY, maxY := x, x, y, y
 
 				for len(q) > 0 {
@@ -299,66 +300,68 @@ type DrizzleStyleCROptions struct {
 // minX/minY are the output origin in reference pixel space.
 // scale is the drizzle scale factor (output pixels per reference pixel).
 func BuildDrizzleStyleCRMasks(frames []FrameInfo, outW, outH int, minX, minY, scale float64, opts DrizzleStyleCROptions) [][]bool {
-	n := len(frames)
-	if n == 0 {
+	if len(frames) == 0 {
 		return nil
 	}
-	outSize := outW * outH
+	model := buildInverseBlotModel(frames, outW, outH, minX, minY, scale)
+	return BuildCRMasksFromModel(frames, model, outW, outH, minX, minY, scale, opts)
+}
 
-	// ------------------------------------------------------------------
-	// Step 1: Build clean model in output space.
-	// For every output pixel, sample each frame at the corresponding
-	// source position (inverse blot) and collect values for median/minmed.
-	// ------------------------------------------------------------------
-	pixelValues := make([][]float64, outSize)
-	for i := range frames {
-		f := &frames[i]
-		for oy := 0; oy < outH; oy++ {
-			for ox := 0; ox < outW; ox++ {
-				refX := float64(ox)/scale + minX
-				refY := float64(oy)/scale + minY
+// buildInverseBlotModel builds a clean model image in output space by sampling
+// each input frame at the corresponding source position (inverse blot) and
+// computing a median or minmed across all frames at each output pixel.
+func buildInverseBlotModel(frames []FrameInfo, outW, outH int, minX, minY, scale float64) []float32 {
+	n := len(frames)
+	model := make([]float32, outW*outH)
+	// Reuse a single scratch buffer across all output pixels instead of
+	// allocating one []float64 per pixel (which would be O(outW*outH) allocs).
+	vals := make([]float64, 0, n)
+
+	for oy := 0; oy < outH; oy++ {
+		refY := float64(oy)/scale + minY
+		for ox := 0; ox < outW; ox++ {
+			refX := float64(ox)/scale + minX
+			vals = vals[:0]
+			for i := range frames {
+				f := &frames[i]
 				sx, sy := ApplyAffineTransform(f.RefToSource, refX-f.OffsetX, refY-f.OffsetY)
 				v := bilinearSample(f.Pixels, f.Width, f.Height, sx, sy)
-				if math.IsNaN(v) || v < 0 {
-					continue
+				if !math.IsNaN(v) && v >= 0 {
+					vals = append(vals, v)
 				}
-				outIdx := oy*outW + ox
-				pixelValues[outIdx] = append(pixelValues[outIdx], v)
 			}
-		}
-	}
-
-	model := make([]float32, outSize)
-	for i, vals := range pixelValues {
-		if len(vals) == 0 {
-			model[i] = float32(math.NaN())
-			continue
-		}
-		sort.Float64s(vals)
-		// Use lower-median (floor index) so that in a 2-frame stack a single
-		// CR spike does not pull the model value up.
-		median := vals[(len(vals)-1)/2]
-		if n <= 3 {
-			// minmed: min(mean, median) — suppresses upward CR spikes in small stacks
-			var sum float64
-			for _, v := range vals {
-				sum += v
+			outIdx := oy*outW + ox
+			if len(vals) == 0 {
+				model[outIdx] = float32(math.NaN())
+				continue
 			}
-			mean := sum / float64(len(vals))
-			if mean < median {
-				model[i] = float32(mean)
+			sort.Float64s(vals)
+			median := vals[(len(vals)-1)/2]
+			if n <= 3 {
+				var sum float64
+				for _, v := range vals {
+					sum += v
+				}
+				mean := sum / float64(len(vals))
+				if mean < median {
+					model[outIdx] = float32(mean)
+				} else {
+					model[outIdx] = float32(median)
+				}
 			} else {
-				model[i] = float32(median)
+				model[outIdx] = float32(median)
 			}
-		} else {
-			model[i] = float32(median)
 		}
 	}
+	return model
+}
 
-	// ------------------------------------------------------------------
-	// Step 2: Per-frame — blot model back, compute 4-neighbor derivative,
-	// flag seeds, then grow flags to connected neighbors.
-	// ------------------------------------------------------------------
+// BuildCRMasksFromModel flags cosmic rays by blotting a pre-built output-space
+// model back to each input frame and comparing. This is steps 2-5 of the
+// AstroDrizzle pipeline. Use this when the model has been built externally
+// (e.g. from per-frame drizzled images) rather than via inverse blot.
+func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, minX, minY, scale float64, opts DrizzleStyleCROptions) [][]bool {
+	n := len(frames)
 	dirs4 := [4][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
 	masks := make([][]bool, n)
 
@@ -372,7 +375,7 @@ func BuildDrizzleStyleCRMasks(frames []FrameInfo, outW, outH int, minX, minY, sc
 		npix := f.Width * f.Height
 		mask := make([]bool, npix)
 
-		// Pre-compute blotted model values for every frame pixel.
+		// Blot the model back to input frame pixel space.
 		blotted := make([]float32, npix)
 		for y := 0; y < f.Height; y++ {
 			for x := 0; x < f.Width; x++ {
@@ -406,12 +409,7 @@ func BuildDrizzleStyleCRMasks(frames []FrameInfo, outW, outH int, minX, minY, sc
 				if excess <= 0 {
 					continue
 				}
-				// 4-neighbor max-absolute derivative of the BLOTTED model.
-				// Using the model (not the raw frame) means the derivative is
-				// large only where the scene itself is steep (star edges), which
-				// relaxes the threshold there to avoid false positives.  At flat
-				// sky regions the model is smooth so maxDeriv ≈ 0, leaving only
-				// the noise floor as the threshold.
+				// 4-neighbor max-absolute derivative of the blotted model.
 				var maxDeriv float64
 				for _, d := range dirs4 {
 					nbv := float64(blotted[(y+d[1])*f.Width+(x+d[0])])

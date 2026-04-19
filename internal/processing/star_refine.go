@@ -50,16 +50,16 @@ func EstimateTranslationAfterWCS(targetPixels []float32, targetWidth, targetHeig
 		return 0, 0, fmt.Errorf("insufficient stars in shared region (ref: %d, target: %d)", len(refStars), len(targetStars))
 	}
 
-	// After WCS warping both images are in the same coordinate space.
-	// Use nearest-neighbour matching: for each ref star find the closest target
-	// star within maxResidual pixels.  Triangle-invariant matching is intentionally
-	// avoided here because it is designed to be translation/rotation agnostic —
-	// when star fields nearly overlap it frequently maps stars to wrong neighbours
-	// that happen to form similar triangles, producing large spurious displacements.
-	const maxResidual = 50.0
-	dxs, dys, err := nearestNeighbourOffsets(refStars, targetStars, maxResidual)
-	if err != nil {
-		return 0, 0, err
+	// Triangle-invariant matching handles large WCS residuals (e.g. reduced-gyro HST)
+	// where nearest-neighbour matching within a fixed radius would fail.
+	pairs := MatchStars(refStars, targetStars, 100, 0.01)
+	if len(pairs) < 3 {
+		return 0, 0, fmt.Errorf("insufficient star matches after WCS correction (found %d)", len(pairs))
+	}
+	var dxs, dys []float64
+	for _, p := range pairs {
+		dxs = append(dxs, p.RefX-p.TargetX)
+		dys = append(dys, p.RefY-p.TargetY)
 	}
 	return medianFloat64(dxs), medianFloat64(dys), nil
 }
@@ -279,44 +279,65 @@ func filterStarsNearNaN(stars []Star, pixels []float32, width, height, nanRadius
 	return out
 }
 
-// nearestNeighbourOffsets matches each refStar to the closest targetStar within
-// searchRadius pixels and returns the per-pair (dx, dy) displacement lists.
-// Each target star is used at most once (greedy, sorted by distance).
-func nearestNeighbourOffsets(refStars, targetStars []Star, searchRadius float64) ([]float64, []float64, error) {
-	type candidate struct {
-		rIdx, tIdx int
-		dx, dy     float64
-		dist       float64
+// EstimateAffineAfterWCS is like EstimateTranslationAfterWCS but solves for a
+// full affine transform rather than
+// translation only.  This captures residual rotation between images that share
+// the same nominal telescope orientation but differ by a small angle (e.g. due
+// to guide-star differences between visits).
+//
+// The returned AffineTransform is intended to be stored as ManualTransform.
+// initialOffsetX/Y should be the current input.OffsetX/Y so the WCS warp
+// accounts for any previously applied translation offset.
+func EstimateAffineAfterWCS(
+	targetPixels []float32, targetWidth, targetHeight int, targetHeader fitsio.Header,
+	refPixels []float32, refWidth, refHeight int, refHeader fitsio.Header,
+	initialOffsetX, initialOffsetY float64,
+) (AffineTransform, error) {
+	transform, err := ComputeWCSTransform(targetHeader, refHeader)
+	if err != nil {
+		return AffineTransform{}, err
 	}
-	var cands []candidate
-	for ri, rs := range refStars {
-		for ti, ts := range targetStars {
-			dx := rs.X - ts.X
-			dy := rs.Y - ts.Y
-			d := math.Sqrt(dx*dx + dy*dy)
-			if d <= searchRadius {
-				cands = append(cands, candidate{ri, ti, dx, dy, d})
-			}
-		}
-	}
-	sort.Slice(cands, func(a, b int) bool { return cands[a].dist < cands[b].dist })
+	transform.C = transform.C - (transform.A*initialOffsetX) - (transform.B*initialOffsetY)
+	transform.F = transform.F - (transform.D*initialOffsetX) - (transform.E*initialOffsetY)
 
-	usedRef := make(map[int]bool)
-	usedTarget := make(map[int]bool)
-	var dxs, dys []float64
-	for _, c := range cands {
-		if usedRef[c.rIdx] || usedTarget[c.tIdx] {
+	warpedTarget, validMask := WarpImageToSizeWithMask(targetPixels, targetWidth, targetHeight, refWidth, refHeight, transform)
+	maskedRef := make([]float32, len(refPixels))
+	maskedTarget := make([]float32, len(refPixels))
+	for i := range refPixels {
+		refVal := float64(refPixels[i])
+		targetVal := float64(warpedTarget[i])
+		if !validMask[i] || math.IsNaN(refVal) || math.IsInf(refVal, 0) || math.IsNaN(targetVal) || math.IsInf(targetVal, 0) {
+			maskedRef[i] = float32(math.NaN())
+			maskedTarget[i] = float32(math.NaN())
 			continue
 		}
-		usedRef[c.rIdx] = true
-		usedTarget[c.tIdx] = true
-		dxs = append(dxs, c.dx)
-		dys = append(dys, c.dy)
+		maskedRef[i] = refPixels[i]
+		maskedTarget[i] = warpedTarget[i]
 	}
-	if len(dxs) < 3 {
-		return nil, nil, fmt.Errorf("insufficient star matches within %.0f pixels after WCS correction (found %d)", searchRadius, len(dxs))
+
+	const nanGuard = 15
+	refStars := filterStarsNearNaN(
+		ExtractStars(maskedRef, refWidth, refHeight, 4.0, 3),
+		maskedRef, refWidth, refHeight, nanGuard,
+	)
+	targetStars := filterStarsNearNaN(
+		ExtractStars(maskedTarget, refWidth, refHeight, 4.0, 3),
+		maskedTarget, refWidth, refHeight, nanGuard,
+	)
+	if len(refStars) < 3 || len(targetStars) < 3 {
+		return AffineTransform{}, fmt.Errorf("insufficient stars in shared region (ref: %d, target: %d)", len(refStars), len(targetStars))
 	}
-	return dxs, dys, nil
+
+	// MatchStars(target, ref) → RefX=target pos, TargetX=ref pos, so
+	// SolveTransformationRANSAC fits T where T(target) ≈ ref = ManualTransform direction.
+	// Triangle matching handles the large orientation residuals produced by reduced-gyro HST.
+	// Full 6-parameter affine (via SolveTransformationRANSAC) captures differential scale
+	// and shear that a similarity-only fit misses.
+	pairs := MatchStars(targetStars, refStars, 100, 0.01)
+	if len(pairs) < 3 {
+		return AffineTransform{}, fmt.Errorf("insufficient star matches after WCS correction (found %d)", len(pairs))
+	}
+	return SolveTransformationRANSAC(pairs, 2000, 1.5)
 }
 
 func translationTransform(dx, dy float64) AffineTransform {

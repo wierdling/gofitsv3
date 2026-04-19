@@ -113,7 +113,15 @@ func (w *starPickerWidget) MinSize() fyne.Size {
 	if z <= 0 {
 		z = 1
 	}
-	return fyne.NewSize(float32(600*z), float32(500*z))
+	ww := float32(w.imageW)
+	hh := float32(w.imageH)
+	if ww <= 0 {
+		ww = 600
+	}
+	if hh <= 0 {
+		hh = 500
+	}
+	return fyne.NewSize(ww*float32(z), hh*float32(z))
 }
 
 // letterboxParams returns the x/y offset (in widget points) and uniform scale

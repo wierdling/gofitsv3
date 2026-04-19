@@ -15,7 +15,7 @@ func TestNormalizeFilterName(t *testing.T) {
 	if got != "F673N" {
 		t.Fatalf("normalizeFilterName = %q, want F673N", got)
 	}
-	if OffsetFileName(" 'F673N  '") != "F673N_offsets.txt" {
+	if OffsetFileName(" 'F673N  '") != "F673N_offsets.json" {
 		t.Fatalf("unexpected offset filename: %q", OffsetFileName(" 'F673N  '"))
 	}
 }
@@ -84,7 +84,7 @@ func TestAutoLoadOffsetsAppliesMatchingFilterFile(t *testing.T) {
 		{Path: filepath.Join(dir, "b_flc.fits"), PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F502N'"}}},
 	}
 	content := "F502N\na_flc.fits\t2.000000\t-1.000000\nb_flc.fits\t3.500000\t4.500000\n"
-	if err := os.WriteFile(filepath.Join(dir, OffsetFileName("F502N")), []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "F502N_offsets.txt"), []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile error: %v", err)
 	}
 	applied, messages := AutoLoadOffsets(inputs)

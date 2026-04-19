@@ -16,6 +16,19 @@ func IdentityTransform() AffineTransform {
 	return AffineTransform{A: 1, E: 1}
 }
 
+func RotationAround(centerX, centerY, angleRad float64) AffineTransform {
+	cosA := math.Cos(angleRad)
+	sinA := math.Sin(angleRad)
+	return AffineTransform{
+		A: cosA,
+		B: -sinA,
+		C: centerX - (cosA*centerX - sinA*centerY),
+		D: sinA,
+		E: cosA,
+		F: centerY - (sinA*centerX + cosA*centerY),
+	}
+}
+
 func ApplyAffineTransform(t AffineTransform, x, y float64) (float64, float64) {
 	return t.A*x + t.B*y + t.C, t.D*x + t.E*y + t.F
 }

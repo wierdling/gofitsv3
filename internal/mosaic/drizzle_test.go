@@ -299,3 +299,56 @@ func transformStarsAroundCenter(stars []processing.Star, cx, cy, angle, dx, dy f
 func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
+
+func TestPlanInputsSameFileSCIChipsGetMapper(t *testing.T) {
+	// Same-file SCI chips now use a WCSMapper for per-pixel distortion-aware
+	// placement instead of the old translation-only affine hack. Verify that
+	// planInputs builds a mapper for chip2 and that the affine in sourceToRef
+	// (used for CR detection) reflects the full WCS rotation, not just a shift.
+	ref := Input{
+		Path:   "single_flc.fits",
+		SCIExt: 1,
+		HDU: fitsio.HDU{Header: fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "10", "CRPIX2": "10",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "1", "CD1_2": "0",
+			"CD2_1": "0", "CD2_2": "1",
+		}}, Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{1, 1, 1, 1}}},
+	}
+	chip2 := Input{
+		Path:   "single_flc.fits",
+		SCIExt: 2,
+		HDU: fitsio.HDU{Header: fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "8", "CRPIX2": "10",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "0", "CD1_2": "-1",
+			"CD2_1": "1", "CD2_2": "0",
+		}}, Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{2, 2, 2, 2}}},
+	}
+
+	planned, statuses, _, _, _, _, err := planInputs([]Input{ref, chip2}, 1)
+	if err != nil {
+		t.Fatalf("planInputs returned error: %v", err)
+	}
+	if len(planned) != 2 {
+		t.Fatalf("planned inputs = %d, want 2", len(planned))
+	}
+	if statuses[1].Status != "aligned" {
+		t.Fatalf("status = %q, want aligned", statuses[1].Status)
+	}
+	// Chip2 must have a mapper for per-pixel WCS placement.
+	if planned[1].mapper == nil {
+		t.Fatal("expected mapper for same-file chip2, got nil")
+	}
+	// The sourceToRef affine should reflect the full WCS rotation from chip2
+	// (90° rotation encoded in its CD matrix), not translation-only.
+	got := planned[1].sourceToRef
+	if got.B == 0 && got.D == 0 {
+		t.Fatalf("expected full WCS affine for chip2, got translation-only %+v", got)
+	}
+	// Sanity: reference has no mapper (it is at identity by definition).
+	if planned[0].mapper != nil {
+		t.Fatal("expected nil mapper for reference chip, got non-nil")
+	}
+	_ = processing.IdentityTransform() // keep import used
+}

@@ -10,11 +10,16 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 
+	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
 	"gofitsv3/internal/utils"
 )
+
+// globalSendToExamine is set by newExamineWorkspace and called by the mosaic workspace
+// to load a drizzle result directly into the examine view.
+var globalSendToExamine func(pixels []float32, width, height int)
 
 type examineState struct {
 	img            *models.LoadedImage
@@ -281,28 +286,30 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			}
 
 			img, loadErr := loadImageFromPath(path)
-			progressDialog.Hide()
-			if loadErr != nil {
-				dialog.ShowError(loadErr, win)
-				return
-			}
+			fyne.Do(func() {
+				progressDialog.Hide()
+				if loadErr != nil {
+					dialog.ShowError(loadErr, win)
+					return
+				}
 
-			state.img = img
-			if preserveStretch {
-				state.img.Mode = labelToMode(savedState.Mode)
-				state.img.Black = savedState.Black
-				state.img.White = savedState.White
-				state.img.Background = savedState.Background
-				state.img.Peak = savedState.Peak
-				state.img.ScaledPeak = savedState.ScaledPeak
-				state.img.ShowClip = savedState.ShowClip
-			}
-			state.headerLines = utils.FormatHeadersLines(img.Primary, img.HDU.Header)
-			pathLabel.SetText(path)
-			syncControlsFromImage()
-			clearMeasurement()
-			headerList.Refresh()
-			refresh()
+				state.img = img
+				if preserveStretch {
+					state.img.Mode = labelToMode(savedState.Mode)
+					state.img.Black = savedState.Black
+					state.img.White = savedState.White
+					state.img.Background = savedState.Background
+					state.img.Peak = savedState.Peak
+					state.img.ScaledPeak = savedState.ScaledPeak
+					state.img.ShowClip = savedState.ShowClip
+				}
+				state.headerLines = utils.FormatHeadersLines(img.Primary, img.HDU.Header)
+				pathLabel.SetText(path)
+				syncControlsFromImage()
+				clearMeasurement()
+				headerList.Refresh()
+				refresh()
+			})
 		}()
 	}
 
@@ -394,6 +401,35 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	)
 	controlsScroll := container.NewVScroll(controls)
 	controlsScroll.SetMinSize(fyne.NewSize(280, 220))
+
+	globalSendToExamine = func(pixels []float32, width, height int) {
+		img := &models.LoadedImage{
+			Path: "(mosaic result)",
+			HDU: fitsio.HDU{
+				Data: fitsio.ImageData{
+					Pixels: pixels,
+					Width:  width,
+					Height: height,
+				},
+			},
+			Mode:       0,
+			Black:      0,
+			White:      1,
+			Background: 0,
+			Peak:       1,
+			ScaledPeak: 1,
+			ShowClip:   true,
+		}
+		_, img.White = processing.AutoLevels(pixels)
+		img.Peak = img.White
+		state.img = img
+		state.headerLines = []string{"Mosaic drizzle result", fmt.Sprintf("Size: %dx%d", width, height)}
+		pathLabel.SetText("(mosaic result)")
+		syncControlsFromImage()
+		clearMeasurement()
+		headerList.Refresh()
+		refresh()
+	}
 
 	viewerTabs := container.NewAppTabs(
 		container.NewTabItem("Viewer", vp.container),

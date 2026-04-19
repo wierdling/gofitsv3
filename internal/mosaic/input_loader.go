@@ -11,34 +11,95 @@ import (
 	"gofitsv3/internal/processing"
 )
 
-// LoadInputFromPath loads a single mosaic input. If the FITS file contains
-// multiple SCI extensions, they are resampled onto one shared canvas using
-// their WCS headers so the drizzle pipeline receives one image per file.
-func LoadInputFromPath(path string) (Input, error) {
+// LoadInputsFromPath loads one or more mosaic inputs from a FITS file.
+// Each SCI extension is returned as its own input so drizzle can treat
+// multi-chip files the same way AstroDrizzle does.
+func LoadInputsFromPath(path string) ([]Input, error) {
 	file, err := fitsio.LoadFile(path)
 	if err != nil {
-		return Input{}, err
+		return nil, err
 	}
 	if len(file.HDUs) == 0 {
-		return Input{}, fmt.Errorf("no HDUs found in %s", path)
+		return nil, fmt.Errorf("no HDUs found in %s", path)
 	}
 
 	primary := file.HDUs[0].Header
 	sci := file.SelectSCI()
 	if len(sci) == 0 {
 		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file)
-		return Input{Path: path, PrimaryHeader: primary, HDU: hdu}, nil
-	}
-	if len(sci) == 1 {
-		hdu := cleanSCIWithMatchingDQ(sci[0], file)
-		return Input{Path: path, PrimaryHeader: primary, HDU: hdu}, nil
+		return []Input{{Path: path, PrimaryHeader: primary, HDU: hdu}}, nil
 	}
 
-	hdu, chipFootprints, err := combineSCIHDUs(path, primary, sci, file)
+	inputs := make([]Input, 0, len(sci))
+	for i := range sci {
+		hdu := cleanSCIWithMatchingDQ(sci[i], file)
+		extver := sciExtNumber(hdu.Header, i+1)
+		d2iX, d2iY := loadD2ITables(file, extver)
+		inputs = append(inputs, Input{
+			Path:          path,
+			SCIExt:        extver,
+			PrimaryHeader: primary,
+			HDU:           hdu,
+			D2IX:          d2iX,
+			D2IY:          d2iY,
+		})
+	}
+	return inputs, nil
+}
+
+// LoadInputFromPath is retained for callers that expect exactly one input.
+func LoadInputFromPath(path string) (Input, error) {
+	inputs, err := LoadInputsFromPath(path)
 	if err != nil {
 		return Input{}, err
 	}
-	return Input{Path: path, PrimaryHeader: primary, HDU: hdu, ChipFootprints: chipFootprints}, nil
+	if len(inputs) == 0 {
+		return Input{}, fmt.Errorf("no mosaic inputs found in %s", path)
+	}
+	return inputs[0], nil
+}
+
+func sciExtNumber(header fitsio.Header, fallback int) int {
+	if extver, ok := fitsio.HeaderFloat(header, "EXTVER"); ok {
+		return int(extver)
+	}
+	return fallback
+}
+
+// chipPlacementTransform is used only by combineSCIHDUs (dead code path).
+// It returns a translation-only affine by discarding inter-chip rotation from the
+// WCS affine approximation.  The active drizzle path uses WCSMapper instead.
+func chipPlacementTransform(chipHeader, refHeader fitsio.Header) (processing.AffineTransform, error) {
+	refToSCI, err := processing.ComputeWCSTransform(chipHeader, refHeader)
+	if err != nil {
+		return processing.AffineTransform{}, err
+	}
+	sciToRef, err := processing.InvertAffineTransform(refToSCI)
+	if err != nil {
+		return processing.AffineTransform{}, err
+	}
+	return processing.AffineTransform{A: 1, B: 0, C: sciToRef.C, D: 0, E: 1, F: sciToRef.F}, nil
+}
+
+// loadD2ITables extracts the D2IMARR lookup-table corrections for a given SCI
+// chip (identified by its 1-based EXTVER) from an HST calibrated FITS file.
+// HST pipeline convention: for SCI EXTVER N, the x-axis correction is in
+// D2IMARR EXTVER 2N-1 and the y-axis correction is in D2IMARR EXTVER 2N.
+// Returns nil tables (no error) if the file has no D2IMARR extensions.
+func loadD2ITables(file *fitsio.File, sciExtver int) (d2iX, d2iY *processing.D2ITable) {
+	xExtver := fmt.Sprintf("%d", 2*sciExtver-1)
+	yExtver := fmt.Sprintf("%d", 2*sciExtver)
+	if hdu := file.GetHDUByExtVer("D2IMARR", xExtver); hdu != nil {
+		if t, err := processing.ParseD2ITableFromHDU(*hdu); err == nil {
+			d2iX = t
+		}
+	}
+	if hdu := file.GetHDUByExtVer("D2IMARR", yExtver); hdu != nil {
+		if t, err := processing.ParseD2ITableFromHDU(*hdu); err == nil {
+			d2iY = t
+		}
+	}
+	return
 }
 
 func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *fitsio.File) (fitsio.HDU, [][4][2]float64, error) {
@@ -56,18 +117,22 @@ func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *
 	maxY := float64(ref.Data.Height - 1)
 
 	for i := 1; i < len(cleaned); i++ {
-		refToSCI, err := processing.ComputeWCSTransform(cleaned[i].Header, ref.Header)
+		// Use WCS to compute the translation of chip i relative to chip 0,
+		// but force the rotation/scale to identity. Each chip's CD matrix is a
+		// local linearisation of the geometric distortion and differs by a tiny
+		// amount between chips even though the detector is physically rigid.
+		// Keeping the full affine rotation from ComputeWCSTransform causes the
+		// inter-chip placement to pick up a false relative rotation. The
+		// translation (C, F) is the piece we want when combining the SCI chips
+		// into a single detector image.
+		transform, err := chipPlacementTransform(cleaned[i].Header, ref.Header)
 		if err != nil {
 			return fitsio.HDU{}, nil, fmt.Errorf("combine %s SCI[%d]: %w", filepath.Base(path), i+1, err)
 		}
-		sciToRef, err := processing.InvertAffineTransform(refToSCI)
-		if err != nil {
-			return fitsio.HDU{}, nil, fmt.Errorf("combine %s SCI[%d]: %w", filepath.Base(path), i+1, err)
-		}
-		transforms[i] = sciToRef
+		transforms[i] = transform
 
 		for _, corner := range imageCorners(cleaned[i].Data.Width, cleaned[i].Data.Height) {
-			x, y := processing.ApplyAffineTransform(sciToRef, corner[0], corner[1])
+			x, y := processing.ApplyAffineTransform(transforms[i], corner[0], corner[1])
 			if x < minX {
 				minX = x
 			}
@@ -115,7 +180,7 @@ func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *
 					continue
 				}
 				refX, refY := processing.ApplyAffineTransform(transforms[i], float64(x), float64(y))
-				drizzlePixel(sums, weights, width, height, refX-minX, refY-minY, 1, float32(val))
+				drizzlePixelSquare(sums, weights, width, height, refX-minX, refY-minY, 1, float32(val))
 			}
 		}
 	}

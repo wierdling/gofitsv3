@@ -96,3 +96,34 @@ func TestCombineSCIHDUsShiftsCRPIXForExpandedCanvas(t *testing.T) {
 		t.Fatalf("CRPIX2 = %q, want 10", got)
 	}
 }
+
+func TestChipPlacementTransformIgnoresRotationTerms(t *testing.T) {
+	refHeader := fitsio.Header{Cards: map[string]string{
+		"CRPIX1": "10",
+		"CRPIX2": "10",
+		"CRVAL1": "100",
+		"CRVAL2": "22",
+		"CD1_1":  "1",
+		"CD1_2":  "0",
+		"CD2_1":  "0",
+		"CD2_2":  "1",
+	}}
+	chipHeader := fitsio.Header{Cards: map[string]string{
+		"CRPIX1": "8",
+		"CRPIX2": "10",
+		"CRVAL1": "100",
+		"CRVAL2": "22",
+		"CD1_1":  "0",
+		"CD1_2":  "-1",
+		"CD2_1":  "1",
+		"CD2_2":  "0",
+	}}
+
+	transform, err := chipPlacementTransform(chipHeader, refHeader)
+	if err != nil {
+		t.Fatalf("chipPlacementTransform returned error: %v", err)
+	}
+	if transform.A != 1 || transform.B != 0 || transform.D != 0 || transform.E != 1 {
+		t.Fatalf("expected translation-only transform, got %+v", transform)
+	}
+}
