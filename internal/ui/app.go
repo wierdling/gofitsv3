@@ -19,30 +19,35 @@ func Run() error {
 
 	win := a.NewWindow("Go Fits V3 - " + version.Version)
 
-	compose := newComposeWorkspace(a, win)
+	composeContent, composeMenus := newComposeWorkspace(a, win)
 	examine := newExamineWorkspace(a, win)
-	mosaic := newMosaicWorkspace(a, win)
+	mosaicContent, mosaicMenu := newMosaicWorkspace(a, win)
 	editContent, setEditImage := newEditWorkspace(a, win)
 
 	editTab := container.NewTabItem("Edit", editContent)
-	mosaicTab := container.NewTabItem("Mosaic", mosaic)
+	mosaicTab := container.NewTabItem("Mosaic", mosaicContent)
+	composeTab := container.NewTabItem("Compose", composeContent)
 	tabs := container.NewAppTabs(
 		mosaicTab,
 		container.NewTabItem("Examine", examine),
-		container.NewTabItem("Compose", compose),
+		composeTab,
 		editTab,
 	)
-
-	tabs.OnChanged = func(tab *container.TabItem) {
-		if tab == mosaicTab && globalSetMosaicMenu != nil {
-			globalSetMosaicMenu()
-		}
-	}
 
 	globalExportToEdit = func(img image.Image) {
 		setEditImage(img)
 		tabs.Select(editTab)
 	}
+
+	windowMenu := fyne.NewMenu("Window",
+		fyne.NewMenuItem("Debug Log", func() {
+			showDebugWindow(a)
+		}),
+	)
+
+	allMenus := append([]*fyne.Menu{mosaicMenu}, composeMenus...)
+	allMenus = append(allMenus, windowMenu)
+	win.SetMainMenu(fyne.NewMainMenu(allMenus...))
 
 	win.SetContent(tabs)
 	// Use a very large size so the OS/Fyne caps it to the screen bounds,

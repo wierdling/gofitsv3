@@ -2,7 +2,9 @@ package processing
 
 import (
 	"math"
+	"runtime"
 	"sort"
+	"sync"
 )
 
 type Star struct {
@@ -10,6 +12,16 @@ type Star struct {
 	Y    float64
 	Flux float64
 	Area int
+}
+
+// ExtractAndLimitStars extracts stars and caps the result at maxStars brightest.
+// Use this instead of ExtractStars when you want to reuse the catalog across multiple calls.
+func ExtractAndLimitStars(pixels []float32, width, height int, thresholdSigma float64, minArea, maxStars int) []Star {
+	stars := ExtractStars(pixels, width, height, thresholdSigma, minArea)
+	if maxStars > 0 && len(stars) > maxStars {
+		stars = stars[:maxStars]
+	}
+	return stars
 }
 
 func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, minArea int) []Star {
@@ -37,7 +49,7 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 			q := [][2]int{{x, y}}
 			visited[idx] = true
 			var blob [][2]int
-			var fluxSum float64
+			var fluxSum, peakNetFlux float64
 
 			for len(q) > 0 {
 				curr := q[0]
@@ -48,6 +60,9 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 				netFlux := float64(pixels[cIdx]) - median
 				if netFlux < 0 {
 					netFlux = 0
+				}
+				if netFlux > peakNetFlux {
+					peakNetFlux = netFlux
 				}
 				fluxSum += netFlux
 				for _, d := range dirs {
@@ -97,6 +112,13 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 			}
 			// Reject blobs whose bounding box is more than 4:1 elongated.
 			if shorter == 0 || longer/shorter > 4 {
+				continue
+			}
+
+			// Reject compact spikes where a single pixel holds most of the flux.
+			// Cosmic rays deposit nearly all energy in 1-2 pixels; a real stellar
+			// PSF spreads flux across multiple pixels after the Gaussian pre-filter.
+			if fluxSum > 0 && peakNetFlux/fluxSum > 0.75 {
 				continue
 			}
 
@@ -291,6 +313,7 @@ func CentroidNear(pixels []float32, width, height int, x, y float64, searchRadiu
 
 // gaussianConvolve applies a separable Gaussian blur (two 1-D passes).
 // NaN pixels are excluded from kernel sums so chip gaps don't bleed.
+// Both passes are parallelized across available CPUs.
 func gaussianConvolve(pixels []float32, width, height int, sigma float64) []float32 {
 	radius := int(math.Ceil(3 * sigma))
 	size := 2*radius + 1
@@ -305,50 +328,84 @@ func gaussianConvolve(pixels []float32, width, height int, sigma float64) []floa
 		kernel[i] /= ksum
 	}
 
-	// Horizontal pass.
-	tmp := make([]float32, width*height)
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			var val, wsum float64
-			for ki, w := range kernel {
-				sx := x + ki - radius
-				if sx < 0 || sx >= width {
-					continue
-				}
-				v := float64(pixels[y*width+sx])
-				if math.IsNaN(v) {
-					continue
-				}
-				val += w * v
-				wsum += w
-			}
-			if wsum > 0 {
-				tmp[y*width+x] = float32(val / wsum)
-			}
-		}
-	}
+	nWorkers := runtime.NumCPU()
 
-	// Vertical pass.
-	out := make([]float32, width*height)
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			var val, wsum float64
-			for ki, w := range kernel {
-				sy := y + ki - radius
-				if sy < 0 || sy >= height {
-					continue
-				}
-				v := float64(tmp[sy*width+x])
-				if math.IsNaN(v) {
-					continue
-				}
-				val += w * v
-				wsum += w
-			}
-			if wsum > 0 {
-				out[y*width+x] = float32(val / wsum)
-			}
+	// Horizontal pass: each row is independent.
+	tmp := make([]float32, width*height)
+	var wg sync.WaitGroup
+	rowsPerWorker := (height + nWorkers - 1) / nWorkers
+	for w := 0; w < nWorkers; w++ {
+		y0 := w * rowsPerWorker
+		y1 := y0 + rowsPerWorker
+		if y1 > height {
+			y1 = height
 		}
+		if y0 >= height {
+			break
+		}
+		wg.Add(1)
+		go func(y0, y1 int) {
+			defer wg.Done()
+			for y := y0; y < y1; y++ {
+				for x := 0; x < width; x++ {
+					var val, wsum float64
+					for ki, w := range kernel {
+						sx := x + ki - radius
+						if sx < 0 || sx >= width {
+							continue
+						}
+						v := float64(pixels[y*width+sx])
+						if math.IsNaN(v) {
+							continue
+						}
+						val += w * v
+						wsum += w
+					}
+					if wsum > 0 {
+						tmp[y*width+x] = float32(val / wsum)
+					}
+				}
+			}
+		}(y0, y1)
 	}
+	wg.Wait()
+
+	// Vertical pass: each row of the output is independent.
+	out := make([]float32, width*height)
+	for w := 0; w < nWorkers; w++ {
+		y0 := w * rowsPerWorker
+		y1 := y0 + rowsPerWorker
+		if y1 > height {
+			y1 = height
+		}
+		if y0 >= height {
+			break
+		}
+		wg.Add(1)
+		go func(y0, y1 int) {
+			defer wg.Done()
+			for y := y0; y < y1; y++ {
+				for x := 0; x < width; x++ {
+					var val, wsum float64
+					for ki, w := range kernel {
+						sy := y + ki - radius
+						if sy < 0 || sy >= height {
+							continue
+						}
+						v := float64(tmp[sy*width+x])
+						if math.IsNaN(v) {
+							continue
+						}
+						val += w * v
+						wsum += w
+					}
+					if wsum > 0 {
+						out[y*width+x] = float32(val / wsum)
+					}
+				}
+			}
+		}(y0, y1)
+	}
+	wg.Wait()
 	return out
 }

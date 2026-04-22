@@ -5,10 +5,13 @@ import (
 	"math"
 	"sort"
 
+	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
 )
 
 func EstimateTranslationAfterWCS(targetPixels []float32, targetWidth, targetHeight int, targetHeader fitsio.Header, refPixels []float32, refWidth, refHeight int, refHeader fitsio.Header, initialOffsetX, initialOffsetY float64) (float64, float64, error) {
+	debuglog.Log("EstimateTranslationAfterWCS: starting")
+	defer debuglog.Log("EstimateTranslationAfterWCS: finished")
 	transform, err := ComputeWCSTransform(targetHeader, refHeader)
 	if err != nil {
 		return 0, 0, err
@@ -73,6 +76,8 @@ func EstimateTranslationFromRefStars(
 	refWidth, refHeight int, refHeader fitsio.Header,
 	initialOffsetX, initialOffsetY float64,
 ) (float64, float64, error) {
+	debuglog.Log("EstimateTranslationFromRefStars: starting")
+	defer debuglog.Log("EstimateTranslationFromRefStars: finished")
 	if len(refStars) == 0 {
 		return 0, 0, fmt.Errorf("no reference stars provided")
 	}
@@ -148,6 +153,95 @@ func EstimateTranslationFromRefStars(
 // Matching by proximity (nearest star) rather than brightness avoids false
 // matches in crowded fields where a brighter but unrelated star happens to lie
 // inside the search box.
+// EstimateRScaleFromRefStars is like EstimateAffineFromRefStars but constrains
+// the refinement to a similarity transform: translation, rotation, and one
+// uniform scale (TweakReg-style rscale).
+func EstimateRScaleFromRefStars(
+	refStars []Star,
+	targetPixels []float32, targetWidth, targetHeight int, targetHeader fitsio.Header,
+	refHeader fitsio.Header,
+	initialOffsetX, initialOffsetY float64,
+	initialRefinement *AffineTransform,
+) (AffineTransform, error) {
+	debuglog.Log("EstimateRScaleFromRefStars: starting")
+	defer debuglog.Log("EstimateRScaleFromRefStars: finished")
+	if len(refStars) < 2 {
+		return AffineTransform{}, fmt.Errorf("at least 2 reference stars are required")
+	}
+
+	refToTarget, err := ComputeWCSTransform(targetHeader, refHeader)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+	sourceToRef, err := InvertAffineTransform(refToTarget)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+
+	current := ComposeAffineTransforms(translationTransform(initialOffsetX, initialOffsetY), sourceToRef)
+	if initialRefinement != nil {
+		current = ComposeAffineTransforms(*initialRefinement, current)
+	}
+
+	refToSource, err := InvertAffineTransform(current)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+
+	targetStars := ExtractStars(targetPixels, targetWidth, targetHeight, 4.0, 3)
+	debuglog.Log(fmt.Sprintf("EstimateRScaleFromRefStars: %d target stars detected", len(targetStars)))
+	if len(targetStars) == 0 {
+		return AffineTransform{}, fmt.Errorf("no stars detected in target image")
+	}
+
+	const centroidSearchRadius = 200.0
+
+	var pairs []MatchedPair
+	inBounds := 0
+	for _, rs := range refStars {
+		tx, ty := ApplyAffineTransform(refToSource, rs.X, rs.Y)
+		if tx < 0 || tx >= float64(targetWidth) || ty < 0 || ty >= float64(targetHeight) {
+			debuglog.Log(fmt.Sprintf("EstimateRScaleFromRefStars: ref star (%.1f,%.1f) projects out of bounds → (%.1f,%.1f)", rs.X, rs.Y, tx, ty))
+			continue
+		}
+		inBounds++
+
+		bestDist := centroidSearchRadius
+		var bestStar Star
+		found := false
+		for _, ts := range targetStars {
+			d := math.Hypot(ts.X-tx, ts.Y-ty)
+			if d < bestDist {
+				bestDist = d
+				bestStar = ts
+				found = true
+			}
+		}
+		if !found {
+			debuglog.Log(fmt.Sprintf("EstimateRScaleFromRefStars: ref star (%.1f,%.1f) → predicted (%.1f,%.1f) no match within %.0fpx", rs.X, rs.Y, tx, ty, centroidSearchRadius))
+			continue
+		}
+		debuglog.Log(fmt.Sprintf("EstimateRScaleFromRefStars: ref star (%.1f,%.1f) matched target star (%.1f,%.1f) dist=%.1fpx", rs.X, rs.Y, bestStar.X, bestStar.Y, bestDist))
+
+		wx, wy := ApplyAffineTransform(current, bestStar.X, bestStar.Y)
+		pairs = append(pairs, MatchedPair{
+			RefX: wx, RefY: wy,
+			TargetX: rs.X, TargetY: rs.Y,
+		})
+	}
+
+	debuglog.Log(fmt.Sprintf("EstimateRScaleFromRefStars: %d/%d ref stars in-bounds, %d matched", inBounds, len(refStars), len(pairs)))
+	if len(pairs) < 2 {
+		return AffineTransform{}, fmt.Errorf("only %d of %d reference stars found in target image (need 2)", len(pairs), len(refStars))
+	}
+
+	refinement, err := SolveRScaleTransformationRANSAC(pairs, 300, 2.0)
+	if err != nil {
+		return AffineTransform{}, fmt.Errorf("rscale solve failed: %w", err)
+	}
+	return refinement, nil
+}
+
 func EstimateAffineFromRefStars(
 	refStars []Star,
 	targetPixels []float32, targetWidth, targetHeight int, targetHeader fitsio.Header,
@@ -155,6 +249,8 @@ func EstimateAffineFromRefStars(
 	initialOffsetX, initialOffsetY float64,
 	initialRefinement *AffineTransform,
 ) (AffineTransform, error) {
+	debuglog.Log("EstimateAffineFromRefStars: starting")
+	defer debuglog.Log("EstimateAffineFromRefStars: finished")
 	if len(refStars) < 3 {
 		return AffineTransform{}, fmt.Errorf("at least 3 reference stars are required")
 	}
@@ -279,6 +375,292 @@ func filterStarsNearNaN(stars []Star, pixels []float32, width, height, nanRadius
 	return out
 }
 
+type candidateMatch struct {
+	refIdx    int
+	targetIdx int
+	distSq    float64
+}
+
+// matchStarsByMutualProximity matches stars already brought into roughly the
+// same pixel coordinate system. It is much cheaper than triangle matching and
+// is intended for the post-WCS refinement path. Only mutual nearest-neighbour
+// matches are accepted, and ambiguous matches are rejected using a best-vs-
+// second-best distance ratio test.
+func matchStarsByMutualProximity(refStars, targetStars []Star, maxStars int, maxRadius, maxRatio float64) []MatchedPair {
+	if len(refStars) == 0 || len(targetStars) == 0 {
+		return nil
+	}
+	if maxStars > 0 && len(refStars) > maxStars {
+		refStars = refStars[:maxStars]
+	}
+	if maxStars > 0 && len(targetStars) > maxStars {
+		targetStars = targetStars[:maxStars]
+	}
+	maxDistSq := maxRadius * maxRadius
+	ratioSq := maxRatio * maxRatio
+
+	bestTargetForRef := make([]int, len(refStars))
+	bestDistRef := make([]float64, len(refStars))
+	secondDistRef := make([]float64, len(refStars))
+	for i := range bestTargetForRef {
+		bestTargetForRef[i] = -1
+		bestDistRef[i] = math.Inf(1)
+		secondDistRef[i] = math.Inf(1)
+	}
+	for ri, rs := range refStars {
+		for ti, ts := range targetStars {
+			dx := rs.X - ts.X
+			dy := rs.Y - ts.Y
+			distSq := dx*dx + dy*dy
+			if distSq > maxDistSq {
+				continue
+			}
+			if distSq < bestDistRef[ri] {
+				secondDistRef[ri] = bestDistRef[ri]
+				bestDistRef[ri] = distSq
+				bestTargetForRef[ri] = ti
+			} else if distSq < secondDistRef[ri] {
+				secondDistRef[ri] = distSq
+			}
+		}
+	}
+
+	bestRefForTarget := make([]int, len(targetStars))
+	bestDistTarget := make([]float64, len(targetStars))
+	secondDistTarget := make([]float64, len(targetStars))
+	for i := range bestRefForTarget {
+		bestRefForTarget[i] = -1
+		bestDistTarget[i] = math.Inf(1)
+		secondDistTarget[i] = math.Inf(1)
+	}
+	for ti, ts := range targetStars {
+		for ri, rs := range refStars {
+			dx := rs.X - ts.X
+			dy := rs.Y - ts.Y
+			distSq := dx*dx + dy*dy
+			if distSq > maxDistSq {
+				continue
+			}
+			if distSq < bestDistTarget[ti] {
+				secondDistTarget[ti] = bestDistTarget[ti]
+				bestDistTarget[ti] = distSq
+				bestRefForTarget[ti] = ri
+			} else if distSq < secondDistTarget[ti] {
+				secondDistTarget[ti] = distSq
+			}
+		}
+	}
+
+	candidates := make([]candidateMatch, 0, minInt(len(refStars), len(targetStars)))
+	for ri, ti := range bestTargetForRef {
+		if ti < 0 || bestRefForTarget[ti] != ri {
+			continue
+		}
+		if math.IsInf(bestDistRef[ri], 1) || math.IsInf(bestDistTarget[ti], 1) {
+			continue
+		}
+		if !math.IsInf(secondDistRef[ri], 1) && bestDistRef[ri] > ratioSq*secondDistRef[ri] {
+			continue
+		}
+		if !math.IsInf(secondDistTarget[ti], 1) && bestDistTarget[ti] > ratioSq*secondDistTarget[ti] {
+			continue
+		}
+		candidates = append(candidates, candidateMatch{refIdx: ri, targetIdx: ti, distSq: bestDistRef[ri]})
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].distSq < candidates[j].distSq })
+
+	pairs := make([]MatchedPair, 0, len(candidates))
+	usedRef := make([]bool, len(refStars))
+	usedTarget := make([]bool, len(targetStars))
+	for _, c := range candidates {
+		if usedRef[c.refIdx] || usedTarget[c.targetIdx] {
+			continue
+		}
+		usedRef[c.refIdx] = true
+		usedTarget[c.targetIdx] = true
+		rs := refStars[c.refIdx]
+		ts := targetStars[c.targetIdx]
+		pairs = append(pairs, MatchedPair{
+			RefX: rs.X, RefY: rs.Y,
+			TargetX: ts.X, TargetY: ts.Y,
+		})
+	}
+	return pairs
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func pairBoundsTarget(pairs []MatchedPair) (width, height, diag float64) {
+	if len(pairs) == 0 {
+		return 0, 0, 0
+	}
+	minX, maxX := pairs[0].TargetX, pairs[0].TargetX
+	minY, maxY := pairs[0].TargetY, pairs[0].TargetY
+	for _, p := range pairs[1:] {
+		if p.TargetX < minX {
+			minX = p.TargetX
+		}
+		if p.TargetX > maxX {
+			maxX = p.TargetX
+		}
+		if p.TargetY < minY {
+			minY = p.TargetY
+		}
+		if p.TargetY > maxY {
+			maxY = p.TargetY
+		}
+	}
+	width = maxX - minX
+	height = maxY - minY
+	diag = math.Hypot(width, height)
+	return width, height, diag
+}
+
+func rscaleResidualStats(pairs []MatchedPair, t AffineTransform) (rms, maxErr float64) {
+	if len(pairs) == 0 {
+		return 0, 0
+	}
+	var sumSq float64
+	for _, p := range pairs {
+		px := t.A*p.RefX + t.B*p.RefY + t.C
+		py := t.D*p.RefX + t.E*p.RefY + t.F
+		err := math.Hypot(px-p.TargetX, py-p.TargetY)
+		sumSq += err * err
+		if err > maxErr {
+			maxErr = err
+		}
+	}
+	return math.Sqrt(sumSq / float64(len(pairs))), maxErr
+}
+
+func validateLocalRScalePairs(pairs []MatchedPair) error {
+	const (
+		minPairs     = 8
+		minShortAxis = 120.0
+		minDiag      = 250.0
+		maxRMS       = 1.75
+		maxErr       = 4.5
+	)
+	if len(pairs) < minPairs {
+		return fmt.Errorf("local matcher found only %d pairs", len(pairs))
+	}
+	w, h, diag := pairBoundsTarget(pairs)
+	shortAxis := math.Min(w, h)
+	if shortAxis < minShortAxis || diag < minDiag {
+		return fmt.Errorf("local matches poorly distributed (bbox %.1fx%.1f, diag %.1f)", w, h, diag)
+	}
+	t, err := solveRScaleLeastSquares(pairs)
+	if err != nil {
+		return err
+	}
+	rms, peak := rscaleResidualStats(pairs, t)
+	if rms > maxRMS || peak > maxErr {
+		return fmt.Errorf("local matches inconsistent (rms %.2f px, max %.2f px)", rms, peak)
+	}
+	return nil
+}
+
+func validateFallbackRScalePairs(pairs []MatchedPair) error {
+	const (
+		minPairs = 4
+		maxRMS   = 2.25
+		maxErr   = 6.0
+	)
+	if len(pairs) < minPairs {
+		return fmt.Errorf("triangle matcher found only %d pairs", len(pairs))
+	}
+	t, err := solveRScaleLeastSquares(pairs)
+	if err != nil {
+		return err
+	}
+	rms, peak := rscaleResidualStats(pairs, t)
+	if rms > maxRMS || peak > maxErr {
+		return fmt.Errorf("triangle matches inconsistent (rms %.2f px, max %.2f px)", rms, peak)
+	}
+	return nil
+}
+
+// selectPairsForRScaleAfterWCS tries the cheap local matcher first because the
+// WCS warp should already have brought the stars into nearly the same frame.
+// It only accepts that result when the matches are numerous, spatially well
+// spread, and geometrically self-consistent. Otherwise it falls back to the
+// slower triangle matcher.
+func selectPairsForRScaleAfterWCS(targetStars, refStars []Star) ([]MatchedPair, error) {
+	local := matchStarsByMutualProximity(targetStars, refStars, 40, 12.0, 0.80)
+	localErr := validateLocalRScalePairs(local)
+	if localErr == nil {
+		return local, nil
+	}
+
+	fallback := MatchStars(targetStars, refStars, 30, 0.01)
+	fallbackErr := validateFallbackRScalePairs(fallback)
+	if fallbackErr == nil {
+		return fallback, nil
+	}
+
+	return nil, fmt.Errorf("rscale matching failed: local=%v; triangle=%v", localErr, fallbackErr)
+}
+
+// EstimateRScaleAfterWCS is like EstimateTranslationAfterWCS but solves for a
+// similarity transform (translation + rotation + uniform scale) rather than a
+// full affine transform.
+func EstimateRScaleAfterWCS(
+	targetPixels []float32, targetWidth, targetHeight int, targetHeader fitsio.Header,
+	refPixels []float32, refWidth, refHeight int, refHeader fitsio.Header,
+	initialOffsetX, initialOffsetY float64,
+) (AffineTransform, error) {
+	debuglog.Log("EstimateRScaleAfterWCS: starting")
+	defer debuglog.Log("EstimateRScaleAfterWCS: finished")
+	transform, err := ComputeWCSTransform(targetHeader, refHeader)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+	transform.C = transform.C - (transform.A * initialOffsetX) - (transform.B * initialOffsetY)
+	transform.F = transform.F - (transform.D * initialOffsetX) - (transform.E * initialOffsetY)
+
+	warpedTarget, validMask := WarpImageToSizeWithMask(targetPixels, targetWidth, targetHeight, refWidth, refHeight, transform)
+	maskedRef := make([]float32, len(refPixels))
+	maskedTarget := make([]float32, len(refPixels))
+	for i := range refPixels {
+		refVal := float64(refPixels[i])
+		targetVal := float64(warpedTarget[i])
+		if !validMask[i] || math.IsNaN(refVal) || math.IsInf(refVal, 0) || math.IsNaN(targetVal) || math.IsInf(targetVal, 0) {
+			maskedRef[i] = float32(math.NaN())
+			maskedTarget[i] = float32(math.NaN())
+			continue
+		}
+		maskedRef[i] = refPixels[i]
+		maskedTarget[i] = warpedTarget[i]
+	}
+
+	const nanGuard = 15
+	refStars := filterStarsNearNaN(
+		ExtractStars(maskedRef, refWidth, refHeight, 4.0, 3),
+		maskedRef, refWidth, refHeight, nanGuard,
+	)
+	targetStars := filterStarsNearNaN(
+		ExtractStars(maskedTarget, refWidth, refHeight, 4.0, 3),
+		maskedTarget, refWidth, refHeight, nanGuard,
+	)
+	if len(refStars) < 2 || len(targetStars) < 2 {
+		return AffineTransform{}, fmt.Errorf("insufficient stars in shared region (ref: %d, target: %d)", len(refStars), len(targetStars))
+	}
+
+	pairs, err := selectPairsForRScaleAfterWCS(targetStars, refStars)
+	if err != nil {
+		return AffineTransform{}, err
+	}
+	return SolveRScaleTransformationRANSAC(pairs, 300, 1.5)
+}
+
 // EstimateAffineAfterWCS is like EstimateTranslationAfterWCS but solves for a
 // full affine transform rather than
 // translation only.  This captures residual rotation between images that share
@@ -293,12 +675,14 @@ func EstimateAffineAfterWCS(
 	refPixels []float32, refWidth, refHeight int, refHeader fitsio.Header,
 	initialOffsetX, initialOffsetY float64,
 ) (AffineTransform, error) {
+	debuglog.Log("EstimateAffineAfterWCS: starting")
+	defer debuglog.Log("EstimateAffineAfterWCS: finished")
 	transform, err := ComputeWCSTransform(targetHeader, refHeader)
 	if err != nil {
 		return AffineTransform{}, err
 	}
-	transform.C = transform.C - (transform.A*initialOffsetX) - (transform.B*initialOffsetY)
-	transform.F = transform.F - (transform.D*initialOffsetX) - (transform.E*initialOffsetY)
+	transform.C = transform.C - (transform.A * initialOffsetX) - (transform.B * initialOffsetY)
+	transform.F = transform.F - (transform.D * initialOffsetX) - (transform.E * initialOffsetY)
 
 	warpedTarget, validMask := WarpImageToSizeWithMask(targetPixels, targetWidth, targetHeight, refWidth, refHeight, transform)
 	maskedRef := make([]float32, len(refPixels))

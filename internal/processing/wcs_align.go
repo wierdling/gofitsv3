@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
 )
 
@@ -122,6 +123,22 @@ func (m *WCSMapper) MapPixel(x, y float64) (float64, float64) {
 	return rx, ry
 }
 
+type sipCoeff struct {
+	p     int
+	q     int
+	coeff float64
+}
+
+type sipPoly struct {
+	coeffs []sipCoeff
+	maxP   int
+	maxQ   int
+}
+
+func (p sipPoly) empty() bool {
+	return len(p.coeffs) == 0
+}
+
 type linearWCS struct {
 	crpix1 float64
 	crpix2 float64
@@ -131,15 +148,17 @@ type linearWCS struct {
 	cd12   float64
 	cd21   float64
 	cd22   float64
-	a      map[[2]int]float64
-	b      map[[2]int]float64
-	ap     map[[2]int]float64
-	bp     map[[2]int]float64
+	a      sipPoly
+	b      sipPoly
+	ap     sipPoly
+	bp     sipPoly
 	d2iX   *D2ITable
 	d2iY   *D2ITable
 }
 
 func AlignChannelUsingWCS(targetPixels []float32, targetWidth, targetHeight int, targetHeader fitsio.Header, refPixels []float32, refWidth, refHeight int, refHeader fitsio.Header) ([]float32, AffineTransform, error) {
+	debuglog.Log("AlignChannelUsingWCS: starting")
+	defer debuglog.Log("AlignChannelUsingWCS: finished")
 	if targetWidth <= 0 || targetHeight <= 0 || refWidth <= 0 || refHeight <= 0 {
 		return nil, AffineTransform{}, fmt.Errorf("invalid image dimensions (target: %dx%d, ref: %dx%d)", targetWidth, targetHeight, refWidth, refHeight)
 	}
@@ -157,6 +176,8 @@ func AlignChannelUsingWCS(targetPixels []float32, targetWidth, targetHeight int,
 }
 
 func ComputeWCSTransform(targetHeader fitsio.Header, refHeader fitsio.Header) (AffineTransform, error) {
+	debuglog.Log("ComputeWCSTransform: starting")
+	defer debuglog.Log("ComputeWCSTransform: finished")
 	targetWCS, err := parseLinearWCS(targetHeader)
 	if err != nil {
 		return AffineTransform{}, err
@@ -264,7 +285,7 @@ func pixelToWorldLinear(x, y float64, w linearWCS) (float64, float64) {
 	}
 	dx := (x + 1) - w.crpix1
 	dy := (y + 1) - w.crpix2
-	if len(w.a) > 0 || len(w.b) > 0 {
+	if !w.a.empty() || !w.b.empty() {
 		dx, dy = applyForwardSIP(w, dx, dy)
 	}
 	xi := w.cd11*dx + w.cd12*dy
@@ -291,7 +312,7 @@ func worldToPixelLinear(ra, dec float64, w linearWCS) (float64, float64, error) 
 	d2 := dec - w.crval2
 	dx := (w.cd22*d1 - w.cd12*d2) / det
 	dy := (-w.cd21*d1 + w.cd11*d2) / det
-	if len(w.a) > 0 || len(w.b) > 0 {
+	if !w.a.empty() || !w.b.empty() {
 		dx, dy = applyInverseSIP(w, dx, dy)
 	}
 	// xImg/yImg is the D2I-corrected image pixel (0-indexed).
@@ -318,52 +339,69 @@ func worldToPixelLinear(ra, dec float64, w linearWCS) (float64, float64, error) 
 }
 
 func parseSIP(header fitsio.Header, w *linearWCS) {
-	w.a = parseSIPCoeffMap(header, "A")
-	w.b = parseSIPCoeffMap(header, "B")
-	w.ap = parseSIPCoeffMap(header, "AP")
-	w.bp = parseSIPCoeffMap(header, "BP")
+	w.a = parseSIPPoly(header, "A")
+	w.b = parseSIPPoly(header, "B")
+	w.ap = parseSIPPoly(header, "AP")
+	w.bp = parseSIPPoly(header, "BP")
 }
 
-func parseSIPCoeffMap(header fitsio.Header, prefix string) map[[2]int]float64 {
+func parseSIPPoly(header fitsio.Header, prefix string) sipPoly {
 	order, ok := tryHeaderFloat(header, prefix+"_ORDER")
 	if !ok || order < 0 {
-		return nil
+		return sipPoly{}
 	}
-	coeffs := make(map[[2]int]float64)
 	maxOrder := int(order)
+	coeffs := make([]sipCoeff, 0, (maxOrder+1)*(maxOrder+1))
+	maxP, maxQ := 0, 0
 	for p := 0; p <= maxOrder; p++ {
 		for q := 0; q <= maxOrder; q++ {
 			key := fmt.Sprintf("%s_%d_%d", prefix, p, q)
 			if v, ok := tryHeaderFloat(header, key); ok {
-				coeffs[[2]int{p, q}] = v
+				coeffs = append(coeffs, sipCoeff{p: p, q: q, coeff: v})
+				if p > maxP {
+					maxP = p
+				}
+				if q > maxQ {
+					maxQ = q
+				}
 			}
 		}
 	}
 	if len(coeffs) == 0 {
-		return nil
+		return sipPoly{}
 	}
-	return coeffs
+	return sipPoly{coeffs: coeffs, maxP: maxP, maxQ: maxQ}
 }
 
-// intPow returns x^n for small non-negative integer n without math.Pow.
-func intPow(x float64, n int) float64 {
-	if n == 0 {
-		return 1
-	}
-	r := 1.0
-	for range n {
-		r *= x
-	}
-	return r
-}
-
-func applySIPPolynomial(coeffs map[[2]int]float64, u, v float64) float64 {
-	if len(coeffs) == 0 {
+func applySIPPolynomial(poly sipPoly, u, v float64) float64 {
+	if poly.empty() {
 		return 0
 	}
+	var smallU [16]float64
+	var smallV [16]float64
+	uPows := smallU[:]
+	if poly.maxP+1 > len(uPows) {
+		uPows = make([]float64, poly.maxP+1)
+	} else {
+		uPows = uPows[:poly.maxP+1]
+	}
+	vPows := smallV[:]
+	if poly.maxQ+1 > len(vPows) {
+		vPows = make([]float64, poly.maxQ+1)
+	} else {
+		vPows = vPows[:poly.maxQ+1]
+	}
+	uPows[0] = 1
+	vPows[0] = 1
+	for i := 1; i <= poly.maxP; i++ {
+		uPows[i] = uPows[i-1] * u
+	}
+	for i := 1; i <= poly.maxQ; i++ {
+		vPows[i] = vPows[i-1] * v
+	}
 	sum := 0.0
-	for pq, coeff := range coeffs {
-		sum += coeff * intPow(u, pq[0]) * intPow(v, pq[1])
+	for _, term := range poly.coeffs {
+		sum += term.coeff * uPows[term.p] * vPows[term.q]
 	}
 	return sum
 }
@@ -373,7 +411,7 @@ func applyForwardSIP(w linearWCS, u, v float64) (float64, float64) {
 }
 
 func applyInverseSIP(w linearWCS, u, v float64) (float64, float64) {
-	if len(w.ap) > 0 || len(w.bp) > 0 {
+	if !w.ap.empty() || !w.bp.empty() {
 		return u + applySIPPolynomial(w.ap, u, v), v + applySIPPolynomial(w.bp, u, v)
 	}
 	guessU, guessV := u, v

@@ -14,23 +14,24 @@ import (
 	"gofitsv3/internal/mosaic"
 )
 
-// globalSetMosaicMenu is called whenever the Mosaic tab becomes active so the
-// Settings menu is re-applied after other workspaces may have overwritten it.
-var globalSetMosaicMenu func()
 
 func defaultDrizzleSettings() models.DrizzleSettings {
 	return models.DrizzleSettings{
-		FinalScale:  0,
-		Scale:       1.0,
-		PixFrac:     1.0,
-		CRMethod:    int(mosaic.CRMethodNone),
-		SepKernel:   int(mosaic.KernelTurbo),
-		FinalKernel: int(mosaic.KernelSquare),
+		FinalScale:         0,
+		Scale:              1.0,
+		PixFrac:            1.0,
+		CRMethod:           int(mosaic.CRMethodNone),
+		SepKernel:          int(mosaic.KernelTurbo),
+		FinalKernel:        int(mosaic.KernelSquare),
+		AlignmentMode:      int(mosaic.AlignmentModeTweakRegRScale),
+		SearchRadiusArcsec: 1.5,
+		NumRefs:            1,
 	}
 }
 
 var kernelNames = []string{"Square", "Point", "Turbo", "Gaussian", "Tophat", "Lanczos2", "Lanczos3"}
 var crMethodNames = []string{"None", "Legacy (single-frame)", "Drizzle-style (multi-frame)"}
+var alignmentModeNames = []string{"General Affine (legacy)", "RScale (legacy)", "TweakReg RScale", "TweakReg General"}
 
 func kernelIndex(k int) int {
 	if k >= 0 && k < len(kernelNames) {
@@ -93,6 +94,36 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 	}
 
+	alignSelect := widget.NewSelect(alignmentModeNames, nil)
+	alignmentMode := current.AlignmentMode
+	if alignmentMode >= 0 && alignmentMode < len(alignmentModeNames) {
+		alignSelect.SetSelected(alignmentModeNames[alignmentMode])
+	} else {
+		alignSelect.SetSelected(alignmentModeNames[int(mosaic.AlignmentModeTweakRegRScale)])
+	}
+	alignSelect.OnChanged = func(s string) {
+		for i, name := range alignmentModeNames {
+			if name == s {
+				alignmentMode = i
+				break
+			}
+		}
+	}
+
+	searchRadiusEntry := widget.NewEntry()
+	searchRadius := current.SearchRadiusArcsec
+	if searchRadius <= 0 {
+		searchRadius = 1.5
+	}
+	searchRadiusEntry.SetText(fmt.Sprintf("%.2f", searchRadius))
+
+	numRefsEntry := widget.NewEntry()
+	numRefs := current.NumRefs
+	if numRefs < 1 {
+		numRefs = 1
+	}
+	numRefsEntry.SetText(fmt.Sprintf("%d", numRefs))
+
 	notes := widget.NewLabel(
 		"Output Scale: desired plate scale in arcsec/pixel (AstroDrizzle final_scale).\n" +
 			"  Smaller value = finer sampling = larger output image.\n" +
@@ -103,6 +134,13 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 			"PixFrac: drop size as fraction of pixel (1.0 = full coverage).\n" +
 			"Sep Kernel: used during the per-frame drizzle pass.\n" +
 			"Final Kernel: used during the final combination pass.\n" +
+			"Alignment Mode: TweakReg modes use catalog matching via full WCS (recommended).\n" +
+			"  Legacy modes use image warping and are kept for backward compatibility.\n" +
+			"  RScale = shift + rotation + uniform scale; General = full 6-parameter affine.\n" +
+			"Search Radius: TweakReg catalog matching tolerance in arcseconds (default 1.5).\n" +
+			"Num Reference Images: first N images are treated as pre-aligned references.\n" +
+			"  Each non-reference image aligns to whichever reference it overlaps.\n" +
+			"  Use 2 for a two-chip detector where each chip is loaded separately.\n" +
 			"Lanczos kernels: only appropriate when PixFrac = 1.0.",
 	)
 	notes.TextStyle = fyne.TextStyle{Italic: true}
@@ -115,6 +153,9 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		widget.NewFormItem("CR Method", crSelect),
 		widget.NewFormItem("Sep Kernel", sepSelect),
 		widget.NewFormItem("Final Kernel", finalSelect),
+		widget.NewFormItem("Alignment Mode", alignSelect),
+		widget.NewFormItem("Search Radius (arcsec)", searchRadiusEntry),
+		widget.NewFormItem("Num Reference Images", numRefsEntry),
 	)
 
 	content := container.NewVBox(form, notes)
@@ -147,15 +188,31 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 			return
 		}
 
+		srText := strings.TrimSpace(searchRadiusEntry.Text)
+		srVal, errSR := strconv.ParseFloat(srText, 64)
+		if errSR != nil || srVal <= 0 {
+			dialog.ShowInformation("Invalid Value", "Search Radius must be a positive number in arcseconds.", win)
+			return
+		}
+
+		nrVal, errNR := strconv.Atoi(strings.TrimSpace(numRefsEntry.Text))
+		if errNR != nil || nrVal < 1 {
+			dialog.ShowInformation("Invalid Value", "Num Reference Images must be a positive integer.", win)
+			return
+		}
+
 		onSave(models.DrizzleSettings{
-			FinalScale:  finalScale,
-			Scale:       scale,
-			PixFrac:     pixFrac,
-			CRMethod:    crMethod,
-			SepKernel:   sepKernel,
-			FinalKernel: finalKernel,
+			FinalScale:         finalScale,
+			Scale:              scale,
+			PixFrac:            pixFrac,
+			CRMethod:           crMethod,
+			SepKernel:          sepKernel,
+			FinalKernel:        finalKernel,
+			AlignmentMode:      alignmentMode,
+			SearchRadiusArcsec: srVal,
+			NumRefs:            nrVal,
 		})
 	}, win)
 	d.Show()
-	d.Resize(fyne.NewSize(760, 420))
+	d.Resize(fyne.NewSize(760, 510))
 }

@@ -21,6 +21,7 @@ type OffsetRecord struct {
 	ManualTransform    processing.AffineTransform `json:"transform,omitempty"`
 	HasManualTransform bool                       `json:"hasTransform,omitempty"`
 	Locked             bool                       `json:"locked,omitempty"`
+	Excluded           bool                       `json:"excluded,omitempty"`
 }
 
 type offsetFile struct {
@@ -69,6 +70,7 @@ func SaveOffsetsForInputs(path string, filter string, inputs []Input) error {
 			HasManualTransform: inp.HasManualTransform,
 			ManualTransform:    inp.ManualTransform,
 			Locked:             inp.OffsetLocked,
+			Excluded:           inp.Excluded,
 		}
 		records = append(records, rec)
 	}
@@ -179,6 +181,7 @@ func ApplyOffsetsToInputs(inputs []Input, filter string, records map[string]Offs
 			inputs[i].ManualTransform = rec.ManualTransform
 			inputs[i].HasManualTransform = rec.HasManualTransform
 			inputs[i].OffsetLocked = rec.Locked
+			inputs[i].Excluded = rec.Excluded
 			applied++
 		}
 	}
@@ -218,6 +221,7 @@ func UpdateMasterOffsets(dir string, inputs []Input) error {
 			ManualTransform:    inp.ManualTransform,
 			HasManualTransform: inp.HasManualTransform,
 			Locked:             inp.OffsetLocked,
+			Excluded:           inp.Excluded,
 		}
 	}
 
@@ -282,6 +286,7 @@ func AutoLoadOffsets(inputs []Input) (int, []string) {
 				inputs[idx].ManualTransform = rec.ManualTransform
 				inputs[idx].HasManualTransform = rec.HasManualTransform
 				inputs[idx].OffsetLocked = rec.Locked
+				inputs[idx].Excluded = rec.Excluded
 				handledByMaster[idx] = true
 				applied++
 			}
@@ -339,6 +344,7 @@ func AutoLoadOffsets(inputs []Input) (int, []string) {
 				inputs[idx].ManualTransform = rec.ManualTransform
 				inputs[idx].HasManualTransform = rec.HasManualTransform
 				inputs[idx].OffsetLocked = rec.Locked
+				inputs[idx].Excluded = rec.Excluded
 				applied++
 			}
 		}

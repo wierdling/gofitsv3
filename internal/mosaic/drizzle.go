@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
+	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/processing"
 )
@@ -26,6 +29,7 @@ type Input struct {
 	ManualTransform    processing.AffineTransform
 	HasManualTransform bool
 	OffsetLocked       bool
+	Excluded           bool
 	// D2IX and D2IY hold the detector-to-image correction lookup tables parsed
 	// from the D2IMARR FITS extensions of HST calibrated files. Either or both
 	// may be nil if the file has no such corrections.
@@ -100,6 +104,37 @@ const (
 	// Only meaningful when pixfrac == 1 and scale == 1.
 	KernelLanczos3
 )
+
+// defaultSearchRadiusArcsec is the TweakReg catalog-matching search radius used
+// when the caller supplies zero (i.e. when loading projects that predate the setting).
+const defaultSearchRadiusArcsec = 1.5
+
+// AlignmentMode selects the residual star-alignment model used after WCS placement.
+type AlignmentMode int
+
+const (
+	// AlignmentModeGeneralAffine fits a full 6-parameter affine using the
+	// legacy warp-based strategy (kept for backward compatibility).
+	AlignmentModeGeneralAffine AlignmentMode = iota
+	// AlignmentModeRScale fits a similarity transform using the legacy
+	// warp-based strategy (kept for backward compatibility).
+	AlignmentModeRScale
+	// AlignmentModeTweakRegRScale is the default: catalog-based matching with
+	// full WCS projection (no image warp) + similarity transform fitting.
+	AlignmentModeTweakRegRScale
+	// AlignmentModeTweakRegGeneral is catalog-based matching with full WCS
+	// projection + full 6-parameter affine fitting.
+	AlignmentModeTweakRegGeneral
+)
+
+func normalizeAlignmentMode(mode AlignmentMode) AlignmentMode {
+	switch mode {
+	case AlignmentModeRScale, AlignmentModeTweakRegRScale, AlignmentModeTweakRegGeneral:
+		return mode
+	default:
+		return AlignmentModeGeneralAffine
+	}
+}
 
 type Options struct {
 	// Scale is the internal output/input pixel size ratio used directly when
@@ -208,6 +243,8 @@ func nativePlateScaleArcsec(header fitsio.Header) (float64, bool) {
 }
 
 func Build(inputs []Input, options Options) (*Result, error) {
+	debuglog.Log("Build: starting drizzle")
+	defer debuglog.Log("Build: finished")
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
 	}
@@ -309,6 +346,17 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 		model := buildMedianModel(sepImages, width, height, len(dataPlanned))
 		sepImages = nil // allow GC before final drizzle pass
+		// Wire full WCS mappers into each FrameInfo so BuildCRMasksFromModel
+		// blots using the same per-pixel mapping as drizzleSepFrame did.
+		// Without this, the affine SourceToRef approximation can be off by
+		// several pixels when SIP distortion is present, causing stars to be
+		// falsely flagged (blot samples background instead of the star peak).
+		for slot, pi := range dataPlanned {
+			pi := pi // capture for closure
+			frameInfos[slot].MapFunc = func(x, y float64) (float64, float64) {
+				return planned[pi].mapPixel(x, y)
+			}
+		}
 		crMasks = processing.BuildCRMasksFromModel(
 			frameInfos, model, width, height, minX, minY, options.Scale,
 			processing.DrizzleStyleCROptions{SeedSNR: 4.0, DerivScale: 1.2},
@@ -351,9 +399,8 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 		includedCount++
 
-		// trimX := effectiveEdgeTrim(planned[i].input.HDU.Data.Width, options.Scale)
-		// trimY := effectiveEdgeTrim(planned[i].input.HDU.Data.Height, options.Scale)
-		trimX, trimY := 0, 0
+		trimX := effectiveEdgeTrim(planned[i].input.HDU.Data.Width, options.Scale)
+		trimY := effectiveEdgeTrim(planned[i].input.HDU.Data.Height, options.Scale)
 		for y := trimY; y < planned[i].input.HDU.Data.Height-trimY; y++ {
 			for x := trimX; x < planned[i].input.HDU.Data.Width-trimX; x++ {
 				idx := y*planned[i].input.HDU.Data.Width + x
@@ -393,9 +440,8 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 		chipCorners := p.input.ChipFootprints
 		if len(chipCorners) == 0 {
-			// trimX := float64(effectiveEdgeTrim(p.input.HDU.Data.Width, options.Scale))
-			// trimY := float64(effectiveEdgeTrim(p.input.HDU.Data.Height, options.Scale))
-			trimX, trimY := 0.0, 0.0
+			trimX := float64(effectiveEdgeTrim(p.input.HDU.Data.Width, options.Scale))
+			trimY := float64(effectiveEdgeTrim(p.input.HDU.Data.Height, options.Scale))
 			w := float64(p.input.HDU.Data.Width)
 			h := float64(p.input.HDU.Data.Height)
 			chipCorners = [][4][2]float64{{
@@ -427,7 +473,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		OriginX:             minX,
 		OriginY:             minY,
 		Scale:               options.Scale,
-		OutputHeader:        buildOutputHeader(firstDataInput(inputs), width, height, minX, minY, options.Scale, includedCount),
+		OutputHeader:        buildOutputHeader(wcsReferenceInput(inputs), width, height, minX, minY, options.Scale, includedCount),
 		Inputs:              statuses,
 		InputFootprints:     footprints,
 		InputFootprintPaths: footprintPaths,
@@ -500,82 +546,226 @@ func sortedByDistFromRef(inputs []Input) []int {
 }
 
 func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
+	return AlignInputsByStarsWithMode(inputs, 1, AlignmentModeTweakRegRScale, 0)
+}
+
+func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode, searchRadiusArcsec float64) ([]StarAlignmentResult, error) {
+	debuglog.Log("AlignInputsByStarsWithMode: starting")
+	defer debuglog.Log("AlignInputsByStarsWithMode: finished")
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
 	}
+	mode = normalizeAlignmentMode(mode)
+	if searchRadiusArcsec <= 0 {
+		searchRadiusArcsec = defaultSearchRadiusArcsec
+	}
+
+	if numRefs < 1 {
+		numRefs = 1
+	}
+	if numRefs > len(inputs) {
+		numRefs = len(inputs)
+	}
+
 	results := make([]StarAlignmentResult, len(inputs))
-	results[0] = StarAlignmentResult{
-		OffsetX:            inputs[0].OffsetX,
-		OffsetY:            inputs[0].OffsetY,
-		ManualTransform:    inputs[0].ManualTransform,
-		HasManualTransform: inputs[0].HasManualTransform,
-		Applied:            true,
+	for r := 0; r < numRefs; r++ {
+		results[r] = StarAlignmentResult{
+			OffsetX:            inputs[r].OffsetX,
+			OffsetY:            inputs[r].OffsetY,
+			ManualTransform:    inputs[r].ManualTransform,
+			HasManualTransform: inputs[r].HasManualTransform,
+			Applied:            true,
+		}
 	}
 
 	aligned := make([]bool, len(inputs))
-	aligned[0] = true
-	queue := []int{0}
-	// Track the last error per image so users see the real failure reason.
+	for r := 0; r < numRefs; r++ {
+		aligned[r] = true
+	}
+	queue := make([]int, numRefs)
+	for r := 0; r < numRefs; r++ {
+		queue[r] = r
+	}
 	lastErr := make([]string, len(inputs))
-	// Process closest-to-reference images first for better chain alignment.
 	ordered := sortedByDistFromRef(inputs)
 
+	// For TweakReg modes, extract reference stars from each designated reference
+	// image once up front.
+	isTweakReg := mode == AlignmentModeTweakRegRScale || mode == AlignmentModeTweakRegGeneral
+	fitgeom := "rscale"
+	if mode == AlignmentModeTweakRegGeneral {
+		fitgeom = "general"
+	}
+
+	type refCache struct {
+		input      Input
+		stars      []processing.Star
+		w0toR      processing.AffineTransform
+		wRto0      processing.AffineTransform
+		hasWCS     bool
+	}
+	refCaches := make([]refCache, numRefs)
+	refCaches[0] = refCache{input: inputs[0], hasWCS: true}
+	if isTweakReg {
+		refCaches[0].stars = processing.ExtractAndLimitStars(
+			inputs[0].HDU.Data.Pixels, inputs[0].HDU.Data.Width, inputs[0].HDU.Data.Height, 4.0, 3, 200)
+		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[0] extracted %d stars", len(refCaches[0].stars)))
+	}
+	for r := 1; r < numRefs; r++ {
+		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
+		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
+		if err0 != nil || err1 != nil {
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[%d] WCS error: %v / %v", r, err0, err1))
+			refCaches[r] = refCache{input: inputs[r]}
+			continue
+		}
+		rc := refCache{input: inputs[r], w0toR: w0toR, wRto0: wRto0, hasWCS: true}
+		if isTweakReg {
+			rc.stars = processing.ExtractAndLimitStars(
+				inputs[r].HDU.Data.Pixels, inputs[r].HDU.Data.Width, inputs[r].HDU.Data.Height, 4.0, 3, 200)
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[%d] extracted %d stars", r, len(rc.stars)))
+		}
+		refCaches[r] = rc
+	}
+
+	// alignOneToAnyRef tries each designated reference in order and returns on
+	// the first success.  For secondary references (r>0) the refinement is
+	// composed back to inputs[0] pixel space.
+	type alignOneResult struct {
+		i          int
+		refinement processing.AffineTransform
+		errMsg     string
+		ok         bool
+	}
+
+	alignOneToRef := func(i int) alignOneResult {
+		for r := 0; r < numRefs; r++ {
+			rc := refCaches[r]
+			if !rc.hasWCS {
+				continue
+			}
+			var (
+				refinement processing.AffineTransform
+				err        error
+			)
+			switch mode {
+			case AlignmentModeTweakRegRScale, AlignmentModeTweakRegGeneral:
+				mapper, mapErr := processing.NewWCSMapper(
+					inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
+					rc.input.HDU.Header, rc.input.D2IX, rc.input.D2IY,
+				)
+				if mapErr != nil {
+					err = fmt.Errorf("WCSMapper: %v", mapErr)
+					break
+				}
+				refinement, err = processing.EstimateTweakRegAlignmentWithRefStars(
+					inputs[i].HDU.Data.Pixels,
+					inputs[i].HDU.Data.Width,
+					inputs[i].HDU.Data.Height,
+					mapper,
+					rc.stars,
+					rc.input.HDU.Data.Width,
+					rc.input.HDU.Data.Height,
+					rc.input.HDU.Header,
+					searchRadiusArcsec,
+					fitgeom,
+				)
+			case AlignmentModeRScale:
+				refinement, err = processing.EstimateRScaleAfterWCS(
+					inputs[i].HDU.Data.Pixels, inputs[i].HDU.Data.Width, inputs[i].HDU.Data.Height, inputs[i].HDU.Header,
+					rc.input.HDU.Data.Pixels, rc.input.HDU.Data.Width, rc.input.HDU.Data.Height, rc.input.HDU.Header,
+					inputs[i].OffsetX, inputs[i].OffsetY,
+				)
+			default:
+				refinement, err = processing.EstimateAffineAfterWCS(
+					inputs[i].HDU.Data.Pixels, inputs[i].HDU.Data.Width, inputs[i].HDU.Data.Height, inputs[i].HDU.Header,
+					rc.input.HDU.Data.Pixels, rc.input.HDU.Data.Width, rc.input.HDU.Data.Height, rc.input.HDU.Header,
+					inputs[i].OffsetX, inputs[i].OffsetY,
+				)
+			}
+			if err != nil {
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: input[%d] vs ref[%d]: %v", i, r, err))
+				continue
+			}
+			if r > 0 {
+				refinement = processing.ComposeAffineTransforms(rc.wRto0,
+					processing.ComposeAffineTransforms(refinement, rc.w0toR))
+			}
+			return alignOneResult{i: i, refinement: refinement, ok: true}
+		}
+		return alignOneResult{i: i, errMsg: lastErr[i]}
+	}
+
+	primaryPassDone := false
 	for len(queue) > 0 {
 		refIdx := queue[0]
 		queue = queue[1:]
 
-		for _, i := range ordered {
-			if aligned[i] {
+		if refIdx < numRefs {
+			// Designated reference: run (or re-use) the full multi-ref TweakReg pass.
+			// Only run once — alignOneToRef already tries every reference internally.
+			if primaryPassDone {
+				continue
+			}
+			primaryPassDone = true
+			// Collect unaligned inputs and run them concurrently against the reference.
+			var toAlign []int
+			for _, i := range ordered {
+				if !aligned[i] {
+					toAlign = append(toAlign, i)
+				}
+			}
+			if len(toAlign) == 0 {
 				continue
 			}
 
-			var initOx, initOy float64
-			if refIdx == 0 {
-				initOx = inputs[i].OffsetX
-				initOy = inputs[i].OffsetY
+			ch := make(chan alignOneResult, len(toAlign))
+			sem := make(chan struct{}, runtime.NumCPU())
+			var wg sync.WaitGroup
+			for _, i := range toAlign {
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(i int) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					ch <- alignOneToRef(i)
+				}(i)
 			}
+			wg.Wait()
+			close(ch)
 
-			if refIdx == 0 {
-				affine, err := processing.EstimateAffineAfterWCS(
-					inputs[i].HDU.Data.Pixels,
-					inputs[i].HDU.Data.Width,
-					inputs[i].HDU.Data.Height,
-					inputs[i].HDU.Header,
-					inputs[refIdx].HDU.Data.Pixels,
-					inputs[refIdx].HDU.Data.Width,
-					inputs[refIdx].HDU.Data.Height,
-					inputs[refIdx].HDU.Header,
-					initOx, initOy,
-				)
-				if err != nil {
-					lastErr[i] = err.Error()
+			for r := range ch {
+				if r.ok {
+					results[r.i] = StarAlignmentResult{
+						OffsetX:            inputs[r.i].OffsetX,
+						OffsetY:            inputs[r.i].OffsetY,
+						ManualTransform:    r.refinement,
+						HasManualTransform: true,
+						Applied:            true,
+					}
+					aligned[r.i] = true
+					queue = append(queue, r.i)
+				} else {
+					lastErr[r.i] = r.errMsg
+				}
+			}
+		} else {
+			// Chain fallback: translate unaligned images against an already-aligned intermediate.
+			// (refIdx here is always a non-reference intermediate, never a designated reference.)
+			for _, i := range ordered {
+				if aligned[i] {
 					continue
 				}
-				results[i] = StarAlignmentResult{
-					OffsetX:            inputs[i].OffsetX,
-					OffsetY:            inputs[i].OffsetY,
-					ManualTransform:    affine,
-					HasManualTransform: true,
-					Applied:            true,
-				}
-			} else {
 				dx, dy, err := processing.EstimateTranslationAfterWCS(
-					inputs[i].HDU.Data.Pixels,
-					inputs[i].HDU.Data.Width,
-					inputs[i].HDU.Data.Height,
-					inputs[i].HDU.Header,
-					inputs[refIdx].HDU.Data.Pixels,
-					inputs[refIdx].HDU.Data.Width,
-					inputs[refIdx].HDU.Data.Height,
-					inputs[refIdx].HDU.Header,
-					initOx, initOy,
+					inputs[i].HDU.Data.Pixels, inputs[i].HDU.Data.Width, inputs[i].HDU.Data.Height, inputs[i].HDU.Header,
+					inputs[refIdx].HDU.Data.Pixels, inputs[refIdx].HDU.Data.Width, inputs[refIdx].HDU.Data.Height, inputs[refIdx].HDU.Header,
+					0, 0,
 				)
 				if err != nil {
 					lastErr[i] = err.Error()
 					continue
 				}
-				bToA, err := processing.ComputeWCSTransform(
-					inputs[refIdx].HDU.Header, inputs[0].HDU.Header)
+				bToA, err := processing.ComputeWCSTransform(inputs[refIdx].HDU.Header, inputs[0].HDU.Header)
 				if err != nil {
 					lastErr[i] = err.Error()
 					continue
@@ -587,10 +777,9 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 					HasManualTransform: false,
 					Applied:            true,
 				}
+				aligned[i] = true
+				queue = append(queue, i)
 			}
-
-			aligned[i] = true
-			queue = append(queue, i)
 		}
 	}
 
@@ -614,58 +803,183 @@ func AlignInputsByStars(inputs []Input) ([]StarAlignmentResult, error) {
 }
 
 func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]StarAlignmentResult, error) {
+	return AlignInputsBySelectedStarsWithMode(inputs, refStars, 1, AlignmentModeTweakRegRScale, 0)
+}
+
+// AlignInputsBySelectedStarsWithMode aligns all non-reference inputs to the
+// nearest reference image that has enough star overlap.  numRefs designates the
+// first numRefs inputs as pre-aligned references (they are passed through
+// unchanged).  refStars are positions in inputs[0] pixel space; they are
+// automatically projected into each secondary reference's pixel space via the
+// linear WCS when needed.  The returned ManualTransform for every aligned image
+// is always expressed in inputs[0] pixel space.
+func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.Star, numRefs int, mode AlignmentMode, searchRadiusArcsec float64) ([]StarAlignmentResult, error) {
+	debuglog.Log("AlignInputsBySelectedStarsWithMode: starting")
+	defer debuglog.Log("AlignInputsBySelectedStarsWithMode: finished")
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
 	}
 	if len(refStars) == 0 {
 		return nil, fmt.Errorf("no reference stars provided")
 	}
+	mode = normalizeAlignmentMode(mode)
+	if searchRadiusArcsec <= 0 {
+		searchRadiusArcsec = defaultSearchRadiusArcsec
+	}
+	if numRefs < 1 {
+		numRefs = 1
+	}
+	if numRefs > len(inputs) {
+		numRefs = len(inputs)
+	}
 
 	results := make([]StarAlignmentResult, len(inputs))
-	results[0] = StarAlignmentResult{
-		OffsetX:            inputs[0].OffsetX,
-		OffsetY:            inputs[0].OffsetY,
-		ManualTransform:    inputs[0].ManualTransform,
-		HasManualTransform: inputs[0].HasManualTransform,
-		Applied:            true,
+	for r := 0; r < numRefs; r++ {
+		results[r] = StarAlignmentResult{
+			OffsetX:            inputs[r].OffsetX,
+			OffsetY:            inputs[r].OffsetY,
+			ManualTransform:    inputs[r].ManualTransform,
+			HasManualTransform: inputs[r].HasManualTransform,
+			Applied:            true,
+		}
+	}
+
+	// For each secondary reference, compute:
+	//   starsInR  – refStars projected into inputs[r] pixel space
+	//   w0toR     – linear WCS transform: inputs[0] pixels → inputs[r] pixels
+	//   wRto0     – linear WCS transform: inputs[r] pixels → inputs[0] pixels
+	// These are used to convert a refinement solved in inputs[r] space back to
+	// inputs[0] space via:  ManualTransform = wRto0 ∘ T_r ∘ w0toR
+	type refEntry struct {
+		input   Input
+		stars   []processing.Star
+		w0toR   processing.AffineTransform
+		wRto0   processing.AffineTransform
+		hasWCS  bool
+	}
+	refs := make([]refEntry, numRefs)
+	refs[0] = refEntry{input: inputs[0], stars: refStars, hasWCS: true}
+	for r := 1; r < numRefs; r++ {
+		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
+		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
+		if err0 != nil || err1 != nil {
+			debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: ref[%d] WCS error: %v / %v", r, err0, err1))
+			refs[r] = refEntry{input: inputs[r]}
+			continue
+		}
+		starsR := make([]processing.Star, len(refStars))
+		for j, s := range refStars {
+			sx, sy := processing.ApplyAffineTransform(w0toR, s.X, s.Y)
+			starsR[j] = processing.Star{X: sx, Y: sy, Flux: s.Flux}
+		}
+		refs[r] = refEntry{input: inputs[r], stars: starsR, w0toR: w0toR, wRto0: wRto0, hasWCS: true}
+	}
+
+	fitgeom := "rscale"
+	if mode == AlignmentModeTweakRegGeneral {
+		fitgeom = "general"
 	}
 
 	// Align closest images first so results are more stable across runs.
 	for _, i := range sortedByDistFromRef(inputs) {
-		refinement, err := processing.EstimateAffineFromRefStars(
-			refStars,
-			inputs[i].HDU.Data.Pixels,
-			inputs[i].HDU.Data.Width,
-			inputs[i].HDU.Data.Height,
-			inputs[i].HDU.Header,
-			inputs[0].HDU.Header,
-			inputs[i].OffsetX,
-			inputs[i].OffsetY,
-			manualTransformPtr(inputs[i]),
-		)
-		if err != nil {
+		if i < numRefs {
+			continue
+		}
+
+		var lastErr string
+		aligned := false
+
+		for r := 0; r < numRefs && !aligned; r++ {
+			ref := refs[r]
+			if !ref.hasWCS {
+				continue
+			}
+
+			var (
+				refinement processing.AffineTransform
+				err        error
+			)
+			switch mode {
+			case AlignmentModeTweakRegRScale, AlignmentModeTweakRegGeneral:
+				mapper, mapErr := processing.NewWCSMapper(
+					inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
+					ref.input.HDU.Header, ref.input.D2IX, ref.input.D2IY,
+				)
+				if mapErr != nil {
+					err = fmt.Errorf("WCSMapper: %v", mapErr)
+					break
+				}
+				refinement, err = processing.EstimateTweakRegAlignmentWithRefStars(
+					inputs[i].HDU.Data.Pixels,
+					inputs[i].HDU.Data.Width,
+					inputs[i].HDU.Data.Height,
+					mapper,
+					ref.stars,
+					ref.input.HDU.Data.Width,
+					ref.input.HDU.Data.Height,
+					ref.input.HDU.Header,
+					searchRadiusArcsec,
+					fitgeom,
+				)
+			case AlignmentModeRScale:
+				refinement, err = processing.EstimateRScaleFromRefStars(
+					ref.stars,
+					inputs[i].HDU.Data.Pixels,
+					inputs[i].HDU.Data.Width,
+					inputs[i].HDU.Data.Height,
+					inputs[i].HDU.Header,
+					ref.input.HDU.Header,
+					inputs[i].OffsetX,
+					inputs[i].OffsetY,
+					manualTransformPtr(inputs[i]),
+				)
+			default:
+				refinement, err = processing.EstimateAffineFromRefStars(
+					ref.stars,
+					inputs[i].HDU.Data.Pixels,
+					inputs[i].HDU.Data.Width,
+					inputs[i].HDU.Data.Height,
+					inputs[i].HDU.Header,
+					ref.input.HDU.Header,
+					inputs[i].OffsetX,
+					inputs[i].OffsetY,
+					manualTransformPtr(inputs[i]),
+				)
+			}
+			if err != nil {
+				debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: input[%d] vs ref[%d]: %v", i, r, err))
+				lastErr = err.Error()
+				continue
+			}
+
+			// Convert refinement from inputs[r] space to inputs[0] space.
+			manualT := refinement
+			if r > 0 {
+				manualT = processing.ComposeAffineTransforms(ref.wRto0,
+					processing.ComposeAffineTransforms(refinement, ref.w0toR))
+			}
+			if inputs[i].HasManualTransform {
+				manualT = processing.ComposeAffineTransforms(manualT, inputs[i].ManualTransform)
+			}
+			results[i] = StarAlignmentResult{
+				OffsetX:            inputs[i].OffsetX,
+				OffsetY:            inputs[i].OffsetY,
+				ManualTransform:    manualT,
+				HasManualTransform: true,
+				Applied:            true,
+			}
+			aligned = true
+		}
+
+		if !aligned {
 			results[i] = StarAlignmentResult{
 				OffsetX:            inputs[i].OffsetX,
 				OffsetY:            inputs[i].OffsetY,
 				ManualTransform:    inputs[i].ManualTransform,
 				HasManualTransform: inputs[i].HasManualTransform,
-				Error:              err.Error(),
+				Error:              lastErr,
 				Applied:            false,
 			}
-			continue
-		}
-
-		storedT := refinement
-		if inputs[i].HasManualTransform {
-			storedT = processing.ComposeAffineTransforms(refinement, inputs[i].ManualTransform)
-		}
-
-		results[i] = StarAlignmentResult{
-			OffsetX:            inputs[i].OffsetX,
-			OffsetY:            inputs[i].OffsetY,
-			ManualTransform:    storedT,
-			HasManualTransform: true,
-			Applied:            true,
 		}
 	}
 
@@ -1243,6 +1557,16 @@ func firstDataInput(inputs []Input) Input {
 		}
 	}
 	return inputs[0]
+}
+
+// wcsReferenceInput returns the input whose WCS should anchor the output header.
+// If a ReferenceOnly image is present it defines the output coordinate frame, so
+// use it. Otherwise fall back to the first data-bearing input.
+func wcsReferenceInput(inputs []Input) Input {
+	if len(inputs) > 0 && inputs[0].ReferenceOnly {
+		return inputs[0]
+	}
+	return firstDataInput(inputs)
 }
 
 func firstNonEmpty(values ...string) string {

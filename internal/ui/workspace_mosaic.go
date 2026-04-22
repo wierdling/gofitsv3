@@ -28,6 +28,32 @@ import (
 	"gofitsv3/internal/stretch"
 )
 
+// minWidthLayout enforces a minimum width on its single child while preserving its natural height.
+type minWidthLayout struct{ w float32 }
+
+func (l *minWidthLayout) Layout(obs []fyne.CanvasObject, size fyne.Size) {
+	for _, o := range obs {
+		o.Resize(size)
+		o.Move(fyne.NewPos(0, 0))
+	}
+}
+
+func (l *minWidthLayout) MinSize(obs []fyne.CanvasObject) fyne.Size {
+	var h float32
+	for _, o := range obs {
+		if m := o.MinSize().Height; m > h {
+			h = m
+		}
+	}
+	w := l.w
+	for _, o := range obs {
+		if m := o.MinSize().Width; m > w {
+			w = m
+		}
+	}
+	return fyne.NewSize(w, h)
+}
+
 type mosaicState struct {
 	inputs      []mosaic.Input
 	statuses    []mosaic.InputStatus
@@ -40,7 +66,7 @@ type mosaicState struct {
 	drizzleSettingsSet bool
 }
 
-func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
+func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu) {
 	state := &mosaicState{drizzleSettings: defaultDrizzleSettings()}
 	activeFilter := "" // set when a filter batch is loaded; used for default save names
 
@@ -78,12 +104,18 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	// (if set). The reference is marked ReferenceOnly so Build() uses it only
 	// for WCS anchoring and excludes its pixels from the output.
 	inputsWithRef := func() []mosaic.Input {
+		var active []mosaic.Input
+		for _, inp := range state.inputs {
+			if !inp.Excluded {
+				active = append(active, inp)
+			}
+		}
 		if state.referenceInput == nil {
-			return state.inputs
+			return active
 		}
 		ref := *state.referenceInput
 		ref.ReferenceOnly = true
-		return append([]mosaic.Input{ref}, state.inputs...)
+		return append([]mosaic.Input{ref}, active...)
 	}
 
 	// Active star picker (non-nil only while in star-selection mode).
@@ -490,52 +522,111 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		}
 		exitStarMode()
 
-		var progressDialog dialog.Dialog
-		fyne.DoAndWait(func() {
-			progressDialog = dialog.NewCustom("Aligning By Selected Stars", "Matching selected stars across images...", widget.NewProgressBarInfinite(), win)
-			progressDialog.Show()
-		})
+		progressDialog := dialog.NewCustom("Aligning By Selected Stars", "Matching selected stars across images...", widget.NewProgressBarInfinite(), win)
+		progressDialog.Show()
 		go func() {
 			alignInputs := inputsWithRef()
-			results, err := mosaic.AlignInputsBySelectedStars(alignInputs, refStars)
-			fyne.DoAndWait(func() { progressDialog.Hide() })
-			if err != nil {
-				fyne.Do(func() { dialog.ShowError(err, win) })
-				return
+			numRefs := state.drizzleSettings.NumRefs
+			if numRefs < 1 {
+				numRefs = 1
 			}
-			offset := 0
-			if state.referenceInput != nil {
-				offset = 1
+			results, err := mosaic.AlignInputsBySelectedStarsWithMode(alignInputs, refStars, numRefs, mosaic.AlignmentMode(state.drizzleSettings.AlignmentMode), state.drizzleSettings.SearchRadiusArcsec)
+
+			type alignRow struct {
+				stateIdx int
+				result   mosaic.StarAlignmentResult
 			}
-			for ri := offset; ri < len(results); ri++ {
-				i := ri - offset
-				if i >= len(state.inputs) || i >= len(state.statuses) {
-					continue
-				}
-				if state.inputs[i].OffsetLocked {
-					continue
-				}
-				if results[ri].Applied {
-					state.inputs[i].OffsetX = results[ri].OffsetX
-					state.inputs[i].OffsetY = results[ri].OffsetY
-					state.inputs[i].ManualTransform = results[ri].ManualTransform
-					state.inputs[i].HasManualTransform = results[ri].HasManualTransform
-					if i == 0 && state.referenceInput == nil {
-						state.statuses[i].Status = "reference"
-					} else {
-						state.statuses[i].Status = "star aligned"
+			var rows []alignRow
+			if err == nil {
+				var activeIndices []int
+				for i, inp := range state.inputs {
+					if !inp.Excluded {
+						activeIndices = append(activeIndices, i)
 					}
-					state.statuses[i].Error = ""
-				} else if results[ri].Error != "" {
-					state.statuses[i].Status = "star align failed"
-					state.statuses[i].Error = results[ri].Error
+				}
+				offset := 0
+				if state.referenceInput != nil {
+					offset = 1
+				}
+				for ri := offset; ri < len(results); ri++ {
+					ai := ri - offset
+					if ai >= len(activeIndices) {
+						continue
+					}
+					si := activeIndices[ai]
+					if si >= len(state.inputs) || state.inputs[si].OffsetLocked {
+						continue
+					}
+					rows = append(rows, alignRow{stateIdx: si, result: results[ri]})
 				}
 			}
-			fyne.DoAndWait(func() {
-				rebuildOffsetControls()
-				updateStatus()
+
+			fyne.Do(func() {
+				progressDialog.Hide()
+				if err != nil {
+					dialog.ShowError(err, win)
+					return
+				}
+				if len(rows) == 0 {
+					dialog.ShowInformation("Star Alignment", "No alignment results to review.", win)
+					return
+				}
+
+				content := container.NewVBox()
+				checks := make([]*widget.Check, len(rows))
+				for i, r := range rows {
+					name := mosaic.InputLabel(state.inputs[r.stateIdx])
+					if r.result.Applied {
+						rot := 0.0
+						if r.result.HasManualTransform {
+							t := r.result.ManualTransform
+							rot = math.Atan2(t.D, t.A) * 180 / math.Pi
+						}
+						label := fmt.Sprintf("%s  X: %.2f  Y: %.2f  Rot°: %.4f", name, r.result.OffsetX, r.result.OffsetY, rot)
+						chk := widget.NewCheck(label, nil)
+						chk.SetChecked(true)
+						checks[i] = chk
+						content.Add(chk)
+					} else {
+						label := fmt.Sprintf("%s  [failed: %s]", name, r.result.Error)
+						chk := widget.NewCheck(label, nil)
+						chk.Disable()
+						checks[i] = chk
+						content.Add(chk)
+					}
+				}
+
+				var d dialog.Dialog
+				applyBtn := widget.NewButton("Apply", func() {
+					for i, r := range rows {
+						if checks[i] == nil || !checks[i].Checked {
+							continue
+						}
+						si := r.stateIdx
+						if si >= len(state.inputs) || si >= len(state.statuses) {
+							continue
+						}
+						state.inputs[si].OffsetX = r.result.OffsetX
+						state.inputs[si].OffsetY = r.result.OffsetY
+						state.inputs[si].ManualTransform = r.result.ManualTransform
+						state.inputs[si].HasManualTransform = r.result.HasManualTransform
+						if si == 0 && state.referenceInput == nil {
+							state.statuses[si].Status = "reference"
+						} else {
+							state.statuses[si].Status = "star aligned"
+						}
+						state.statuses[si].Error = ""
+					}
+					d.Hide()
+					rebuildOffsetControls()
+					updateStatus()
+					go buildDrizzlePreview()
+				})
+				scroll := container.NewVScroll(content)
+				scroll.SetMinSize(fyne.NewSize(520, 200))
+				d = dialog.NewCustom("Star Alignment Results", "Dismiss", container.NewVBox(scroll, applyBtn), win)
+				d.Show()
 			})
-			buildDrizzlePreview()
 		}()
 	}
 
@@ -967,40 +1058,57 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			offsetControls.Refresh()
 			return
 		}
+
+		// nameCell wraps a label in a container with a minimum width so every row's
+		// name column is the same width regardless of text length.
+		nameCell := func(obj fyne.CanvasObject) fyne.CanvasObject {
+			return container.New(&minWidthLayout{160}, obj)
+		}
+		hdrLabel := func(text string) fyne.CanvasObject {
+			return widget.NewLabelWithStyle(text, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		}
+		header := container.NewHBox(
+			hdrLabel(""), hdrLabel(""),
+			nameCell(hdrLabel("Name")),
+			hdrLabel("X"), hdrLabel("Y"), hdrLabel("Rot°"),
+			hdrLabel("Flash"), hdrLabel("Apply"),
+			hdrLabel("Lock"), hdrLabel("Incl."),
+		)
+		offsetControls.Add(header)
+
 		for idx := range state.inputs {
 			name := mosaic.InputLabel(state.inputs[idx])
-			xEntry := widget.NewEntry()
-			xEntry.SetText(fmt.Sprintf("%.2f", state.inputs[idx].OffsetX))
-			yEntry := widget.NewEntry()
-			yEntry.SetText(fmt.Sprintf("%.2f", state.inputs[idx].OffsetY))
-			// Rotation: extract current angle from ManualTransform if present.
-			rotEntry := widget.NewEntry()
+			xEntry := NewNumberEntry(1, 2)
+			xEntry.SetValue(state.inputs[idx].OffsetX)
+			yEntry := NewNumberEntry(1, 2)
+			yEntry.SetValue(state.inputs[idx].OffsetY)
+			rotEntry := NewNumberEntry(0.01, 4)
 			currentRot := 0.0
 			if state.inputs[idx].HasManualTransform {
 				t := state.inputs[idx].ManualTransform
 				currentRot = math.Atan2(t.D, t.A) * 180 / math.Pi
 			}
-			rotEntry.SetText(fmt.Sprintf("%.4f", currentRot))
+			rotEntry.SetValue(currentRot)
 
-			lockCheck := widget.NewCheck("Lock", func(index int) func(bool) {
+			includeCheck := widget.NewCheck("", func(index int) func(bool) {
+				return func(included bool) {
+					state.inputs[index].Excluded = !included
+				}
+			}(idx))
+			includeCheck.SetChecked(!state.inputs[idx].Excluded)
+
+			lockCheck := widget.NewCheck("", func(index int) func(bool) {
 				return func(locked bool) {
 					state.inputs[index].OffsetLocked = locked
 				}
 			}(idx))
 			lockCheck.SetChecked(state.inputs[idx].OffsetLocked)
 
-			applyBtn := widget.NewButton("Apply", func(index int, xBox, yBox, rotBox *widget.Entry) func() {
+			applyBtn := widget.NewButton("Apply", func(index int, xBox, yBox, rotBox *NumberEntry) func() {
 				return func() {
-					xVal, errX := strconv.ParseFloat(strings.TrimSpace(xBox.Text), 64)
-					yVal, errY := strconv.ParseFloat(strings.TrimSpace(yBox.Text), 64)
-					rotVal, errR := strconv.ParseFloat(strings.TrimSpace(rotBox.Text), 64)
-					if errX != nil || errY != nil {
-						dialog.ShowInformation("Invalid Offset", "Offsets must be valid numbers in pixels.", win)
-						return
-					}
-					if errR != nil {
-						rotVal = 0
-					}
+					xVal := xBox.Value()
+					yVal := yBox.Value()
+					rotVal := rotBox.Value()
 					state.inputs[index].OffsetX = xVal
 					state.inputs[index].OffsetY = yVal
 					if rotVal != 0 {
@@ -1071,18 +1179,50 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				rotEntry.Disable()
 				applyBtn.Disable()
 				lockCheck.Disable()
-				name += " (reference)"
 			}
-			btnBox := container.NewHBox(flashBtn, applyBtn, lockCheck)
-			row := container.NewBorder(nil, nil, widget.NewLabel(name), btnBox,
-				container.NewGridWithColumns(6,
-					widget.NewLabel("X"), xEntry,
-					widget.NewLabel("Y"), yEntry,
-					widget.NewLabel("Rot°"), rotEntry,
-				),
+
+			upBtn := widget.NewButton("↑", func(index int) func() {
+				return func() {
+					if index == 0 {
+						return
+					}
+					state.inputs[index-1], state.inputs[index] = state.inputs[index], state.inputs[index-1]
+					if index < len(state.statuses) && index-1 < len(state.statuses) {
+						state.statuses[index-1], state.statuses[index] = state.statuses[index], state.statuses[index-1]
+					}
+					resetPreview()
+					rebuildOffsetControls()
+				}
+			}(idx))
+			downBtn := widget.NewButton("↓", func(index int) func() {
+				return func() {
+					if index >= len(state.inputs)-1 {
+						return
+					}
+					state.inputs[index], state.inputs[index+1] = state.inputs[index+1], state.inputs[index]
+					if index < len(state.statuses) && index+1 < len(state.statuses) {
+						state.statuses[index], state.statuses[index+1] = state.statuses[index+1], state.statuses[index]
+					}
+					resetPreview()
+					rebuildOffsetControls()
+				}
+			}(idx))
+			if idx == 0 {
+				upBtn.Disable()
+			}
+			if idx == len(state.inputs)-1 {
+				downBtn.Disable()
+			}
+
+			row := container.NewHBox(
+				upBtn, downBtn,
+				nameCell(widget.NewLabel(name)),
+				xEntry, yEntry, rotEntry,
+				flashBtn, applyBtn,
+				container.NewCenter(lockCheck),
+				container.NewCenter(includeCheck),
 			)
 			offsetControls.Add(row)
-			offsetControls.Add(widget.NewSeparator())
 		}
 		offsetControls.Refresh()
 	}
@@ -1207,55 +1347,112 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			dialog.ShowInformation("Missing Inputs", "Load at least two FITS files before star alignment.", win)
 			return
 		}
-		var progressDialog dialog.Dialog
-		fyne.DoAndWait(func() {
-			progressDialog = dialog.NewCustom("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", widget.NewProgressBarInfinite(), win)
-			progressDialog.Show()
-		})
+		progressDialog := dialog.NewCustom("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", widget.NewProgressBarInfinite(), win)
+		progressDialog.Show()
 		go func() {
 			alignInputs := inputsWithRef()
-			results, err := mosaic.AlignInputsByStars(alignInputs)
-			fyne.DoAndWait(func() { progressDialog.Hide() })
-			if err != nil {
-				fyne.Do(func() { dialog.ShowError(err, win) })
-				return
+			numRefs := state.drizzleSettings.NumRefs
+			if numRefs < 1 {
+				numRefs = 1
 			}
-			// When a reference baseline is set it occupies results[0]; the
-			// actual filter frames start at results[1]. Without a baseline
-			// results map 1:1 to state.inputs.
-			offset := 0
-			if state.referenceInput != nil {
-				offset = 1
+			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, numRefs, mosaic.AlignmentMode(state.drizzleSettings.AlignmentMode), state.drizzleSettings.SearchRadiusArcsec)
+
+			// Build the row data entirely off the main goroutine before touching UI.
+			type alignRow struct {
+				stateIdx int
+				result   mosaic.StarAlignmentResult
 			}
-			for ri := offset; ri < len(results); ri++ {
-				i := ri - offset
-				if i >= len(state.inputs) || i >= len(state.statuses) {
-					continue
-				}
-				if state.inputs[i].OffsetLocked {
-					continue
-				}
-				if results[ri].Applied {
-					state.inputs[i].OffsetX = results[ri].OffsetX
-					state.inputs[i].OffsetY = results[ri].OffsetY
-					state.inputs[i].ManualTransform = results[ri].ManualTransform
-					state.inputs[i].HasManualTransform = results[ri].HasManualTransform
-					if i == 0 && state.referenceInput == nil {
-						state.statuses[i].Status = "reference"
-					} else {
-						state.statuses[i].Status = "star aligned"
+			var rows []alignRow
+			if err == nil {
+				var activeIndices []int
+				for i, inp := range state.inputs {
+					if !inp.Excluded {
+						activeIndices = append(activeIndices, i)
 					}
-					state.statuses[i].Error = ""
-				} else if results[ri].Error != "" {
-					state.statuses[i].Status = "star align failed"
-					state.statuses[i].Error = results[ri].Error
+				}
+				offset := 0
+				if state.referenceInput != nil {
+					offset = 1
+				}
+				for ri := offset; ri < len(results); ri++ {
+					ai := ri - offset
+					if ai >= len(activeIndices) {
+						continue
+					}
+					si := activeIndices[ai]
+					if si >= len(state.inputs) || state.inputs[si].OffsetLocked {
+						continue
+					}
+					rows = append(rows, alignRow{stateIdx: si, result: results[ri]})
 				}
 			}
-			fyne.DoAndWait(func() {
-				rebuildOffsetControls()
-				updateStatus()
+
+			fyne.Do(func() {
+				progressDialog.Hide()
+				if err != nil {
+					dialog.ShowError(err, win)
+					return
+				}
+				if len(rows) == 0 {
+					dialog.ShowInformation("Star Alignment", "No alignment results to review.", win)
+					return
+				}
+
+				content := container.NewVBox()
+				checks := make([]*widget.Check, len(rows))
+				for i, r := range rows {
+					name := mosaic.InputLabel(state.inputs[r.stateIdx])
+					if r.result.Applied {
+						rot := 0.0
+						if r.result.HasManualTransform {
+							t := r.result.ManualTransform
+							rot = math.Atan2(t.D, t.A) * 180 / math.Pi
+						}
+						label := fmt.Sprintf("%s  X: %.2f  Y: %.2f  Rot°: %.4f", name, r.result.OffsetX, r.result.OffsetY, rot)
+						chk := widget.NewCheck(label, nil)
+						chk.SetChecked(true)
+						checks[i] = chk
+						content.Add(chk)
+					} else {
+						label := fmt.Sprintf("%s  [failed: %s]", name, r.result.Error)
+						chk := widget.NewCheck(label, nil)
+						chk.Disable()
+						checks[i] = chk
+						content.Add(chk)
+					}
+				}
+
+				var d dialog.Dialog
+				applyBtn := widget.NewButton("Apply", func() {
+					for i, r := range rows {
+						if checks[i] == nil || !checks[i].Checked {
+							continue
+						}
+						si := r.stateIdx
+						if si >= len(state.inputs) || si >= len(state.statuses) {
+							continue
+						}
+						state.inputs[si].OffsetX = r.result.OffsetX
+						state.inputs[si].OffsetY = r.result.OffsetY
+						state.inputs[si].ManualTransform = r.result.ManualTransform
+						state.inputs[si].HasManualTransform = r.result.HasManualTransform
+						if si == 0 && state.referenceInput == nil {
+							state.statuses[si].Status = "reference"
+						} else {
+							state.statuses[si].Status = "star aligned"
+						}
+						state.statuses[si].Error = ""
+					}
+					d.Hide()
+					rebuildOffsetControls()
+					updateStatus()
+					go buildDrizzlePreview()
+				})
+				scroll := container.NewVScroll(content)
+				scroll.SetMinSize(fyne.NewSize(520, 200))
+				d = dialog.NewCustom("Star Alignment Results", "Dismiss", container.NewVBox(scroll, applyBtn), win)
+				d.Show()
 			})
-			buildDrizzlePreview()
 		}()
 	})
 
@@ -1398,7 +1595,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			dialog.ShowInformation("Saved", "Offset file saved successfully.", win)
 		}, win)
 		save.SetFileName(mosaic.OffsetFileName(filter))
-		save.SetFilter(storage.NewExtensionFileFilter([]string{".txt"}))
+		save.SetFilter(storage.NewExtensionFileFilter([]string{".json"}))
 		save.Show()
 	}
 
@@ -1568,7 +1765,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		clearOffsetsBtn,
 		clearBtn,
 		widget.NewSeparator(),
-		widget.NewLabel("Per-Image Offsets (pixels)"),
+		widget.NewLabel("Input Frames"),
 		offsetScroll,
 		widget.NewSeparator(),
 		widget.NewLabel("Input Status"),
@@ -1926,16 +2123,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		fyne.NewMenuItem("Save Project", saveMosaicProject),
 		fyne.NewMenuItem("Load Project", loadMosaicProject),
 	)
-	setMosaicMenu := func() {
-		win.SetMainMenu(fyne.NewMainMenu(settingsMenu))
-	}
-	globalSetMosaicMenu = setMosaicMenu
-	setMosaicMenu()
-
 	previewPane := container.NewBorder(zoomRow, nil, nil, nil, previewSwap)
 	split := container.NewHSplit(leftStack, previewPane)
 	split.SetOffset(0.38)
-	return split
+	return split, settingsMenu
 }
 
 // buildMosaicPreviewImageWithLevels renders a mosaic result to RGBA using the same

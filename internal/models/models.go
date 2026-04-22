@@ -45,12 +45,15 @@ type DrizzleSettings struct {
 	// final_scale semantics).  When > 0, the internal multiplier is computed from
 	// the reference image WCS.  Scale is used as a raw multiplier fallback when
 	// FinalScale is zero.
-	FinalScale  float64 `json:"finalScale"`
-	Scale       float64 `json:"scale"`
-	PixFrac     float64 `json:"pixFrac"`
-	CRMethod    int     `json:"crMethod"`
-	SepKernel   int     `json:"sepKernel"`
-	FinalKernel int     `json:"finalKernel"`
+	FinalScale    float64 `json:"finalScale"`
+	Scale         float64 `json:"scale"`
+	PixFrac       float64 `json:"pixFrac"`
+	CRMethod      int     `json:"crMethod"`
+	SepKernel     int     `json:"sepKernel"`
+	FinalKernel   int     `json:"finalKernel"`
+	AlignmentMode      int     `json:"alignmentMode"`
+	SearchRadiusArcsec float64 `json:"searchRadiusArcsec"`
+	NumRefs            int     `json:"numRefs"`
 }
 
 type MosaicInputState struct {

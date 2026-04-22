@@ -30,7 +30,7 @@ import (
 // stretch settings already applied.
 var globalSendToChannel func(channelIdx int, img *models.LoadedImage)
 
-func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
+func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*fyne.Menu) {
 	imgs := make([]*models.LoadedImage, 3)
 	var origPixels [3][]float32
 	viewports := []*viewport{newViewport(), newViewport(), newViewport(), newViewport()}
@@ -261,17 +261,18 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 
 				imgs[idx] = img
 				captureOrig(idx)
-				if controlSets != nil {
-					applyChannelState(idx, channelStateFromImage(img), imgs, viewports, controlSets)
-				}
 
-				progressDialog.Hide()
-				refresh()
-				closeHeaderWindow(idx)
-
-				if updateMenus != nil {
-					updateMenus()
-				}
+				fyne.Do(func() {
+					if controlSets != nil {
+						applyChannelState(idx, channelStateFromImage(img), imgs, viewports, controlSets)
+					}
+					progressDialog.Hide()
+					refresh()
+					closeHeaderWindow(idx)
+					if updateMenus != nil {
+						updateMenus()
+					}
+				})
 			}()
 
 		}, win)
@@ -449,17 +450,19 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 					flipCheck.SetChecked(project.Flip)
 				})
 
-				progressDialog.Hide()
-				refresh()
-				for idx := range headerWins {
-					closeHeaderWindow(idx)
-				}
-				if updateMenus != nil {
-					updateMenus()
-				}
-				if len(errors) > 0 {
-					dialog.ShowError(fmt.Errorf("%s", strings.Join(errors, "\n")), win)
-				}
+				fyne.Do(func() {
+					progressDialog.Hide()
+					refresh()
+					for idx := range headerWins {
+						closeHeaderWindow(idx)
+					}
+					if updateMenus != nil {
+						updateMenus()
+					}
+					if len(errors) > 0 {
+						dialog.ShowError(fmt.Errorf("%s", strings.Join(errors, "\n")), win)
+					}
+				})
 			}()
 		}, win)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".json", ".gofits"}))
@@ -654,6 +657,56 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		globalExportToEdit(img)
 	})
 
+	var measureEnabled bool
+	var measureStart *imagePoint
+	var measureEnd *imagePoint
+
+	measureLabel := widget.NewLabel("Measure: --")
+	measureLabel.TextStyle = fyne.TextStyle{Monospace: true}
+
+	updateMeasurement := func() {
+		viewports[3].setMeasurementOverlay(measureStart, measureEnd, flipCheck.Checked)
+		switch {
+		case measureStart != nil && measureEnd != nil:
+			m := measurePoints(*measureStart, *measureEnd)
+			measureLabel.SetText(fmt.Sprintf("A(%d,%d) B(%d,%d)\ndx=%+d dy=%+d d=%.2f px", m.Start.X, m.Start.Y, m.End.X, m.End.Y, m.DX, m.DY, m.Distance))
+		case measureStart != nil:
+			measureLabel.SetText(fmt.Sprintf("Measure: A=(%d,%d) — click B", measureStart.X, measureStart.Y))
+		default:
+			measureLabel.SetText("Measure: --")
+		}
+	}
+
+	measureCheck := widget.NewCheck("Measure composite", func(v bool) {
+		measureEnabled = v
+		if !v {
+			measureStart = nil
+			measureEnd = nil
+			updateMeasurement()
+		}
+	})
+
+	viewports[3].overlay.onTapped = func(pos fyne.Position) {
+		if !measureEnabled {
+			return
+		}
+		point, ok := viewports[3].imagePointAtPosition(pos, flipCheck.Checked)
+		if !ok {
+			return
+		}
+		if measureStart == nil || measureEnd != nil {
+			measureStart = &imagePoint{X: point.X, Y: point.Y}
+			measureEnd = nil
+		} else {
+			measureEnd = &imagePoint{X: point.X, Y: point.Y}
+		}
+		updateMeasurement()
+	}
+
+	viewports[3].onViewChanged = func() {
+		updateMeasurement()
+	}
+
 	//alignBtn := widget.NewButton("1. Align to Channel 2 (Green)", alignChannels)
 	//crossCleanBtn := widget.NewButton("2. Cross-Channel Clean", crossChannelClean)
 
@@ -741,7 +794,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		// }
 
 		saveProjectItem.Disabled = imgs[0] == nil && imgs[1] == nil && imgs[2] == nil
-		win.SetMainMenu(fyne.NewMainMenu(fileMenu, headersMenu, processMenu, viewMenu))
+		if m := win.MainMenu(); m != nil {
+			m.Refresh()
+		}
 	}
 	updateMenus()
 
@@ -767,6 +822,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		//alignBtn,
 		//crossCleanBtn,
 		exportToEditBtn,
+		measureCheck,
+		measureLabel,
 		widget.NewSeparator(),
 		widget.NewLabel("Per-channel controls"),
 		controlSets[0].Content,
@@ -784,7 +841,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 
 	split := container.NewHSplit(controlsScroll, grid)
 	split.SetOffset(0.32)
-	return split
+	return split, []*fyne.Menu{fileMenu, headersMenu, processMenu, viewMenu}
 }
 
 // loadImagesFromPath loads all SCI extensions from a FITS file as separate LoadedImage values.

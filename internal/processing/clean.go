@@ -3,9 +3,13 @@ package processing
 import (
 	"math"
 	"sort"
+
+	"gofitsv3/internal/debuglog"
 )
 
 func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, passes int, masterMask []bool) []float32 {
+	debuglog.Log("RemoveCosmicRays: starting")
+	defer debuglog.Log("RemoveCosmicRays: finished")
 	if passes <= 0 {
 		out := make([]float32, len(pixels))
 		copy(out, pixels)
@@ -166,6 +170,12 @@ type FrameInfo struct {
 	OffsetX     float64
 	OffsetY     float64
 	Sigma       float64
+	// MapFunc, if non-nil, maps a source pixel (x,y) to reference space.
+	// BuildCRMasksFromModel uses it instead of SourceToRef for blotting,
+	// allowing a full WCS mapper to be passed in for per-pixel accuracy.
+	// The returned coordinates must already include any offset adjustment
+	// (i.e. they are the same reference-space coords used during drizzle).
+	MapFunc func(x, y float64) (float64, float64)
 }
 
 // BuildCosmicRayMasks detects cosmic rays by comparing each pixel across
@@ -174,6 +184,8 @@ type FrameInfo struct {
 // into adjacent above-threshold pixels. Returns one boolean mask per frame
 // (true = cosmic ray, skip during drizzle).
 func BuildCosmicRayMasks(frames []FrameInfo, seedMultiplier, growMultiplier float64) [][]bool {
+	debuglog.Log("BuildCosmicRayMasks: starting")
+	defer debuglog.Log("BuildCosmicRayMasks: finished")
 	n := len(frames)
 	masks := make([][]bool, n)
 
@@ -300,6 +312,8 @@ type DrizzleStyleCROptions struct {
 // minX/minY are the output origin in reference pixel space.
 // scale is the drizzle scale factor (output pixels per reference pixel).
 func BuildDrizzleStyleCRMasks(frames []FrameInfo, outW, outH int, minX, minY, scale float64, opts DrizzleStyleCROptions) [][]bool {
+	debuglog.Log("BuildDrizzleStyleCRMasks: starting")
+	defer debuglog.Log("BuildDrizzleStyleCRMasks: finished")
 	if len(frames) == 0 {
 		return nil
 	}
@@ -361,6 +375,8 @@ func buildInverseBlotModel(frames []FrameInfo, outW, outH int, minX, minY, scale
 // AstroDrizzle pipeline. Use this when the model has been built externally
 // (e.g. from per-frame drizzled images) rather than via inverse blot.
 func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, minX, minY, scale float64, opts DrizzleStyleCROptions) [][]bool {
+	debuglog.Log("BuildCRMasksFromModel: starting")
+	defer debuglog.Log("BuildCRMasksFromModel: finished")
 	n := len(frames)
 	dirs4 := [4][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
 	masks := make([][]bool, n)
@@ -376,12 +392,24 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 		mask := make([]bool, npix)
 
 		// Blot the model back to input frame pixel space.
+		// Use MapFunc when available (full WCS accuracy); fall back to the
+		// affine SourceToRef approximation otherwise.
 		blotted := make([]float32, npix)
 		for y := 0; y < f.Height; y++ {
 			for x := 0; x < f.Width; x++ {
-				refX, refY := ApplyAffineTransform(f.SourceToRef, float64(x), float64(y))
-				ox := (refX + f.OffsetX - minX) * scale
-				oy := (refY + f.OffsetY - minY) * scale
+				var refX, refY float64
+				if f.MapFunc != nil {
+					refX, refY = f.MapFunc(float64(x), float64(y))
+					// MapFunc already includes any offset; OffsetX/Y are 0 here.
+					refX -= minX
+					refY -= minY
+				} else {
+					refX, refY = ApplyAffineTransform(f.SourceToRef, float64(x), float64(y))
+					refX = refX + f.OffsetX - minX
+					refY = refY + f.OffsetY - minY
+				}
+				ox := refX * scale
+				oy := refY * scale
 				v := bilinearSample(model, outW, outH, ox, oy)
 				if math.IsNaN(v) {
 					blotted[y*f.Width+x] = float32(math.NaN())
