@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/color"
 	"io"
 	"math"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"sync"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/storage"
@@ -34,6 +36,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	imgs := make([]*models.LoadedImage, 3)
 	var origPixels [3][]float32
 	viewports := []*viewport{newViewport(), newViewport(), newViewport(), newViewport()}
+	// Channel histograms: black background, channel-colored bars; compose: white bars.
+	viewports[0].histColor = [4]uint8{100, 149, 237, 255} // blue
+	viewports[1].histColor = [4]uint8{80, 200, 80, 255}   // green
+	viewports[2].histColor = [4]uint8{237, 80, 80, 255}   // red
+	viewports[3].histColor = [4]uint8{255, 255, 255, 255}  // white (compose)
 	headerWins := make([]fyne.Window, 3)
 	levels := defaultRGBLevels()
 	var levelsWin *rgbLevelsWindow
@@ -162,9 +169,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				resizedCount++
 			}
 
-			progressDialog.Hide()
-			refresh()
-			dialog.ShowInformation("Complete", fmt.Sprintf("Rescaled %d channel(s) to match Channel 2 pixel scale.", resizedCount), win)
+			fyne.Do(func() {
+				progressDialog.Hide()
+				refresh()
+				dialog.ShowInformation("Complete", fmt.Sprintf("Rescaled %d channel(s) to match Channel 2 pixel scale.", resizedCount), win)
+			})
 		}()
 	}
 
@@ -289,10 +298,29 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	controlSets = []*models.ChannelControl{
-		channelControls("Channel 1 (Blue)", 0, imgs, &origPixels, viewports, refresh, saveChannelGray),
-		channelControls("Channel 2 (Green)", 1, imgs, &origPixels, viewports, refresh, saveChannelGray),
-		channelControls("Channel 3 (Red)", 2, imgs, &origPixels, viewports, refresh, saveChannelGray),
+		channelControls("Channel 1 (Blue)", 0, imgs, &origPixels, viewports, refresh),
+		channelControls("Channel 2 (Green)", 1, imgs, &origPixels, viewports, refresh),
+		channelControls("Channel 3 (Red)", 2, imgs, &origPixels, viewports, refresh),
 	}
+
+	for i := 0; i < 3; i++ {
+		idx := i
+		viewports[idx].SetLoadSave(
+			func() { loadChannel(idx) },
+			func() { saveChannelGray(idx) },
+		)
+	}
+	viewports[3].SetCenterAction("Export to Edit", func() {
+		if globalExportToEdit == nil {
+			return
+		}
+		img := viewports[3].image.Image
+		if img == nil {
+			dialog.ShowInformation("Nothing to export", "Compose all three channels first.", win)
+			return
+		}
+		globalExportToEdit(img)
+	})
 
 	copySettings := func() {
 		if imgs[0] == nil {
@@ -328,12 +356,12 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				dst.ShowClip = src.ShowClip
 
 				controlSets[idx].ModeSelect.SetSelected(modeToLabel(src.Mode))
-				controlSets[idx].BackgroundEntry.SetText(fmt.Sprintf("%.3f", src.Background))
-				controlSets[idx].PeakEntry.SetText(fmt.Sprintf("%.3f", src.Peak))
-				controlSets[idx].ScaledPeakEntry.SetText(fmt.Sprintf("%.3f", src.ScaledPeak))
+				controlSets[idx].BackgroundEntry.SetValue(src.Background)
+				controlSets[idx].PeakEntry.SetValue(src.Peak)
+				controlSets[idx].ScaledPeakEntry.SetValue(src.ScaledPeak)
 				controlSets[idx].ShowClip.SetChecked(src.ShowClip)
-				viewports[idx].blackBox.SetText(fmt.Sprintf("%.3f", src.Black))
-				viewports[idx].whiteBox.SetText(fmt.Sprintf("%.3f", src.White))
+				viewports[idx].blackBox.SetValue(src.Black)
+				viewports[idx].whiteBox.SetValue(src.White)
 			}
 		})
 		refresh()
@@ -433,24 +461,28 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}()
 
 				errors := make([]string, 0, 3)
-				withSuspendedRefresh(func() {
-					for res := range results {
-						if res.state.Path == "" {
-							imgs[res.idx] = nil
-							continue
-						}
-						if res.err != nil {
-							errors = append(errors, fmt.Sprintf("Channel %d: %v", res.idx+1, res.err))
-							continue
-						}
-						imgs[res.idx] = res.img
-						captureOrig(res.idx)
-						applyChannelState(res.idx, res.state, imgs, viewports, controlSets)
+				for res := range results {
+					if res.state.Path == "" {
+						imgs[res.idx] = nil
+						continue
 					}
-					flipCheck.SetChecked(project.Flip)
-				})
+					if res.err != nil {
+						errors = append(errors, fmt.Sprintf("Channel %d: %v", res.idx+1, res.err))
+						continue
+					}
+					imgs[res.idx] = res.img
+					captureOrig(res.idx)
+				}
 
 				fyne.Do(func() {
+					withSuspendedRefresh(func() {
+						for i, img := range imgs[:3] {
+							if img != nil {
+								applyChannelState(i, project.Channels[i], imgs, viewports, controlSets)
+							}
+						}
+						flipCheck.SetChecked(project.Flip)
+					})
 					progressDialog.Hide()
 					refresh()
 					for idx := range headerWins {
@@ -550,10 +582,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			alignedBlue, transformBlue, blueMethod, errBlue := alignWithFallback(imgs[0])
 			alignedRed, transformRed, redMethod, errRed := alignWithFallback(imgs[2])
 
-			win.Canvas().Refresh(win.Content())
-
 			if errBlue != nil || errRed != nil {
-				progressDialog.Hide()
 				errMsg := ""
 				if errBlue != nil {
 					errMsg += fmt.Sprintf("Channel 1 alignment failed: %v\n", errBlue)
@@ -561,7 +590,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				if errRed != nil {
 					errMsg += fmt.Sprintf("Channel 3 alignment failed: %v", errRed)
 				}
-				dialog.ShowError(fmt.Errorf("%s", errMsg), win)
+				fyne.Do(func() {
+					progressDialog.Hide()
+					dialog.ShowError(fmt.Errorf("%s", errMsg), win)
+				})
 				return
 			}
 
@@ -573,15 +605,16 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			imgs[2].HDU.Data.Width = width
 			imgs[2].HDU.Data.Height = height
 
-			progressDialog.Hide()
-			refresh()
 			msg := fmt.Sprintf("Alignment Complete.\n\nBlue Method: %s\nBlue Shift:\n  X: %+.2f px\n  Y: %+.2f px\n\nRed Method: %s\nRed Shift:\n  X: %+.2f px\n  Y: %+.2f px",
 				blueMethod,
 				transformBlue.C, transformBlue.F,
 				redMethod,
 				transformRed.C, transformRed.F)
-
-			dialog.ShowInformation("Alignment Data", msg, win)
+			fyne.Do(func() {
+				progressDialog.Hide()
+				refresh()
+				dialog.ShowInformation("Alignment Data", msg, win)
+			})
 		}()
 	}
 
@@ -619,11 +652,12 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			imgs[1].HDU.Data.Pixels = cleanG
 			imgs[2].HDU.Data.Pixels = cleanR
 
-			win.Canvas().Refresh(win.Content())
-			progressDialog.Hide()
-			refresh()
-
-			dialog.ShowInformation("Complete", "Master mask generated and cosmic rays eradicated.", win)
+			fyne.Do(func() {
+				win.Canvas().Refresh(win.Content())
+				progressDialog.Hide()
+				refresh()
+				dialog.ShowInformation("Complete", "Master mask generated and cosmic rays eradicated.", win)
+			})
 		}()
 	}
 
@@ -644,18 +678,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		save.SetFileName("composite.png")
 		save.Show()
 	}
-
-	exportToEditBtn := widget.NewButton("Export to Edit", func() {
-		if globalExportToEdit == nil {
-			return
-		}
-		img := viewports[3].image.Image
-		if img == nil {
-			dialog.ShowInformation("Nothing to export", "Compose all three channels first.", win)
-			return
-		}
-		globalExportToEdit(img)
-	})
 
 	var measureEnabled bool
 	var measureStart *imagePoint
@@ -712,44 +734,27 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	saveProjectItem := fyne.NewMenuItem("Save Project", saveProject)
 	loadProjectItem := fyne.NewMenuItem("Load Project", loadProject)
+	exportRGBItem := fyne.NewMenuItem("Export RGB", exportRGB)
 	fileMenu := fyne.NewMenu("File",
 		loadProjectItem,
 		saveProjectItem,
-		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Load Channel 1", func() { loadChannel(0) }),
-		fyne.NewMenuItem("Load Channel 2", func() { loadChannel(1) }),
-		fyne.NewMenuItem("Load Channel 3", func() { loadChannel(2) }),
-	)
-	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 settings to 2 & 3", copySettings)
-	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
-	cleanChannelsItem := fyne.NewMenuItem("Cross-Channel Clean", crossChannelClean)
-
-	//channelsMenu := fyne.NewMenu("Channels", copySettingsItem, alignChannelsItem, cleanChannelsItem)
-
-	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
-	resetDataItem := fyne.NewMenuItem("Reset Data (Undo Align & Clean)", resetData)
-	exportRGBItem := fyne.NewMenuItem("Export RGB", exportRGB)
-	processMenu := fyne.NewMenu("Process",
-		copySettingsItem,
-		normalizeScaleItem,
-		alignChannelsItem,
-		cleanChannelsItem,
-		resetDataItem,
 		fyne.NewMenuItemSeparator(),
 		exportRGBItem,
 	)
 
 	viewHeaderItems := []*fyne.MenuItem{
-		fyne.NewMenuItem("View Channel 1", func() { showHeader(0) }),
-		fyne.NewMenuItem("View Channel 2", func() { showHeader(1) }),
-		fyne.NewMenuItem("View Channel 3", func() { showHeader(2) }),
+		fyne.NewMenuItem("View FITS Header 1", func() { showHeader(0) }),
+		fyne.NewMenuItem("View FITS Header 2", func() { showHeader(1) }),
+		fyne.NewMenuItem("View FITS Header 3", func() { showHeader(2) }),
 	}
 	saveHeaderItems := []*fyne.MenuItem{
-		fyne.NewMenuItem("Save Channel 1...", func() { saveHeader(0) }),
-		fyne.NewMenuItem("Save Channel 2...", func() { saveHeader(1) }),
-		fyne.NewMenuItem("Save Channel 3...", func() { saveHeader(2) }),
+		fyne.NewMenuItem("Save FITS Header 1...", func() { saveHeader(0) }),
+		fyne.NewMenuItem("Save FITS Header 2...", func() { saveHeader(1) }),
+		fyne.NewMenuItem("Save FITS Header 3...", func() { saveHeader(2) }),
 	}
-	headersMenu := fyne.NewMenu("Headers",
+	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 Settings to 2 & 3", copySettings)
+	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
+	channelsMenu := fyne.NewMenu("Channels",
 		viewHeaderItems[0],
 		viewHeaderItems[1],
 		viewHeaderItems[2],
@@ -757,7 +762,21 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		saveHeaderItems[0],
 		saveHeaderItems[1],
 		saveHeaderItems[2],
+		fyne.NewMenuItemSeparator(),
+		copySettingsItem,
+		normalizeScaleItem,
 	)
+
+	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
+	cleanChannelsItem := fyne.NewMenuItem("Cross-Channel Clean", crossChannelClean)
+	resetDataItem := fyne.NewMenuItem("Reset Data (Undo Align & Clean)", resetData)
+	processMenu := fyne.NewMenu("Process",
+		alignChannelsItem,
+		cleanChannelsItem,
+		fyne.NewMenuItemSeparator(),
+		resetDataItem,
+	)
+
 	openLevels := func() {
 		if levelsWin == nil {
 			levelsWin = newRGBLevelsWindow(app, levels, refresh)
@@ -821,7 +840,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		widget.NewSeparator(),
 		//alignBtn,
 		//crossCleanBtn,
-		exportToEditBtn,
 		measureCheck,
 		measureLabel,
 		widget.NewSeparator(),
@@ -835,13 +853,15 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	controlsScroll.SetMinSize(fyne.NewSize(260, 200))
 
 	grid := container.NewGridWithColumns(2,
-		viewports[0].container, viewports[1].container,
-		viewports[2].container, viewports[3].container,
+		channelBorder(viewports[0].container, color.RGBA{100, 149, 237, 255}), // blue
+		channelBorder(viewports[1].container, color.RGBA{80, 200, 80, 255}),   // green
+		channelBorder(viewports[2].container, color.RGBA{237, 80, 80, 255}),   // red
+		channelBorder(viewports[3].container, color.RGBA{220, 220, 220, 255}), // white/composite
 	)
 
 	split := container.NewHSplit(controlsScroll, grid)
 	split.SetOffset(0.32)
-	return split, []*fyne.Menu{fileMenu, headersMenu, processMenu, viewMenu}
+	return split, []*fyne.Menu{fileMenu, channelsMenu, processMenu, viewMenu}
 }
 
 // loadImagesFromPath loads all SCI extensions from a FITS file as separate LoadedImage values.
@@ -926,16 +946,16 @@ func applyChannelState(idx int, state models.ChannelState, imgs []*models.Loaded
 	img.ShowClip = state.ShowClip
 
 	controls[idx].ModeSelect.SetSelected(modeToLabel(img.Mode))
-	controls[idx].BackgroundEntry.SetText(fmt.Sprintf("%.3f", img.Background))
-	controls[idx].PeakEntry.SetText(fmt.Sprintf("%.3f", img.Peak))
-	controls[idx].ScaledPeakEntry.SetText(fmt.Sprintf("%.3f", img.ScaledPeak))
+	controls[idx].BackgroundEntry.SetValue(img.Background)
+	controls[idx].PeakEntry.SetValue(img.Peak)
+	controls[idx].ScaledPeakEntry.SetValue(img.ScaledPeak)
 	controls[idx].ShowClip.SetChecked(img.ShowClip)
 
-	views[idx].blackBox.SetText(fmt.Sprintf("%.3f", img.Black))
-	views[idx].whiteBox.SetText(fmt.Sprintf("%.3f", img.White))
+	views[idx].blackBox.SetValue(img.Black)
+	views[idx].whiteBox.SetValue(img.White)
 }
 
-func channelControls(label string, idx int, imgs []*models.LoadedImage, origPixels *[3][]float32, views []*viewport, refresh func(), saveChannelGray func(int)) *models.ChannelControl {
+func channelControls(label string, idx int, imgs []*models.LoadedImage, origPixels *[3][]float32, views []*viewport, refresh func()) *models.ChannelControl {
 	selectBox := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
 		if imgs[idx] == nil {
 			return
@@ -956,13 +976,13 @@ func channelControls(label string, idx int, imgs []*models.LoadedImage, origPixe
 	})
 	selectBox.SetSelected("Linear")
 
-	backgroundEntry := widget.NewEntry()
-	peakEntry := widget.NewEntry()
-	scaledPeakEntry := widget.NewEntry()
+	backgroundEntry := NewNumberEntry(0.001, 4)
+	peakEntry := NewNumberEntry(0.001, 4)
+	scaledPeakEntry := NewNumberEntry(1, 1)
 
-	backgroundEntry.SetText("0")
-	peakEntry.SetText("1")
-	scaledPeakEntry.SetText("1")
+	backgroundEntry.SetValue(0)
+	peakEntry.SetValue(1)
+	scaledPeakEntry.SetValue(1)
 
 	showClip := widget.NewCheck("Show clipped (blue/green/red)", func(v bool) {
 		if imgs[idx] == nil {
@@ -977,21 +997,11 @@ func channelControls(label string, idx int, imgs []*models.LoadedImage, origPixe
 		if imgs[idx] == nil {
 			return
 		}
-		if v, err := utils.ParseFloat(backgroundEntry.Text); err == nil {
-			imgs[idx].Background = v
-		}
-		if v, err := utils.ParseFloat(peakEntry.Text); err == nil {
-			imgs[idx].Peak = v
-		}
-		if v, err := utils.ParseFloat(scaledPeakEntry.Text); err == nil {
-			imgs[idx].ScaledPeak = v
-		}
-		if v, err := utils.ParseFloat(views[idx].blackBox.Text); err == nil {
-			imgs[idx].Black = v
-		}
-		if v, err := utils.ParseFloat(views[idx].whiteBox.Text); err == nil {
-			imgs[idx].White = v
-		}
+		imgs[idx].Background = backgroundEntry.Value()
+		imgs[idx].Peak = peakEntry.Value()
+		imgs[idx].ScaledPeak = scaledPeakEntry.Value()
+		imgs[idx].Black = views[idx].blackBox.Value()
+		imgs[idx].White = views[idx].whiteBox.Value()
 		refresh()
 	})
 
@@ -999,31 +1009,18 @@ func channelControls(label string, idx int, imgs []*models.LoadedImage, origPixe
 		if imgs[idx] == nil {
 			return
 		}
-		blackVal := imgs[idx].Black
-		if v, err := utils.ParseFloat(views[idx].blackBox.Text); err == nil {
-			blackVal = v
-		}
-		whiteVal := imgs[idx].White
-		if v, err := utils.ParseFloat(views[idx].whiteBox.Text); err == nil {
-			whiteVal = v
-		} else {
-			_, whiteVal = processing.AutoLevels(imgs[idx].HDU.Data.Pixels)
-		}
-		imgs[idx].Background = blackVal
-		imgs[idx].Peak = whiteVal
+		black, white, bg, peak := processing.SmartLevels(imgs[idx].HDU.Data.Pixels)
+		imgs[idx].Black = black
+		imgs[idx].White = white
+		imgs[idx].Background = bg
+		imgs[idx].Peak = peak
 		imgs[idx].ScaledPeak = 10
-		imgs[idx].White = whiteVal
-		imgs[idx].Black = 0
-		views[idx].blackBox.SetText("0")
-		views[idx].whiteBox.SetText(fmt.Sprintf("%.2f", whiteVal))
-		backgroundEntry.SetText(fmt.Sprintf("%.2f", blackVal))
-		peakEntry.SetText(fmt.Sprintf("%.2f", whiteVal))
-		scaledPeakEntry.SetText("10")
+		views[idx].blackBox.SetValue(black)
+		views[idx].whiteBox.SetValue(white)
+		backgroundEntry.SetValue(bg)
+		peakEntry.SetValue(peak)
+		scaledPeakEntry.SetValue(10)
 		refresh()
-	})
-
-	saveGray := widget.NewButton("Save Gray", func() {
-		saveChannelGray(idx)
 	})
 
 	xOffsetEntry := widget.NewEntry()
@@ -1074,7 +1071,7 @@ func channelControls(label string, idx int, imgs []*models.LoadedImage, origPixe
 				widget.NewFormItem("Scaled peak level", scaledPeakEntry),
 			),
 			showClip,
-			container.NewHBox(auto, apply, saveGray),
+			container.NewHBox(auto, apply),
 			widget.NewLabel("Manual Offset"),
 			container.NewGridWithColumns(6,
 				widget.NewLabel("X"), xOffsetEntry,
@@ -1098,8 +1095,8 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 		if imgs[i] == nil {
 			views[i].image.Image = blankImg()
 			views[i].bins = [256]int{}
-			views[i].blackBox.SetText("--")
-			views[i].whiteBox.SetText("--")
+			views[i].blackBox.SetValue(0)
+			views[i].whiteBox.SetValue(0)
 
 			if views[i].StatsLabel != nil {
 				views[i].StatsLabel.SetText("Mean: -- | Std: --")
@@ -1127,8 +1124,8 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 			views[i].StatsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f", stats.Mean, stats.Std))
 		}
 
-		views[i].blackBox.SetText(fmt.Sprintf("%.3f", imgs[i].Black))
-		views[i].whiteBox.SetText(fmt.Sprintf("%.3f", imgs[i].White))
+		views[i].blackBox.SetValue(imgs[i].Black)
+		views[i].whiteBox.SetValue(imgs[i].White)
 
 		views[i].histogram.Refresh()
 		if views[i].zoomLabel.Selected == "fit in preview" {
@@ -1147,8 +1144,8 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 		}
 		views[3].image.Image = blankImg()
 		views[3].bins = [256]int{}
-		views[3].blackBox.SetText("--")
-		views[3].whiteBox.SetText("--")
+		views[3].blackBox.SetValue(0)
+		views[3].whiteBox.SetValue(0)
 		views[3].histogram.Refresh()
 		views[3].image.Refresh()
 		return
@@ -1169,8 +1166,8 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 	views[3].image.Image = img
 	views[3].origW, views[3].origH = w, h
 	views[3].bins = [256]int{}
-	views[3].blackBox.SetText("--")
-	views[3].whiteBox.SetText("--")
+	views[3].blackBox.SetValue(0)
+	views[3].whiteBox.SetValue(0)
 	views[3].histogram.Refresh()
 
 	if views[3].zoomLabel.Selected == "fit in preview" {
@@ -1186,6 +1183,15 @@ func defaultRGBLevels() *models.RgbLevels {
 		Min: [3]float64{0, 0, 0},
 		Max: [3]float64{255, 255, 255},
 	}
+}
+
+// channelBorder wraps a canvas object with a colored rectangular border.
+func channelBorder(content fyne.CanvasObject, col color.Color) fyne.CanvasObject {
+	rect := canvas.NewRectangle(color.Transparent)
+	rect.StrokeColor = col
+	rect.StrokeWidth = 1
+	rect.CornerRadius = 6
+	return container.NewMax(content, rect)
 }
 
 func modeToLabel(m stretch.Mode) string {

@@ -2,10 +2,12 @@ package ui
 
 import (
 	"image"
+	"syscall"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver"
 	"fyne.io/fyne/v2/theme"
 
 	"gofitsv3/internal/version"
@@ -45,16 +47,31 @@ func Run() error {
 		}),
 	)
 
-	allMenus := append([]*fyne.Menu{mosaicMenu}, composeMenus...)
-	allMenus = append(allMenus, windowMenu)
+	allMenus := append(composeMenus, mosaicMenu, windowMenu)
 	win.SetMainMenu(fyne.NewMainMenu(allMenus...))
 
 	win.SetContent(tabs)
-	// Use a very large size so the OS/Fyne caps it to the screen bounds,
-	// which effectively starts the window maximized.
-	win.Resize(fyne.NewSize(10000, 10000))
 	win.Show()
+	maximizeWindow(win)
 
 	a.Run()
 	return nil
+}
+
+// maximizeWindow sends SW_MAXIMIZE to the native Win32 window handle.
+func maximizeWindow(win fyne.Window) {
+	nw, ok := win.(driver.NativeWindow)
+	if !ok {
+		return
+	}
+	nw.RunNative(func(ctx any) {
+		wctx, ok := ctx.(driver.WindowsWindowContext)
+		if !ok {
+			return
+		}
+		const swMaximize = 3
+		user32 := syscall.NewLazyDLL("user32.dll")
+		showWindow := user32.NewProc("ShowWindow")
+		showWindow.Call(wctx.HWND, uintptr(swMaximize))
+	})
 }

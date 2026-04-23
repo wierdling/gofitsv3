@@ -104,11 +104,11 @@ func NewNumberEntry(step float64, decimals int) *NumberEntry {
 	})
 	n.clearBtn.Importance = widget.LowImportance
 
-	n.content = container.NewHBox(
-		n.entry,
-		container.NewVBox(n.upBtn, n.downBtn),
+	btnSide := container.NewHBox(
+		container.NewCenter(container.NewVBox(n.upBtn, n.downBtn)),
 		n.clearBtn,
 	)
+	n.content = container.NewBorder(nil, nil, nil, btnSide, n.entry)
 
 	n.syncText()
 	return n
@@ -145,8 +145,20 @@ func (n *NumberEntry) Enable() {
 func (n *NumberEntry) syncText() {
 	text := fmt.Sprintf("%.*f", n.Decimals, n.value)
 	if n.entry.Text != text {
-		n.entry.SetText(text)
+		fyne.Do(func() {
+			n.entry.SetText(text)
+		})
 	}
+}
+
+func (n *NumberEntry) MinSize() fyne.Size {
+	s := n.content.MinSize()
+	// Fyne Entry.MinSize ignores placeholder width; enforce enough room for 10 chars + buttons.
+	const minWidth float32 = 180
+	if s.Width < minWidth {
+		s.Width = minWidth
+	}
+	return s
 }
 
 func (n *NumberEntry) CreateRenderer() fyne.WidgetRenderer {

@@ -101,12 +101,9 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	})
 	modeSelect.SetSelected("Linear")
 
-	bgEntry := widget.NewEntry()
-	peakEntry := widget.NewEntry()
-	sPeakEntry := widget.NewEntry()
-	bgEntry.SetText("0")
-	peakEntry.SetText("1")
-	sPeakEntry.SetText("1")
+	bgEntry := NewNumberEntry(0.001, 4)
+	peakEntry := NewNumberEntry(0.001, 4)
+	sPeakEntry := NewNumberEntry(1, 1)
 
 	showClip := widget.NewCheck("Show clipped", func(v bool) {
 		if state.img == nil {
@@ -135,16 +132,16 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	syncControlsFromImage := func() {
 		if state.img == nil {
 			modeSelect.SetSelected("Linear")
-			bgEntry.SetText("0")
-			peakEntry.SetText("1")
-			sPeakEntry.SetText("1")
+			bgEntry.SetValue(0)
+			peakEntry.SetValue(1)
+			sPeakEntry.SetValue(1)
 			showClip.SetChecked(true)
 			return
 		}
 		modeSelect.SetSelected(modeToLabel(state.img.Mode))
-		bgEntry.SetText(fmt.Sprintf("%.3f", state.img.Background))
-		peakEntry.SetText(fmt.Sprintf("%.3f", state.img.Peak))
-		sPeakEntry.SetText(fmt.Sprintf("%.3f", state.img.ScaledPeak))
+		bgEntry.SetValue(state.img.Background)
+		peakEntry.SetValue(state.img.Peak)
+		sPeakEntry.SetValue(state.img.ScaledPeak)
 		showClip.SetChecked(state.img.ShowClip)
 	}
 
@@ -154,8 +151,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			vp.image.Image = blankImg()
 			vp.origW, vp.origH = 0, 0
 			vp.bins = [256]int{}
-			vp.blackBox.SetText("--")
-			vp.whiteBox.SetText("--")
+			vp.blackBox.SetValue(0)
+			vp.whiteBox.SetValue(0)
 			if vp.StatsLabel != nil {
 				vp.StatsLabel.SetText("Mean: -- | Std: --")
 			}
@@ -181,8 +178,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		if vp.StatsLabel != nil {
 			vp.StatsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f", stats.Mean, stats.Std))
 		}
-		vp.blackBox.SetText(fmt.Sprintf("%.3f", state.img.Black))
-		vp.whiteBox.SetText(fmt.Sprintf("%.3f", state.img.White))
+		vp.blackBox.SetValue(state.img.Black)
+		vp.whiteBox.SetValue(state.img.White)
 		vp.histogram.Refresh()
 		if vp.zoomLabel.Selected == "fit in preview" {
 			vp.zoom = vp.fitZoom()
@@ -230,21 +227,11 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		if state.img == nil {
 			return
 		}
-		if v, err := utils.ParseFloat(bgEntry.Text); err == nil {
-			state.img.Background = v
-		}
-		if v, err := utils.ParseFloat(peakEntry.Text); err == nil {
-			state.img.Peak = v
-		}
-		if v, err := utils.ParseFloat(sPeakEntry.Text); err == nil {
-			state.img.ScaledPeak = v
-		}
-		if v, err := utils.ParseFloat(vp.blackBox.Text); err == nil {
-			state.img.Black = v
-		}
-		if v, err := utils.ParseFloat(vp.whiteBox.Text); err == nil {
-			state.img.White = v
-		}
+		state.img.Background = bgEntry.Value()
+		state.img.Peak = peakEntry.Value()
+		state.img.ScaledPeak = sPeakEntry.Value()
+		state.img.Black = vp.blackBox.Value()
+		state.img.White = vp.whiteBox.Value()
 		refresh()
 	})
 
@@ -252,14 +239,9 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		if state.img == nil {
 			return
 		}
-		blackVal := state.img.Black
-		if v, err := utils.ParseFloat(vp.blackBox.Text); err == nil {
-			blackVal = v
-		}
-		whiteVal := state.img.White
-		if v, err := utils.ParseFloat(vp.whiteBox.Text); err == nil {
-			whiteVal = v
-		} else {
+		blackVal := vp.blackBox.Value()
+		whiteVal := vp.whiteBox.Value()
+		if whiteVal == 0 {
 			_, whiteVal = processing.AutoLevels(state.img.HDU.Data.Pixels)
 		}
 		state.img.Background = blackVal
@@ -267,11 +249,11 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		state.img.ScaledPeak = 10
 		state.img.White = whiteVal
 		state.img.Black = 0
-		vp.blackBox.SetText("0")
-		vp.whiteBox.SetText(fmt.Sprintf("%.2f", whiteVal))
-		bgEntry.SetText(fmt.Sprintf("%.2f", blackVal))
-		peakEntry.SetText(fmt.Sprintf("%.2f", whiteVal))
-		sPeakEntry.SetText("10")
+		vp.blackBox.SetValue(0)
+		vp.whiteBox.SetValue(whiteVal)
+		bgEntry.SetValue(blackVal)
+		peakEntry.SetValue(whiteVal)
+		sPeakEntry.SetValue(10)
 		refresh()
 	})
 
@@ -351,21 +333,11 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		}
 		// Snapshot the current UI values into a copy of the image.
 		imgCopy := *state.img
-		if v, err := utils.ParseFloat(vp.blackBox.Text); err == nil {
-			imgCopy.Black = v
-		}
-		if v, err := utils.ParseFloat(vp.whiteBox.Text); err == nil {
-			imgCopy.White = v
-		}
-		if v, err := utils.ParseFloat(bgEntry.Text); err == nil {
-			imgCopy.Background = v
-		}
-		if v, err := utils.ParseFloat(peakEntry.Text); err == nil {
-			imgCopy.Peak = v
-		}
-		if v, err := utils.ParseFloat(sPeakEntry.Text); err == nil {
-			imgCopy.ScaledPeak = v
-		}
+		imgCopy.Black = vp.blackBox.Value()
+		imgCopy.White = vp.whiteBox.Value()
+		imgCopy.Background = bgEntry.Value()
+		imgCopy.Peak = peakEntry.Value()
+		imgCopy.ScaledPeak = sPeakEntry.Value()
 		idx := channelSelect.SelectedIndex()
 		if idx < 0 {
 			idx = 0

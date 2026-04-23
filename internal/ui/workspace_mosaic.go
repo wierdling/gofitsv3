@@ -17,6 +17,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 
@@ -141,24 +142,54 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	var starModeRefResult *mosaic.Result
 	stretchMode := stretch.Asinh
 
-	blackEntry := widget.NewEntry()
-	whiteEntry := widget.NewEntry()
-	bgEntry := widget.NewEntry()
-	peakEntry := widget.NewEntry()
-	scaledPeakEntry := widget.NewEntry()
+	var mosaicBins [256]int
+	mosaicHistogram := canvas.NewRaster(func(w, h int) image.Image {
+		img := image.NewRGBA(image.Rect(0, 0, w, h))
+		for i := range img.Pix {
+			img.Pix[i] = 255
+		}
+		maxCount := 0
+		for _, c := range mosaicBins {
+			if c > maxCount {
+				maxCount = c
+			}
+		}
+		if maxCount == 0 {
+			return img
+		}
+		for i, c := range mosaicBins {
+			x := i * w / len(mosaicBins)
+			barH := int(float64(c) / float64(maxCount) * float64(h))
+			for y := h - 1; y >= h-barH; y-- {
+				idx := y*img.Stride + x*4
+				img.Pix[idx] = 80
+				img.Pix[idx+1] = 80
+				img.Pix[idx+2] = 80
+				img.Pix[idx+3] = 255
+			}
+		}
+		return img
+	})
+	mosaicHistogram.SetMinSize(fyne.NewSize(200, 48))
 
-	blackEntry.SetText("0.0000")
-	whiteEntry.SetText("1.0000")
-	bgEntry.SetText("0.0000")
-	peakEntry.SetText("1000.0")
-	scaledPeakEntry.SetText("1000.0")
+	blackEntry := NewNumberEntry(0.001, 4)
+	whiteEntry := NewNumberEntry(0.001, 4)
+	bgEntry := NewNumberEntry(0.001, 4)
+	peakEntry := NewNumberEntry(1, 1)
+	scaledPeakEntry := NewNumberEntry(1, 1)
+
+	blackEntry.SetValue(0)
+	whiteEntry.SetValue(1)
+	bgEntry.SetValue(0)
+	peakEntry.SetValue(1000)
+	scaledPeakEntry.SetValue(1000)
 
 	parseLevelEntries := func() (black, white, bg, peak, scaledPeak float64) {
-		black, _ = strconv.ParseFloat(strings.TrimSpace(blackEntry.Text), 64)
-		white, _ = strconv.ParseFloat(strings.TrimSpace(whiteEntry.Text), 64)
-		bg, _ = strconv.ParseFloat(strings.TrimSpace(bgEntry.Text), 64)
-		peak, _ = strconv.ParseFloat(strings.TrimSpace(peakEntry.Text), 64)
-		scaledPeak, _ = strconv.ParseFloat(strings.TrimSpace(scaledPeakEntry.Text), 64)
+		black = blackEntry.Value()
+		white = whiteEntry.Value()
+		bg = bgEntry.Value()
+		peak = peakEntry.Value()
+		scaledPeak = scaledPeakEntry.Value()
 		if peak <= 0 {
 			peak = 1000
 		}
@@ -184,12 +215,12 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	var loadLevelPrefsAndMode func(string) bool
 
 	autoLevels := func(pixels []float32) {
-		minV, maxV := processing.AutoLevels(pixels)
-		blackEntry.SetText(fmt.Sprintf("%.4f", minV))
-		whiteEntry.SetText(fmt.Sprintf("%.4f", maxV))
-		bgEntry.SetText(fmt.Sprintf("%.4f", minV))
-		peakEntry.SetText(fmt.Sprintf("%.4f", maxV))
-		scaledPeakEntry.SetText(fmt.Sprintf("%.4f", maxV))
+		black, white, bg, peak := processing.SmartLevels(pixels)
+		blackEntry.SetValue(black)
+		whiteEntry.SetValue(white)
+		bgEntry.SetValue(bg)
+		peakEntry.SetValue(peak)
+		scaledPeakEntry.SetValue(10)
 		levelsSet = true
 	}
 
@@ -209,11 +240,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			return
 		}
 		data, err := json.Marshal(savedLevels{
-			Black:      blackEntry.Text,
-			White:      whiteEntry.Text,
-			Background: bgEntry.Text,
-			Peak:       peakEntry.Text,
-			ScaledPeak: scaledPeakEntry.Text,
+			Black:      fmt.Sprintf("%.4f", blackEntry.Value()),
+			White:      fmt.Sprintf("%.4f", whiteEntry.Value()),
+			Background: fmt.Sprintf("%.4f", bgEntry.Value()),
+			Peak:       fmt.Sprintf("%.4f", peakEntry.Value()),
+			ScaledPeak: fmt.Sprintf("%.4f", scaledPeakEntry.Value()),
 			Mode:       modeNameForMode(stretchMode),
 		})
 		if err == nil {
@@ -270,6 +301,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		preview.Image = blankImg()
 		preview.Refresh()
 		statsLabel.SetText("Mean: -- | Std: -- | Size: --")
+		mosaicBins = [256]int{}
+		mosaicHistogram.Refresh()
 	}
 	var rebuildOffsetControls func()
 
@@ -437,9 +470,13 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			preview.Image = img
 			preview.Refresh()
 			stats := histogram.Compute(state.result.Pixels)
+			mosaicBins = stats.Hist
+			mosaicHistogram.Refresh()
 			statsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f | Size: %dx%d", stats.Mean, stats.Std, state.result.Width, state.result.Height))
 		} else {
 			statsLabel.SetText("Mean: -- | Std: -- | Size: --")
+			mosaicBins = [256]int{}
+			mosaicHistogram.Refresh()
 		}
 
 		starPanelScroll.Hide()
@@ -663,6 +700,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			img := buildMosaicPreviewImageWithLevels(state.result, black, white, bg, peak, scaledPeak, stretchMode)
 			preview.Image = img
 			preview.Refresh()
+			stats := histogram.Compute(state.result.Pixels)
+			mosaicBins = stats.Hist
+			mosaicHistogram.Refresh()
 		}
 
 		measurePanelScroll.Hide()
@@ -1503,6 +1543,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			preview.Image = img
 			preview.Refresh()
 			stats := histogram.Compute(result.Pixels)
+			mosaicBins = stats.Hist
+			mosaicHistogram.Refresh()
 			statsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f | Size: %dx%d", stats.Mean, stats.Std, result.Width, result.Height))
 			updateZoom()
 		})
@@ -1638,11 +1680,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		state.statuses = nil
 		activeFilter = ""
 		levelsSet = false
-		blackEntry.SetText("0.0000")
-		whiteEntry.SetText("1.0000")
-		bgEntry.SetText("0.0000")
-		peakEntry.SetText("1000.0")
-		scaledPeakEntry.SetText("1000.0")
+		blackEntry.SetValue(0)
+		whiteEntry.SetValue(1)
+		bgEntry.SetValue(0)
+		peakEntry.SetValue(1000)
+		scaledPeakEntry.SetValue(1000)
 		updateStatus()
 		resetPreview()
 		rebuildOffsetControls()
@@ -1669,13 +1711,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	modeSelect.SetSelected("Asinh")
 	levelsForm := widget.NewForm(
 		widget.NewFormItem("Mode", modeSelect),
-		widget.NewFormItem("Black", blackEntry),
-		widget.NewFormItem("White", whiteEntry),
 		widget.NewFormItem("Background", bgEntry),
 		widget.NewFormItem("Peak", peakEntry),
 		widget.NewFormItem("Scaled Peak", scaledPeakEntry),
 	)
-	autoLevelsBtn := widget.NewButton("Auto Levels", func() {
+	autoLevelsBtn := widget.NewButton("Auto Scaling", func() {
 		if state.result != nil {
 			autoLevels(state.result.Pixels)
 			applyLevelsToPreview()
@@ -1684,7 +1724,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			applyLevelsToPreview()
 		}
 	})
-	applyLevelsBtn := widget.NewButton("Apply", func() {
+	applyLevelsBtn := widget.NewButton("Apply Values", func() {
 		applyLevelsToPreview()
 		saveLevelPrefs()
 	})
@@ -1707,11 +1747,21 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		if err := json.Unmarshal([]byte(raw), &sl); err != nil {
 			return false
 		}
-		blackEntry.SetText(sl.Black)
-		whiteEntry.SetText(sl.White)
-		bgEntry.SetText(sl.Background)
-		peakEntry.SetText(sl.Peak)
-		scaledPeakEntry.SetText(sl.ScaledPeak)
+		if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.Black), 64); err2 == nil {
+			blackEntry.SetValue(v)
+		}
+		if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.White), 64); err2 == nil {
+			whiteEntry.SetValue(v)
+		}
+		if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.Background), 64); err2 == nil {
+			bgEntry.SetValue(v)
+		}
+		if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.Peak), 64); err2 == nil {
+			peakEntry.SetValue(v)
+		}
+		if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.ScaledPeak), 64); err2 == nil {
+			scaledPeakEntry.SetValue(v)
+		}
 		if sl.Mode != "" {
 			modeSelect.SetSelected(sl.Mode)
 		}
@@ -1750,6 +1800,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	})
 
 	controls := container.NewVBox(
+		widget.NewLabel("Preview Levels"),
+		levelsForm,
+		container.NewGridWithColumns(2, autoLevelsBtn, applyLevelsBtn),
+		widget.NewSeparator(),
 		widget.NewLabel("Mosaic / Drizzle"),
 		container.NewGridWithColumns(2, loadBtn, batchBtn),
 		savePreviewCheck,
@@ -1770,10 +1824,6 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		widget.NewSeparator(),
 		widget.NewLabel("Input Status"),
 		statusScroll,
-		widget.NewSeparator(),
-		widget.NewLabel("Preview Levels"),
-		levelsForm,
-		container.NewGridWithColumns(2, autoLevelsBtn, applyLevelsBtn),
 	)
 
 	// Now assign all the variables that enterStarMode/exitStarMode need.
@@ -1929,17 +1979,20 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		updateZoom()
 	})
 
-	zoomRow := container.NewBorder(nil, nil,
+	previewHeader := container.NewVBox(
+		mosaicHistogram,
+		statsLabel,
 		container.NewHBox(
-			widget.NewLabel("Zoom:"),
+			layout.NewSpacer(),
+			widget.NewLabel("Black"),
+			blackEntry,
 			zoomOutBtn,
 			zoomSelect,
 			zoomInBtn,
-			zoomCustomEntry,
-			widget.NewButton("Apply", func() { applyCustomZoom() }),
+			widget.NewLabel("White"),
+			whiteEntry,
+			layout.NewSpacer(),
 		),
-		nil,
-		statsLabel,
 	)
 
 	// Default to "fit in preview" on startup.
@@ -2117,13 +2170,13 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		})
 	}
 
-	settingsMenu := fyne.NewMenu("Settings",
-		fyne.NewMenuItem("Drizzle...", openDrizzleSettings),
-		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Save Project", saveMosaicProject),
+	settingsMenu := fyne.NewMenu("Mosaic",
 		fyne.NewMenuItem("Load Project", loadMosaicProject),
+		fyne.NewMenuItem("Save Project", saveMosaicProject),
+		fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem("Drizzle...", openDrizzleSettings),
 	)
-	previewPane := container.NewBorder(zoomRow, nil, nil, nil, previewSwap)
+	previewPane := container.NewBorder(previewHeader, nil, nil, nil, previewSwap)
 	split := container.NewHSplit(leftStack, previewPane)
 	split.SetOffset(0.38)
 	return split, settingsMenu

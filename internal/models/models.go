@@ -8,6 +8,13 @@ import (
 	"gofitsv3/internal/stretch"
 )
 
+// NumberField is implemented by numeric input widgets (e.g. NumberEntry).
+type NumberField interface {
+	fyne.CanvasObject
+	SetValue(float64)
+	Value() float64
+}
+
 type LoadedImage struct {
 	Path       string
 	HDU        fitsio.HDU
@@ -83,9 +90,9 @@ type MosaicProject struct {
 type ChannelControl struct {
 	Content         fyne.CanvasObject
 	ModeSelect      *widget.Select
-	BackgroundEntry *widget.Entry
-	PeakEntry       *widget.Entry
-	ScaledPeakEntry *widget.Entry
+	BackgroundEntry NumberField
+	PeakEntry       NumberField
+	ScaledPeakEntry NumberField
 	ShowClip        *widget.Check
 }
 

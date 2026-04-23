@@ -231,6 +231,23 @@ func HistogramRGB(buf []byte) [3]histogram.Stats {
 	return stats
 }
 
+// SmartLevels returns good initial stretch and display parameters for an astronomical image.
+// black/white are display clip points; background/peak are stretch zero and shoulder values.
+func SmartLevels(pixels []float32) (black, white, background, peak float64) {
+	if len(pixels) == 0 {
+		return 0, 1, 0, 1
+	}
+	stats := histogram.Compute(pixels)
+	bg, _ := EstimateBackground(pixels)
+	black, white = histogram.PercentileClip(stats, 0.1, 99.9)
+	_, peak = histogram.PercentileClip(stats, 0, 99.5)
+	background = bg
+	if peak <= background {
+		peak = background + 1
+	}
+	return
+}
+
 func AutoLevels(pixels []float32) (float64, float64) {
 	if len(pixels) == 0 {
 		return 0, 1

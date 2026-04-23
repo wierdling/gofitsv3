@@ -25,8 +25,8 @@ type viewport struct {
 	zoomLabel     *widget.Select
 	zoomOut       *widget.Button
 	zoomIn        *widget.Button
-	blackBox      *widget.Entry
-	whiteBox      *widget.Entry
+	blackBox      *NumberEntry
+	whiteBox      *NumberEntry
 	container     fyne.CanvasObject
 	zoom          float64
 	origW         int
@@ -35,7 +35,9 @@ type viewport struct {
 	overlay       *viewerInteractionLayer
 	bins          [256]int
 	customZoom    string
+	histColor     [4]uint8 // bar color; if zero, use default white-bg/gray-bar style
 	StatsLabel    *widget.Label
+	actionRow     *fyne.Container
 	onViewChanged func()
 }
 
@@ -55,12 +57,8 @@ func newViewport() *viewport {
 	overlay.scroll = vp.scroll
 	vp.scroll.SetMinSize(fyne.NewSize(260, 180))
 
-	vp.blackBox = widget.NewEntry()
-	vp.blackBox.SetPlaceHolder("000000")
-	vp.blackBox.SetText("--")
-	vp.whiteBox = widget.NewEntry()
-	vp.whiteBox.SetPlaceHolder("000000")
-	vp.whiteBox.SetText("--")
+	vp.blackBox = NewNumberEntry(0.001, 4)
+	vp.whiteBox = NewNumberEntry(0.001, 4)
 	vp.zoomLabel = widget.NewSelect([]string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}, func(s string) {
 		vp.setZoomFromSelect(s)
 	})
@@ -71,26 +69,43 @@ func newViewport() *viewport {
 	vp.StatsLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.StatsLabel.Alignment = fyne.TextAlignCenter
 
+	vp.actionRow = container.NewHBox(layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer())
+
 	header := container.NewVBox(
 		vp.histogram,
-		vp.StatsLabel,
-		container.NewHBox(
-			layout.NewSpacer(),
-			widget.NewLabel("Black"),
-			container.New(layout.NewGridWrapLayout(fyne.NewSize(110, vp.blackBox.MinSize().Height)), vp.blackBox),
-			vp.zoomOut,
-			vp.zoomLabel,
-			vp.zoomIn,
-			widget.NewLabel("White"),
-			container.New(layout.NewGridWrapLayout(fyne.NewSize(110, vp.whiteBox.MinSize().Height)), vp.whiteBox),
-			layout.NewSpacer(),
-		),
+		vp.actionRow,
 	)
-	vp.container = container.NewBorder(header, nil, nil, nil, vp.scroll)
+	footer := container.NewHBox(
+		layout.NewSpacer(),
+		widget.NewLabel("Black"),
+		vp.blackBox,
+		vp.zoomOut,
+		vp.zoomLabel,
+		vp.zoomIn,
+		widget.NewLabel("White"),
+		vp.whiteBox,
+		layout.NewSpacer(),
+	)
+	vp.container = container.NewBorder(header, footer, nil, nil, vp.scroll)
 
 	vp.zoomLabel.SetSelected("fit in preview")
 
 	return vp
+}
+
+func (vp *viewport) SetCenterAction(label string, fn func()) {
+	btn := widget.NewButton(label, fn)
+	vp.actionRow.Objects = []fyne.CanvasObject{layout.NewSpacer(), btn, layout.NewSpacer()}
+	vp.actionRow.Refresh()
+}
+
+func (vp *viewport) SetLoadSave(loadFn, saveFn func()) {
+	loadBtn := widget.NewButton("Load", loadFn)
+	saveBtn := widget.NewButton("Save", saveFn)
+	vp.actionRow.Objects = []fyne.CanvasObject{
+		loadBtn, layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer(), saveBtn,
+	}
+	vp.actionRow.Refresh()
 }
 
 func isPresetZoom(option string) bool {
@@ -188,9 +203,20 @@ func (vp *viewport) fitZoom() float64 {
 
 func (vp *viewport) drawHist(w, h int) image.Image {
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	for i := range img.Pix {
-		img.Pix[i] = 255
+
+	colored := vp.histColor[3] > 0
+	if colored {
+		// black background — img.Pix is already zero (transparent), set alpha
+		for i := 3; i < len(img.Pix); i += 4 {
+			img.Pix[i] = 255
+		}
+	} else {
+		// white background
+		for i := range img.Pix {
+			img.Pix[i] = 255
+		}
 	}
+
 	maxCount := 0
 	for _, c := range vp.bins {
 		if c > maxCount {
@@ -200,14 +226,22 @@ func (vp *viewport) drawHist(w, h int) image.Image {
 	if maxCount == 0 {
 		return img
 	}
+
+	var r, g, b uint8
+	if colored {
+		r, g, b = vp.histColor[0], vp.histColor[1], vp.histColor[2]
+	} else {
+		r, g, b = 80, 80, 80
+	}
+
 	for i, c := range vp.bins {
 		x := i * w / len(vp.bins)
 		barH := int(float64(c) / float64(maxCount) * float64(h))
 		for y := h - 1; y >= h-barH; y-- {
-			idx := (y*img.Stride + x*4)
-			img.Pix[idx] = 80
-			img.Pix[idx+1] = 80
-			img.Pix[idx+2] = 80
+			idx := y*img.Stride + x*4
+			img.Pix[idx] = r
+			img.Pix[idx+1] = g
+			img.Pix[idx+2] = b
 			img.Pix[idx+3] = 255
 		}
 	}
