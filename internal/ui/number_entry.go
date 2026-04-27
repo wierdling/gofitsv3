@@ -12,15 +12,15 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// chevron SVGs — white fill so Fyne's theme engine recolors them correctly.
-var chevronUpResource = fyne.NewStaticResource("chevron-up.svg", []byte(
-	`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 8">` +
-		`<path d="M0 7 L6 1 L12 7 L10 7 L6 3 L2 7 Z" fill="#ffffff"/>` +
+// triangle SVGs — solid filled triangles, white fill.
+var chevronUpResource = fyne.NewStaticResource("tri-up.svg", []byte(
+	`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 8">` +
+		`<path d="M5 0 L10 8 L0 8 Z" fill="#ffffff"/>` +
 		`</svg>`))
 
-var chevronDownResource = fyne.NewStaticResource("chevron-down.svg", []byte(
-	`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 8">` +
-		`<path d="M0 1 L6 7 L12 1 L10 1 L6 5 L2 1 Z" fill="#ffffff"/>` +
+var chevronDownResource = fyne.NewStaticResource("tri-down.svg", []byte(
+	`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 8">` +
+		`<path d="M5 8 L10 0 L0 0 Z" fill="#ffffff"/>` +
 		`</svg>`))
 
 // chevronBtn is a minimal tappable icon — no button chrome, sized explicitly.
@@ -47,6 +47,27 @@ func (b *chevronBtn) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(img)
 }
 
+// selectAllEntry is a widget.Entry that selects all text when it gains focus.
+type selectAllEntry struct {
+	widget.Entry
+}
+
+func newSelectAllEntry() *selectAllEntry {
+	e := &selectAllEntry{}
+	e.ExtendBaseWidget(e)
+	return e
+}
+
+func (e *selectAllEntry) FocusGained() {
+	e.Entry.FocusGained()
+	e.TypedShortcut(&fyne.ShortcutSelectAll{})
+}
+
+func (e *selectAllEntry) Tapped(ev *fyne.PointEvent) {
+	e.Entry.Tapped(ev)
+	e.TypedShortcut(&fyne.ShortcutSelectAll{})
+}
+
 // NumberEntry is a compact numeric input with chevron step buttons and a clear
 // button that resets the value to zero.
 type NumberEntry struct {
@@ -58,9 +79,13 @@ type NumberEntry struct {
 	Decimals int
 	// OnChanged is called whenever the value changes (button click or manual edit).
 	OnChanged func(float64)
+	// MinWidth overrides the default 180-pixel minimum. When > 0, the entry is at
+	// least max(content natural min, MinWidth) wide. Set to 1 to get the natural
+	// content minimum with no extra enforcement.
+	MinWidth float32
 
 	value    float64
-	entry    *widget.Entry
+	entry    *selectAllEntry
 	upBtn    *chevronBtn
 	downBtn  *chevronBtn
 	clearBtn *widget.Button
@@ -75,7 +100,7 @@ func NewNumberEntry(step float64, decimals int) *NumberEntry {
 	}
 	n.ExtendBaseWidget(n)
 
-	n.entry = widget.NewEntry()
+	n.entry = newSelectAllEntry()
 	n.entry.OnChanged = func(s string) {
 		v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
 		if err != nil {
@@ -105,8 +130,8 @@ func NewNumberEntry(step float64, decimals int) *NumberEntry {
 	n.clearBtn.Importance = widget.LowImportance
 
 	btnSide := container.NewHBox(
-		container.NewCenter(container.NewVBox(n.upBtn, n.downBtn)),
 		n.clearBtn,
+		container.NewCenter(container.NewVBox(n.upBtn, n.downBtn)),
 	)
 	n.content = container.NewBorder(nil, nil, nil, btnSide, n.entry)
 
@@ -153,10 +178,13 @@ func (n *NumberEntry) syncText() {
 
 func (n *NumberEntry) MinSize() fyne.Size {
 	s := n.content.MinSize()
-	// Fyne Entry.MinSize ignores placeholder width; enforce enough room for 10 chars + buttons.
-	const minWidth float32 = 180
-	if s.Width < minWidth {
-		s.Width = minWidth
+	// Fyne Entry.MinSize ignores placeholder width; enforce enough room for content.
+	minW := n.MinWidth
+	if minW <= 0 {
+		minW = 180 // default: enough room for ~10 chars + buttons
+	}
+	if s.Width < minW {
+		s.Width = minW
 	}
 	return s
 }

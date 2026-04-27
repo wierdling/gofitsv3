@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"math"
 	"strconv"
 	"strings"
@@ -11,8 +12,153 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
+
+// hpad returns a fixed-width invisible spacer for horizontal edge padding.
+func hpad(w float32) fyne.CanvasObject {
+	r := canvas.NewRectangle(color.Transparent)
+	r.SetMinSize(fyne.NewSize(w, 0))
+	return r
+}
+
+// vpad returns a fixed-height invisible spacer for vertical padding.
+func vpad(h float32) fyne.CanvasObject {
+	r := canvas.NewRectangle(color.Transparent)
+	r.SetMinSize(fyne.NewSize(0, h))
+	return r
+}
+
+// ─── chanBadge ───────────────────────────────────────────────────────────────
+
+type chanBadge struct {
+	widget.BaseWidget
+	letter string
+	col    color.Color
+}
+
+func newChanBadge(letter string, col color.Color) *chanBadge {
+	b := &chanBadge{letter: letter, col: col}
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+func (b *chanBadge) MinSize() fyne.Size {
+	s := theme.TextSize() + 2
+	return fyne.NewSize(s, s)
+}
+
+func (b *chanBadge) CreateRenderer() fyne.WidgetRenderer {
+	bg := canvas.NewRectangle(b.col)
+	bg.CornerRadius = 4
+	txt := canvas.NewText(b.letter, color.White)
+	txt.TextSize = theme.TextSize() - 1
+	txt.TextStyle = fyne.TextStyle{Bold: true}
+	return &chanBadgeRenderer{b: b, bg: bg, txt: txt}
+}
+
+type chanBadgeRenderer struct {
+	b   *chanBadge
+	bg  *canvas.Rectangle
+	txt *canvas.Text
+}
+
+func (r *chanBadgeRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.bg, r.txt}
+}
+func (r *chanBadgeRenderer) MinSize() fyne.Size {
+	s := theme.TextSize() + 2
+	return fyne.NewSize(s, s)
+}
+func (r *chanBadgeRenderer) Layout(size fyne.Size) {
+	s := theme.TextSize() + 2
+	x := (size.Width - s) / 2
+	y := (size.Height - s) / 2
+	r.bg.Move(fyne.NewPos(x, y))
+	r.bg.Resize(fyne.NewSize(s, s))
+	ts := r.txt.MinSize()
+	r.txt.Move(fyne.NewPos(x+(s-ts.Width)/2, y+(s-ts.Height)/2))
+	r.txt.Resize(ts)
+}
+func (r *chanBadgeRenderer) Refresh() {
+	r.bg.FillColor = r.b.col
+	r.txt.Color = color.White
+	r.bg.Refresh()
+	r.txt.Refresh()
+}
+func (r *chanBadgeRenderer) Destroy() {}
+
+// ─── compactBtn ──────────────────────────────────────────────────────────────
+
+const (
+	compactVPad float32 = 5
+	compactHPad float32 = 10
+)
+
+type compactBtn struct {
+	widget.BaseWidget
+	text  string
+	onTap func()
+}
+
+func newCompactBtn(text string, onTap func()) *compactBtn {
+	b := &compactBtn{text: text, onTap: onTap}
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+func (b *compactBtn) Tapped(_ *fyne.PointEvent) {
+	if b.onTap != nil {
+		b.onTap()
+	}
+}
+func (b *compactBtn) TappedSecondary(_ *fyne.PointEvent) {}
+
+func (b *compactBtn) CreateRenderer() fyne.WidgetRenderer {
+	bg := canvas.NewRectangle(theme.ButtonColor())
+	bg.CornerRadius = 4
+	txt := canvas.NewText(b.text, theme.ForegroundColor())
+	txt.TextSize = theme.TextSize()
+	return &compactBtnRenderer{btn: b, bg: bg, txt: txt}
+}
+
+type compactBtnRenderer struct {
+	btn *compactBtn
+	bg  *canvas.Rectangle
+	txt *canvas.Text
+}
+
+func (r *compactBtnRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.bg, r.txt}
+}
+func (r *compactBtnRenderer) MinSize() fyne.Size {
+	ts := r.txt.MinSize()
+	return fyne.NewSize(ts.Width+compactHPad*2, ts.Height+compactVPad*2)
+}
+func (r *compactBtnRenderer) Layout(size fyne.Size) {
+	ms := r.MinSize()
+	x := (size.Width - ms.Width) / 2
+	if x < 0 {
+		x = 0
+	}
+	y := (size.Height - ms.Height) / 2
+	if y < 0 {
+		y = 0
+	}
+	r.bg.Move(fyne.NewPos(x, y))
+	r.bg.Resize(ms)
+	ts := r.txt.MinSize()
+	r.txt.Move(fyne.NewPos(x+(ms.Width-ts.Width)/2, y+(ms.Height-ts.Height)/2))
+	r.txt.Resize(ts)
+}
+func (r *compactBtnRenderer) Refresh() {
+	r.bg.FillColor = theme.ButtonColor()
+	r.txt.Color = theme.ForegroundColor()
+	r.bg.Refresh()
+	r.txt.Refresh()
+}
+func (r *compactBtnRenderer) Destroy() {}
 
 type imagePoint struct {
 	X int
@@ -72,10 +218,13 @@ func newViewport() *viewport {
 	vp.actionRow = container.NewHBox(layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer())
 
 	header := container.NewVBox(
-		vp.histogram,
+		vpad(4),
 		vp.actionRow,
+		vpad(4),
+		vp.histogram,
 	)
-	footer := container.NewHBox(
+	footerRow := container.NewHBox(
+		hpad(6),
 		layout.NewSpacer(),
 		widget.NewLabel("Black"),
 		vp.blackBox,
@@ -85,7 +234,9 @@ func newViewport() *viewport {
 		widget.NewLabel("White"),
 		vp.whiteBox,
 		layout.NewSpacer(),
+		hpad(6),
 	)
+	footer := container.NewVBox(footerRow, vpad(5))
 	vp.container = container.NewBorder(header, footer, nil, nil, vp.scroll)
 
 	vp.zoomLabel.SetSelected("fit in preview")
@@ -93,17 +244,28 @@ func newViewport() *viewport {
 	return vp
 }
 
-func (vp *viewport) SetCenterAction(label string, fn func()) {
-	btn := widget.NewButton(label, fn)
-	vp.actionRow.Objects = []fyne.CanvasObject{layout.NewSpacer(), btn, layout.NewSpacer()}
+func (vp *viewport) SetLoadSave(chanLabel, letter string, col color.Color, loadFn, saveFn func()) {
+	badge := newChanBadge(letter, col)
+	nameText := canvas.NewText(chanLabel, col)
+	nameText.TextSize = theme.TextSize()
+	nameText.TextStyle = fyne.TextStyle{Bold: true}
+	vp.actionRow.Objects = []fyne.CanvasObject{
+		hpad(6), badge, hpad(4), nameText,
+		layout.NewSpacer(),
+		vp.StatsLabel, hpad(6), newCompactBtn("Load", loadFn), newCompactBtn("Save", saveFn), hpad(6),
+	}
 	vp.actionRow.Refresh()
 }
 
-func (vp *viewport) SetLoadSave(loadFn, saveFn func()) {
-	loadBtn := widget.NewButton("Load", loadFn)
-	saveBtn := widget.NewButton("Save", saveFn)
+func (vp *viewport) SetCenterAction(chanLabel, letter string, col color.Color, actionLabel string, fn func()) {
+	badge := newChanBadge(letter, col)
+	nameText := canvas.NewText(chanLabel, col)
+	nameText.TextSize = theme.TextSize()
+	nameText.TextStyle = fyne.TextStyle{Bold: true}
 	vp.actionRow.Objects = []fyne.CanvasObject{
-		loadBtn, layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer(), saveBtn,
+		hpad(6), badge, hpad(4), nameText,
+		layout.NewSpacer(),
+		vp.StatsLabel, hpad(6), newCompactBtn(actionLabel, fn), hpad(6),
 	}
 	vp.actionRow.Refresh()
 }

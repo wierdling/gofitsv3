@@ -13,11 +13,25 @@ import (
 	"gofitsv3/internal/version"
 )
 
+// appTheme wraps the dark theme and widens the inner padding so button text
+// has more breathing room on the left and right.
+type appTheme struct{ fyne.Theme }
+
+func (t appTheme) Size(name fyne.ThemeSizeName) float32 {
+	switch name {
+	case theme.SizeNameInnerPadding:
+		return 5 // default is 4; gives TextSize+10 control height
+	case theme.SizeNameInputRadius:
+		return 10 // default is 5; rounder button and input corners
+	}
+	return t.Theme.Size(name)
+}
+
 // Run starts the Fyne application.
 func Run() error {
 	a := app.NewWithID("gofitsv3")
 	a.SetIcon(fyne.NewStaticResource("icon.png", iconBytes))
-	a.Settings().SetTheme(theme.DarkTheme())
+	a.Settings().SetTheme(&appTheme{theme.DarkTheme()})
 
 	win := a.NewWindow("Go Fits V3 - " + version.Version)
 

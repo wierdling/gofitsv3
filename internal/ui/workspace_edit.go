@@ -91,9 +91,11 @@ func (es *editWorkspaceState) applyEdits() {
 		img = processing.ApplyCurvesRGBA(img, rLUT, gLUT, bLUT)
 		img = processing.SharpenRGBA(img, strength, radius)
 
-		prog.Hide()
-		es.canvasImg.Image = img
-		es.canvasImg.Refresh()
+		fyne.Do(func() {
+			prog.Hide()
+			es.canvasImg.Image = img
+			es.canvasImg.Refresh()
+		})
 	}()
 }
 
@@ -424,7 +426,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 
 	zoomOutBtn := widget.NewButton("-", func() { es.stepZoom(1.0 / 1.15) })
 	zoomInBtn := widget.NewButton("+", func() { es.stepZoom(1.15) })
-	zoomBar := container.NewHBox(zoomOutBtn, es.zoomSelect, zoomInBtn)
+	zoomBar := container.NewCenter(container.NewHBox(zoomOutBtn, es.zoomSelect, zoomInBtn))
 	rightPanel := container.NewBorder(zoomBar, nil, nil, nil, es.imgScroll)
 
 	// --- Level sliders (0–255) ---
@@ -550,21 +552,25 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 			format := export.PNG
 			lower := strings.ToLower(path)
 			switch {
+			case strings.HasSuffix(lower, ".webp"):
+				format = export.WEBP
 			case strings.HasSuffix(lower, ".tif"), strings.HasSuffix(lower, ".tiff"):
 				format = export.TIFF
 			case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
 				format = export.JPEG
 			}
-			if err := export.FromImage(path, rgba, format, export.Options{Quality: 92}); err != nil {
-				dialog.ShowError(err, win)
-			}
+			showExportOptionsDialog(format, win, func(opts export.Options) {
+				if err := export.FromImage(path, rgba, format, opts); err != nil {
+					dialog.ShowError(err, win)
+				}
+			})
 		}, win)
 		saveName := "edited.png"
 		if es.loadedName != "" {
 			saveName = es.loadedName
 		}
 		save.SetFileName(saveName)
-		save.SetFilter(storage.NewExtensionFileFilter([]string{".png", ".jpg", ".jpeg", ".tif", ".tiff"}))
+		save.SetFilter(storage.NewExtensionFileFilter([]string{".png", ".webp", ".jpg", ".jpeg", ".tif", ".tiff"}))
 		save.Show()
 	})
 
@@ -626,11 +632,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 		}
 	}
 
-	controls := container.NewVBox(
-		loadBtn,
-		widget.NewSeparator(),
-
-		widget.NewLabelWithStyle("RGB Levels", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+	levelsTab := container.NewTabItem("Levels", container.NewVBox(
 		widget.NewLabel("Red"),
 		es.rgbHists[0],
 		sliderRow("Min", es.rMinSlider, refreshHists),
@@ -643,30 +645,34 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 		es.rgbHists[2],
 		sliderRow("Min", es.bMinSlider, refreshHists),
 		sliderRow("Max", es.bMaxSlider, refreshHists),
-
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Curves", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+	))
+	curvesTab := container.NewTabItem("Curves", container.NewVBox(
 		es.curvesChannel,
 		es.curves,
-
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Sharpen", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+	))
+	sharpenTab := container.NewTabItem("Sharpen", container.NewVBox(
 		sliderRow("Strength", es.sharpSlider),
 		sliderRow("Radius", es.sharpRadiusSlider),
-
-		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Heal", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+	))
+	healTab := container.NewTabItem("Heal", container.NewVBox(
 		healToggleBtn,
 		es.healStatusLabel,
 		sliderRow("Brush Size", es.healBrushSlider),
 		healUndoBtn,
+	))
+	tabs := container.NewAppTabs(levelsTab, curvesTab, sharpenTab, healTab)
 
+	controls := container.NewVBox(
+		loadBtn,
+		widget.NewSeparator(),
+		tabs,
 		widget.NewSeparator(),
 		container.NewHBox(applyBtn, resetBtn),
 		saveBtn,
 	)
 
-	controlsScroll := container.NewVScroll(controls)
+	paddedControls := container.New(layout.NewCustomPaddedLayout(0, 0, 20, 20), controls)
+	controlsScroll := container.NewVScroll(paddedControls)
 	controlsScroll.SetMinSize(fyne.NewSize(280, 200))
 
 	split := container.NewHSplit(controlsScroll, rightPanel)

@@ -24,15 +24,16 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 	}
 
 	primary := file.HDUs[0].Header
+	inst, _ := instrument.FromHeader(primary)
 	sci := file.SelectSCI()
 	if len(sci) == 0 {
-		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file)
+		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst.BadDQBits)
 		return []Input{{Path: path, PrimaryHeader: primary, HDU: hdu}}, nil
 	}
 
 	inputs := make([]Input, 0, len(sci))
 	for i := range sci {
-		hdu := cleanSCIWithMatchingDQ(sci[i], file)
+		hdu := cleanSCIWithMatchingDQ(sci[i], file, inst.BadDQBits)
 		extver := sciExtNumber(hdu.Header, i+1)
 		d2iX, d2iY := loadD2ITables(file, extver)
 		inputs = append(inputs, Input{
@@ -42,6 +43,7 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 			HDU:           hdu,
 			D2IX:          d2iX,
 			D2IY:          d2iY,
+			ERRPixels:     loadERRPixels(file, extver),
 		})
 	}
 	return inputs, nil
@@ -102,10 +104,27 @@ func loadD2ITables(file *fitsio.File, sciExtver int) (d2iX, d2iY *processing.D2I
 	return
 }
 
+// loadERRPixels returns the pixel data from the ERR extension matching
+// sciExtver, or nil if no ERR extension exists. ERR EXTVER matches SCI EXTVER.
+func loadERRPixels(file *fitsio.File, sciExtver int) []float32 {
+	extver := fmt.Sprintf("%d", sciExtver)
+	hdu := file.GetHDUByExtVer("ERR", extver)
+	if hdu == nil {
+		hdu = file.GetHDU("ERR")
+	}
+	if hdu == nil || len(hdu.Data.Pixels) == 0 {
+		return nil
+	}
+	pixels := make([]float32, len(hdu.Data.Pixels))
+	copy(pixels, hdu.Data.Pixels)
+	return pixels
+}
+
 func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *fitsio.File) (fitsio.HDU, [][4][2]float64, error) {
+	inst, _ := instrument.FromHeader(primary)
 	cleaned := make([]fitsio.HDU, len(sci))
 	for i := range sci {
-		cleaned[i] = cleanSCIWithMatchingDQ(sci[i], file)
+		cleaned[i] = cleanSCIWithMatchingDQ(sci[i], file, inst.BadDQBits)
 	}
 
 	ref := cleaned[0]
@@ -165,7 +184,6 @@ func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *
 	// so a small value here is fine.  The value is taken from the instrument
 	// metadata so that detectors with wider inter-chip gaps (e.g. ACS/WFC)
 	// get a larger trim.
-	inst, _ := instrument.FromHeader(primary)
 	chipInnerTrim := inst.ChipInnerTrim
 
 	sums := make([]float32, width*height)
@@ -180,7 +198,7 @@ func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *
 					continue
 				}
 				refX, refY := processing.ApplyAffineTransform(transforms[i], float64(x), float64(y))
-				drizzlePixelSquare(sums, weights, width, height, refX-minX, refY-minY, 1, float32(val))
+				drizzlePixelSquare(sums, weights, width, height, refX-minX, refY-minY, 1, float32(val), 1.0)
 			}
 		}
 	}
@@ -251,16 +269,16 @@ func buildCombinedInputHeader(path string, primary, ref fitsio.Header, width, he
 	return fitsio.Header{Cards: cards}
 }
 
-func cleanSCIWithMatchingDQ(hdu fitsio.HDU, file *fitsio.File) fitsio.HDU {
+func cleanSCIWithMatchingDQ(hdu fitsio.HDU, file *fitsio.File, badBits uint32) fitsio.HDU {
 	dq := matchingDQHDU(file, hdu)
 	if dq == nil {
 		return hdu
 	}
-	mask, err := badpix.MaskFromDQ(hdu, *dq, 0)
+	mask, err := badpix.MaskFromDQ(hdu, *dq, badBits)
 	if err != nil {
 		return hdu
 	}
-	hdu.Data = badpix.InterpolateBicubic(hdu.Data, mask)
+	hdu.Data = badpix.RepairMaskedPixels(hdu.Data, mask)
 	return hdu
 }
 

@@ -491,13 +491,6 @@ func matchStarsByMutualProximity(refStars, targetStars []Star, maxStars int, max
 	return pairs
 }
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func pairBoundsTarget(pairs []MatchedPair) (width, height, diag float64) {
 	if len(pairs) == 0 {
 		return 0, 0, 0

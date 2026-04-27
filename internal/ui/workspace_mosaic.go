@@ -55,6 +55,61 @@ func (l *minWidthLayout) MinSize(obs []fyne.CanvasObject) fyne.Size {
 	return fyne.NewSize(w, h)
 }
 
+// fixedVSpacingLayout stacks its children vertically with an exact pixel gap between them.
+type fixedVSpacingLayout struct{ gap float32 }
+
+func (l *fixedVSpacingLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	y := float32(0)
+	for i, o := range objects {
+		if i > 0 {
+			y += l.gap
+		}
+		h := o.MinSize().Height
+		o.Move(fyne.NewPos(0, y))
+		o.Resize(fyne.NewSize(size.Width, h))
+		y += h
+	}
+}
+
+func (l *fixedVSpacingLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var w, h float32
+	for i, o := range objects {
+		if i > 0 {
+			h += l.gap
+		}
+		ms := o.MinSize()
+		if ms.Width > w {
+			w = ms.Width
+		}
+		h += ms.Height
+	}
+	return fyne.NewSize(w, h)
+}
+
+// sidePaddedLayout adds equal horizontal padding on the left and right of its single child.
+type sidePaddedLayout struct{ pad float32 }
+
+func (l *sidePaddedLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	for _, o := range objects {
+		o.Move(fyne.NewPos(l.pad, 0))
+		o.Resize(fyne.NewSize(size.Width-2*l.pad, size.Height))
+	}
+}
+
+func (l *sidePaddedLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var w, h float32
+	for _, o := range objects {
+		ms := o.MinSize()
+		if ms.Width > w {
+			w = ms.Width
+		}
+		if ms.Height > h {
+			h = ms.Height
+		}
+	}
+	return fyne.NewSize(w+2*l.pad, h)
+}
+
 type mosaicState struct {
 	inputs      []mosaic.Input
 	statuses    []mosaic.InputStatus
@@ -83,6 +138,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	offsetControls := container.NewVBox(widget.NewLabel("No FITS files loaded."))
 	offsetScroll := container.NewVScroll(offsetControls)
 	offsetScroll.SetMinSize(fyne.NewSize(260, 180))
+	offsetHeader := container.NewVBox()
 	saveBtn := widget.NewButton("Save Drizzle FITS", func() {})
 	saveBtn.Disable()
 	sendToExamineBtn := widget.NewButton("Send to Examine", func() {
@@ -215,12 +271,15 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	var loadLevelPrefsAndMode func(string) bool
 
 	autoLevels := func(pixels []float32) {
-		black, white, bg, peak := processing.SmartLevels(pixels)
-		blackEntry.SetValue(black)
-		whiteEntry.SetValue(white)
-		bgEntry.SetValue(bg)
-		peakEntry.SetValue(peak)
-		scaledPeakEntry.SetValue(10)
+		img := &models.LoadedImage{
+			HDU: fitsio.HDU{Data: fitsio.ImageData{Pixels: pixels}},
+		}
+		processing.AutoScaleLikeFitsLiberator(img)
+		blackEntry.SetValue(img.Black)
+		whiteEntry.SetValue(img.White)
+		bgEntry.SetValue(img.Background)
+		peakEntry.SetValue(img.Peak)
+		scaledPeakEntry.SetValue(img.ScaledPeak)
 		levelsSet = true
 	}
 
@@ -1093,9 +1152,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 	rebuildOffsetControls = func() {
 		offsetControls.Objects = nil
+		offsetHeader.Objects = nil
 		if len(state.inputs) == 0 {
 			offsetControls.Add(widget.NewLabel("No FITS files loaded."))
 			offsetControls.Refresh()
+			offsetHeader.Refresh()
 			return
 		}
 
@@ -1107,22 +1168,60 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		hdrLabel := func(text string) fyne.CanvasObject {
 			return widget.NewLabelWithStyle(text, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 		}
+
+		// Measure actual data-widget widths at runtime so the header cells match exactly.
+		compactEntry := NewNumberEntry(1, 2)
+		compactEntry.MinWidth = 1 // use the content's natural minimum (no extra enforcement)
+		entryColW := compactEntry.MinSize().Width
+
+		btnUpW := widget.NewButton("↑", nil).MinSize().Width
+		flashBtnW := widget.NewButton("Flash", nil).MinSize().Width
+		applyBtnW := widget.NewButton("Apply", nil).MinSize().Width
+		// Compute column width for lock/include: at least as wide as the label so text is not clipped.
+		checkNatW := container.NewCenter(widget.NewCheck("", nil)).MinSize().Width
+		lockColW := hdrLabel("Lock").MinSize().Width
+		if lockColW < checkNatW {
+			lockColW = checkNatW
+		}
+		inclColW := hdrLabel("Incl.").MinSize().Width
+		if inclColW < checkNatW {
+			inclColW = checkNatW
+		}
+
+		// hdrCell forces a header label to exactly the width of the corresponding data widget.
+		hdrCell := func(text string, w float32) fyne.CanvasObject {
+			return container.New(&minWidthLayout{w: w}, hdrLabel(text))
+		}
+		hdrSpace := func(w float32) fyne.CanvasObject {
+			r := canvas.NewRectangle(color.Transparent)
+			r.SetMinSize(fyne.NewSize(w, 1))
+			return r
+		}
+
 		header := container.NewHBox(
-			hdrLabel(""), hdrLabel(""),
+			hdrSpace(btnUpW), hdrSpace(btnUpW),
 			nameCell(hdrLabel("Name")),
-			hdrLabel("X"), hdrLabel("Y"), hdrLabel("Rot°"),
-			hdrLabel("Flash"), hdrLabel("Apply"),
-			hdrLabel("Lock"), hdrLabel("Incl."),
+			hdrCell("X", entryColW),
+			hdrCell("Y", entryColW),
+			hdrCell("Rot°", entryColW),
+			hdrCell("Flash", flashBtnW),
+			hdrCell("Apply", applyBtnW),
+			hdrCell("Lock", lockColW),
+			hdrCell("Incl.", inclColW),
 		)
-		offsetControls.Add(header)
+		offsetHeader.Add(header)
+		offsetHeader.Refresh()
 
 		for idx := range state.inputs {
 			name := mosaic.InputLabel(state.inputs[idx])
 			xEntry := NewNumberEntry(1, 2)
+			xEntry.MinWidth = 1
 			xEntry.SetValue(state.inputs[idx].OffsetX)
 			yEntry := NewNumberEntry(1, 2)
+			yEntry.MinWidth = 1
 			yEntry.SetValue(state.inputs[idx].OffsetY)
 			rotEntry := NewNumberEntry(0.01, 4)
+			rotEntry.MinWidth = 1
 			currentRot := 0.0
 			if state.inputs[idx].HasManualTransform {
 				t := state.inputs[idx].ManualTransform
@@ -1259,8 +1358,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				nameCell(widget.NewLabel(name)),
 				xEntry, yEntry, rotEntry,
 				flashBtn, applyBtn,
-				container.NewCenter(lockCheck),
-				container.NewCenter(includeCheck),
+				container.New(&minWidthLayout{w: lockColW}, container.NewCenter(lockCheck)),
+				container.New(&minWidthLayout{w: inclColW}, container.NewCenter(includeCheck)),
 			)
 			offsetControls.Add(row)
 		}
@@ -1374,7 +1473,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		fd.Show()
 	})
 
-	savePreviewCheck := widget.NewCheck("Save Preview", func(v bool) {
+	savePreviewToggle := NewToggle(func(v bool) {
 		state.savePreview = v
 	})
 
@@ -1513,12 +1612,13 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 		s := state.drizzleSettings
 		result, err := mosaic.Build(inputsWithRef(), mosaic.Options{
-			Scale:       s.Scale,
-			FinalScale:  s.FinalScale,
-			PixFrac:     s.PixFrac,
-			CRMethod:    mosaic.CRMethod(s.CRMethod),
-			SepKernel:   mosaic.DrizzleKernel(s.SepKernel),
-			FinalKernel: mosaic.DrizzleKernel(s.FinalKernel),
+			Scale:           s.Scale,
+			FinalScale:      s.FinalScale,
+			PixFrac:         s.PixFrac,
+			CRMethod:        mosaic.CRMethod(s.CRMethod),
+			SepKernel:       mosaic.DrizzleKernel(s.SepKernel),
+			FinalKernel:     mosaic.DrizzleKernel(s.FinalKernel),
+			UseERRWeighting: s.UseERRWeighting,
 		})
 
 		fyne.DoAndWait(func() { progressDialog.Hide() })
@@ -1709,11 +1809,15 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		}
 	})
 	modeSelect.SetSelected("Asinh")
-	levelsForm := widget.NewForm(
-		widget.NewFormItem("Mode", modeSelect),
-		widget.NewFormItem("Background", bgEntry),
-		widget.NewFormItem("Peak", peakEntry),
-		widget.NewFormItem("Scaled Peak", scaledPeakEntry),
+	makeFormRow := func(label string, w fyne.CanvasObject) fyne.CanvasObject {
+		lbl := widget.NewLabel(label)
+		return container.NewBorder(nil, nil, container.New(&minWidthLayout{w: 90}, lbl), nil, w)
+	}
+	levelsForm := container.New(&fixedVSpacingLayout{15},
+		makeFormRow("Mode", modeSelect),
+		makeFormRow("Background", bgEntry),
+		makeFormRow("Peak", peakEntry),
+		makeFormRow("Scaled Peak", scaledPeakEntry),
 	)
 	autoLevelsBtn := widget.NewButton("Auto Scaling", func() {
 		if state.result != nil {
@@ -1799,35 +1903,44 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		resetPreview()
 	})
 
+	inputTabs := container.NewAppTabs(
+		container.NewTabItem("Input Frames", container.NewBorder(offsetHeader, nil, nil, nil, offsetScroll)),
+		container.NewTabItem("Input Status", statusScroll),
+	)
+
 	controls := container.NewVBox(
 		widget.NewLabel("Preview Levels"),
 		levelsForm,
+		func() fyne.CanvasObject {
+			r := canvas.NewRectangle(color.Transparent)
+			r.SetMinSize(fyne.NewSize(1, 20))
+			return r
+		}(),
 		container.NewGridWithColumns(2, autoLevelsBtn, applyLevelsBtn),
 		widget.NewSeparator(),
 		widget.NewLabel("Mosaic / Drizzle"),
 		container.NewGridWithColumns(2, loadBtn, batchBtn),
-		savePreviewCheck,
+		container.NewHBox(savePreviewToggle, widget.NewLabel("Save Preview")),
 		widget.NewSeparator(),
 		widget.NewLabel("Baseline Reference"),
 		refLabel,
-		container.NewGridWithColumns(2, setRefBtn, clearRefBtn),
+		container.New(&fixedVSpacingLayout{15},
+			container.NewGridWithColumns(2, setRefBtn, clearRefBtn),
+			container.NewGridWithColumns(2, starAlignBtn, selectStarsBtn),
+			container.NewGridWithColumns(2, measureBtn, buildBtn),
+			container.NewGridWithColumns(2, saveOffsetsBtn, loadOffsetsBtn),
+			container.NewGridWithColumns(2, clearOffsetsBtn, clearBtn),
+		),
 		widget.NewSeparator(),
-		container.NewGridWithColumns(2, starAlignBtn, selectStarsBtn),
-		container.NewGridWithColumns(2, measureBtn, buildBtn),
-		container.NewGridWithColumns(2, saveBtn, sendToExamineBtn),
-		container.NewGridWithColumns(2, saveOffsetsBtn, loadOffsetsBtn),
-		clearOffsetsBtn,
-		clearBtn,
-		widget.NewSeparator(),
-		widget.NewLabel("Input Frames"),
-		offsetScroll,
-		widget.NewSeparator(),
-		widget.NewLabel("Input Status"),
-		statusScroll,
+		inputTabs,
 	)
 
 	// Now assign all the variables that enterStarMode/exitStarMode need.
-	controlsScroll = container.NewVScroll(controls)
+	// Wrap controls with a 20px right pad so the vertical scrollbar never
+	// overlaps the rightmost widgets.
+	controlsRightPad := canvas.NewRectangle(color.Transparent)
+	controlsRightPad.SetMinSize(fyne.NewSize(20, 1))
+	controlsScroll = container.NewVScroll(container.NewBorder(nil, nil, nil, controlsRightPad, controls))
 	controlsScroll.SetMinSize(fyne.NewSize(320, 220))
 
 	starPanelScroll = container.NewVScroll(starPanel)
@@ -1980,19 +2093,19 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	})
 
 	previewHeader := container.NewVBox(
+		container.NewHBox(layout.NewSpacer(), statsLabel, saveBtn, sendToExamineBtn),
 		mosaicHistogram,
-		statsLabel,
-		container.NewHBox(
-			layout.NewSpacer(),
-			widget.NewLabel("Black"),
-			blackEntry,
-			zoomOutBtn,
-			zoomSelect,
-			zoomInBtn,
-			widget.NewLabel("White"),
-			whiteEntry,
-			layout.NewSpacer(),
-		),
+	)
+	previewFooter := container.NewHBox(
+		layout.NewSpacer(),
+		widget.NewLabel("Black"),
+		blackEntry,
+		zoomOutBtn,
+		zoomSelect,
+		zoomInBtn,
+		widget.NewLabel("White"),
+		whiteEntry,
+		layout.NewSpacer(),
 	)
 
 	// Default to "fit in preview" on startup.
@@ -2171,13 +2284,15 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	}
 
 	settingsMenu := fyne.NewMenu("Mosaic",
-		fyne.NewMenuItem("Load Project", loadMosaicProject),
-		fyne.NewMenuItem("Save Project", saveMosaicProject),
+		fyne.NewMenuItem("Load Mosaic Project", loadMosaicProject),
+		fyne.NewMenuItem("Save Mosaic Project", saveMosaicProject),
 		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Drizzle...", openDrizzleSettings),
+		fyne.NewMenuItem("Drizzle Settings", openDrizzleSettings),
 	)
-	previewPane := container.NewBorder(previewHeader, nil, nil, nil, previewSwap)
-	split := container.NewHSplit(leftStack, previewPane)
+	footerBottomPad := canvas.NewRectangle(color.Transparent)
+	footerBottomPad.SetMinSize(fyne.NewSize(1, 20))
+	previewPane := container.NewBorder(previewHeader, container.NewVBox(previewFooter, footerBottomPad), nil, nil, previewSwap)
+	split := container.NewHSplit(container.New(&sidePaddedLayout{20}, leftStack), previewPane)
 	split.SetOffset(0.38)
 	return split, settingsMenu
 }

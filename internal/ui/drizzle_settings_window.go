@@ -124,6 +124,10 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 	}
 	numRefsEntry.SetText(fmt.Sprintf("%d", numRefs))
 
+	useERRWeighting := current.UseERRWeighting
+	errWeightCheck := widget.NewCheck("", func(v bool) { useERRWeighting = v })
+	errWeightCheck.SetChecked(useERRWeighting)
+
 	notes := widget.NewLabel(
 		"Output Scale: desired plate scale in arcsec/pixel (AstroDrizzle final_scale).\n" +
 			"  Smaller value = finer sampling = larger output image.\n" +
@@ -156,6 +160,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		widget.NewFormItem("Alignment Mode", alignSelect),
 		widget.NewFormItem("Search Radius (arcsec)", searchRadiusEntry),
 		widget.NewFormItem("Num Reference Images", numRefsEntry),
+		widget.NewFormItem("ERR Inverse-Variance Weighting", errWeightCheck),
 	)
 
 	content := container.NewVBox(form, notes)
@@ -211,6 +216,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 			AlignmentMode:      alignmentMode,
 			SearchRadiusArcsec: srVal,
 			NumRefs:            nrVal,
+			UseERRWeighting:    useERRWeighting,
 		})
 	}, win)
 	d.Show()

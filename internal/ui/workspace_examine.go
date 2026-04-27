@@ -7,6 +7,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 
@@ -38,6 +39,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		headerLines: []string{"No FITS loaded."},
 	}
 	vp := newViewport()
+	vp.actionRow.Objects = []fyne.CanvasObject{layout.NewSpacer(), vp.StatsLabel, hpad(6)}
 	reloadBtn := widget.NewButton("Reload Current FITS", func() {})
 	reloadBtn.Disable()
 
@@ -105,7 +107,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	peakEntry := NewNumberEntry(0.001, 4)
 	sPeakEntry := NewNumberEntry(1, 1)
 
-	showClip := widget.NewCheck("Show clipped", func(v bool) {
+	showClip := NewToggle(func(v bool) {
 		if state.img == nil {
 			return
 		}
@@ -114,7 +116,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	})
 	showClip.SetChecked(true)
 
-	flipCheck := widget.NewCheck("Flip image vertically", func(v bool) {
+	flipCheck := NewToggle(func(v bool) {
 		state.flip = v
 		if refresh != nil {
 			refresh()
@@ -346,8 +348,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	})
 
 	controls := container.NewVBox(
-		widget.NewButton("Load FITS", loadFits),
-		reloadBtn,
+		container.NewHBox(widget.NewButton("Load FITS", loadFits), reloadBtn),
 		pathLabel,
 		widget.NewSeparator(),
 		widget.NewLabel("Stretch Controls"),
@@ -357,8 +358,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			widget.NewFormItem("Peak", peakEntry),
 			widget.NewFormItem("Scaled Peak", sPeakEntry),
 		),
-		showClip,
-		flipCheck,
+		container.NewHBox(showClip, widget.NewLabel("Show clipped")),
+		container.NewHBox(flipCheck, widget.NewLabel("Flip image vertically")),
 		container.NewHBox(autoBtn, applyBtn),
 		widget.NewSeparator(),
 		widget.NewLabel("Examine Tools"),
@@ -371,7 +372,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		channelSelect,
 		sendToChannelBtn,
 	)
-	controlsScroll := container.NewVScroll(controls)
+	paddedControls := container.NewBorder(nil, nil, hpad(8), hpad(8), controls)
+	controlsScroll := container.NewVScroll(paddedControls)
 	controlsScroll.SetMinSize(fyne.NewSize(280, 220))
 
 	globalSendToExamine = func(pixels []float32, width, height int) {
@@ -389,7 +391,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			White:      1,
 			Background: 0,
 			Peak:       1,
-			ScaledPeak: 1,
+			ScaledPeak: 10,
 			ShowClip:   true,
 		}
 		_, img.White = processing.AutoLevels(pixels)

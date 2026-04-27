@@ -82,23 +82,62 @@ func PercentileClip(s Stats, lowPct, highPct float64) (float64, float64) {
 	if s.Count == 0 || s.Max == s.Min {
 		return s.Min, s.Max
 	}
-	lowTarget := int(math.Round(float64(s.Count) * lowPct / 100.0))
-	highTarget := int(math.Round(float64(s.Count) * highPct / 100.0))
+
+	if lowPct < 0 {
+		lowPct = 0
+	}
+	if lowPct > 100 {
+		lowPct = 100
+	}
+	if highPct < 0 {
+		highPct = 0
+	}
+	if highPct > 100 {
+		highPct = 100
+	}
+	if highPct < lowPct {
+		lowPct, highPct = highPct, lowPct
+	}
+
+	lowTarget := int(math.Ceil(float64(s.Count) * lowPct / 100.0))
+	highTarget := int(math.Ceil(float64(s.Count) * highPct / 100.0))
+
+	if lowTarget < 1 {
+		lowTarget = 1
+	}
+	if highTarget < 1 {
+		highTarget = 1
+	}
+	if lowTarget > s.Count {
+		lowTarget = s.Count
+	}
+	if highTarget > s.Count {
+		highTarget = s.Count
+	}
 
 	rangeVal := s.Max - s.Min
+
 	var cumulative int
 	low := s.Min
 	high := s.Max
+	foundLow := false
+	foundHigh := false
 
 	for i, count := range s.Hist {
 		cumulative += count
 		binVal := s.Min + (float64(i)/255.0)*rangeVal
-		if cumulative <= lowTarget {
+
+		if !foundLow && cumulative >= lowTarget {
 			low = binVal
+			foundLow = true
 		}
-		if cumulative <= highTarget {
+
+		if !foundHigh && cumulative >= highTarget {
 			high = binVal
+			foundHigh = true
+			break
 		}
 	}
+
 	return low, high
 }

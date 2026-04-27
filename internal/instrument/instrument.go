@@ -20,14 +20,48 @@ type Info struct {
 	// HasSIP indicates whether exposures from this detector typically carry SIP
 	// distortion coefficients in their headers.
 	HasSIP bool
+	// BadDQBits is the bitmask of DQ flag values that mark a pixel as bad and
+	// should be interpolated over before processing. A value of 0 means any
+	// non-zero DQ flag is considered bad (the most conservative default).
+	//
+	// Bit definitions (HST convention):
+	//   4    = permanent bad detector pixel
+	//   16   = hot pixel (>0.1 e/s dark current above local mean)
+	//   32   = unstable pixel / CTE-tail artifact
+	//   64   = warm pixel (0.02–0.1 e/s above local mean)
+	//   256  = full-well saturation
+	//   512  = bad pixel-to-pixel flat
+	//   1024 = charge trap / sink pixel (UVIS) or IR CR spike (IR)
+	//   8192 = rejected during image combination / CR rejection
+	BadDQBits uint32
 }
 
+// dqBits is a convenience shorthand used in the detector table below.
+const (
+	dqBadDetector uint32 = 4
+	dqHot         uint32 = 16
+	dqUnstable    uint32 = 32
+	dqWarm        uint32 = 64
+	dqSaturated   uint32 = 256
+	dqBadFlat     uint32 = 512
+	dqChargeTrap  uint32 = 1024
+	dqCRRejected  uint32 = 8192
+)
+
+// wfc3BadDQ is the shared bad-pixel bitmask for WFC3/IR and WFC3/UVIS.
+// Warm pixels (64) are omitted: they are mild and the ERR-weighted drizzle
+// naturally down-weights them without discarding the flux entirely.
+const wfc3BadDQ = dqBadDetector | dqHot | dqUnstable | dqSaturated | dqBadFlat | dqChargeTrap | dqCRRejected
+
+// acsBadDQ is the shared bad-pixel bitmask for ACS detectors.
+const acsBadDQ = dqBadDetector | dqHot | dqUnstable | dqSaturated | dqBadFlat | dqChargeTrap | dqCRRejected
+
 var detectors = map[key]Info{
-	{"WFC3", "IR"}:   {PixelScale: 0.128, Chips: 1, ChipInnerTrim: 10, HasSIP: true},
-	{"WFC3", "UVIS"}: {PixelScale: 0.0396, Chips: 2, ChipInnerTrim: 10, HasSIP: true},
-	{"ACS", "WFC"}:   {PixelScale: 0.05, Chips: 2, ChipInnerTrim: 25, HasSIP: true},
-	{"ACS", "HRC"}:   {PixelScale: 0.027, Chips: 1, ChipInnerTrim: 10, HasSIP: true},
-	{"ACS", "SBC"}:   {PixelScale: 0.034, Chips: 1, ChipInnerTrim: 10, HasSIP: false},
+	{"WFC3", "IR"}:   {PixelScale: 0.128, Chips: 1, ChipInnerTrim: 10, HasSIP: true, BadDQBits: wfc3BadDQ},
+	{"WFC3", "UVIS"}: {PixelScale: 0.0396, Chips: 2, ChipInnerTrim: 10, HasSIP: true, BadDQBits: wfc3BadDQ},
+	{"ACS", "WFC"}:   {PixelScale: 0.05, Chips: 2, ChipInnerTrim: 25, HasSIP: true, BadDQBits: acsBadDQ},
+	{"ACS", "HRC"}:   {PixelScale: 0.027, Chips: 1, ChipInnerTrim: 10, HasSIP: true, BadDQBits: acsBadDQ},
+	{"ACS", "SBC"}:   {PixelScale: 0.034, Chips: 1, ChipInnerTrim: 10, HasSIP: false, BadDQBits: acsBadDQ},
 }
 
 type key struct {
@@ -36,11 +70,14 @@ type key struct {
 }
 
 // Default is used when the instrument is not recognised.
+// BadDQBits=0 preserves the original conservative behaviour: any non-zero DQ
+// value is treated as bad.
 var Default = Info{
 	PixelScale:    0.05,
 	Chips:         1,
 	ChipInnerTrim: 10,
 	HasSIP:        false,
+	BadDQBits:     0,
 }
 
 // FromHeader reads INSTRUME and DETECTOR from the provided FITS header and

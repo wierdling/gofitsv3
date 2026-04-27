@@ -15,6 +15,11 @@ type NumberField interface {
 	Value() float64
 }
 
+// CheckField is implemented by any toggle/checkbox widget.
+type CheckField interface {
+	SetChecked(bool)
+}
+
 type LoadedImage struct {
 	Path       string
 	HDU        fitsio.HDU
@@ -61,6 +66,7 @@ type DrizzleSettings struct {
 	AlignmentMode      int     `json:"alignmentMode"`
 	SearchRadiusArcsec float64 `json:"searchRadiusArcsec"`
 	NumRefs            int     `json:"numRefs"`
+	UseERRWeighting    bool    `json:"useERRWeighting"`
 }
 
 type MosaicInputState struct {
@@ -93,7 +99,7 @@ type ChannelControl struct {
 	BackgroundEntry NumberField
 	PeakEntry       NumberField
 	ScaledPeakEntry NumberField
-	ShowClip        *widget.Check
+	ShowClip        CheckField
 }
 
 type RgbLevels struct {
