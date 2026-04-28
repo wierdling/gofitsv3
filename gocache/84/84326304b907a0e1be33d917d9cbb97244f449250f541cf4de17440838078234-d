@@ -1,7 +1,0 @@
-./config.go
-./config_windows.go
-./focus_manager.go
-./lifecycle.go
-./meta.go
-./theme.go
-./theme_windows.go

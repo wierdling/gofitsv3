@@ -1,8 +1,0 @@
-./base.go
-./base_renderer.go
-./overlay_container.go
-./scroller.go
-./scroller_behavior_other.go
-./shadow.go
-./shadowing_renderer.go
-./simple_renderer.go
