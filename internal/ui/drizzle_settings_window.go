@@ -17,20 +17,21 @@ import (
 
 func defaultDrizzleSettings() models.DrizzleSettings {
 	return models.DrizzleSettings{
-		FinalScale:         0,
-		Scale:              1.0,
-		PixFrac:            1.0,
-		CRMethod:           int(mosaic.CRMethodNone),
-		SepKernel:          int(mosaic.KernelTurbo),
-		FinalKernel:        int(mosaic.KernelSquare),
-		AlignmentMode:      int(mosaic.AlignmentModeTweakRegRScale),
-		SearchRadiusArcsec: 1.5,
-		NumRefs:            1,
+		FinalScale:   0,
+		Scale:        1.0,
+		PixFrac:      1.0,
+		CRMethod:     int(mosaic.CRMethodNone),
+		SepKernel:    int(mosaic.KernelTurbo),
+		FinalKernel:  int(mosaic.KernelSquare),
+		CRSeedSNR:    4.0,
+		CRDerivScale: 1.2,
 	}
 }
 
 var kernelNames = []string{"Square", "Point", "Turbo", "Gaussian", "Tophat", "Lanczos2", "Lanczos3"}
 var crMethodNames = []string{"None", "Legacy (single-frame)", "Drizzle-style (multi-frame)"}
+
+// alignmentModeNames is also used by alignment_settings_window.go.
 var alignmentModeNames = []string{"General Affine (legacy)", "RScale (legacy)", "TweakReg RScale", "TweakReg General"}
 
 func kernelIndex(k int) int {
@@ -94,39 +95,23 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 	}
 
-	alignSelect := widget.NewSelect(alignmentModeNames, nil)
-	alignmentMode := current.AlignmentMode
-	if alignmentMode >= 0 && alignmentMode < len(alignmentModeNames) {
-		alignSelect.SetSelected(alignmentModeNames[alignmentMode])
-	} else {
-		alignSelect.SetSelected(alignmentModeNames[int(mosaic.AlignmentModeTweakRegRScale)])
-	}
-	alignSelect.OnChanged = func(s string) {
-		for i, name := range alignmentModeNames {
-			if name == s {
-				alignmentMode = i
-				break
-			}
-		}
-	}
-
-	searchRadiusEntry := widget.NewEntry()
-	searchRadius := current.SearchRadiusArcsec
-	if searchRadius <= 0 {
-		searchRadius = 1.5
-	}
-	searchRadiusEntry.SetText(fmt.Sprintf("%.2f", searchRadius))
-
-	numRefsEntry := widget.NewEntry()
-	numRefs := current.NumRefs
-	if numRefs < 1 {
-		numRefs = 1
-	}
-	numRefsEntry.SetText(fmt.Sprintf("%d", numRefs))
-
 	useERRWeighting := current.UseERRWeighting
 	errWeightCheck := widget.NewCheck("", func(v bool) { useERRWeighting = v })
 	errWeightCheck.SetChecked(useERRWeighting)
+
+	crSeedSNREntry := widget.NewEntry()
+	crSeedSNR := current.CRSeedSNR
+	if crSeedSNR <= 0 {
+		crSeedSNR = 4.0
+	}
+	crSeedSNREntry.SetText(fmt.Sprintf("%.2f", crSeedSNR))
+
+	crDerivScaleEntry := widget.NewEntry()
+	crDerivScale := current.CRDerivScale
+	if crDerivScale <= 0 {
+		crDerivScale = 1.2
+	}
+	crDerivScaleEntry.SetText(fmt.Sprintf("%.2f", crDerivScale))
 
 	notes := widget.NewLabel(
 		"Output Scale: desired plate scale in arcsec/pixel (AstroDrizzle final_scale).\n" +
@@ -138,14 +123,10 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 			"PixFrac: drop size as fraction of pixel (1.0 = full coverage).\n" +
 			"Sep Kernel: used during the per-frame drizzle pass.\n" +
 			"Final Kernel: used during the final combination pass.\n" +
-			"Alignment Mode: TweakReg modes use catalog matching via full WCS (recommended).\n" +
-			"  Legacy modes use image warping and are kept for backward compatibility.\n" +
-			"  RScale = shift + rotation + uniform scale; General = full 6-parameter affine.\n" +
-			"Search Radius: TweakReg catalog matching tolerance in arcseconds (default 1.5).\n" +
-			"Num Reference Images: first N images are treated as pre-aligned references.\n" +
-			"  Each non-reference image aligns to whichever reference it overlaps.\n" +
-			"  Use 2 for a two-chip detector where each chip is loaded separately.\n" +
-			"Lanczos kernels: only appropriate when PixFrac = 1.0.",
+			"Lanczos kernels: only appropriate when PixFrac = 1.0.\n" +
+			"CR Seed SNR: signal-to-noise threshold for seeding a CR candidate (default 4.0).\n" +
+			"CR Deriv Scale: sharpness term weight in the CR rejection test (default 1.2).\n" +
+			"  Both only apply when CR Method is Drizzle-style.",
 	)
 	notes.TextStyle = fyne.TextStyle{Italic: true}
 	notes.Wrapping = fyne.TextWrapWord
@@ -157,10 +138,9 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		widget.NewFormItem("CR Method", crSelect),
 		widget.NewFormItem("Sep Kernel", sepSelect),
 		widget.NewFormItem("Final Kernel", finalSelect),
-		widget.NewFormItem("Alignment Mode", alignSelect),
-		widget.NewFormItem("Search Radius (arcsec)", searchRadiusEntry),
-		widget.NewFormItem("Num Reference Images", numRefsEntry),
 		widget.NewFormItem("ERR Inverse-Variance Weighting", errWeightCheck),
+		widget.NewFormItem("CR Seed SNR", crSeedSNREntry),
+		widget.NewFormItem("CR Deriv Scale", crDerivScaleEntry),
 	)
 
 	content := container.NewVBox(form, notes)
@@ -193,30 +173,28 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 			return
 		}
 
-		srText := strings.TrimSpace(searchRadiusEntry.Text)
-		srVal, errSR := strconv.ParseFloat(srText, 64)
-		if errSR != nil || srVal <= 0 {
-			dialog.ShowInformation("Invalid Value", "Search Radius must be a positive number in arcseconds.", win)
+		crSNRVal, errCSNR := strconv.ParseFloat(strings.TrimSpace(crSeedSNREntry.Text), 64)
+		if errCSNR != nil || crSNRVal <= 0 {
+			dialog.ShowInformation("Invalid Value", "CR Seed SNR must be a positive number.", win)
 			return
 		}
 
-		nrVal, errNR := strconv.Atoi(strings.TrimSpace(numRefsEntry.Text))
-		if errNR != nil || nrVal < 1 {
-			dialog.ShowInformation("Invalid Value", "Num Reference Images must be a positive integer.", win)
+		crDSVal, errCDS := strconv.ParseFloat(strings.TrimSpace(crDerivScaleEntry.Text), 64)
+		if errCDS != nil || crDSVal <= 0 {
+			dialog.ShowInformation("Invalid Value", "CR Deriv Scale must be a positive number.", win)
 			return
 		}
 
 		onSave(models.DrizzleSettings{
-			FinalScale:         finalScale,
-			Scale:              scale,
-			PixFrac:            pixFrac,
-			CRMethod:           crMethod,
-			SepKernel:          sepKernel,
-			FinalKernel:        finalKernel,
-			AlignmentMode:      alignmentMode,
-			SearchRadiusArcsec: srVal,
-			NumRefs:            nrVal,
-			UseERRWeighting:    useERRWeighting,
+			FinalScale:      finalScale,
+			Scale:           scale,
+			PixFrac:         pixFrac,
+			CRMethod:        crMethod,
+			SepKernel:       sepKernel,
+			FinalKernel:     finalKernel,
+			UseERRWeighting: useERRWeighting,
+			CRSeedSNR:       crSNRVal,
+			CRDerivScale:    crDSVal,
 		})
 	}, win)
 	d.Show()

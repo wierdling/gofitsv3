@@ -352,3 +352,94 @@ func TestPlanInputsSameFileSCIChipsGetMapper(t *testing.T) {
 	}
 	_ = processing.IdentityTransform() // keep import used
 }
+
+func TestEstimateSkyValueMedianIgnoresOutlier(t *testing.T) {
+	pixels := []float32{5, 5, 5, 5, 100}
+	sky, err := estimateSkyValue(pixels, SkysubOptions{Enabled: true, Stat: SkyStatMedian, Width: 0.1, Clip: 5, LSigma: 4, USigma: 4})
+	if err != nil {
+		t.Fatalf("estimateSkyValue returned error: %v", err)
+	}
+	if math.Abs(sky-5) > 1e-6 {
+		t.Fatalf("sky = %v, want 5", sky)
+	}
+}
+
+func TestEstimateSkyValueSkipsNaNsAndBounds(t *testing.T) {
+	pixels := []float32{float32(math.NaN()), 1, 2, 3, 50}
+	sky, err := estimateSkyValue(pixels, SkysubOptions{Enabled: true, Stat: SkyStatMean, Width: 0.1, Clip: 2, LSigma: 4, USigma: 4, Lower: 1.5, Upper: 3.5, HasLower: true, HasUpper: true})
+	if err != nil {
+		t.Fatalf("estimateSkyValue returned error: %v", err)
+	}
+	if math.Abs(sky-2.5) > 1e-6 {
+		t.Fatalf("sky = %v, want 2.5", sky)
+	}
+}
+
+func TestBuildSkysubDisabledIsNoOp(t *testing.T) {
+	inputs := []Input{
+		makeInput("a_flc.fits", 2, 2, filledPixels(2, 2, 10), headerWithCRPIX(10, 10)),
+		makeInput("b_flc.fits", 2, 2, filledPixels(2, 2, 14), headerWithCRPIX(10, 10)),
+	}
+
+	result, err := Build(inputs, Options{Scale: 1, Skysub: SkysubOptions{Enabled: false}})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+	for i, px := range result.Pixels {
+		if math.Abs(float64(px-12)) > 1e-6 {
+			t.Fatalf("pixel[%d] = %v, want 12", i, px)
+		}
+		if result.Inputs[i/4].SkySubtracted {
+			t.Fatalf("input %d unexpectedly marked sky-subtracted", i/4)
+		}
+	}
+}
+
+func TestBuildSkysubLocalMinSubtractsPerInput(t *testing.T) {
+	inputs := []Input{
+		makeInput("a_flc.fits", 2, 2, filledPixels(2, 2, 10), headerWithCRPIX(10, 10)),
+		makeInput("b_flc.fits", 2, 2, filledPixels(2, 2, 14), headerWithCRPIX(10, 10)),
+	}
+
+	result, err := Build(inputs, Options{Scale: 1, Skysub: SkysubOptions{Enabled: true, Method: SkyMethodLocalMin, Stat: SkyStatMedian, Width: 0.1, Clip: 5, LSigma: 4, USigma: 4}})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+	for i, px := range result.Pixels {
+		if math.Abs(float64(px)) > 1e-6 {
+			t.Fatalf("pixel[%d] = %v, want 0", i, px)
+		}
+	}
+	if !result.Inputs[0].SkySubtracted || !result.Inputs[1].SkySubtracted {
+		t.Fatalf("expected both inputs to be marked sky-subtracted: %+v", result.Inputs)
+	}
+	if math.Abs(result.Inputs[0].SkyValue-10) > 1e-6 || math.Abs(result.Inputs[1].SkyValue-14) > 1e-6 {
+		t.Fatalf("unexpected sky values: %+v", result.Inputs)
+	}
+	if result.Inputs[0].Status != "sky-subtracted and drizzled" {
+		t.Fatalf("status[0] = %q, want sky-subtracted and drizzled", result.Inputs[0].Status)
+	}
+}
+
+func TestPrepareSkysubWorkingPixelsLeavesReferenceOnlyUntouched(t *testing.T) {
+	planned := []plannedInput{
+		{input: Input{ReferenceOnly: true, HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: filledPixels(2, 2, 20)}}}},
+		{input: Input{Path: "data_flc.fits", HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: filledPixels(2, 2, 10)}}}},
+	}
+	working, applied, skyValues, err := prepareSkysubWorkingPixels(planned, SkysubOptions{Enabled: true, Method: SkyMethodLocalMin, Stat: SkyStatMedian, Width: 0.1, Clip: 5, LSigma: 4, USigma: 4})
+	if err != nil {
+		t.Fatalf("prepareSkysubWorkingPixels returned error: %v", err)
+	}
+	if applied[0] {
+		t.Fatal("reference-only input should not be sky-subtracted")
+	}
+	if !applied[1] {
+		t.Fatal("data input should be sky-subtracted")
+	}
+	if &working[0][0] != &planned[0].input.HDU.Data.Pixels[0] {
+		t.Fatal("reference-only pixels should reuse original slice")
+	}
+	if skyValues[0] == skyValues[0] {
+		t.Fatal("reference-only sky value should remain NaN")
+	}
+}

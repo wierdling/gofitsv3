@@ -19,6 +19,10 @@ import (
 // image before drizzling, to avoid border artifacts.
 const edgeTrim = 20
 
+// weightEpsilon is used when normalizing signed-kernel accumulators such as Lanczos.
+// Very small denominators are treated as uncovered to avoid edge blow-ups.
+const weightEpsilon float32 = 1e-12
+
 type Input struct {
 	Path               string
 	SCIExt             int
@@ -80,6 +84,69 @@ const (
 	// when only one frame is available.
 	CRMethodDrizzle
 )
+
+// BitMask stores one boolean pixel mask bit per pixel. This is used for cosmic
+// ray masks in the final drizzle pass to avoid retaining one byte per pixel per
+// frame.
+//
+// NOTE: processing.BuildCRMasksFromModel and processing.BuildCosmicRayMasks
+// currently return [][]bool. This file compresses those masks immediately after
+// those calls. To reduce peak memory too, change those processing-package
+// functions to produce BitMask-compatible masks directly or tile their work.
+type BitMask []uint64
+
+func NewBitMask(n int) BitMask {
+	if n <= 0 {
+		return nil
+	}
+	return make([]uint64, (n+63)/64)
+}
+
+func (m BitMask) Set(i int) {
+	if i < 0 {
+		return
+	}
+	word := i >> 6
+	if word >= len(m) {
+		return
+	}
+	m[word] |= uint64(1) << uint(i&63)
+}
+
+func (m BitMask) Get(i int) bool {
+	if len(m) == 0 || i < 0 {
+		return false
+	}
+	word := i >> 6
+	if word >= len(m) {
+		return false
+	}
+	return (m[word] & (uint64(1) << uint(i&63))) != 0
+}
+
+func compressCRMasks(boolMasks [][]bool) []BitMask {
+	if len(boolMasks) == 0 {
+		return nil
+	}
+	masks := make([]BitMask, len(boolMasks))
+	for i, bm := range boolMasks {
+		if len(bm) == 0 {
+			continue
+		}
+		mask := NewBitMask(len(bm))
+		for px, flagged := range bm {
+			if flagged {
+				mask.Set(px)
+			}
+		}
+		masks[i] = mask
+	}
+	return masks
+}
+
+func isFinite32(v float32) bool {
+	return math.Float32bits(v)&0x7f800000 != 0x7f800000
+}
 
 // DrizzleKernel selects how each input pixel's flux is distributed onto the
 // output grid during the drizzle step.
@@ -147,7 +214,9 @@ type Options struct {
 	// FinalScale is the desired output plate scale in arcseconds per pixel,
 	// matching AstroDrizzle's final_scale parameter.  When > 0, Build reads
 	// the native plate scale from the reference image WCS and computes:
+	//
 	//   Scale = nativePlateScale / FinalScale
+	//
 	// Smaller FinalScale → finer sampling → larger output (e.g. 0.02 arcsec/px
 	// on a 0.04 arcsec/px camera yields Scale = 2, doubling each dimension).
 	// If WCS plate scale cannot be determined, FinalScale is treated as Scale.
@@ -167,18 +236,33 @@ type Options struct {
 	// ERR FITS extension. Pixels with higher noise contribute less to the output.
 	// When false (the default) all pixels are weighted equally by geometric overlap.
 	UseERRWeighting bool
+	// KeepWeights retains the final output weight/coverage image in Result.Weights.
+	// Leave false for lower memory use. The final drizzle pass still allocates
+	// weights while normalizing the image, but setting this to false releases that
+	// full-size buffer before returning the Result.
+	KeepWeights bool
+	// CRSeedSNR and CRDerivScale tune the drizzle-style CR detection.
+	// Zero values fall back to the defaults (4.0 and 1.2 respectively).
+	// Only used when CRMethod == CRMethodDrizzle.
+	CRSeedSNR    float64
+	CRDerivScale float64
+	// Skysub controls optional AstroDrizzle-style sky subtraction applied to
+	// non-reference inputs before CR rejection and final drizzle.
+	Skysub SkysubOptions
 }
 
 type InputStatus struct {
-	Path         string
-	Status       string
-	Error        string
-	Included     bool
-	Cleaned      bool
-	OffsetX      float64
-	OffsetY      float64
-	HasAffine    bool
-	AffineRotDeg float64
+	Path          string
+	Status        string
+	Error         string
+	Included      bool
+	Cleaned       bool
+	SkySubtracted bool
+	SkyValue      float64
+	OffsetX       float64
+	OffsetY       float64
+	HasAffine     bool
+	AffineRotDeg  float64
 }
 
 type Result struct {
@@ -206,6 +290,13 @@ type StarAlignmentResult struct {
 	HasManualTransform bool
 	Error              string
 	Applied            bool
+	// Alignment diagnostics are intentionally part of the public result shape,
+	// but this file cannot fully populate them until the processing-package
+	// alignment estimators return match/residual statistics. Zero means unknown.
+	MatchedStars int
+	RMS          float64
+	MedianError  float64
+	MaxError     float64
 }
 
 type plannedInput struct {
@@ -258,8 +349,10 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	}
 
 	// Resolve FinalScale (arcsec/pixel) → internal Scale multiplier.
+	// Use the same WCS anchor that will be used for the output header, so a
+	// ReferenceOnly baseline and same-scale filter runs produce matching grids.
 	if options.FinalScale > 0 {
-		ref := firstDataInput(inputs)
+		ref := wcsReferenceInput(inputs)
 		if ps, ok := nativePlateScaleArcsec(ref.HDU.Header); ok && ps > 0 {
 			options.Scale = ps / options.FinalScale
 		} else {
@@ -309,6 +402,21 @@ func Build(inputs []Input, options Options) (*Result, error) {
 			dataPlanned = append(dataPlanned, i)
 		}
 	}
+	if len(dataPlanned) == 0 {
+		return nil, fmt.Errorf("no data-bearing FITS inputs selected")
+	}
+
+	workingPixels, skyApplied, skyValues, err := prepareSkysubWorkingPixels(planned, options.Skysub)
+	if err != nil {
+		return nil, err
+	}
+	for i := range planned {
+		if planned[i].input.ReferenceOnly || !skyApplied[i] {
+			continue
+		}
+		statuses[planned[i].statusIndex].SkySubtracted = true
+		statuses[planned[i].statusIndex].SkyValue = skyValues[i]
+	}
 
 	// crMaskIndex[plannedIdx] = index into crMasks; -1 if not included.
 	crMaskIndex := make([]int, len(planned))
@@ -328,9 +436,9 @@ func Build(inputs []Input, options Options) (*Result, error) {
 			if err != nil {
 				refToSource = processing.IdentityTransform()
 			}
-			_, sigma := processing.EstimateBackground(planned[pi].input.HDU.Data.Pixels)
+			_, sigma := processing.EstimateBackground(workingPixels[pi])
 			frameInfos[slot] = processing.FrameInfo{
-				Pixels:      planned[pi].input.HDU.Data.Pixels,
+				Pixels:      workingPixels[pi],
 				Width:       planned[pi].input.HDU.Data.Width,
 				Height:      planned[pi].input.HDU.Data.Height,
 				SourceToRef: planned[pi].sourceToRef,
@@ -342,18 +450,18 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 	}
 
-	var crMasks [][]bool
+	var crMasks []BitMask
 	switch {
 	case effectiveCR == CRMethodDrizzle && len(dataPlanned) > 1:
 		// Separate pass: drizzle each frame individually with SepKernel to build
 		// per-frame images, then median-combine into a clean model. This gives the
 		// model better fidelity than inverse-blot when the sep kernel is non-trivial.
-		sepImages := make([][]float32, len(dataPlanned))
+		sepFrames := make([]SepFrame, len(dataPlanned))
 		for slot, pi := range dataPlanned {
-			sepImages[slot] = drizzleSepFrame(planned[pi], width, height, minX, minY, options.Scale, dropSize, options.SepKernel, options.UseERRWeighting)
+			sepFrames[slot] = drizzleSepFrame(planned[pi], workingPixels[pi], width, height, minX, minY, options.Scale, dropSize, options.SepKernel, options.UseERRWeighting)
 		}
-		model := buildMedianModel(sepImages, width, height, len(dataPlanned))
-		sepImages = nil // allow GC before final drizzle pass
+		model := buildMedianModel(sepFrames, width, height, len(dataPlanned))
+		sepFrames = nil // allow GC before final drizzle pass
 		// Wire full WCS mappers into each FrameInfo so BuildCRMasksFromModel
 		// blots using the same per-pixel mapping as drizzleSepFrame did.
 		// Without this, the affine SourceToRef approximation can be off by
@@ -365,12 +473,24 @@ func Build(inputs []Input, options Options) (*Result, error) {
 				return planned[pi].mapPixel(x, y)
 			}
 		}
-		crMasks = processing.BuildCRMasksFromModel(
+		crSeedSNR := options.CRSeedSNR
+		if crSeedSNR <= 0 {
+			crSeedSNR = 4.0
+		}
+		crDerivScale := options.CRDerivScale
+		if crDerivScale <= 0 {
+			crDerivScale = 1.2
+		}
+		boolMasks := processing.BuildCRMasksFromModel(
 			frameInfos, model, width, height, minX, minY, options.Scale,
-			processing.DrizzleStyleCROptions{SeedSNR: 4.0, DerivScale: 1.2},
+			processing.DrizzleStyleCROptions{SeedSNR: crSeedSNR, DerivScale: crDerivScale},
 		)
+		crMasks = compressCRMasks(boolMasks)
+		boolMasks = nil
 	case effectiveCR == CRMethodLegacy && len(dataPlanned) > 1:
-		crMasks = processing.BuildCosmicRayMasks(frameInfos, 5.0, 2.0)
+		boolMasks := processing.BuildCosmicRayMasks(frameInfos, 5.0, 2.0)
+		crMasks = compressCRMasks(boolMasks)
+		boolMasks = nil
 	}
 
 	// Final drizzle pass: accumulate all frames into the output using FinalKernel.
@@ -382,13 +502,15 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		if planned[i].input.ReferenceOnly {
 			continue
 		}
-		pixels := planned[i].input.HDU.Data.Pixels
-		var crMask []bool
+		pixels := workingPixels[i]
+		var crMask BitMask
+		cleaned := false
 
 		if effectiveCR != CRMethodNone {
 			slot := crMaskIndex[i]
 			if slot >= 0 && crMasks != nil {
 				crMask = crMasks[slot]
+				cleaned = len(crMask) > 0
 			} else if len(dataPlanned) == 1 {
 				// Only one data frame — no inter-frame comparison possible.
 				// Do not apply any CR removal (a lone frame has no reference to
@@ -397,54 +519,30 @@ func Build(inputs []Input, options Options) (*Result, error) {
 				// Single-frame fallback: always use legacy Laplacian detector.
 				_, sigma := processing.EstimateBackground(pixels)
 				pixels = processing.RemoveCosmicRays(pixels, planned[i].input.HDU.Data.Width, planned[i].input.HDU.Data.Height, sigma, 2, nil)
+				cleaned = true
 			}
-			statuses[planned[i].statusIndex].Cleaned = true
-			statuses[planned[i].statusIndex].Status = "cleaned and drizzled"
+			if cleaned {
+				statuses[planned[i].statusIndex].Cleaned = true
+			}
+			statuses[planned[i].statusIndex].Status = drizzleBuildStatus(statuses[planned[i].statusIndex].SkySubtracted, cleaned)
 		} else if statuses[planned[i].statusIndex].Status == "reference" {
-			statuses[planned[i].statusIndex].Status = "reference drizzled"
+			if statuses[planned[i].statusIndex].SkySubtracted {
+				statuses[planned[i].statusIndex].Status = drizzleBuildStatus(true, false)
+			} else {
+				statuses[planned[i].statusIndex].Status = "reference drizzled"
+			}
 		} else {
-			statuses[planned[i].statusIndex].Status = "aligned and drizzled"
+			statuses[planned[i].statusIndex].Status = drizzleBuildStatus(statuses[planned[i].statusIndex].SkySubtracted, false)
 		}
 		includedCount++
 
 		trimX := effectiveEdgeTrim(planned[i].input.HDU.Data.Width, options.Scale)
 		trimY := effectiveEdgeTrim(planned[i].input.HDU.Data.Height, options.Scale)
-		for y := trimY; y < planned[i].input.HDU.Data.Height-trimY; y++ {
-			for x := trimX; x < planned[i].input.HDU.Data.Width-trimX; x++ {
-				idx := y*planned[i].input.HDU.Data.Width + x
-				if crMask != nil && crMask[idx] {
-					continue
-				}
-				val := float64(pixels[idx])
-				if math.IsNaN(val) || math.IsInf(val, 0) {
-					continue
-				}
-
-				var pixelWeight float32 = 1.0
-				if options.UseERRWeighting {
-					if errPix := planned[i].input.ERRPixels; errPix != nil && idx < len(errPix) {
-						if e := errPix[idx]; e > 0 && !math.IsNaN(float64(e)) {
-							pixelWeight = 1.0 / (e * e)
-						}
-					}
-				}
-
-				refX, refY := planned[i].mapPixel(float64(x), float64(y))
-				outX := (refX - minX) * options.Scale
-				outY := (refY - minY) * options.Scale
-				drizzlePixelKernel(sums, weights, width, height, outX, outY, dropSize, float32(val), finalKernel, pixelWeight)
-			}
-		}
+		drizzlePlannedInput(planned[i], sums, weights, width, height, minX, minY,
+			options.Scale, dropSize, finalKernel, options.UseERRWeighting, crMask, pixels, trimX, trimY)
 	}
 
-	out := make([]float32, len(sums))
-	for i := range out {
-		if weights[i] == 0 {
-			out[i] = float32(math.NaN())
-			continue
-		}
-		out[i] = sums[i] / weights[i]
-	}
+	normalizeAccumulatedImage(sums, weights)
 
 	// Compute output-space footprints for preview border drawing.
 	// If the input had multiple SCI chips merged, expand one footprint per chip;
@@ -483,7 +581,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	}
 
 	return &Result{
-		Pixels:              out,
+		Pixels:              sums,
 		Weights:             weights,
 		Width:               width,
 		Height:              height,
@@ -522,6 +620,7 @@ func SortInputsByWCSDistance(inputs []Input, statuses []InputStatus) {
 	type fileGroup struct {
 		path    string
 		indices []int // original indices into inputs
+		dist    float64
 	}
 	var groups []fileGroup
 	groupIdx := make(map[string]int, len(inputs))
@@ -543,32 +642,28 @@ func SortInputsByWCSDistance(inputs []Input, statuses []InputStatus) {
 		})
 	}
 
+	// Compute each group's WCS distance once. Do not do this in the sort
+	// comparator; WCS projection is substantially more expensive than compare.
+	for g := range groups {
+		if groups[g].path == ref.Path {
+			groups[g].dist = -1
+			continue
+		}
+		rep := inputs[groups[g].indices[0]]
+		d, err := processing.CenterDistInRefPixels(
+			rep.HDU.Header, rep.HDU.Data.Width, rep.HDU.Data.Height,
+			ref.HDU.Header, ref.HDU.Data.Width, ref.HDU.Data.Height,
+		)
+		if err != nil {
+			d = math.MaxFloat64
+		}
+		groups[g].dist = d
+	}
+
 	// Sort file groups by WCS distance of their representative chip from ref.
 	// The group containing inputs[0] always sorts first.
 	sort.SliceStable(groups, func(a, b int) bool {
-		if groups[a].path == ref.Path {
-			return true
-		}
-		if groups[b].path == ref.Path {
-			return false
-		}
-		repA := inputs[groups[a].indices[0]]
-		repB := inputs[groups[b].indices[0]]
-		dA, errA := processing.CenterDistInRefPixels(
-			repA.HDU.Header, repA.HDU.Data.Width, repA.HDU.Data.Height,
-			ref.HDU.Header, ref.HDU.Data.Width, ref.HDU.Data.Height,
-		)
-		dB, errB := processing.CenterDistInRefPixels(
-			repB.HDU.Header, repB.HDU.Data.Width, repB.HDU.Data.Height,
-			ref.HDU.Header, ref.HDU.Data.Width, ref.HDU.Data.Height,
-		)
-		if errA != nil {
-			dA = math.MaxFloat64
-		}
-		if errB != nil {
-			dB = math.MaxFloat64
-		}
-		return dA < dB
+		return groups[a].dist < groups[b].dist
 	})
 
 	// Flatten into a flat index order derived from the sorted groups.
@@ -613,6 +708,10 @@ func sortedByDistFromRef(inputs []Input) []int {
 	}
 	entries := make([]entry, len(inputs)-1)
 	for i := 1; i < len(inputs); i++ {
+		if inputs[i].Excluded {
+			entries[i-1] = entry{idx: i, dist: math.MaxFloat64}
+			continue
+		}
 		d, err := processing.CenterDistInRefPixels(
 			inputs[i].HDU.Header,
 			inputs[i].HDU.Data.Width,
@@ -644,6 +743,9 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
 	}
+	if inputs[0].Excluded {
+		return nil, fmt.Errorf("reference image is excluded")
+	}
 	mode = normalizeAlignmentMode(mode)
 	if searchRadiusArcsec <= 0 {
 		searchRadiusArcsec = defaultSearchRadiusArcsec
@@ -657,7 +759,22 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	}
 
 	results := make([]StarAlignmentResult, len(inputs))
+	for i := range inputs {
+		if inputs[i].Excluded {
+			results[i] = StarAlignmentResult{
+				OffsetX:            inputs[i].OffsetX,
+				OffsetY:            inputs[i].OffsetY,
+				ManualTransform:    inputs[i].ManualTransform,
+				HasManualTransform: inputs[i].HasManualTransform,
+				Error:              "excluded",
+				Applied:            false,
+			}
+		}
+	}
 	for r := 0; r < numRefs; r++ {
+		if inputs[r].Excluded {
+			continue
+		}
 		results[r] = StarAlignmentResult{
 			OffsetX:            inputs[r].OffsetX,
 			OffsetY:            inputs[r].OffsetY,
@@ -668,12 +785,21 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	}
 
 	aligned := make([]bool, len(inputs))
-	for r := 0; r < numRefs; r++ {
-		aligned[r] = true
+	for i := range inputs {
+		if inputs[i].Excluded {
+			aligned[i] = true
+		}
 	}
-	queue := make([]int, numRefs)
 	for r := 0; r < numRefs; r++ {
-		queue[r] = r
+		if !inputs[r].Excluded {
+			aligned[r] = true
+		}
+	}
+	queue := make([]int, 0, numRefs)
+	for r := 0; r < numRefs; r++ {
+		if !inputs[r].Excluded {
+			queue = append(queue, r)
+		}
 	}
 	lastErr := make([]string, len(inputs))
 	ordered := sortedByDistFromRef(inputs)
@@ -687,11 +813,11 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	}
 
 	type refCache struct {
-		input      Input
-		stars      []processing.Star
-		w0toR      processing.AffineTransform
-		wRto0      processing.AffineTransform
-		hasWCS     bool
+		input  Input
+		stars  []processing.Star
+		w0toR  processing.AffineTransform
+		wRto0  processing.AffineTransform
+		hasWCS bool
 	}
 	refCaches := make([]refCache, numRefs)
 	refCaches[0] = refCache{input: inputs[0], hasWCS: true}
@@ -701,6 +827,10 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[0] extracted %d stars", len(refCaches[0].stars)))
 	}
 	for r := 1; r < numRefs; r++ {
+		if inputs[r].Excluded {
+			refCaches[r] = refCache{input: inputs[r]}
+			continue
+		}
 		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
 		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
 		if err0 != nil || err1 != nil {
@@ -800,7 +930,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			// Collect unaligned inputs and run them concurrently against the reference.
 			var toAlign []int
 			for _, i := range ordered {
-				if !aligned[i] {
+				if !aligned[i] && !inputs[i].Excluded {
 					toAlign = append(toAlign, i)
 				}
 			}
@@ -842,7 +972,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			// Chain fallback: translate unaligned images against an already-aligned intermediate.
 			// (refIdx here is always a non-reference intermediate, never a designated reference.)
 			for _, i := range ordered {
-				if aligned[i] {
+				if aligned[i] || inputs[i].Excluded {
 					continue
 				}
 				dx, dy, err := processing.EstimateTranslationAfterWCS(
@@ -873,6 +1003,9 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	}
 
 	for i := 1; i < len(inputs); i++ {
+		if inputs[i].Excluded {
+			continue
+		}
 		if !aligned[i] {
 			errMsg := "no overlapping aligned image found"
 			if lastErr[i] != "" {
@@ -908,6 +1041,9 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
 	}
+	if inputs[0].Excluded {
+		return nil, fmt.Errorf("reference image is excluded")
+	}
 	if len(refStars) == 0 {
 		return nil, fmt.Errorf("no reference stars provided")
 	}
@@ -923,7 +1059,22 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 	}
 
 	results := make([]StarAlignmentResult, len(inputs))
+	for i := range inputs {
+		if inputs[i].Excluded {
+			results[i] = StarAlignmentResult{
+				OffsetX:            inputs[i].OffsetX,
+				OffsetY:            inputs[i].OffsetY,
+				ManualTransform:    inputs[i].ManualTransform,
+				HasManualTransform: inputs[i].HasManualTransform,
+				Error:              "excluded",
+				Applied:            false,
+			}
+		}
+	}
 	for r := 0; r < numRefs; r++ {
+		if inputs[r].Excluded {
+			continue
+		}
 		results[r] = StarAlignmentResult{
 			OffsetX:            inputs[r].OffsetX,
 			OffsetY:            inputs[r].OffsetY,
@@ -940,15 +1091,19 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 	// These are used to convert a refinement solved in inputs[r] space back to
 	// inputs[0] space via:  ManualTransform = wRto0 ∘ T_r ∘ w0toR
 	type refEntry struct {
-		input   Input
-		stars   []processing.Star
-		w0toR   processing.AffineTransform
-		wRto0   processing.AffineTransform
-		hasWCS  bool
+		input  Input
+		stars  []processing.Star
+		w0toR  processing.AffineTransform
+		wRto0  processing.AffineTransform
+		hasWCS bool
 	}
 	refs := make([]refEntry, numRefs)
 	refs[0] = refEntry{input: inputs[0], stars: refStars, hasWCS: true}
 	for r := 1; r < numRefs; r++ {
+		if inputs[r].Excluded {
+			refs[r] = refEntry{input: inputs[r]}
+			continue
+		}
 		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
 		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
 		if err0 != nil || err1 != nil {
@@ -971,7 +1126,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 
 	// Align closest images first so results are more stable across runs.
 	for _, i := range sortedByDistFromRef(inputs) {
-		if i < numRefs {
+		if i < numRefs || inputs[i].Excluded {
 			continue
 		}
 
@@ -1092,6 +1247,7 @@ func composePlacementTransform(base processing.AffineTransform, input Input) pro
 	}
 	return placed
 }
+
 func SaveResultFITS(path string, result *Result) error {
 	if result == nil {
 		return fmt.Errorf("no drizzle result available")
@@ -1107,8 +1263,17 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 	ref := inputs[0]
 	statuses := make([]InputStatus, len(inputs))
 	for i, input := range inputs {
-		statuses[i] = InputStatus{Path: InputKey(input), Status: "loaded", OffsetX: input.OffsetX, OffsetY: input.OffsetY,
+		status := "loaded"
+		if input.Excluded {
+			status = "excluded"
+		}
+		statuses[i] = InputStatus{Path: InputKey(input), Status: status, OffsetX: input.OffsetX, OffsetY: input.OffsetY,
 			HasAffine: input.HasManualTransform, AffineRotDeg: affineRotationDeg(input.ManualTransform)}
+	}
+	if ref.Excluded {
+		statuses[0].Status = "failed"
+		statuses[0].Error = "reference image is excluded"
+		return nil, statuses, 0, 0, 0, 0, fmt.Errorf("reference image is excluded")
 	}
 
 	if _, err := processing.ComputeWCSTransform(ref.HDU.Header, ref.HDU.Header); err != nil {
@@ -1122,6 +1287,9 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 	boundsInitialized := false
 
 	for idx, input := range inputs {
+		if input.Excluded {
+			continue
+		}
 		transform := processing.IdentityTransform()
 		var mapper *processing.WCSMapper
 		if idx == 0 {
@@ -1272,10 +1440,10 @@ func mergeHeaders(headers ...fitsio.Header) fitsio.Header {
 	return merged
 }
 
-func imageCorners(width, height int) [][2]float64 {
+func imageCorners(width, height int) [4][2]float64 {
 	maxX := float64(width - 1)
 	maxY := float64(height - 1)
-	return [][2]float64{{0, 0}, {maxX, 0}, {0, maxY}, {maxX, maxY}}
+	return [4][2]float64{{0, 0}, {maxX, 0}, {0, maxY}, {maxX, maxY}}
 }
 
 // effectiveEdgeTrim returns the number of input pixels to exclude from each
@@ -1296,60 +1464,54 @@ func effectiveEdgeTrim(size int, scale float64) int {
 	return t
 }
 
+// SepFrame holds a singly drizzled frame and a compact coverage mask used by
+// the drizzle-style CR median model. A bitset keeps the median model from
+// treating uncovered pixels as real samples without retaining a second full
+// weight image per input.
+type SepFrame struct {
+	Image   []float32
+	Covered BitMask
+}
+
 // drizzleSepFrame drizzles a single planned input into its own output-size
-// accumulator and returns the normalized image. Used to build per-frame images
-// for the AstroDrizzle-style separate pass.
-func drizzleSepFrame(p plannedInput, outW, outH int, minX, minY, scale, dropSize float64, kernel DrizzleKernel, useERRWeighting bool) []float32 {
+// accumulator and returns the normalized image plus a compact coverage mask.
+// Used to build per-frame images for the AstroDrizzle-style separate pass.
+func drizzleSepFrame(p plannedInput, pixels []float32, outW, outH int, minX, minY, scale, dropSize float64, kernel DrizzleKernel, useERRWeighting bool) SepFrame {
 	// Use out as the flux accumulator directly; weights tracks coverage.
 	// This avoids allocating a separate sums array.
 	out := make([]float32, outW*outH)
 	weights := make([]float32, outW*outH)
-	// trimX := effectiveEdgeTrim(p.input.HDU.Data.Width, scale)
-	// trimY := effectiveEdgeTrim(p.input.HDU.Data.Height, scale)
+	// Keep the original behavior of not trimming the separate CR-model frames.
 	trimX, trimY := 0, 0
-	pixels := p.input.HDU.Data.Pixels
-	for y := trimY; y < p.input.HDU.Data.Height-trimY; y++ {
-		for x := trimX; x < p.input.HDU.Data.Width-trimX; x++ {
-			idx := y*p.input.HDU.Data.Width + x
-			val := float64(pixels[idx])
-			if math.IsNaN(val) || math.IsInf(val, 0) {
-				continue
-			}
-			var pixelWeight float32 = 1.0
-			if useERRWeighting {
-				if errPix := p.input.ERRPixels; errPix != nil && idx < len(errPix) {
-					if e := errPix[idx]; e > 0 && !math.IsNaN(float64(e)) {
-						pixelWeight = 1.0 / (e * e)
-					}
-				}
-			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
-			drizzlePixelKernel(out, weights, outW, outH, outX, outY, dropSize, float32(val), kernel, pixelWeight)
-		}
-	}
-	// Normalize in-place: weight-divide where covered, NaN elsewhere.
+	drizzlePlannedInput(p, out, weights, outW, outH, minX, minY, scale, dropSize, kernel, useERRWeighting, nil, pixels, trimX, trimY)
+
+	covered := NewBitMask(len(out))
 	for i := range out {
-		if weights[i] == 0 {
+		if abs32(weights[i]) <= weightEpsilon {
 			out[i] = float32(math.NaN())
-		} else {
-			out[i] /= weights[i]
+			continue
 		}
+		covered.Set(i)
+		out[i] /= weights[i]
 	}
-	return out
+	return SepFrame{Image: out, Covered: covered}
 }
 
 // buildMedianModel combines n per-frame drizzled images into a single clean
-// model using minmed (n ≤ 3) or median (n > 3) at each pixel.
-func buildMedianModel(images [][]float32, outW, outH, n int) []float32 {
+// model using minmed (n ≤ 3) or a true median (n > 3) at each pixel. The
+// per-frame coverage mask prevents uncovered sep-frame pixels from biasing the
+// model, while avoiding full retained weight maps for every input.
+func buildMedianModel(frames []SepFrame, outW, outH, n int) []float32 {
 	model := make([]float32, outW*outH)
-	vals := make([]float64, 0, n)
+	vals := make([]float32, 0, n)
 	for i := range model {
 		vals = vals[:0]
-		for _, img := range images {
-			v := float64(img[i])
-			if !math.IsNaN(v) {
+		for _, frame := range frames {
+			if len(frame.Image) <= i || !frame.Covered.Get(i) {
+				continue
+			}
+			v := frame.Image[i]
+			if isFinite32(v) {
 				vals = append(vals, v)
 			}
 		}
@@ -1363,90 +1525,238 @@ func buildMedianModel(images [][]float32, outW, outH, n int) []float32 {
 				vals[k], vals[k-1] = vals[k-1], vals[k]
 			}
 		}
-		median := vals[(len(vals)-1)/2]
+		median := medianSorted(vals)
 		if n <= 3 {
-			var sum float64
+			var sum float32
 			for _, v := range vals {
 				sum += v
 			}
-			mean := sum / float64(len(vals))
+			mean := sum / float32(len(vals))
 			if mean < median {
-				model[i] = float32(mean)
+				model[i] = mean
 			} else {
-				model[i] = float32(median)
+				model[i] = median
 			}
 		} else {
-			model[i] = float32(median)
+			model[i] = median
 		}
 	}
 	return model
 }
 
-func drizzlePixelKernel(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, kernel DrizzleKernel, pixelWeight float32) {
-	switch kernel {
-	case KernelPoint:
-		drizzlePixelPoint(sums, weights, width, height, cx, cy, value, pixelWeight)
-	case KernelTurbo:
-		drizzlePixelTurbo(sums, weights, width, height, cx, cy, dropSize, value, pixelWeight)
-	case KernelGaussian:
-		drizzlePixelGaussian(sums, weights, width, height, cx, cy, dropSize, value, pixelWeight)
-	case KernelTophat:
-		drizzlePixelTophat(sums, weights, width, height, cx, cy, dropSize, value, pixelWeight)
-	case KernelLanczos2:
-		drizzlePixelLanczos(sums, weights, width, height, cx, cy, value, 2, pixelWeight)
-	case KernelLanczos3:
-		drizzlePixelLanczos(sums, weights, width, height, cx, cy, value, 3, pixelWeight)
-	default: // KernelSquare
-		drizzlePixelSquare(sums, weights, width, height, cx, cy, dropSize, value, pixelWeight)
+func medianSorted(vals []float32) float32 {
+	n := len(vals)
+	if n == 0 {
+		return float32(math.NaN())
+	}
+	mid := n / 2
+	if n%2 == 1 {
+		return vals[mid]
+	}
+	return 0.5 * (vals[mid-1] + vals[mid])
+}
+
+func abs32(v float32) float32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func normalizeAccumulatedImage(sums, weights []float32) {
+	for i := range sums {
+		if i >= len(weights) || abs32(weights[i]) <= weightEpsilon {
+			sums[i] = float32(math.NaN())
+			continue
+		}
+		sums[i] /= weights[i]
 	}
 }
 
-// drizzlePixelSquare is the classic drizzle box-overlap kernel.
-func drizzlePixelSquare(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, pixelWeight float32) {
-	if width <= 0 || height <= 0 {
-		return
+func drizzlePlannedInput(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, kernel DrizzleKernel, useERRWeighting bool, crMask BitMask, pixels []float32, trimX, trimY int) {
+	switch kernel {
+	case KernelPoint:
+		drizzlePlannedInputPoint(p, sums, weights, width, height, minX, minY, scale, useERRWeighting, crMask, pixels, trimX, trimY)
+	case KernelTurbo:
+		drizzlePlannedInputTurbo(p, sums, weights, width, height, minX, minY, scale, dropSize, useERRWeighting, crMask, pixels, trimX, trimY)
+	case KernelGaussian:
+		drizzlePlannedInputGaussian(p, sums, weights, width, height, minX, minY, scale, dropSize, useERRWeighting, crMask, pixels, trimX, trimY)
+	case KernelTophat:
+		drizzlePlannedInputTophat(p, sums, weights, width, height, minX, minY, scale, dropSize, useERRWeighting, crMask, pixels, trimX, trimY)
+	case KernelLanczos2:
+		drizzlePlannedInputLanczos(p, sums, weights, width, height, minX, minY, scale, 2, useERRWeighting, crMask, pixels, trimX, trimY)
+	case KernelLanczos3:
+		drizzlePlannedInputLanczos(p, sums, weights, width, height, minX, minY, scale, 3, useERRWeighting, crMask, pixels, trimX, trimY)
+	default:
+		drizzlePlannedInputSquare(p, sums, weights, width, height, minX, minY, scale, dropSize, useERRWeighting, crMask, pixels, trimX, trimY)
 	}
+}
+
+func drizzlePixelWeight(p plannedInput, idx int, useERRWeighting bool) float32 {
+	if !useERRWeighting {
+		return 1
+	}
+	if errPix := p.input.ERRPixels; errPix != nil && idx < len(errPix) {
+		if e := errPix[idx]; e > 0 && isFinite32(e) {
+			return 1.0 / (e * e)
+		}
+	}
+	return 1
+}
+
+func drizzlePlannedInputPoint(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale float64, useERRWeighting bool, crMask BitMask, pixels []float32, trimX, trimY int) {
+	data := p.input.HDU.Data
+	for y := trimY; y < data.Height-trimY; y++ {
+		row := y * data.Width
+		for x := trimX; x < data.Width-trimX; x++ {
+			idx := row + x
+			if crMask != nil && crMask.Get(idx) {
+				continue
+			}
+			value := pixels[idx]
+			if !isFinite32(value) {
+				continue
+			}
+			refX, refY := p.mapPixel(float64(x), float64(y))
+			outX := (refX - minX) * scale
+			outY := (refY - minY) * scale
+			drizzlePixelPoint(sums, weights, width, height, outX, outY, value, drizzlePixelWeight(p, idx, useERRWeighting))
+		}
+	}
+}
+
+func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, useERRWeighting bool, crMask BitMask, pixels []float32, trimX, trimY int) {
+	data := p.input.HDU.Data
+	half := normalizedDropSize(dropSize) / 2.0
+	for y := trimY; y < data.Height-trimY; y++ {
+		row := y * data.Width
+		for x := trimX; x < data.Width-trimX; x++ {
+			idx := row + x
+			if crMask != nil && crMask.Get(idx) {
+				continue
+			}
+			value := pixels[idx]
+			if !isFinite32(value) {
+				continue
+			}
+			refX, refY := p.mapPixel(float64(x), float64(y))
+			outX := (refX - minX) * scale
+			outY := (refY - minY) * scale
+			drizzlePixelSquarePrepared(sums, weights, width, height, outX, outY, half, value, drizzlePixelWeight(p, idx, useERRWeighting))
+		}
+	}
+}
+
+func drizzlePlannedInputTurbo(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, useERRWeighting bool, crMask BitMask, pixels []float32, trimX, trimY int) {
+	data := p.input.HDU.Data
+	half := normalizedDropSize(dropSize) / 2.0
+	for y := trimY; y < data.Height-trimY; y++ {
+		row := y * data.Width
+		for x := trimX; x < data.Width-trimX; x++ {
+			idx := row + x
+			if crMask != nil && crMask.Get(idx) {
+				continue
+			}
+			value := pixels[idx]
+			if !isFinite32(value) {
+				continue
+			}
+			refX, refY := p.mapPixel(float64(x), float64(y))
+			outX := (refX - minX) * scale
+			outY := (refY - minY) * scale
+			drizzlePixelTurboPrepared(sums, weights, width, height, outX, outY, half, value, drizzlePixelWeight(p, idx, useERRWeighting))
+		}
+	}
+}
+
+func drizzlePlannedInputGaussian(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, useERRWeighting bool, crMask BitMask, pixels []float32, trimX, trimY int) {
+	data := p.input.HDU.Data
+	sigma := normalizedDropSize(dropSize) / (2 * math.Sqrt(2*math.Log(2)))
+	params := gaussianParams{twoSigSq: 2 * sigma * sigma, radius: 3 * sigma}
+	for y := trimY; y < data.Height-trimY; y++ {
+		row := y * data.Width
+		for x := trimX; x < data.Width-trimX; x++ {
+			idx := row + x
+			if crMask != nil && crMask.Get(idx) {
+				continue
+			}
+			value := pixels[idx]
+			if !isFinite32(value) {
+				continue
+			}
+			refX, refY := p.mapPixel(float64(x), float64(y))
+			outX := (refX - minX) * scale
+			outY := (refY - minY) * scale
+			drizzlePixelGaussianPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, useERRWeighting))
+		}
+	}
+}
+
+func drizzlePlannedInputTophat(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, useERRWeighting bool, crMask BitMask, pixels []float32, trimX, trimY int) {
+	data := p.input.HDU.Data
+	radius := normalizedDropSize(dropSize) / 2.0
+	params := tophatParams{radius: radius, radSq: radius * radius}
+	for y := trimY; y < data.Height-trimY; y++ {
+		row := y * data.Width
+		for x := trimX; x < data.Width-trimX; x++ {
+			idx := row + x
+			if crMask != nil && crMask.Get(idx) {
+				continue
+			}
+			value := pixels[idx]
+			if !isFinite32(value) {
+				continue
+			}
+			refX, refY := p.mapPixel(float64(x), float64(y))
+			outX := (refX - minX) * scale
+			outY := (refY - minY) * scale
+			drizzlePixelTophatPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, useERRWeighting))
+		}
+	}
+}
+
+func drizzlePlannedInputLanczos(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale float64, n int, useERRWeighting bool, crMask BitMask, pixels []float32, trimX, trimY int) {
+	data := p.input.HDU.Data
+	for y := trimY; y < data.Height-trimY; y++ {
+		row := y * data.Width
+		for x := trimX; x < data.Width-trimX; x++ {
+			idx := row + x
+			if crMask != nil && crMask.Get(idx) {
+				continue
+			}
+			value := pixels[idx]
+			if !isFinite32(value) {
+				continue
+			}
+			refX, refY := p.mapPixel(float64(x), float64(y))
+			outX := (refX - minX) * scale
+			outY := (refY - minY) * scale
+			drizzlePixelLanczosPrepared(sums, weights, width, height, outX, outY, value, n, drizzlePixelWeight(p, idx, useERRWeighting))
+		}
+	}
+}
+
+func normalizedDropSize(dropSize float64) float64 {
 	if dropSize <= 0 {
-		dropSize = 1
+		return 1
 	}
+	return dropSize
+}
 
-	half := dropSize / 2.0
-	left := cx - half
-	right := cx + half
-	top := cy - half
-	bottom := cy + half
-
-	ix0 := int(math.Floor(left - 0.5))
-	ix1 := int(math.Ceil(right + 0.5))
-	iy0 := int(math.Floor(top - 0.5))
-	iy1 := int(math.Ceil(bottom + 0.5))
-
-	for y := iy0; y <= iy1; y++ {
-		if y < 0 || y >= height {
-			continue
-		}
-		cellTop := float64(y) - 0.5
-		cellBottom := float64(y) + 0.5
-		overlapY := math.Min(bottom, cellBottom) - math.Max(top, cellTop)
-		if overlapY <= 0 {
-			continue
-		}
-		for x := ix0; x <= ix1; x++ {
-			if x < 0 || x >= width {
-				continue
-			}
-			cellLeft := float64(x) - 0.5
-			cellRight := float64(x) + 0.5
-			overlapX := math.Min(right, cellRight) - math.Max(left, cellLeft)
-			if overlapX <= 0 {
-				continue
-			}
-			w := float32(overlapX*overlapY) * pixelWeight
-			idx := y*width + x
-			sums[idx] += value * w
-			weights[idx] += w
-		}
+func clampKernelBounds(x0, x1, y0, y1, width, height int) (int, int, int, int, bool) {
+	if x0 < 0 {
+		x0 = 0
 	}
+	if y0 < 0 {
+		y0 = 0
+	}
+	if x1 >= width {
+		x1 = width - 1
+	}
+	if y1 >= height {
+		y1 = height - 1
+	}
+	return x0, x1, y0, y1, x0 <= x1 && y0 <= y1
 }
 
 // drizzlePixelPoint deposits flux into the single nearest output pixel.
@@ -1461,99 +1771,138 @@ func drizzlePixelPoint(sums, weights []float32, width, height int, cx, cy float6
 	weights[idx] += pixelWeight
 }
 
-// drizzlePixelTurbo is a fast axis-aligned approximation: it accumulates into
-// every output pixel whose center falls within the drop footprint with equal
-// weight, skipping fractional-edge overlap computation.
-func drizzlePixelTurbo(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, pixelWeight float32) {
-	if dropSize <= 0 {
-		dropSize = 1
-	}
-	half := dropSize / 2.0
-	x0 := int(math.Ceil(cx - half))
-	x1 := int(math.Floor(cx + half))
-	y0 := int(math.Ceil(cy - half))
-	y1 := int(math.Floor(cy + half))
-	if x0 > x1 {
-		// Drop is smaller than one pixel: fall back to nearest.
-		drizzlePixelPoint(sums, weights, width, height, cx, cy, value, pixelWeight)
+// drizzlePixelSquarePrepared is the classic drizzle box-overlap kernel with
+// precomputed half drop size.
+func drizzlePixelSquarePrepared(sums, weights []float32, width, height int, cx, cy, half float64, value float32, pixelWeight float32) {
+	if width <= 0 || height <= 0 {
 		return
 	}
-	for y := y0; y <= y1; y++ {
-		if y < 0 || y >= height {
-			continue
-		}
-		for x := x0; x <= x1; x++ {
-			if x < 0 || x >= width {
-				continue
-			}
-			idx := y*width + x
-			sums[idx] += value * pixelWeight
-			weights[idx] += pixelWeight
-		}
-	}
-}
 
-// drizzlePixelGaussian spreads flux with a Gaussian footprint.
-// sigma = dropSize / (2 * sqrt(2*ln2)) so that FWHM == dropSize.
-func drizzlePixelGaussian(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, pixelWeight float32) {
-	if dropSize <= 0 {
-		dropSize = 1
+	left := cx - half
+	right := cx + half
+	top := cy - half
+	bottom := cy + half
+
+	ix0 := int(math.Floor(left-0.5)) + 1
+	ix1 := int(math.Ceil(right+0.5)) - 1
+	iy0 := int(math.Floor(top-0.5)) + 1
+	iy1 := int(math.Ceil(bottom+0.5)) - 1
+
+	var ok bool
+	ix0, ix1, iy0, iy1, ok = clampKernelBounds(ix0, ix1, iy0, iy1, width, height)
+	if !ok {
+		return
 	}
-	sigma := dropSize / (2 * math.Sqrt(2*math.Log(2)))
-	twoSigSq := 2 * sigma * sigma
-	radius := 3 * sigma
-	x0 := int(math.Floor(cx - radius))
-	x1 := int(math.Ceil(cx + radius))
-	y0 := int(math.Floor(cy - radius))
-	y1 := int(math.Ceil(cy + radius))
-	for y := y0; y <= y1; y++ {
-		if y < 0 || y >= height {
+
+	for y := iy0; y <= iy1; y++ {
+		cellTop := float64(y) - 0.5
+		cellBottom := float64(y) + 0.5
+		overlapY := math.Min(bottom, cellBottom) - math.Max(top, cellTop)
+		if overlapY <= 0 {
 			continue
 		}
-		dy := float64(y) - cy
-		for x := x0; x <= x1; x++ {
-			if x < 0 || x >= width {
+		row := y * width
+		for x := ix0; x <= ix1; x++ {
+			cellLeft := float64(x) - 0.5
+			cellRight := float64(x) + 0.5
+			overlapX := math.Min(right, cellRight) - math.Max(left, cellLeft)
+			if overlapX <= 0 {
 				continue
 			}
-			dx := float64(x) - cx
-			gw := float32(math.Exp(-(dx*dx + dy*dy) / twoSigSq))
-			if gw < 1e-6 {
-				continue
-			}
-			w := gw * pixelWeight
-			idx := y*width + x
+			w := float32(overlapX*overlapY) * pixelWeight
+			idx := row + x
 			sums[idx] += value * w
 			weights[idx] += w
 		}
 	}
 }
 
-// drizzlePixelTophat spreads flux uniformly within a circular aperture of
-// radius dropSize/2.
-func drizzlePixelTophat(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, pixelWeight float32) {
-	if dropSize <= 0 {
-		dropSize = 1
+// drizzlePixelTurboPrepared is a fast axis-aligned approximation: it accumulates
+// into every output pixel whose center falls within the drop footprint with
+// equal weight, skipping fractional-edge overlap computation.
+func drizzlePixelTurboPrepared(sums, weights []float32, width, height int, cx, cy, half float64, value float32, pixelWeight float32) {
+	x0 := int(math.Ceil(cx - half))
+	x1 := int(math.Floor(cx + half))
+	y0 := int(math.Ceil(cy - half))
+	y1 := int(math.Floor(cy + half))
+	if x0 > x1 || y0 > y1 {
+		// Drop is smaller than one pixel: fall back to nearest.
+		drizzlePixelPoint(sums, weights, width, height, cx, cy, value, pixelWeight)
+		return
 	}
-	radius := dropSize / 2.0
-	radSq := radius * radius
-	x0 := int(math.Floor(cx - radius))
-	x1 := int(math.Ceil(cx + radius))
-	y0 := int(math.Floor(cy - radius))
-	y1 := int(math.Ceil(cy + radius))
+	var ok bool
+	x0, x1, y0, y1, ok = clampKernelBounds(x0, x1, y0, y1, width, height)
+	if !ok {
+		return
+	}
 	for y := y0; y <= y1; y++ {
-		if y < 0 || y >= height {
-			continue
-		}
-		dy := float64(y) - cy
+		row := y * width
 		for x := x0; x <= x1; x++ {
-			if x < 0 || x >= width {
-				continue
-			}
+			idx := row + x
+			sums[idx] += value * pixelWeight
+			weights[idx] += pixelWeight
+		}
+	}
+}
+
+type gaussianParams struct {
+	twoSigSq float64
+	radius   float64
+}
+
+// drizzlePixelGaussianPrepared spreads flux with a Gaussian footprint.
+func drizzlePixelGaussianPrepared(sums, weights []float32, width, height int, cx, cy float64, params gaussianParams, value float32, pixelWeight float32) {
+	x0 := int(math.Floor(cx - params.radius))
+	x1 := int(math.Ceil(cx + params.radius))
+	y0 := int(math.Floor(cy - params.radius))
+	y1 := int(math.Ceil(cy + params.radius))
+	var ok bool
+	x0, x1, y0, y1, ok = clampKernelBounds(x0, x1, y0, y1, width, height)
+	if !ok {
+		return
+	}
+	for y := y0; y <= y1; y++ {
+		dy := float64(y) - cy
+		row := y * width
+		for x := x0; x <= x1; x++ {
 			dx := float64(x) - cx
-			if dx*dx+dy*dy > radSq {
+			gw := float32(math.Exp(-(dx*dx + dy*dy) / params.twoSigSq))
+			if gw < 1e-6 {
 				continue
 			}
-			idx := y*width + x
+			w := gw * pixelWeight
+			idx := row + x
+			sums[idx] += value * w
+			weights[idx] += w
+		}
+	}
+}
+
+type tophatParams struct {
+	radius float64
+	radSq  float64
+}
+
+// drizzlePixelTophatPrepared spreads flux uniformly within a circular aperture.
+func drizzlePixelTophatPrepared(sums, weights []float32, width, height int, cx, cy float64, params tophatParams, value float32, pixelWeight float32) {
+	x0 := int(math.Floor(cx - params.radius))
+	x1 := int(math.Ceil(cx + params.radius))
+	y0 := int(math.Floor(cy - params.radius))
+	y1 := int(math.Ceil(cy + params.radius))
+	var ok bool
+	x0, x1, y0, y1, ok = clampKernelBounds(x0, x1, y0, y1, width, height)
+	if !ok {
+		return
+	}
+	for y := y0; y <= y1; y++ {
+		dy := float64(y) - cy
+		row := y * width
+		for x := x0; x <= x1; x++ {
+			dx := float64(x) - cx
+			if dx*dx+dy*dy > params.radSq {
+				continue
+			}
+			idx := row + x
 			sums[idx] += value * pixelWeight
 			weights[idx] += pixelWeight
 		}
@@ -1573,35 +1922,86 @@ func lanczos(x float64, n int) float64 {
 	return math.Sin(pix) / pix * math.Sin(pix/fn) / (pix / fn)
 }
 
-// drizzlePixelLanczos uses a separable Lanczos-n resampling kernel.
-func drizzlePixelLanczos(sums, weights []float32, width, height int, cx, cy float64, value float32, n int, pixelWeight float32) {
+// drizzlePixelLanczosPrepared uses a separable Lanczos-n resampling kernel.
+// It accumulates signed kernel weights. Using abs(weight) here changes the
+// interpolation normalization and can damp/alter sharp features.
+func drizzlePixelLanczosPrepared(sums, weights []float32, width, height int, cx, cy float64, value float32, n int, pixelWeight float32) {
 	x0 := int(math.Floor(cx)) - n + 1
 	x1 := int(math.Floor(cx)) + n
 	y0 := int(math.Floor(cy)) - n + 1
 	y1 := int(math.Floor(cy)) + n
+	var ok bool
+	x0, x1, y0, y1, ok = clampKernelBounds(x0, x1, y0, y1, width, height)
+	if !ok {
+		return
+	}
 	for y := y0; y <= y1; y++ {
-		if y < 0 || y >= height {
-			continue
-		}
 		wy := lanczos(float64(y)-cy, n)
 		if wy == 0 {
 			continue
 		}
+		row := y * width
 		for x := x0; x <= x1; x++ {
-			if x < 0 || x >= width {
-				continue
-			}
 			wx := lanczos(float64(x)-cx, n)
 			lw := float32(wx * wy)
 			if lw == 0 {
 				continue
 			}
 			w := lw * pixelWeight
-			idx := y*width + x
+			idx := row + x
 			sums[idx] += value * w
-			weights[idx] += float32(math.Abs(float64(w)))
+			weights[idx] += w
 		}
 	}
+}
+
+// drizzlePixelKernel is kept as a compatibility wrapper for other files in the
+// mosaic package. The main drizzle loops dispatch by kernel once per input
+// instead of calling this per pixel.
+func drizzlePixelKernel(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, kernel DrizzleKernel, pixelWeight float32) {
+	switch kernel {
+	case KernelPoint:
+		drizzlePixelPoint(sums, weights, width, height, cx, cy, value, pixelWeight)
+	case KernelTurbo:
+		drizzlePixelTurbo(sums, weights, width, height, cx, cy, dropSize, value, pixelWeight)
+	case KernelGaussian:
+		drizzlePixelGaussian(sums, weights, width, height, cx, cy, dropSize, value, pixelWeight)
+	case KernelTophat:
+		drizzlePixelTophat(sums, weights, width, height, cx, cy, dropSize, value, pixelWeight)
+	case KernelLanczos2:
+		drizzlePixelLanczos(sums, weights, width, height, cx, cy, value, 2, pixelWeight)
+	case KernelLanczos3:
+		drizzlePixelLanczos(sums, weights, width, height, cx, cy, value, 3, pixelWeight)
+	default:
+		drizzlePixelSquare(sums, weights, width, height, cx, cy, dropSize, value, pixelWeight)
+	}
+}
+
+// drizzlePixelSquare is the classic drizzle box-overlap kernel.
+func drizzlePixelSquare(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, pixelWeight float32) {
+	drizzlePixelSquarePrepared(sums, weights, width, height, cx, cy, normalizedDropSize(dropSize)/2.0, value, pixelWeight)
+}
+
+func drizzlePixelTurbo(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, pixelWeight float32) {
+	drizzlePixelTurboPrepared(sums, weights, width, height, cx, cy, normalizedDropSize(dropSize)/2.0, value, pixelWeight)
+}
+
+// drizzlePixelGaussian spreads flux with a Gaussian footprint.
+// sigma = dropSize / (2 * sqrt(2*ln2)) so that FWHM == dropSize.
+func drizzlePixelGaussian(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, pixelWeight float32) {
+	sigma := normalizedDropSize(dropSize) / (2 * math.Sqrt(2*math.Log(2)))
+	drizzlePixelGaussianPrepared(sums, weights, width, height, cx, cy, gaussianParams{twoSigSq: 2 * sigma * sigma, radius: 3 * sigma}, value, pixelWeight)
+}
+
+// drizzlePixelTophat spreads flux uniformly within a circular aperture of
+// radius dropSize/2.
+func drizzlePixelTophat(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, pixelWeight float32) {
+	radius := normalizedDropSize(dropSize) / 2.0
+	drizzlePixelTophatPrepared(sums, weights, width, height, cx, cy, tophatParams{radius: radius, radSq: radius * radius}, value, pixelWeight)
+}
+
+func drizzlePixelLanczos(sums, weights []float32, width, height int, cx, cy float64, value float32, n int, pixelWeight float32) {
+	drizzlePixelLanczosPrepared(sums, weights, width, height, cx, cy, value, n, pixelWeight)
 }
 
 func FormatStatusLines(inputs []InputStatus) []string {
@@ -1620,6 +2020,9 @@ func FormatStatusLines(inputs []InputStatus) []string {
 		if input.HasAffine {
 			line += fmt.Sprintf(" | affine(rot=%.4f°)", input.AffineRotDeg)
 		}
+		if input.SkySubtracted {
+			line += fmt.Sprintf(" | sky=%+.4f", input.SkyValue)
+		}
 		if input.Cleaned {
 			line += " (cleaned)"
 		}
@@ -1629,6 +2032,19 @@ func FormatStatusLines(inputs []InputStatus) []string {
 		lines = append(lines, line)
 	}
 	return lines
+}
+
+func drizzleBuildStatus(skysubApplied, cleaned bool) string {
+	if skysubApplied && cleaned {
+		return "sky-subtracted, cleaned, and drizzled"
+	}
+	if skysubApplied {
+		return "sky-subtracted and drizzled"
+	}
+	if cleaned {
+		return "cleaned and drizzled"
+	}
+	return "aligned and drizzled"
 }
 
 func LooksLikeFLC(path string) bool {
@@ -1647,11 +2063,12 @@ func affineRotationDeg(t processing.AffineTransform) float64 {
 	return math.Atan2(t.D, t.A) * 180 / math.Pi
 }
 
-// firstDataInput returns the first input that is not marked ReferenceOnly,
-// falling back to inputs[0] if all are reference-only.
+// firstDataInput returns the first non-excluded input that is not marked
+// ReferenceOnly, falling back to inputs[0] if all inputs are reference-only or
+// excluded.
 func firstDataInput(inputs []Input) Input {
 	for _, inp := range inputs {
-		if !inp.ReferenceOnly {
+		if !inp.Excluded && !inp.ReferenceOnly {
 			return inp
 		}
 	}
@@ -1659,10 +2076,11 @@ func firstDataInput(inputs []Input) Input {
 }
 
 // wcsReferenceInput returns the input whose WCS should anchor the output header.
-// If a ReferenceOnly image is present it defines the output coordinate frame, so
-// use it. Otherwise fall back to the first data-bearing input.
+// If the first input is a non-excluded ReferenceOnly image it defines the output
+// coordinate frame, so use it. Otherwise fall back to the first data-bearing
+// non-excluded input.
 func wcsReferenceInput(inputs []Input) Input {
-	if len(inputs) > 0 && inputs[0].ReferenceOnly {
+	if len(inputs) > 0 && !inputs[0].Excluded && inputs[0].ReferenceOnly {
 		return inputs[0]
 	}
 	return firstDataInput(inputs)

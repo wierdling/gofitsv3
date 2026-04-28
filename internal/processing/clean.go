@@ -379,6 +379,7 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 	defer debuglog.Log("BuildCRMasksFromModel: finished")
 	n := len(frames)
 	dirs4 := [4][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
+	dirs8 := [8][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
 	masks := make([][]bool, n)
 
 	for fi := range frames {
@@ -390,6 +391,7 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 
 		npix := f.Width * f.Height
 		mask := make([]bool, npix)
+		excesses := make([]float64, npix)
 
 		// Blot the model back to input frame pixel space.
 		// Use MapFunc when available (full WCS accuracy); fall back to the
@@ -434,6 +436,7 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 					continue
 				}
 				excess := val - bv
+				excesses[idx] = excess
 				if excess <= 0 {
 					continue
 				}
@@ -454,7 +457,7 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 			}
 		}
 
-		// Growth pass: expand flags to 4-connected neighbors with positive excess.
+		// Growth pass: expand flags to 8-connected neighbors with positive excess.
 		growFloor := noiseFloor * 0.5
 		q := make([]int, 0, 256)
 		for idx, flagged := range mask {
@@ -467,7 +470,7 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 			q = q[1:]
 			cx := currIdx % f.Width
 			cy := currIdx / f.Width
-			for _, d := range dirs4 {
+			for _, d := range dirs8 {
 				nx, ny := cx+d[0], cy+d[1]
 				if nx < 0 || nx >= f.Width || ny < 0 || ny >= f.Height {
 					continue
@@ -491,10 +494,77 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 			}
 		}
 
+		recoverCosmicRayHalo(mask, excesses, f.Width, f.Height, f.Sigma)
+
 		masks[fi] = mask
 	}
 
 	return masks
+}
+
+func recoverCosmicRayHalo(mask []bool, excesses []float64, width, height int, sigma float64) {
+	if len(mask) == 0 || sigma <= 0 {
+		return
+	}
+
+	haloFloor := sigma * 0.5
+	if haloFloor <= 0 {
+		return
+	}
+
+	for iter := 0; iter < 2; iter++ {
+		added := make([]int, 0, 64)
+		for idx, flagged := range mask {
+			if !flagged {
+				continue
+			}
+			cx := idx % width
+			cy := idx / width
+			for ny := maxInt(0, cy-1); ny <= minInt(height-1, cy+1); ny++ {
+				for nx := maxInt(0, cx-1); nx <= minInt(width-1, cx+1); nx++ {
+					nIdx := ny*width + nx
+					if nIdx == idx || mask[nIdx] {
+						continue
+					}
+					if excesses[nIdx] <= haloFloor {
+						continue
+					}
+					neighbors := countMaskedNeighbors(mask, width, height, nx, ny)
+					if neighbors >= 2 || (neighbors >= 1 && excesses[nIdx] > sigma) {
+						added = append(added, nIdx)
+					}
+				}
+			}
+		}
+		if len(added) == 0 {
+			return
+		}
+		for _, idx := range added {
+			mask[idx] = true
+		}
+	}
+}
+
+func countMaskedNeighbors(mask []bool, width, height, x, y int) int {
+	count := 0
+	for ny := maxInt(0, y-1); ny <= minInt(height-1, y+1); ny++ {
+		for nx := maxInt(0, x-1); nx <= minInt(width-1, x+1); nx++ {
+			if nx == x && ny == y {
+				continue
+			}
+			if mask[ny*width+nx] {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // bilinearSample returns the bilinear-interpolated value at (x, y).

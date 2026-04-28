@@ -57,16 +57,46 @@ type DrizzleSettings struct {
 	// final_scale semantics).  When > 0, the internal multiplier is computed from
 	// the reference image WCS.  Scale is used as a raw multiplier fallback when
 	// FinalScale is zero.
-	FinalScale    float64 `json:"finalScale"`
-	Scale         float64 `json:"scale"`
-	PixFrac       float64 `json:"pixFrac"`
-	CRMethod      int     `json:"crMethod"`
-	SepKernel     int     `json:"sepKernel"`
-	FinalKernel   int     `json:"finalKernel"`
+	FinalScale         float64 `json:"finalScale"`
+	Scale              float64 `json:"scale"`
+	PixFrac            float64 `json:"pixFrac"`
+	CRMethod           int     `json:"crMethod"`
+	SepKernel          int     `json:"sepKernel"`
+	FinalKernel        int     `json:"finalKernel"`
+	UseERRWeighting    bool    `json:"useERRWeighting"`
+	// CRSeedSNR and CRDerivScale control the drizzle-style CR detection thresholds.
+	// CRSeedSNR is the signal-to-noise ratio threshold for seeding a CR candidate.
+	// CRDerivScale scales the derivative (sharpness) term in the rejection test.
+	CRSeedSNR    float64 `json:"crSeedSNR"`
+	CRDerivScale float64 `json:"crDerivScale"`
+}
+
+// AlignmentSettings holds the star-alignment controls configured through the
+// standalone Mosaic > Alignment Settings dialog.
+type AlignmentSettings struct {
 	AlignmentMode      int     `json:"alignmentMode"`
 	SearchRadiusArcsec float64 `json:"searchRadiusArcsec"`
 	NumRefs            int     `json:"numRefs"`
-	UseERRWeighting    bool    `json:"useERRWeighting"`
+}
+
+// SkysubSettings holds the AstroDrizzle-style sky-subtraction controls
+// configured through the standalone Mosaic > Skysub Settings dialog.
+type SkysubSettings struct {
+	Enabled bool `json:"enabled"`
+	// SkyMethod stores the skysub algorithm as an int so it round-trips
+	// through JSON without importing the mosaic package.
+	SkyMethod int `json:"skyMethod"`
+	// SkyStat stores the sky statistic selector as an int for JSON stability.
+	SkyStat int `json:"skyStat"`
+	// SkyWidth is the histogram bin width in sigma used when SkyStat is mode.
+	SkyWidth    float64 `json:"skyWidth"`
+	SkyLower    float64 `json:"skyLower"`
+	SkyUpper    float64 `json:"skyUpper"`
+	SkyLowerSet bool    `json:"skyLowerSet"`
+	SkyUpperSet bool    `json:"skyUpperSet"`
+	SkyClip     int     `json:"skyClip"`
+	SkyLSigma   float64 `json:"skyLSigma"`
+	SkyUSigma   float64 `json:"skyUSigma"`
 }
 
 type MosaicInputState struct {
@@ -88,8 +118,12 @@ type MosaicProject struct {
 	Inputs             []MosaicInputState `json:"inputs"`
 	ReferencePath      string             `json:"referencePath,omitempty"`
 	ReferenceSCIExt    int                `json:"referenceSciExt,omitempty"`
-	DrizzleSettings    DrizzleSettings    `json:"drizzleSettings"`
-	DrizzleSettingsSet bool               `json:"drizzleSettingsSet"`
+	DrizzleSettings      DrizzleSettings      `json:"drizzleSettings"`
+	DrizzleSettingsSet   bool                 `json:"drizzleSettingsSet"`
+	AlignmentSettings    AlignmentSettings    `json:"alignmentSettings"`
+	AlignmentSettingsSet bool                 `json:"alignmentSettingsSet"`
+	SkysubSettings       SkysubSettings       `json:"skysubSettings"`
+	SkysubSettingsSet    bool                 `json:"skysubSettingsSet"`
 	ActiveFilter       string             `json:"activeFilter,omitempty"`
 }
 

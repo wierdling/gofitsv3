@@ -118,12 +118,16 @@ type mosaicState struct {
 	// referenceInput is an optional drizzled baseline used as the WCS anchor for
 	// star alignment and drizzle. Its pixels are not included in the output.
 	referenceInput     *mosaic.Input
-	drizzleSettings    models.DrizzleSettings
-	drizzleSettingsSet bool
+	drizzleSettings      models.DrizzleSettings
+	drizzleSettingsSet   bool
+	alignmentSettings    models.AlignmentSettings
+	alignmentSettingsSet bool
+	skysubSettings       models.SkysubSettings
+	skysubSettingsSet    bool
 }
 
 func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu) {
-	state := &mosaicState{drizzleSettings: defaultDrizzleSettings()}
+	state := &mosaicState{drizzleSettings: defaultDrizzleSettings(), alignmentSettings: defaultAlignmentSettings(), skysubSettings: defaultSkysubSettings()}
 	activeFilter := "" // set when a filter batch is loaded; used for default save names
 
 	preview := canvas.NewImageFromImage(blankImg())
@@ -622,11 +626,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		progressDialog.Show()
 		go func() {
 			alignInputs := inputsWithRef()
-			numRefs := state.drizzleSettings.NumRefs
+			numRefs := state.alignmentSettings.NumRefs
 			if numRefs < 1 {
 				numRefs = 1
 			}
-			results, err := mosaic.AlignInputsBySelectedStarsWithMode(alignInputs, refStars, numRefs, mosaic.AlignmentMode(state.drizzleSettings.AlignmentMode), state.drizzleSettings.SearchRadiusArcsec)
+			results, err := mosaic.AlignInputsBySelectedStarsWithMode(alignInputs, refStars, numRefs, mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec)
 
 			type alignRow struct {
 				stateIdx int
@@ -1490,11 +1494,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		progressDialog.Show()
 		go func() {
 			alignInputs := inputsWithRef()
-			numRefs := state.drizzleSettings.NumRefs
+			numRefs := state.alignmentSettings.NumRefs
 			if numRefs < 1 {
 				numRefs = 1
 			}
-			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, numRefs, mosaic.AlignmentMode(state.drizzleSettings.AlignmentMode), state.drizzleSettings.SearchRadiusArcsec)
+			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, numRefs, mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec)
 
 			// Build the row data entirely off the main goroutine before touching UI.
 			type alignRow struct {
@@ -1619,6 +1623,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			SepKernel:       mosaic.DrizzleKernel(s.SepKernel),
 			FinalKernel:     mosaic.DrizzleKernel(s.FinalKernel),
 			UseERRWeighting: s.UseERRWeighting,
+			CRSeedSNR:       s.CRSeedSNR,
+			CRDerivScale:    s.CRDerivScale,
+			Skysub:          skysubOptionsFromSettings(state.skysubSettings),
 		})
 
 		fyne.DoAndWait(func() { progressDialog.Hide() })
@@ -1774,6 +1781,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		resetPreview()
 		rebuildOffsetControls()
 	})
+	clearOffsetsBtn.Importance = widget.DangerImportance
 
 	clearBtn := widget.NewButton("Clear", func() {
 		state.inputs = nil
@@ -1789,6 +1797,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		resetPreview()
 		rebuildOffsetControls()
 	})
+	clearBtn.Importance = widget.DangerImportance
 
 	statusScroll := container.NewVScroll(statusLabel)
 	statusScroll.SetMinSize(fyne.NewSize(260, 160))
@@ -1902,6 +1911,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		refLabel.SetText("Reference: none")
 		resetPreview()
 	})
+	clearRefBtn.Importance = widget.DangerImportance
 
 	inputTabs := container.NewAppTabs(
 		container.NewTabItem("Input Frames", container.NewBorder(offsetHeader, nil, nil, nil, offsetScroll)),
@@ -2119,9 +2129,13 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 	saveMosaicProject := func() {
 		proj := models.MosaicProject{
-			DrizzleSettings:    state.drizzleSettings,
-			DrizzleSettingsSet: state.drizzleSettingsSet,
-			ActiveFilter:       activeFilter,
+			DrizzleSettings:      state.drizzleSettings,
+			DrizzleSettingsSet:   state.drizzleSettingsSet,
+			AlignmentSettings:    state.alignmentSettings,
+			AlignmentSettingsSet: state.alignmentSettingsSet,
+			SkysubSettings:       state.skysubSettings,
+			SkysubSettingsSet:    state.skysubSettingsSet,
+			ActiveFilter:         activeFilter,
 		}
 		for _, inp := range state.inputs {
 			mis := models.MosaicInputState{
@@ -2195,6 +2209,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 			state.drizzleSettings = proj.DrizzleSettings
 			state.drizzleSettingsSet = proj.DrizzleSettingsSet
+			state.alignmentSettings = proj.AlignmentSettings
+			state.alignmentSettingsSet = proj.AlignmentSettingsSet
+			state.skysubSettings = proj.SkysubSettings
+			state.skysubSettingsSet = proj.SkysubSettingsSet
 			if proj.ActiveFilter != "" {
 				activeFilter = proj.ActiveFilter
 				loadLevelPrefsAndMode(activeFilter)
@@ -2283,11 +2301,27 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		})
 	}
 
+	openAlignmentSettings := func() {
+		showAlignmentSettingsDialog(win, state.alignmentSettings, func(s models.AlignmentSettings) {
+			state.alignmentSettings = s
+			state.alignmentSettingsSet = true
+		})
+	}
+
+	openSkysubSettings := func() {
+		showSkysubSettingsDialog(win, state.skysubSettings, func(s models.SkysubSettings) {
+			state.skysubSettings = s
+			state.skysubSettingsSet = true
+		})
+	}
+
 	settingsMenu := fyne.NewMenu("Mosaic",
 		fyne.NewMenuItem("Load Mosaic Project", loadMosaicProject),
 		fyne.NewMenuItem("Save Mosaic Project", saveMosaicProject),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Drizzle Settings", openDrizzleSettings),
+		fyne.NewMenuItem("Alignment Settings", openAlignmentSettings),
+		fyne.NewMenuItem("Skysub Settings", openSkysubSettings),
 	)
 	footerBottomPad := canvas.NewRectangle(color.Transparent)
 	footerBottomPad.SetMinSize(fyne.NewSize(1, 20))
