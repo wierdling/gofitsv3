@@ -41,6 +41,7 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 			SCIExt:        extver,
 			PrimaryHeader: primary,
 			HDU:           hdu,
+			ExposureTime:  loadExposureTime(primary, hdu.Header),
 			D2IX:          d2iX,
 			D2IY:          d2iY,
 			ERRPixels:     loadERRPixels(file, extver),
@@ -106,6 +107,17 @@ func loadD2ITables(file *fitsio.File, sciExtver int) (d2iX, d2iY *processing.D2I
 
 // loadERRPixels returns the pixel data from the ERR extension matching
 // sciExtver, or nil if no ERR extension exists. ERR EXTVER matches SCI EXTVER.
+func loadExposureTime(headers ...fitsio.Header) float64 {
+	for _, header := range headers {
+		for _, key := range []string{"EXPTIME", "TEXPTIME", "EFFEXPTM", "EXPOSURE"} {
+			if v, ok := fitsio.HeaderFloat(header, key); ok && v > 0 {
+				return v
+			}
+		}
+	}
+	return 0
+}
+
 func loadERRPixels(file *fitsio.File, sciExtver int) []float32 {
 	extver := fmt.Sprintf("%d", sciExtver)
 	hdu := file.GetHDUByExtVer("ERR", extver)

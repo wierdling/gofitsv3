@@ -123,6 +123,58 @@ func (m *WCSMapper) MapPixel(x, y float64) (float64, float64) {
 	return rx, ry
 }
 
+// MapPixelDiag maps one pixel and returns a diagnostic string tracing every
+// intermediate value through the full WCS pipeline. Useful for debugging
+// extreme or NaN outputs.
+func (m *WCSMapper) MapPixelDiag(x, y float64) (float64, float64, string) {
+	src := m.sourceWCS
+	ref := m.refWCS
+
+	xd, yd := x, y
+	if src.d2iX != nil {
+		xd += src.d2iX.interpolate(x, y)
+	}
+	if src.d2iY != nil {
+		yd += src.d2iY.interpolate(x, y)
+	}
+	dx := (xd + 1) - src.crpix1
+	dy := (yd + 1) - src.crpix2
+	dxSIP, dySIP := dx, dy
+	if !src.a.empty() || !src.b.empty() {
+		dxSIP, dySIP = applyForwardSIP(src, dx, dy)
+	}
+	xi := src.cd11*dxSIP + src.cd12*dySIP
+	eta := src.cd21*dxSIP + src.cd22*dySIP
+	cosSrc := math.Cos(src.crval2 * math.Pi / 180)
+	if math.Abs(cosSrc) < 1e-9 {
+		cosSrc = 1e-9
+	}
+	ra := src.crval1 + xi/cosSrc
+	dec := src.crval2 + eta
+
+	det := ref.cd11*ref.cd22 - ref.cd12*ref.cd21
+	cosRef := math.Cos(ref.crval2 * math.Pi / 180)
+	if math.Abs(cosRef) < 1e-9 {
+		cosRef = 1e-9
+	}
+	d1 := normalizeAngleDelta(ra-ref.crval1) * cosRef
+	d2 := dec - ref.crval2
+	rdx := (ref.cd22*d1 - ref.cd12*d2) / det
+	rdy := (-ref.cd21*d1 + ref.cd11*d2) / det
+	rdxSIP, rdySIP := rdx, rdy
+	if !ref.a.empty() || !ref.b.empty() {
+		rdxSIP, rdySIP = applyInverseSIP(ref, rdx, rdy)
+	}
+	rx := rdxSIP + ref.crpix1 - 1
+	ry := rdySIP + ref.crpix2 - 1
+
+	diag := fmt.Sprintf(
+		"pixel(%.1f,%.1f) d2i(%.3g,%.3g) dx(%.3g,%.3g) sipDx(%.3g,%.3g) xi(%.3g,%.3g) ra/dec(%.6f,%.6f) d1/d2(%.3g,%.3g) rdx(%.3g,%.3g) sipRdx(%.3g,%.3g) out(%.3g,%.3g)",
+		x, y, xd-x, yd-y, dx, dy, dxSIP, dySIP, xi, eta, ra, dec, d1, d2, rdx, rdy, rdxSIP, rdySIP, rx, ry,
+	)
+	return rx, ry, diag
+}
+
 type sipCoeff struct {
 	p     int
 	q     int
@@ -410,17 +462,34 @@ func applyForwardSIP(w linearWCS, u, v float64) (float64, float64) {
 	return u + applySIPPolynomial(w.a, u, v), v + applySIPPolynomial(w.b, u, v)
 }
 
+func isFinite64(x float64) bool {
+	return !math.IsNaN(x) && !math.IsInf(x, 0)
+}
+
 func applyInverseSIP(w linearWCS, u, v float64) (float64, float64) {
 	if !w.ap.empty() || !w.bp.empty() {
-		return u + applySIPPolynomial(w.ap, u, v), v + applySIPPolynomial(w.bp, u, v)
+		cu := applySIPPolynomial(w.ap, u, v)
+		cv := applySIPPolynomial(w.bp, u, v)
+		// SIP corrections for in-domain pixels are sub-pixel to a few pixels.
+		// Out-of-domain extrapolation produces enormous or NaN values — discard.
+		if isFinite64(cu) && isFinite64(cv) && math.Abs(cu) < 1000 && math.Abs(cv) < 1000 {
+			return u + cu, v + cv
+		}
+		return u, v
 	}
 	guessU, guessV := u, v
 	for range 8 {
 		fwdU, fwdV := applyForwardSIP(w, guessU, guessV)
+		if !isFinite64(fwdU) || !isFinite64(fwdV) {
+			return u, v
+		}
 		guessU += u - fwdU
 		guessV += v - fwdV
 	}
-	return guessU, guessV
+	if isFinite64(guessU) && isFinite64(guessV) {
+		return guessU, guessV
+	}
+	return u, v
 }
 
 func headerFloat(header fitsio.Header, key string) (float64, error) {

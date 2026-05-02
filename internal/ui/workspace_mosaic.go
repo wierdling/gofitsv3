@@ -21,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 
+	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
@@ -117,7 +118,7 @@ type mosaicState struct {
 	savePreview bool
 	// referenceInput is an optional drizzled baseline used as the WCS anchor for
 	// star alignment and drizzle. Its pixels are not included in the output.
-	referenceInput     *mosaic.Input
+	referenceInput       *mosaic.Input
 	drizzleSettings      models.DrizzleSettings
 	drizzleSettingsSet   bool
 	alignmentSettings    models.AlignmentSettings
@@ -128,7 +129,8 @@ type mosaicState struct {
 
 func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu) {
 	state := &mosaicState{drizzleSettings: defaultDrizzleSettings(), alignmentSettings: defaultAlignmentSettings(), skysubSettings: defaultSkysubSettings()}
-	activeFilter := "" // set when a filter batch is loaded; used for default save names
+	activeFilter := ""    // set when a filter batch is loaded; used for default save names
+	lastProjectName := "" // updated on save/load so the save dialog pre-populates the same name
 
 	preview := canvas.NewImageFromImage(blankImg())
 	preview.FillMode = canvas.ImageFillContain
@@ -1615,17 +1617,21 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		})
 
 		s := state.drizzleSettings
+		weightingMode := mosaic.WeightingMode(s.WeightingMode)
+		if weightingMode == mosaic.WeightUniform && s.UseERRWeighting {
+			weightingMode = mosaic.WeightERR
+		}
 		result, err := mosaic.Build(inputsWithRef(), mosaic.Options{
-			Scale:           s.Scale,
-			FinalScale:      s.FinalScale,
-			PixFrac:         s.PixFrac,
-			CRMethod:        mosaic.CRMethod(s.CRMethod),
-			SepKernel:       mosaic.DrizzleKernel(s.SepKernel),
-			FinalKernel:     mosaic.DrizzleKernel(s.FinalKernel),
-			UseERRWeighting: s.UseERRWeighting,
-			CRSeedSNR:       s.CRSeedSNR,
-			CRDerivScale:    s.CRDerivScale,
-			Skysub:          skysubOptionsFromSettings(state.skysubSettings),
+			Scale:         s.Scale,
+			FinalScale:    s.FinalScale,
+			PixFrac:       s.PixFrac,
+			CRMethod:      mosaic.CRMethod(s.CRMethod),
+			SepKernel:     mosaic.DrizzleKernel(s.SepKernel),
+			FinalKernel:   mosaic.DrizzleKernel(s.FinalKernel),
+			WeightingMode: weightingMode,
+			CRSeedSNR:     s.CRSeedSNR,
+			CRDerivScale:  s.CRDerivScale,
+			Skysub:        skysubOptionsFromSettings(state.skysubSettings),
 		})
 
 		fyne.DoAndWait(func() { progressDialog.Hide() })
@@ -1635,28 +1641,57 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			return
 		}
 
+		debuglog.Log(fmt.Sprintf("buildDrizzlePreview: Build done, result %dx%d (%d pixels)", result.Width, result.Height, len(result.Pixels)))
 		state.result = result
+
+		// Do CPU-heavy work off the main thread before touching any UI.
+		if !levelsSet {
+			debuglog.Log("buildDrizzlePreview: autoLevels (off main thread)")
+			autoLevels(result.Pixels)
+		}
+		debuglog.Log("buildDrizzlePreview: buildMosaicPreviewImageWithLevels (off main thread)")
+		black, white, bg, peak, scaledPeak := parseLevelEntries()
+		previewImg := buildMosaicPreviewImageWithLevels(result, black, white, bg, peak, scaledPeak, stretchMode)
+		debuglog.Log("buildDrizzlePreview: histogram.Compute (off main thread)")
+		stats := histogram.Compute(result.Pixels)
+
+		debuglog.Log("buildDrizzlePreview: submitting UI update to main thread")
+		uiDone := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(3 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-uiDone:
+					return
+				case <-ticker.C:
+					debuglog.Log("buildDrizzlePreview: still waiting for main thread...")
+				}
+			}
+		}()
 		fyne.DoAndWait(func() {
+			close(uiDone)
+			debuglog.Log("buildDrizzlePreview: UI update start (on main thread)")
 			state.statuses = result.Inputs
 			saveBtn.Enable()
 			sendToExamineBtn.Enable()
+			debuglog.Log("buildDrizzlePreview: rebuildOffsetControls")
 			rebuildOffsetControls()
+			debuglog.Log("buildDrizzlePreview: updateStatus")
 			updateStatus()
-			if !levelsSet {
-				autoLevels(result.Pixels)
-			}
-			black, white, bg, peak, scaledPeak := parseLevelEntries()
-			img := buildMosaicPreviewImageWithLevels(result, black, white, bg, peak, scaledPeak, stretchMode)
-			preview.Image = img
+			debuglog.Log("buildDrizzlePreview: preview.Refresh")
+			preview.Image = previewImg
 			preview.Refresh()
-			stats := histogram.Compute(result.Pixels)
 			mosaicBins = stats.Hist
 			mosaicHistogram.Refresh()
 			statsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f | Size: %dx%d", stats.Mean, stats.Std, result.Width, result.Height))
+			debuglog.Log("buildDrizzlePreview: updateZoom")
 			updateZoom()
+			debuglog.Log("buildDrizzlePreview: UI update done")
 		})
 
 		if state.savePreview {
+			debuglog.Log("buildDrizzlePreview: saving preview FITS")
 			filter, dir, ok := currentFilterAndDir()
 			if !ok {
 				fyne.Do(func() {
@@ -1669,6 +1704,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				fyne.Do(func() { dialog.ShowError(err, win) })
 				return
 			}
+			debuglog.Log("buildDrizzlePreview: preview FITS saved")
 			fyne.Do(func() {
 				dialog.ShowInformation("Preview Saved", fmt.Sprintf("Saved preview FITS to %s.", filepath.Base(previewPath)), win)
 			})
@@ -2175,12 +2211,16 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				dialog.ShowError(writeErr, win)
 				return
 			}
+			lastProjectName = filepath.Base(path)
 			app.Preferences().SetString("lastDir", filepath.Dir(path))
 			dialog.ShowInformation("Saved", "Mosaic project saved.", win)
 		}, win)
-		name := "mosaic_project.json"
-		if activeFilter != "" {
-			name = activeFilter + "_project.json"
+		name := lastProjectName
+		if name == "" {
+			name = "mosaic_project.json"
+			if activeFilter != "" {
+				name = activeFilter + "_project.json"
+			}
 		}
 		fd.SetFileName(name)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".json"}))
@@ -2195,6 +2235,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			}
 			path := r.URI().Path()
 			r.Close()
+			lastProjectName = filepath.Base(path)
 			app.Preferences().SetString("lastDir", filepath.Dir(path))
 			data, readErr := os.ReadFile(path)
 			if readErr != nil {
@@ -2334,6 +2375,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 // buildMosaicPreviewImageWithLevels renders a mosaic result to RGBA using the same
 // ApplyStretchParallel pipeline used throughout the rest of the application.
 func buildMosaicPreviewImageWithLevels(result *mosaic.Result, black, white, background, peak, scaledPeak float64, mode stretch.Mode) *image.RGBA {
+	debuglog.Log(fmt.Sprintf("buildMosaicPreviewImage: start %dx%d", result.Width, result.Height))
 	img := &models.LoadedImage{
 		HDU: fitsio.HDU{
 			Data: fitsio.ImageData{
@@ -2349,12 +2391,16 @@ func buildMosaicPreviewImageWithLevels(result *mosaic.Result, black, white, back
 		Peak:       peak,
 		ScaledPeak: scaledPeak,
 	}
+	debuglog.Log("buildMosaicPreviewImage: ApplyStretchParallel")
 	stretched, mask := processing.ApplyStretchParallel(img)
 	if mask == nil {
 		mask = make([]byte, len(stretched.Pixels))
 	}
+	debuglog.Log("buildMosaicPreviewImage: ToGrayRGBA")
 	rgba := processing.ToGrayRGBA(stretched, mask)
+	debuglog.Log(fmt.Sprintf("buildMosaicPreviewImage: drawInputBorders (%d footprints)", len(result.InputFootprints)))
 	drawInputBorders(rgba, result.InputFootprints)
+	debuglog.Log("buildMosaicPreviewImage: done")
 	return rgba
 }
 
@@ -2378,7 +2424,7 @@ func drawThickLine(img *image.RGBA, a, b [2]float64, thickness int, c color.RGBA
 	dx := b[0] - a[0]
 	dy := b[1] - a[1]
 	length := math.Sqrt(dx*dx + dy*dy)
-	if length == 0 {
+	if length == 0 || math.IsNaN(length) || math.IsInf(length, 0) || length > 1e7 {
 		return
 	}
 	// Perpendicular unit vector.

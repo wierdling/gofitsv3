@@ -14,22 +14,23 @@ import (
 	"gofitsv3/internal/mosaic"
 )
 
-
 func defaultDrizzleSettings() models.DrizzleSettings {
 	return models.DrizzleSettings{
-		FinalScale:   0,
-		Scale:        1.0,
-		PixFrac:      1.0,
-		CRMethod:     int(mosaic.CRMethodNone),
-		SepKernel:    int(mosaic.KernelTurbo),
-		FinalKernel:  int(mosaic.KernelSquare),
-		CRSeedSNR:    4.0,
-		CRDerivScale: 1.2,
+		FinalScale:    0,
+		Scale:         1.0,
+		PixFrac:       1.0,
+		CRMethod:      int(mosaic.CRMethodNone),
+		SepKernel:     int(mosaic.KernelTurbo),
+		FinalKernel:   int(mosaic.KernelSquare),
+		WeightingMode: int(mosaic.WeightUniform),
+		CRSeedSNR:     4.0,
+		CRDerivScale:  1.2,
 	}
 }
 
 var kernelNames = []string{"Square", "Point", "Turbo", "Gaussian", "Tophat", "Lanczos2", "Lanczos3"}
-var crMethodNames = []string{"None", "Legacy (single-frame)", "Drizzle-style (multi-frame)"}
+var crMethodNames = []string{"None", "Drizzle-style (multi-frame)"}
+var weightingModeNames = []string{"Uniform", "Exposure Time", "ERR Inverse-Variance"}
 
 // alignmentModeNames is also used by alignment_settings_window.go.
 var alignmentModeNames = []string{"General Affine (legacy)", "RScale (legacy)", "TweakReg RScale", "TweakReg General"}
@@ -95,9 +96,23 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 	}
 
-	useERRWeighting := current.UseERRWeighting
-	errWeightCheck := widget.NewCheck("", func(v bool) { useERRWeighting = v })
-	errWeightCheck.SetChecked(useERRWeighting)
+	weightingMode := current.WeightingMode
+	if weightingMode == 0 && current.UseERRWeighting {
+		weightingMode = int(mosaic.WeightERR)
+	}
+	weightSelect := widget.NewSelect(weightingModeNames, nil)
+	if weightingMode < 0 || weightingMode >= len(weightingModeNames) {
+		weightingMode = int(mosaic.WeightUniform)
+	}
+	weightSelect.SetSelected(weightingModeNames[weightingMode])
+	weightSelect.OnChanged = func(s string) {
+		for i, name := range weightingModeNames {
+			if name == s {
+				weightingMode = i
+				break
+			}
+		}
+	}
 
 	crSeedSNREntry := widget.NewEntry()
 	crSeedSNR := current.CRSeedSNR
@@ -123,6 +138,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 			"PixFrac: drop size as fraction of pixel (1.0 = full coverage).\n" +
 			"Sep Kernel: used during the per-frame drizzle pass.\n" +
 			"Final Kernel: used during the final combination pass.\n" +
+			"Weighting: Uniform ignores EXPTIME; Exposure Time matches classic drizzle EXP weighting; ERR uses the ERR plane.\n" +
 			"Lanczos kernels: only appropriate when PixFrac = 1.0.\n" +
 			"CR Seed SNR: signal-to-noise threshold for seeding a CR candidate (default 4.0).\n" +
 			"CR Deriv Scale: sharpness term weight in the CR rejection test (default 1.2).\n" +
@@ -138,7 +154,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		widget.NewFormItem("CR Method", crSelect),
 		widget.NewFormItem("Sep Kernel", sepSelect),
 		widget.NewFormItem("Final Kernel", finalSelect),
-		widget.NewFormItem("ERR Inverse-Variance Weighting", errWeightCheck),
+		widget.NewFormItem("Weighting", weightSelect),
 		widget.NewFormItem("CR Seed SNR", crSeedSNREntry),
 		widget.NewFormItem("CR Deriv Scale", crDerivScaleEntry),
 	)
@@ -186,15 +202,15 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 
 		onSave(models.DrizzleSettings{
-			FinalScale:      finalScale,
-			Scale:           scale,
-			PixFrac:         pixFrac,
-			CRMethod:        crMethod,
-			SepKernel:       sepKernel,
-			FinalKernel:     finalKernel,
-			UseERRWeighting: useERRWeighting,
-			CRSeedSNR:       crSNRVal,
-			CRDerivScale:    crDSVal,
+			FinalScale:    finalScale,
+			Scale:         scale,
+			PixFrac:       pixFrac,
+			CRMethod:      crMethod,
+			SepKernel:     sepKernel,
+			FinalKernel:   finalKernel,
+			WeightingMode: weightingMode,
+			CRSeedSNR:     crSNRVal,
+			CRDerivScale:  crDSVal,
 		})
 	}, win)
 	d.Show()

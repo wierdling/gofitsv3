@@ -29,18 +29,18 @@ var editZoomPresets = []string{"fit", "10%", "25%", "50%", "75%", "100%", "150%"
 
 // editWorkspaceState holds all mutable state for the edit tab.
 type editWorkspaceState struct {
-	win     fyne.Window
-	source  *image.RGBA
-	origW   int
-	origH   int
-	zoom    float64
+	win    fyne.Window
+	source *image.RGBA
+	origW  int
+	origH  int
+	zoom   float64
 
 	canvasImg *canvas.Image
 	imgScroll *container.Scroll
 
 	// per-channel histograms (drawn with min/max marker lines)
-	rgbHists  [3]*canvas.Raster
-	rgbBins   [3][256]int
+	rgbHists [3]*canvas.Raster
+	rgbBins  [3][256]int
 
 	// zoom controls
 	zoomSelect *widget.Select
@@ -65,11 +65,17 @@ type editWorkspaceState struct {
 	loadedName string // base filename of the last loaded image
 
 	// heal tool
-	healOverlay    *healLayer
-	healActive     bool
+	healOverlay     *healLayer
+	healActive      bool
 	healBrushSlider *widget.Slider
 	healStatusLabel *widget.Label
-	healUndo       *image.RGBA // single-level undo buffer
+	healUndo        *image.RGBA // single-level undo buffer
+
+	editTabs             *container.AppTabs
+	cleanTab             *container.TabItem
+	cleanStatusLabel     *widget.Label
+	cleanBlobSlider      *widget.Slider
+	cleanIntensitySlider *widget.Slider
 }
 
 func (es *editWorkspaceState) applyEdits() {
@@ -247,8 +253,44 @@ func (es *editWorkspaceState) setImage(img image.Image) {
 	es.setZoomSelectLabel("fit")
 	es.applyZoom()
 	es.canvasImg.Refresh()
+	if es.cleanStatusLabel != nil {
+		es.cleanStatusLabel.SetText("Run this after cross-channel clean to remove tiny pure-color specks.")
+	}
+	if es.editTabs != nil && es.cleanTab != nil {
+		es.editTabs.Select(es.cleanTab)
+	}
 }
 
+func (es *editWorkspaceState) runColorSpeckClean() {
+	rgba := toRGBA(es.canvasImg.Image)
+	if rgba == nil {
+		dialog.ShowInformation("Nothing to clean", "Load or compose an image first.", es.win)
+		return
+	}
+
+	prog := dialog.NewCustom("Cleaning", "Removing tiny RGB specks...", widget.NewProgressBarInfinite(), es.win)
+	prog.Show()
+
+	go func() {
+		cfg := processing.ColorSpeckCleanConfigFromSettings(
+			int(math.Round(es.cleanBlobSlider.Value)),
+			es.cleanIntensitySlider.Value,
+		)
+		cleaned, repaired := processing.CleanColorSpecksRGBA(rgba, cfg)
+		fyne.Do(func() {
+			prog.Hide()
+			if cleaned == nil {
+				return
+			}
+			es.setImage(cleaned)
+			if repaired == 0 {
+				es.cleanStatusLabel.SetText("No tiny pure-color specks were detected.")
+				return
+			}
+			es.cleanStatusLabel.SetText(fmt.Sprintf("Removed %d speck pixels. The cleaned image is now the new edit base.", repaired))
+		})
+	}()
+}
 func (es *editWorkspaceState) applyZoom() {
 	if es.origW == 0 || es.zoom <= 0 {
 		return
@@ -324,7 +366,6 @@ func (es *editWorkspaceState) setZoomSelectLabel(label string) {
 	}
 	es.zoomSelect.SetSelected(label)
 }
-
 
 // sliderRow creates a labelled slider with a live value readout.
 // Optional extra callbacks are called in addition to the value label update.
@@ -607,6 +648,17 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 		es.undoHeal()
 	})
 
+	es.cleanStatusLabel = widget.NewLabel("Run this after cross-channel clean to remove tiny pure-color specks.")
+	es.cleanBlobSlider = widget.NewSlider(1, 100)
+	es.cleanBlobSlider.Step = 1
+	es.cleanBlobSlider.SetValue(25)
+	es.cleanIntensitySlider = widget.NewSlider(0, 100)
+	es.cleanIntensitySlider.Step = 1
+	es.cleanIntensitySlider.SetValue(50)
+	cleanBtn := widget.NewButton("Remove Color Specks", func() {
+		es.runColorSpeckClean()
+	})
+
 	es.healOverlay.onHealStroke = func(src fyne.Position, dsts []fyne.Position) {
 		es.doHealStroke(src, dsts)
 		if es.healActive {
@@ -654,13 +706,22 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 		sliderRow("Strength", es.sharpSlider),
 		sliderRow("Radius", es.sharpRadiusSlider),
 	))
+	cleanTab := container.NewTabItem("Clean", container.NewVBox(
+		widget.NewLabel("Targets small red, green, or blue cosmic-ray leftovers in the composed RGB image."),
+		sliderRow("Max Blob Size", es.cleanBlobSlider),
+		sliderRow("Intensity", es.cleanIntensitySlider),
+		cleanBtn,
+		es.cleanStatusLabel,
+	))
 	healTab := container.NewTabItem("Heal", container.NewVBox(
 		healToggleBtn,
 		es.healStatusLabel,
 		sliderRow("Brush Size", es.healBrushSlider),
 		healUndoBtn,
 	))
-	tabs := container.NewAppTabs(levelsTab, curvesTab, sharpenTab, healTab)
+	tabs := container.NewAppTabs(levelsTab, curvesTab, sharpenTab, cleanTab, healTab)
+	es.editTabs = tabs
+	es.cleanTab = cleanTab
 
 	controls := container.NewVBox(
 		loadBtn,

@@ -615,39 +615,98 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			return
 		}
 
+		sharedWidth := 0
+		sharedHeight := 0
+		for i := 0; i < 3; i++ {
+			data := imgs[i].HDU.Data
+			if data.Width <= 0 || data.Height <= 0 {
+				dialog.ShowInformation(
+					"Invalid Channel Data",
+					fmt.Sprintf("Channel %d has invalid dimensions %dx%d.", i+1, data.Width, data.Height),
+					win,
+				)
+				return
+			}
+			usableHeight := len(data.Pixels) / data.Width
+			if usableHeight <= 0 {
+				dialog.ShowInformation(
+					"Invalid Channel Data",
+					fmt.Sprintf("Channel %d does not have enough pixels for its declared width %d.", i+1, data.Width),
+					win,
+				)
+				return
+			}
+			if usableHeight > data.Height {
+				usableHeight = data.Height
+			}
+			if i == 0 || data.Width < sharedWidth {
+				sharedWidth = data.Width
+			}
+			if i == 0 || usableHeight < sharedHeight {
+				sharedHeight = usableHeight
+			}
+		}
+		if sharedWidth <= 0 || sharedHeight <= 0 {
+			dialog.ShowInformation("Invalid Channel Data", "Could not determine a shared image region to clean.", win)
+			return
+		}
+
 		progressDialog := dialog.NewCustom("Cleaning", "Building star mask and removing artifacts...", widget.NewProgressBarInfinite(), win)
 		progressDialog.Show()
 
 		go func() {
-			width := imgs[1].HDU.Data.Width
-			height := imgs[1].HDU.Data.Height
+			cropTopLeft := func(data fitsio.ImageData, width, height int) []float32 {
+				cropped := make([]float32, width*height)
+				for y := 0; y < height; y++ {
+					srcStart := y * data.Width
+					dstStart := y * width
+					copy(cropped[dstStart:dstStart+width], data.Pixels[srcStart:srcStart+width])
+				}
+				return cropped
+			}
+			pasteTopLeft := func(dst []float32, dstWidth int, src []float32, width, height int) {
+				for y := 0; y < height; y++ {
+					dstStart := y * dstWidth
+					srcStart := y * width
+					copy(dst[dstStart:dstStart+width], src[srcStart:srcStart+width])
+				}
+			}
 
-			var channels [][]float32
-			var sigmas []float64
-
+			channels := make([][]float32, 0, 3)
+			sigmas := make([]float64, 0, 3)
 			for i := 0; i < 3; i++ {
-				channels = append(channels, imgs[i].HDU.Data.Pixels)
-				_, sig := processing.EstimateBackground(imgs[i].HDU.Data.Pixels)
+				cropped := cropTopLeft(imgs[i].HDU.Data, sharedWidth, sharedHeight)
+				channels = append(channels, cropped)
+				_, sig := processing.EstimateBackground(cropped)
 				sigmas = append(sigmas, sig)
 			}
 
-			starMask := processing.BuildMasterMask(channels, width, height, sigmas)
-
+			starMasks := processing.BuildLayerStarMasks(channels, sharedWidth, sharedHeight, sigmas)
 			passes := 2
 
-			cleanB := processing.RemoveCosmicRays(imgs[0].HDU.Data.Pixels, width, height, sigmas[0], passes, starMask)
-			cleanG := processing.RemoveCosmicRays(imgs[1].HDU.Data.Pixels, width, height, sigmas[1], passes, starMask)
-			cleanR := processing.RemoveCosmicRays(imgs[2].HDU.Data.Pixels, width, height, sigmas[2], passes, starMask)
+			cleaned := make([][]float32, 3)
+			var wg sync.WaitGroup
+			for i := 0; i < 3; i++ {
+				wg.Add(1)
+				go func(idx int) {
+					defer wg.Done()
+					cleaned[idx] = processing.RemoveCosmicRays(channels[idx], sharedWidth, sharedHeight, sigmas[idx], passes, starMasks[idx])
+				}(i)
+			}
+			wg.Wait()
 
-			imgs[0].HDU.Data.Pixels = cleanB
-			imgs[1].HDU.Data.Pixels = cleanG
-			imgs[2].HDU.Data.Pixels = cleanR
+			for i := 0; i < 3; i++ {
+				out := make([]float32, len(imgs[i].HDU.Data.Pixels))
+				copy(out, imgs[i].HDU.Data.Pixels)
+				pasteTopLeft(out, imgs[i].HDU.Data.Width, cleaned[i], sharedWidth, sharedHeight)
+				imgs[i].HDU.Data.Pixels = out
+			}
 
 			fyne.Do(func() {
 				win.Canvas().Refresh(win.Content())
 				progressDialog.Hide()
 				refresh()
-				dialog.ShowInformation("Complete", "Master mask generated and cosmic rays eradicated.", win)
+				dialog.ShowInformation("Complete", fmt.Sprintf("Star masks generated and cosmic rays eradicated in the shared %dx%d region.", sharedWidth, sharedHeight), win)
 			})
 		}()
 	}
@@ -800,10 +859,12 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
 	cleanChannelsItem := fyne.NewMenuItem("Cross-Channel Clean", crossChannelClean)
+	postRGBCleanItem := fyne.NewMenuItem("Post-RGB Clean in Edit", sendToEdit)
 	resetDataItem := fyne.NewMenuItem("Reset Data (Undo Align & Clean)", resetData)
 	processMenu := fyne.NewMenu("Process",
 		alignChannelsItem,
 		cleanChannelsItem,
+		postRGBCleanItem,
 		fyne.NewMenuItemSeparator(),
 		resetDataItem,
 	)
@@ -832,6 +893,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		normalizeScaleItem.Disabled = !allLoaded
 		alignChannelsItem.Disabled = !allLoaded
 		cleanChannelsItem.Disabled = !allLoaded
+		postRGBCleanItem.Disabled = !allLoaded
 		resetDataItem.Disabled = !allLoaded
 		exportRGBItem.Disabled = !allLoaded
 		sendToEditItem.Disabled = !allLoaded

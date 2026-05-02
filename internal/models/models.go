@@ -57,13 +57,14 @@ type DrizzleSettings struct {
 	// final_scale semantics).  When > 0, the internal multiplier is computed from
 	// the reference image WCS.  Scale is used as a raw multiplier fallback when
 	// FinalScale is zero.
-	FinalScale         float64 `json:"finalScale"`
-	Scale              float64 `json:"scale"`
-	PixFrac            float64 `json:"pixFrac"`
-	CRMethod           int     `json:"crMethod"`
-	SepKernel          int     `json:"sepKernel"`
-	FinalKernel        int     `json:"finalKernel"`
-	UseERRWeighting    bool    `json:"useERRWeighting"`
+	FinalScale      float64 `json:"finalScale"`
+	Scale           float64 `json:"scale"`
+	PixFrac         float64 `json:"pixFrac"`
+	CRMethod        int     `json:"crMethod"`
+	SepKernel       int     `json:"sepKernel"`
+	FinalKernel     int     `json:"finalKernel"`
+	WeightingMode   int     `json:"weightingMode"`
+	UseERRWeighting bool    `json:"useERRWeighting,omitempty"`
 	// CRSeedSNR and CRDerivScale control the drizzle-style CR detection thresholds.
 	// CRSeedSNR is the signal-to-noise ratio threshold for seeding a CR candidate.
 	// CRDerivScale scales the derivative (sharpness) term in the rejection test.
@@ -115,16 +116,16 @@ type MosaicInputState struct {
 }
 
 type MosaicProject struct {
-	Inputs             []MosaicInputState `json:"inputs"`
-	ReferencePath      string             `json:"referencePath,omitempty"`
-	ReferenceSCIExt    int                `json:"referenceSciExt,omitempty"`
-	DrizzleSettings      DrizzleSettings      `json:"drizzleSettings"`
-	DrizzleSettingsSet   bool                 `json:"drizzleSettingsSet"`
-	AlignmentSettings    AlignmentSettings    `json:"alignmentSettings"`
-	AlignmentSettingsSet bool                 `json:"alignmentSettingsSet"`
-	SkysubSettings       SkysubSettings       `json:"skysubSettings"`
-	SkysubSettingsSet    bool                 `json:"skysubSettingsSet"`
-	ActiveFilter       string             `json:"activeFilter,omitempty"`
+	Inputs               []MosaicInputState `json:"inputs"`
+	ReferencePath        string             `json:"referencePath,omitempty"`
+	ReferenceSCIExt      int                `json:"referenceSciExt,omitempty"`
+	DrizzleSettings      DrizzleSettings    `json:"drizzleSettings"`
+	DrizzleSettingsSet   bool               `json:"drizzleSettingsSet"`
+	AlignmentSettings    AlignmentSettings  `json:"alignmentSettings"`
+	AlignmentSettingsSet bool               `json:"alignmentSettingsSet"`
+	SkysubSettings       SkysubSettings     `json:"skysubSettings"`
+	SkysubSettingsSet    bool               `json:"skysubSettingsSet"`
+	ActiveFilter         string             `json:"activeFilter,omitempty"`
 }
 
 type ChannelControl struct {

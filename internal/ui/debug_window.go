@@ -1,11 +1,13 @@
 package ui
 
 import (
+	"strings"
 	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
 	"gofitsv3/internal/debuglog"
@@ -87,7 +89,25 @@ func showDebugWindow(a fyne.App) {
 	})
 
 	win := a.NewWindow("Debug Log")
-	win.SetContent(container.NewBorder(nil, clearBtn, nil, nil, list))
+
+	exportBtn := widget.NewButton("Export Text", func() {
+		debugWinMu.Lock()
+		snapshot := make([]string, len(debugLines))
+		copy(snapshot, debugLines)
+		debugWinMu.Unlock()
+
+		fd := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
+			if err != nil || uc == nil {
+				return
+			}
+			defer uc.Close()
+			uc.Write([]byte(strings.Join(snapshot, "\n") + "\n"))
+		}, win)
+		fd.SetFileName("debug_log.txt")
+		fd.Show()
+	})
+
+	win.SetContent(container.NewBorder(nil, container.NewHBox(clearBtn, exportBtn), nil, nil, list))
 	win.Resize(fyne.NewSize(700, 400))
 	win.SetOnClosed(func() {
 		ticker.Stop()

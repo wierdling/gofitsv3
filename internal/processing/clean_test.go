@@ -75,3 +75,16 @@ func TestBuildCRMasksFromModelDoesNotOvergrowWeakNeighbor(t *testing.T) {
 		t.Fatalf("weak neighbor should not be pulled into the CR mask")
 	}
 }
+
+func TestRemoveCosmicRaysHandlesShorterMasterMask(t *testing.T) {
+	width, height := 4, 4
+	pixels := make([]float32, width*height)
+	masterMask := make([]bool, 10)
+	pixels[5] = 100
+
+	cleaned := RemoveCosmicRays(pixels, width, height, 1, 1, masterMask)
+
+	if len(cleaned) != len(pixels) {
+		t.Fatalf("cleaned length = %d, want %d", len(cleaned), len(pixels))
+	}
+}

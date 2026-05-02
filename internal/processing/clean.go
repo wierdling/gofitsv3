@@ -1,6 +1,7 @@
 package processing
 
 import (
+	"fmt"
 	"math"
 	"sort"
 
@@ -15,6 +16,26 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 		copy(out, pixels)
 		return out
 	}
+	if width <= 0 || height <= 0 || len(pixels) == 0 {
+		out := make([]float32, len(pixels))
+		copy(out, pixels)
+		return out
+	}
+
+	limitPixels := len(pixels)
+	if masterMask != nil && len(masterMask) < limitPixels {
+		limitPixels = len(masterMask)
+	}
+	effectiveHeight := height
+	maxHeight := limitPixels / width
+	if maxHeight <= 0 {
+		out := make([]float32, len(pixels))
+		copy(out, pixels)
+		return out
+	}
+	if effectiveHeight > maxHeight {
+		effectiveHeight = maxHeight
+	}
 
 	currentPixels := pixels
 	for p := 0; p < passes; p++ {
@@ -22,14 +43,16 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 		copy(out, currentPixels)
 
 		cleaned := make([]bool, len(currentPixels))
+		visitMarks := make([]uint32, len(currentPixels))
+		var visitGen uint32
 		laplacianThreshold := globalSigma * 10.0
 		growThreshold := globalSigma * 2.0
 		dirs := [][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
 
-		for y := 2; y < height-2; y++ {
+		for y := 2; y < effectiveHeight-2; y++ {
 			for x := 2; x < width-2; x++ {
 				idx := y*width + x
-				if masterMask != nil && masterMask[idx] {
+				if masterMask != nil && idx < len(masterMask) && masterMask[idx] {
 					continue
 				}
 				if cleaned[idx] {
@@ -63,11 +86,17 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 					continue
 				}
 
-				replacementVal := estimateWideBackground(currentPixels, width, height, x, y)
+				replacementVal := estimateWideBackground(currentPixels, width, effectiveHeight, x, y)
 				var candidates []int
 				q := []int{idx}
-				localVisited := make([]bool, len(currentPixels))
-				localVisited[idx] = true
+				visitGen++
+				if visitGen == 0 {
+					for i := range visitMarks {
+						visitMarks[i] = 0
+					}
+					visitGen = 1
+				}
+				visitMarks[idx] = visitGen
 				minX, maxX, minY, maxY := x, x, y, y
 
 				for len(q) > 0 {
@@ -92,11 +121,11 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 
 					for _, d := range dirs {
 						nx, ny := cx+d[0], cy+d[1]
-						if nx < 0 || nx >= width || ny < 0 || ny >= height {
+						if nx < 0 || nx >= width || ny < 0 || ny >= effectiveHeight {
 							continue
 						}
 						nIdx := ny*width + nx
-						if cleaned[nIdx] || localVisited[nIdx] {
+						if cleaned[nIdx] || visitMarks[nIdx] == visitGen {
 							continue
 						}
 						nVal := float64(currentPixels[nIdx])
@@ -104,7 +133,7 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 							continue
 						}
 						if nVal > replacementVal+growThreshold {
-							localVisited[nIdx] = true
+							visitMarks[nIdx] = visitGen
 							q = append(q, nIdx)
 						}
 					}
@@ -125,7 +154,9 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 				}
 
 				if isStar {
-					cleaned[idx] = true
+					for _, cIdx := range candidates {
+						cleaned[cIdx] = true
+					}
 				} else {
 					for _, cIdx := range candidates {
 						out[cIdx] = float32(replacementVal)
@@ -286,10 +317,10 @@ func BuildCosmicRayMasks(frames []FrameInfo, seedMultiplier, growMultiplier floa
 // DrizzleStyleCROptions controls the AstroDrizzle-like multi-frame CR detector.
 type DrizzleStyleCROptions struct {
 	// SeedSNR is the signal-to-noise ratio above which a pixel is seeded as a
-	// cosmic-ray candidate.  AstroDrizzle default is ~4.
+	// cosmic-ray candidate. AstroDrizzle default is about 4.
 	SeedSNR float64
 	// DerivScale weights the 4-neighbor derivative contribution to the
-	// per-pixel threshold.  AstroDrizzle default is ~1.2.
+	// per-pixel threshold. AstroDrizzle default is about 1.2.
 	DerivScale float64
 }
 
@@ -297,8 +328,8 @@ type DrizzleStyleCROptions struct {
 // that operates across multiple aligned exposures:
 //
 //  1. Builds a clean model image in the output (drizzle) space using minmed
-//     (min of mean and median) for small stacks (n ≤ 3) or median for larger
-//     stacks.  Each output pixel is sampled from every frame via inverse blot.
+//     (min of mean and median) for small stacks (n <= 3) or median for larger
+//     stacks. Each output pixel is sampled from every frame via inverse blot.
 //  2. Blots the model back to each input frame's pixel space.
 //  3. Computes a 4-neighbor max-absolute derivative at each frame pixel.
 //  4. Seeds pixels whose excess over the blotted model exceeds
@@ -384,6 +415,7 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 
 	for fi := range frames {
 		f := &frames[fi]
+		debuglog.Log(fmt.Sprintf("BuildCRMasksFromModel: frame %d/%d (%dx%d)", fi+1, n, f.Width, f.Height))
 		if f.Sigma <= 0 {
 			masks[fi] = make([]bool, f.Width*f.Height)
 			continue

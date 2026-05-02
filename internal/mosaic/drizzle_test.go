@@ -74,6 +74,53 @@ func TestBuildAveragesOverlappingInputs(t *testing.T) {
 	}
 }
 
+func TestBuildExposureWeightingNormalizesToRate(t *testing.T) {
+	ref := makeInput("ref_flc.fits", 2, 2, filledPixels(2, 2, 100), headerWithCRPIX(10, 10))
+	ref.ExposureTime = 100
+	ref.PrimaryHeader.Cards["EXPTIME"] = "100"
+	other := makeInput("other_flc.fits", 2, 2, filledPixels(2, 2, 110), headerWithCRPIX(10, 10))
+	other.ExposureTime = 110
+	other.PrimaryHeader.Cards["EXPTIME"] = "110"
+
+	result, err := Build([]Input{ref, other}, Options{Scale: 1, WeightingMode: WeightExposure})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+
+	for i := range result.Pixels {
+		if math.Abs(float64(result.Pixels[i]-1)) > 1e-6 {
+			t.Fatalf("pixel[%d] = %v, want 1", i, result.Pixels[i])
+		}
+		if math.Abs(float64(result.Weights[i]-210)) > 1e-6 {
+			t.Fatalf("weight[%d] = %v, want 210", i, result.Weights[i])
+		}
+	}
+}
+
+func TestBuildExposureWeightingWithDrizzleCRKeepsValidPixels(t *testing.T) {
+	ref := makeInput("ref_flc.fits", 2, 2, []float32{100, 110, 90, 100}, headerWithCRPIX(10, 10))
+	ref.ExposureTime = 100
+	ref.PrimaryHeader.Cards["EXPTIME"] = "100"
+	other := makeInput("other_flc.fits", 2, 2, []float32{110, 121, 99, 110}, headerWithCRPIX(10, 10))
+	other.ExposureTime = 110
+	other.PrimaryHeader.Cards["EXPTIME"] = "110"
+
+	result, err := Build([]Input{ref, other}, Options{Scale: 1, WeightingMode: WeightExposure, CRMethod: CRMethodDrizzle})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+
+	want := []float32{1, 1.1, 0.9, 1}
+	for i, w := range want {
+		if math.IsNaN(float64(result.Pixels[i])) {
+			t.Fatalf("pixel[%d] is NaN, want %v", i, w)
+		}
+		if math.Abs(float64(result.Pixels[i]-w)) > 1e-5 {
+			t.Fatalf("pixel[%d] = %v, want %v", i, result.Pixels[i], w)
+		}
+	}
+}
+
 func TestBuildSkipsNaNPixels(t *testing.T) {
 	inputs := []Input{
 		makeInput("ref_flc.fits", 2, 2, []float32{1, 1, 1, 1}, headerWithCRPIX(10, 10)),
@@ -185,7 +232,8 @@ func TestLooksLikeFLC(t *testing.T) {
 func makeInput(path string, width, height int, pixels []float32, header fitsio.Header) Input {
 	return Input{
 		Path:          path,
-		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F502N'", "INSTRUME": "'WFC3'"}},
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F502N'", "INSTRUME": "'WFC3'", "EXPTIME": "100"}},
+		ExposureTime:  100,
 		HDU: fitsio.HDU{
 			Header: header,
 			Data:   fitsio.ImageData{Width: width, Height: height, Pixels: pixels},
@@ -244,9 +292,9 @@ func TestAlignInputsBySelectedStarsAppliesAffineRefinement(t *testing.T) {
 		makeInput("target_flc.fits", 400, 400, targetPixels, wcsHdr()),
 	}
 
-	results, err := AlignInputsBySelectedStars(inputs, refStars)
+	results, err := AlignInputsBySelectedStarsWithMode(inputs, refStars, 1, AlignmentModeRScale, 0)
 	if err != nil {
-		t.Fatalf("AlignInputsBySelectedStars returned error: %v", err)
+		t.Fatalf("AlignInputsBySelectedStarsWithMode returned error: %v", err)
 	}
 	if !results[1].Applied {
 		t.Fatalf("target alignment was not applied")
