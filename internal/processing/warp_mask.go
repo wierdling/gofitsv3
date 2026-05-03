@@ -5,6 +5,16 @@ import "math"
 func WarpImageToSizeWithMask(targetPixels []float32, srcWidth, srcHeight, outWidth, outHeight int, t AffineTransform) ([]float32, []bool) {
 	out := make([]float32, outWidth*outHeight)
 	valid := make([]bool, outWidth*outHeight)
+	if srcWidth <= 0 || srcHeight <= 0 || len(targetPixels) == 0 {
+		return out, valid
+	}
+	maxHeight := len(targetPixels) / srcWidth
+	if maxHeight <= 0 {
+		return out, valid
+	}
+	if srcHeight > maxHeight {
+		srcHeight = maxHeight
+	}
 	for y := 0; y < outHeight; y++ {
 		for x := 0; x < outWidth; x++ {
 			srcX := t.A*float64(x) + t.B*float64(y) + t.C

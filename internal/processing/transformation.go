@@ -94,6 +94,16 @@ func WarpImage(targetPixels []float32, width, height int, t AffineTransform) []f
 
 func WarpImageToSize(targetPixels []float32, srcWidth, srcHeight, outWidth, outHeight int, t AffineTransform) []float32 {
 	out := make([]float32, outWidth*outHeight)
+	if srcWidth <= 0 || srcHeight <= 0 || len(targetPixels) == 0 {
+		return out
+	}
+	maxHeight := len(targetPixels) / srcWidth
+	if maxHeight <= 0 {
+		return out
+	}
+	if srcHeight > maxHeight {
+		srcHeight = maxHeight
+	}
 	for y := 0; y < outHeight; y++ {
 		for x := 0; x < outWidth; x++ {
 			srcX := t.A*float64(x) + t.B*float64(y) + t.C

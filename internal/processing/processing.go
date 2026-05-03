@@ -199,6 +199,10 @@ func stretchForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 		data, _ := ApplyStretchParallel(img)
 		return data
 	}
+	if sharedDrizzleGrid(img, ref) {
+		data, _ := ApplyStretchParallel(img)
+		return data
+	}
 
 	alignedPixels, _, err := AlignChannelUsingWCS(
 		img.HDU.Data.Pixels,
@@ -229,6 +233,28 @@ func stretchForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 
 	data, _ := ApplyStretchParallel(img)
 	return data
+}
+
+func sharedDrizzleGrid(img, ref *models.LoadedImage) bool {
+	if img == nil || ref == nil {
+		return false
+	}
+	if img.HDU.Data.Width != ref.HDU.Data.Width || img.HDU.Data.Height != ref.HDU.Data.Height {
+		return false
+	}
+	imgScale, ok1 := fitsio.HeaderFloat(img.HDU.Header, "DRIZSCAL")
+	refScale, ok2 := fitsio.HeaderFloat(ref.HDU.Header, "DRIZSCAL")
+	imgOffX, ok3 := fitsio.HeaderFloat(img.HDU.Header, "ORIGOFFX")
+	refOffX, ok4 := fitsio.HeaderFloat(ref.HDU.Header, "ORIGOFFX")
+	imgOffY, ok5 := fitsio.HeaderFloat(img.HDU.Header, "ORIGOFFY")
+	refOffY, ok6 := fitsio.HeaderFloat(ref.HDU.Header, "ORIGOFFY")
+	if !(ok1 && ok2 && ok3 && ok4 && ok5 && ok6) {
+		return false
+	}
+	const tol = 1e-6
+	return math.Abs(imgScale-refScale) <= tol &&
+		math.Abs(imgOffX-refOffX) <= tol &&
+		math.Abs(imgOffY-refOffY) <= tol
 }
 
 func ApplyRGBLevels(buf []byte, levels *models.RgbLevels) []byte {

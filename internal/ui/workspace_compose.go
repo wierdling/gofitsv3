@@ -157,6 +157,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				imgs[i].HDU.Data.Pixels = resized
 				imgs[i].HDU.Data.Width = newW
 				imgs[i].HDU.Data.Height = newH
+				clearComposeOrigPixels(&origPixels, i)
 				resizedCount++
 			}
 
@@ -260,7 +261,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}
 
 				imgs[idx] = img
-				origPixels[idx] = nil
+				clearComposeOrigPixels(&origPixels, idx)
 
 				fyne.Do(func() {
 					if controlSets != nil {
@@ -462,7 +463,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						continue
 					}
 					imgs[res.idx] = res.img
-					origPixels[res.idx] = nil
+					clearComposeOrigPixels(&origPixels, res.idx)
 				}
 
 				fyne.Do(func() {
@@ -510,7 +511,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					continue
 				}
 				imgs[i] = reloaded
-				origPixels[i] = nil
+				clearComposeOrigPixels(&origPixels, i)
 				applyChannelState(i, state, imgs, viewports, controlSets)
 			}
 		})
@@ -591,10 +592,12 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			imgs[0].HDU.Data.Pixels = alignedBlue
 			imgs[0].HDU.Data.Width = width
 			imgs[0].HDU.Data.Height = height
+			clearComposeOrigPixels(&origPixels, 0)
 
 			imgs[2].HDU.Data.Pixels = alignedRed
 			imgs[2].HDU.Data.Width = width
 			imgs[2].HDU.Data.Height = height
+			clearComposeOrigPixels(&origPixels, 2)
 
 			msg := fmt.Sprintf("Alignment Complete.\n\nBlue Method: %s\nBlue Shift:\n  X: %+.2f px\n  Y: %+.2f px\n\nRed Method: %s\nRed Shift:\n  X: %+.2f px\n  Y: %+.2f px",
 				blueMethod,
@@ -700,6 +703,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				copy(out, imgs[i].HDU.Data.Pixels)
 				pasteTopLeft(out, imgs[i].HDU.Data.Width, cleaned[i], sharedWidth, sharedHeight)
 				imgs[i].HDU.Data.Pixels = out
+				clearComposeOrigPixels(&origPixels, i)
 			}
 
 			fyne.Do(func() {
@@ -824,7 +828,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			}
 			for i := 0; i < 3; i++ {
 				imgs[i] = nil
-				origPixels[i] = nil
+				clearComposeOrigPixels(&origPixels, i)
 				viewports[i].image.Image = blankImg()
 			}
 			viewports[3].image.Image = blankImg()
@@ -920,7 +924,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			return
 		}
 		imgs[channelIdx] = img
-		origPixels[channelIdx] = nil
+		clearComposeOrigPixels(&origPixels, channelIdx)
 		applyChannelState(channelIdx, channelStateFromImage(img), imgs, viewports, controlSets)
 		refresh()
 		if updateMenus != nil {

@@ -120,9 +120,59 @@ func EstimateTweakRegAlignmentWithRefStars(
 	}
 
 	if fitgeom == "rscale" {
-		return SolveRScaleTransformationRANSAC(pairs, 300, 1.5)
+		rscale, err := SolveRScaleTransformationRANSAC(pairs, 300, 1.5)
+		if err != nil {
+			return AffineTransform{}, err
+		}
+		general, generalErr := SolveTransformationRANSAC(pairs, 2000, 1.5)
+		if generalErr == nil && shouldUpgradeTweakRegFit(pairs, rscale, general, refWidth, refHeight) {
+			rRMS, rMax := residualStats(pairs, rscale)
+			gRMS, gMax := residualStats(pairs, general)
+			debuglog.Log(fmt.Sprintf("EstimateTweakRegAlignmentWithRefStars: upgrading fitgeom from rscale to general (pairs=%d, rscale rms=%.2f max=%.2f, general rms=%.2f max=%.2f)", len(pairs), rRMS, rMax, gRMS, gMax))
+			return general, nil
+		}
+		return rscale, nil
 	}
 	return SolveTransformationRANSAC(pairs, 2000, 1.5)
+}
+
+func shouldUpgradeTweakRegFit(pairs []MatchedPair, rscale, general AffineTransform, refWidth, refHeight int) bool {
+	if len(pairs) < 6 || refWidth <= 0 || refHeight <= 0 {
+		return false
+	}
+	rRMS, rMax := residualStats(pairs, rscale)
+	gRMS, gMax := residualStats(pairs, general)
+	if !(gRMS < rRMS && gMax < rMax) {
+		return false
+	}
+	if rRMS <= 1.25 && rMax <= 3.5 {
+		return false
+	}
+	if gRMS > 0.75*rRMS && gMax > 0.8*rMax {
+		return false
+	}
+	w, h, diag := pairBoundsTarget(pairs)
+	shortAxis := math.Min(w, h)
+	minShortAxis := math.Max(120, 0.20*math.Min(float64(refWidth), float64(refHeight)))
+	minDiag := math.Max(250, 0.35*math.Hypot(float64(refWidth), float64(refHeight)))
+	return shortAxis >= minShortAxis && diag >= minDiag
+}
+
+func residualStats(pairs []MatchedPair, t AffineTransform) (rms, maxErr float64) {
+	if len(pairs) == 0 {
+		return 0, 0
+	}
+	var sumSq float64
+	for _, p := range pairs {
+		px := t.A*p.RefX + t.B*p.RefY + t.C
+		py := t.D*p.RefX + t.E*p.RefY + t.F
+		err := math.Hypot(px-p.TargetX, py-p.TargetY)
+		sumSq += err * err
+		if err > maxErr {
+			maxErr = err
+		}
+	}
+	return math.Sqrt(sumSq / float64(len(pairs))), maxErr
 }
 
 // sigmaClipPairs removes pairs whose residual under transform t exceeds

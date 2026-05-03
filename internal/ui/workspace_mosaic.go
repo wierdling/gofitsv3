@@ -375,6 +375,63 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	// It must only be called from a goroutine (it shows a progress dialog and blocks).
 	var buildDrizzlePreview func()
 
+	autoAlignToReferenceBaseline := func() {
+		if state.referenceInput == nil || len(state.inputs) == 0 {
+			return
+		}
+		alignInputs := inputsWithRef()
+		if len(alignInputs) < 2 {
+			return
+		}
+
+		mode := mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode)
+		searchRadius := state.alignmentSettings.SearchRadiusArcsec
+		debuglog.Log(fmt.Sprintf("buildDrizzlePreview: reference baseline set, auto-running AlignInputsByStarsWithMode against baseline only (mode=%d, searchRadius=%.2f)", int(mode), searchRadius))
+		results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, 1, mode, searchRadius)
+		if err != nil {
+			debuglog.Log(fmt.Sprintf("buildDrizzlePreview: auto reference star alignment failed: %v", err))
+			return
+		}
+
+		activeIndices := make([]int, 0, len(state.inputs))
+		for i, inp := range state.inputs {
+			if !inp.Excluded {
+				activeIndices = append(activeIndices, i)
+			}
+		}
+
+		applied := 0
+		failed := 0
+		locked := 0
+		for ri := 1; ri < len(results); ri++ {
+			ai := ri - 1
+			if ai >= len(activeIndices) {
+				continue
+			}
+			si := activeIndices[ai]
+			if si >= len(state.inputs) {
+				continue
+			}
+			if state.inputs[si].OffsetLocked {
+				locked++
+				continue
+			}
+			if !results[ri].Applied {
+				failed++
+				debuglog.Log(fmt.Sprintf("buildDrizzlePreview: auto reference star alignment failed for %s: %s", mosaic.InputLabel(state.inputs[si]), results[ri].Error))
+				continue
+			}
+
+			state.inputs[si].OffsetX = results[ri].OffsetX
+			state.inputs[si].OffsetY = results[ri].OffsetY
+			state.inputs[si].ManualTransform = results[ri].ManualTransform
+			state.inputs[si].HasManualTransform = results[ri].HasManualTransform
+			applied++
+			debuglog.Log(fmt.Sprintf("buildDrizzlePreview: auto reference star alignment applied to %s (x=%.2f, y=%.2f, affine=%v)", mosaic.InputLabel(state.inputs[si]), results[ri].OffsetX, results[ri].OffsetY, results[ri].HasManualTransform))
+		}
+		debuglog.Log(fmt.Sprintf("buildDrizzlePreview: auto reference star alignment summary applied=%d failed=%d locked=%d", applied, failed, locked))
+	}
+
 	applyAutoLoadedOffsets := func(inputs []mosaic.Input) []string {
 		_, messages := mosaic.AutoLoadOffsets(inputs)
 		return messages
@@ -1615,6 +1672,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			progressDialog = dialog.NewCustom("Processing", "Aligning, cleaning, and drizzling selected inputs...", widget.NewProgressBarInfinite(), win)
 			progressDialog.Show()
 		})
+
+		autoAlignToReferenceBaseline()
 
 		s := state.drizzleSettings
 		weightingMode := mosaic.WeightingMode(s.WeightingMode)
