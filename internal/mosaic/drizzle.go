@@ -1351,11 +1351,18 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 			continue
 		}
 
-		// Use the linear affine approximation for canvas bounds: it is exact for
-		// linear WCS and a good-enough envelope for distorted chips. Per-pixel
-		// accuracy comes from the mapper in the drizzle loop below.
+		// Use mapPixel for canvas bounds so they match the actual pixel
+		// placement in the drizzle loop. The affine approximation can diverge
+		// from the WCS mapper for inputs far from the linearisation point
+		// (e.g. large mosaic offsets with SIP distortion), which shifts those
+		// frames in the output canvas. Round to 1e-6 pixels to eliminate
+		// floating-point noise from the WCS round-trip (the true error is
+		// at the sub-arcsecond level, so 1e-6 pixels is safe).
+		const boundsRound = 1e6
 		for _, corner := range imageCorners(input.HDU.Data.Width, input.HDU.Data.Height) {
-			x, y := processing.ApplyAffineTransform(transform, corner[0], corner[1])
+			rx, ry := p.mapPixel(corner[0], corner[1])
+			x := math.Round(rx*boundsRound) / boundsRound
+			y := math.Round(ry*boundsRound) / boundsRound
 			if !boundsInitialized {
 				minX, maxX = x, x
 				minY, maxY = y, y
