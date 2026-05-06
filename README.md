@@ -343,21 +343,9 @@ When reporting image-processing issues, include:
 
 ## License
 
-Add the project license here.
-
-Example:
-
 ```text
 MIT License
 ```
-
-or
-
-```text
-All rights reserved.
-```
-
----
 
 ## Acknowledgments
 
