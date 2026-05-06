@@ -94,7 +94,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 
 	var refresh func()
 
-	modeSelect := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
+	modeSelect := NewSafeSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
 		if state.img == nil {
 			return
 		}
@@ -327,7 +327,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	}
 
 	// Send to Compose channel
-	channelSelect := widget.NewSelect([]string{"Channel 1", "Channel 2", "Channel 3"}, nil)
+	channelSelect := NewSafeSelect([]string{"Channel 1", "Channel 2", "Channel 3"}, nil)
 	channelSelect.SetSelectedIndex(0)
 	sendToChannelBtn := widget.NewButton("Send to Channel", func() {
 		if globalSendToChannel == nil || state.img == nil {

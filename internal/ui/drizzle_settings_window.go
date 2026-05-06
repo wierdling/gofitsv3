@@ -56,7 +56,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 	pixFracEntry := widget.NewEntry()
 	pixFracEntry.SetText(fmt.Sprintf("%.4f", current.PixFrac))
 
-	crSelect := widget.NewSelect(crMethodNames, nil)
+	crSelect := NewSafeSelect(crMethodNames, nil)
 	crMethod := current.CRMethod
 	if crMethod >= 0 && crMethod < len(crMethodNames) {
 		crSelect.SetSelected(crMethodNames[crMethod])
@@ -72,7 +72,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 	}
 
-	sepSelect := widget.NewSelect(kernelNames, nil)
+	sepSelect := NewSafeSelect(kernelNames, nil)
 	sepKernel := current.SepKernel
 	sepSelect.SetSelected(kernelNames[kernelIndex(sepKernel)])
 	sepSelect.OnChanged = func(s string) {
@@ -84,7 +84,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 	}
 
-	finalSelect := widget.NewSelect(kernelNames, nil)
+	finalSelect := NewSafeSelect(kernelNames, nil)
 	finalKernel := current.FinalKernel
 	finalSelect.SetSelected(kernelNames[kernelIndex(finalKernel)])
 	finalSelect.OnChanged = func(s string) {
@@ -100,7 +100,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 	if weightingMode == 0 && current.UseERRWeighting {
 		weightingMode = int(mosaic.WeightERR)
 	}
-	weightSelect := widget.NewSelect(weightingModeNames, nil)
+	weightSelect := NewSafeSelect(weightingModeNames, nil)
 	if weightingMode < 0 || weightingMode >= len(weightingModeNames) {
 		weightingMode = int(mosaic.WeightUniform)
 	}

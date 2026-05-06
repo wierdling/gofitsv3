@@ -42,7 +42,7 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 	if method < 0 || method >= len(skyMethodNames) {
 		method = int(mosaic.SkyMethodLocalMin)
 	}
-	methodSelect := widget.NewSelect(skyMethodNames, func(s string) {
+	methodSelect := NewSafeSelect(skyMethodNames, func(s string) {
 		for i, name := range skyMethodNames {
 			if name == s {
 				method = i
@@ -56,7 +56,7 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 	if stat < 0 || stat >= len(skyStatNames) {
 		stat = int(mosaic.SkyStatMedian)
 	}
-	statSelect := widget.NewSelect(skyStatNames, func(s string) {
+	statSelect := NewSafeSelect(skyStatNames, func(s string) {
 		for i, name := range skyStatNames {
 			if name == s {
 				stat = i

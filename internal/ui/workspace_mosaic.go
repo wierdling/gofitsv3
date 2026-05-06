@@ -432,6 +432,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		debuglog.Log(fmt.Sprintf("buildDrizzlePreview: auto reference star alignment summary applied=%d failed=%d locked=%d", applied, failed, locked))
 	}
 
+	_ = autoAlignToReferenceBaseline
+
 	applyAutoLoadedOffsets := func(inputs []mosaic.Input) []string {
 		_, messages := mosaic.AutoLoadOffsets(inputs)
 		return messages
@@ -1466,7 +1468,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					}
 
 					options := mosaic.FilterOptions(groups)
-					filterSelect := widget.NewSelect(options, nil)
+					filterSelect := NewSafeSelect(options, nil)
 
 					type fileCheck struct {
 						path    string
@@ -1673,7 +1675,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			progressDialog.Show()
 		})
 
-		autoAlignToReferenceBaseline()
+		// Temporarily disabled while checking whether baseline auto-alignment causes the chip-edge regression.
+		// autoAlignToReferenceBaseline()
 
 		s := state.drizzleSettings
 		weightingMode := mosaic.WeightingMode(s.WeightingMode)
@@ -1898,7 +1901,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	statusScroll.SetMinSize(fyne.NewSize(260, 160))
 
 	// Level controls form.
-	modeSelect := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(s string) {
+	modeSelect := NewSafeSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(s string) {
 		switch s {
 		case "Linear":
 			stretchMode = stretch.Linear
@@ -2064,7 +2067,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 	// Zoom controls for the preview pane header.
 	zoomPresets := []string{"fit in preview", "6%", "12%", "25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%"}
-	zoomSelect := widget.NewSelect(zoomPresets, nil)
+	zoomSelect := NewSafeSelect(zoomPresets, nil)
 	zoomCustomEntry := widget.NewEntry()
 	zoomCustomEntry.SetPlaceHolder("custom %")
 	zoomCustomEntry.Resize(fyne.NewSize(70, zoomCustomEntry.MinSize().Height))

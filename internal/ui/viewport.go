@@ -168,7 +168,7 @@ type imagePoint struct {
 type viewport struct {
 	image         *canvas.Image
 	histogram     *canvas.Raster
-	zoomLabel     *widget.Select
+	zoomLabel     *SafeSelect
 	zoomOut       *widget.Button
 	zoomIn        *widget.Button
 	blackBox      *NumberEntry
@@ -205,7 +205,7 @@ func newViewport() *viewport {
 
 	vp.blackBox = NewNumberEntry(0.001, 4)
 	vp.whiteBox = NewNumberEntry(0.001, 4)
-	vp.zoomLabel = widget.NewSelect([]string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}, func(s string) {
+	vp.zoomLabel = NewSafeSelect([]string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}, func(s string) {
 		vp.setZoomFromSelect(s)
 	})
 	vp.zoomOut = widget.NewButton("-", func() { vp.stepZoom(0.95) })

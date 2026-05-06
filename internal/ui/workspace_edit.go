@@ -43,7 +43,7 @@ type editWorkspaceState struct {
 	rgbBins  [3][256]int
 
 	// zoom controls
-	zoomSelect *widget.Select
+	zoomSelect *SafeSelect
 	customZoom string
 
 	// level sliders (min/max per channel, 0-255)
@@ -56,7 +56,7 @@ type editWorkspaceState struct {
 
 	// curves widget and channel selector
 	curves        *curvesWidget
-	curvesChannel *widget.Select
+	curvesChannel *SafeSelect
 
 	// sharpening sliders
 	sharpSlider       *widget.Slider // strength 0-3
@@ -460,7 +460,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 	es.imgScroll.SetMinSize(fyne.NewSize(400, 300))
 
 	// Zoom controls
-	es.zoomSelect = widget.NewSelect(append([]string{}, editZoomPresets...), func(sel string) {
+	es.zoomSelect = NewSafeSelect(append([]string{}, editZoomPresets...), func(sel string) {
 		es.setZoomFromSelect(sel)
 	})
 	es.zoomSelect.SetSelected("fit")
@@ -498,7 +498,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 
 	// --- Curves widget ---
 	es.curves = newCurvesWidget(nil) // onChange wired after applyBtn exists
-	es.curvesChannel = widget.NewSelect(
+	es.curvesChannel = NewSafeSelect(
 		[]string{"All", "Red", "Green", "Blue"},
 		func(sel string) {
 			switch sel {

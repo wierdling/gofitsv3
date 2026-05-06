@@ -23,7 +23,7 @@ func defaultAlignmentSettings() models.AlignmentSettings {
 }
 
 func showAlignmentSettingsDialog(win fyne.Window, current models.AlignmentSettings, onSave func(models.AlignmentSettings)) {
-	alignSelect := widget.NewSelect(alignmentModeNames, nil)
+	alignSelect := NewSafeSelect(alignmentModeNames, nil)
 	alignmentMode := current.AlignmentMode
 	if alignmentMode >= 0 && alignmentMode < len(alignmentModeNames) {
 		alignSelect.SetSelected(alignmentModeNames[alignmentMode])
