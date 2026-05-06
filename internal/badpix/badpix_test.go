@@ -54,7 +54,7 @@ func TestInterpolateBicubic(t *testing.T) {
 	mask[2*w+2] = true // center masked
 	img := fitsio.ImageData{Width: w, Height: h, Pixels: pixels}
 
-	out := InterpolateBicubic(img, mask)
+	out := RepairMaskedPixels(img, mask)
 	got := out.Pixels[2*w+2]
 	if math.IsNaN(float64(got)) || math.IsInf(float64(got), 0) {
 		t.Fatalf("interpolated value is invalid: %v", got)
@@ -74,7 +74,7 @@ func TestInterpolateEdge(t *testing.T) {
 	img := fitsio.ImageData{Width: 3, Height: 3, Pixels: []float32{1, 2, 3, 4, 5, 6, 7, 8, 9}}
 	mask := make([]bool, len(img.Pixels))
 	mask[0] = true // top-left corner
-	out := InterpolateBicubic(img, mask)
+	out := RepairMaskedPixels(img, mask)
 	if math.IsNaN(float64(out.Pixels[0])) || out.Pixels[0] == img.Pixels[0] {
 		t.Fatalf("edge interpolation failed: %v", out.Pixels[0])
 	}

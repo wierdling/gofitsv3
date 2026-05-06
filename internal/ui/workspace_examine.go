@@ -7,14 +7,20 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 
+	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
 	"gofitsv3/internal/utils"
 )
+
+// globalSendToExamine is set by newExamineWorkspace and called by the mosaic workspace
+// to load a drizzle result directly into the examine view.
+var globalSendToExamine func(pixels []float32, width, height int)
 
 type examineState struct {
 	img            *models.LoadedImage
@@ -33,6 +39,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		headerLines: []string{"No FITS loaded."},
 	}
 	vp := newViewport()
+	vp.actionRow.Objects = []fyne.CanvasObject{layout.NewSpacer(), vp.StatsLabel, hpad(6)}
 	reloadBtn := widget.NewButton("Reload Current FITS", func() {})
 	reloadBtn.Disable()
 
@@ -87,7 +94,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 
 	var refresh func()
 
-	modeSelect := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
+	modeSelect := NewSafeSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
 		if state.img == nil {
 			return
 		}
@@ -96,14 +103,11 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	})
 	modeSelect.SetSelected("Linear")
 
-	bgEntry := widget.NewEntry()
-	peakEntry := widget.NewEntry()
-	sPeakEntry := widget.NewEntry()
-	bgEntry.SetText("0")
-	peakEntry.SetText("1")
-	sPeakEntry.SetText("1")
+	bgEntry := NewNumberEntry(0.001, 4)
+	peakEntry := NewNumberEntry(0.001, 4)
+	sPeakEntry := NewNumberEntry(1, 1)
 
-	showClip := widget.NewCheck("Show clipped", func(v bool) {
+	showClip := NewToggle(func(v bool) {
 		if state.img == nil {
 			return
 		}
@@ -112,7 +116,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	})
 	showClip.SetChecked(true)
 
-	flipCheck := widget.NewCheck("Flip image vertically", func(v bool) {
+	flipCheck := NewToggle(func(v bool) {
 		state.flip = v
 		if refresh != nil {
 			refresh()
@@ -130,16 +134,16 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	syncControlsFromImage := func() {
 		if state.img == nil {
 			modeSelect.SetSelected("Linear")
-			bgEntry.SetText("0")
-			peakEntry.SetText("1")
-			sPeakEntry.SetText("1")
+			bgEntry.SetValue(0)
+			peakEntry.SetValue(1)
+			sPeakEntry.SetValue(1)
 			showClip.SetChecked(true)
 			return
 		}
 		modeSelect.SetSelected(modeToLabel(state.img.Mode))
-		bgEntry.SetText(fmt.Sprintf("%.3f", state.img.Background))
-		peakEntry.SetText(fmt.Sprintf("%.3f", state.img.Peak))
-		sPeakEntry.SetText(fmt.Sprintf("%.3f", state.img.ScaledPeak))
+		bgEntry.SetValue(state.img.Background)
+		peakEntry.SetValue(state.img.Peak)
+		sPeakEntry.SetValue(state.img.ScaledPeak)
 		showClip.SetChecked(state.img.ShowClip)
 	}
 
@@ -149,8 +153,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			vp.image.Image = blankImg()
 			vp.origW, vp.origH = 0, 0
 			vp.bins = [256]int{}
-			vp.blackBox.SetText("--")
-			vp.whiteBox.SetText("--")
+			vp.blackBox.SetValue(0)
+			vp.whiteBox.SetValue(0)
 			if vp.StatsLabel != nil {
 				vp.StatsLabel.SetText("Mean: -- | Std: --")
 			}
@@ -176,8 +180,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		if vp.StatsLabel != nil {
 			vp.StatsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f", stats.Mean, stats.Std))
 		}
-		vp.blackBox.SetText(fmt.Sprintf("%.3f", state.img.Black))
-		vp.whiteBox.SetText(fmt.Sprintf("%.3f", state.img.White))
+		vp.blackBox.SetValue(state.img.Black)
+		vp.whiteBox.SetValue(state.img.White)
 		vp.histogram.Refresh()
 		if vp.zoomLabel.Selected == "fit in preview" {
 			vp.zoom = vp.fitZoom()
@@ -225,21 +229,11 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		if state.img == nil {
 			return
 		}
-		if v, err := utils.ParseFloat(bgEntry.Text); err == nil {
-			state.img.Background = v
-		}
-		if v, err := utils.ParseFloat(peakEntry.Text); err == nil {
-			state.img.Peak = v
-		}
-		if v, err := utils.ParseFloat(sPeakEntry.Text); err == nil {
-			state.img.ScaledPeak = v
-		}
-		if v, err := utils.ParseFloat(vp.blackBox.Text); err == nil {
-			state.img.Black = v
-		}
-		if v, err := utils.ParseFloat(vp.whiteBox.Text); err == nil {
-			state.img.White = v
-		}
+		state.img.Background = bgEntry.Value()
+		state.img.Peak = peakEntry.Value()
+		state.img.ScaledPeak = sPeakEntry.Value()
+		state.img.Black = vp.blackBox.Value()
+		state.img.White = vp.whiteBox.Value()
 		refresh()
 	})
 
@@ -247,14 +241,9 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		if state.img == nil {
 			return
 		}
-		blackVal := state.img.Black
-		if v, err := utils.ParseFloat(vp.blackBox.Text); err == nil {
-			blackVal = v
-		}
-		whiteVal := state.img.White
-		if v, err := utils.ParseFloat(vp.whiteBox.Text); err == nil {
-			whiteVal = v
-		} else {
+		blackVal := vp.blackBox.Value()
+		whiteVal := vp.whiteBox.Value()
+		if whiteVal == 0 {
 			_, whiteVal = processing.AutoLevels(state.img.HDU.Data.Pixels)
 		}
 		state.img.Background = blackVal
@@ -262,11 +251,11 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		state.img.ScaledPeak = 10
 		state.img.White = whiteVal
 		state.img.Black = 0
-		vp.blackBox.SetText("0")
-		vp.whiteBox.SetText(fmt.Sprintf("%.2f", whiteVal))
-		bgEntry.SetText(fmt.Sprintf("%.2f", blackVal))
-		peakEntry.SetText(fmt.Sprintf("%.2f", whiteVal))
-		sPeakEntry.SetText("10")
+		vp.blackBox.SetValue(0)
+		vp.whiteBox.SetValue(whiteVal)
+		bgEntry.SetValue(blackVal)
+		peakEntry.SetValue(whiteVal)
+		sPeakEntry.SetValue(10)
 		refresh()
 	})
 
@@ -281,28 +270,30 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			}
 
 			img, loadErr := loadImageFromPath(path)
-			progressDialog.Hide()
-			if loadErr != nil {
-				dialog.ShowError(loadErr, win)
-				return
-			}
+			fyne.Do(func() {
+				progressDialog.Hide()
+				if loadErr != nil {
+					dialog.ShowError(loadErr, win)
+					return
+				}
 
-			state.img = img
-			if preserveStretch {
-				state.img.Mode = labelToMode(savedState.Mode)
-				state.img.Black = savedState.Black
-				state.img.White = savedState.White
-				state.img.Background = savedState.Background
-				state.img.Peak = savedState.Peak
-				state.img.ScaledPeak = savedState.ScaledPeak
-				state.img.ShowClip = savedState.ShowClip
-			}
-			state.headerLines = utils.FormatHeadersLines(img.Primary, img.HDU.Header)
-			pathLabel.SetText(path)
-			syncControlsFromImage()
-			clearMeasurement()
-			headerList.Refresh()
-			refresh()
+				state.img = img
+				if preserveStretch {
+					state.img.Mode = labelToMode(savedState.Mode)
+					state.img.Black = savedState.Black
+					state.img.White = savedState.White
+					state.img.Background = savedState.Background
+					state.img.Peak = savedState.Peak
+					state.img.ScaledPeak = savedState.ScaledPeak
+					state.img.ShowClip = savedState.ShowClip
+				}
+				state.headerLines = utils.FormatHeadersLines(img.Primary, img.HDU.Header)
+				pathLabel.SetText(path)
+				syncControlsFromImage()
+				clearMeasurement()
+				headerList.Refresh()
+				refresh()
+			})
 		}()
 	}
 
@@ -335,9 +326,29 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		loadFitsFromPath(state.img.Path, true)
 	}
 
+	// Send to Compose channel
+	channelSelect := NewSafeSelect([]string{"Channel 1", "Channel 2", "Channel 3"}, nil)
+	channelSelect.SetSelectedIndex(0)
+	sendToChannelBtn := widget.NewButton("Send to Channel", func() {
+		if globalSendToChannel == nil || state.img == nil {
+			return
+		}
+		// Snapshot the current UI values into a copy of the image.
+		imgCopy := *state.img
+		imgCopy.Black = vp.blackBox.Value()
+		imgCopy.White = vp.whiteBox.Value()
+		imgCopy.Background = bgEntry.Value()
+		imgCopy.Peak = peakEntry.Value()
+		imgCopy.ScaledPeak = sPeakEntry.Value()
+		idx := channelSelect.SelectedIndex()
+		if idx < 0 {
+			idx = 0
+		}
+		globalSendToChannel(idx, &imgCopy)
+	})
+
 	controls := container.NewVBox(
-		widget.NewButton("Load FITS", loadFits),
-		reloadBtn,
+		container.NewHBox(widget.NewButton("Load FITS", loadFits), reloadBtn),
 		pathLabel,
 		widget.NewSeparator(),
 		widget.NewLabel("Stretch Controls"),
@@ -347,8 +358,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			widget.NewFormItem("Peak", peakEntry),
 			widget.NewFormItem("Scaled Peak", sPeakEntry),
 		),
-		showClip,
-		flipCheck,
+		container.NewHBox(showClip, widget.NewLabel("Show clipped")),
+		container.NewHBox(flipCheck, widget.NewLabel("Flip image vertically")),
 		container.NewHBox(autoBtn, applyBtn),
 		widget.NewSeparator(),
 		widget.NewLabel("Examine Tools"),
@@ -356,9 +367,43 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		coordLabel,
 		measureLabel,
 		widget.NewButton("Clear Measurement", clearMeasurement),
+		widget.NewSeparator(),
+		widget.NewLabel("Send to Compose"),
+		channelSelect,
+		sendToChannelBtn,
 	)
-	controlsScroll := container.NewVScroll(controls)
+	paddedControls := container.NewBorder(nil, nil, hpad(8), hpad(8), controls)
+	controlsScroll := container.NewVScroll(paddedControls)
 	controlsScroll.SetMinSize(fyne.NewSize(280, 220))
+
+	globalSendToExamine = func(pixels []float32, width, height int) {
+		img := &models.LoadedImage{
+			Path: "(mosaic result)",
+			HDU: fitsio.HDU{
+				Data: fitsio.ImageData{
+					Pixels: pixels,
+					Width:  width,
+					Height: height,
+				},
+			},
+			Mode:       0,
+			Black:      0,
+			White:      1,
+			Background: 0,
+			Peak:       1,
+			ScaledPeak: 10,
+			ShowClip:   true,
+		}
+		_, img.White = processing.AutoLevels(pixels)
+		img.Peak = img.White
+		state.img = img
+		state.headerLines = []string{"Mosaic drizzle result", fmt.Sprintf("Size: %dx%d", width, height)}
+		pathLabel.SetText("(mosaic result)")
+		syncControlsFromImage()
+		clearMeasurement()
+		headerList.Refresh()
+		refresh()
+	}
 
 	viewerTabs := container.NewAppTabs(
 		container.NewTabItem("Viewer", vp.container),

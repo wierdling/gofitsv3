@@ -16,10 +16,34 @@ func IdentityTransform() AffineTransform {
 	return AffineTransform{A: 1, E: 1}
 }
 
+func RotationAround(centerX, centerY, angleRad float64) AffineTransform {
+	cosA := math.Cos(angleRad)
+	sinA := math.Sin(angleRad)
+	return AffineTransform{
+		A: cosA,
+		B: -sinA,
+		C: centerX - (cosA*centerX - sinA*centerY),
+		D: sinA,
+		E: cosA,
+		F: centerY - (sinA*centerX + cosA*centerY),
+	}
+}
+
 func ApplyAffineTransform(t AffineTransform, x, y float64) (float64, float64) {
 	return t.A*x + t.B*y + t.C, t.D*x + t.E*y + t.F
 }
 
+// ComposeAffineTransforms returns after(before(x, y)).
+func ComposeAffineTransforms(after, before AffineTransform) AffineTransform {
+	return AffineTransform{
+		A: after.A*before.A + after.B*before.D,
+		B: after.A*before.B + after.B*before.E,
+		C: after.A*before.C + after.B*before.F + after.C,
+		D: after.D*before.A + after.E*before.D,
+		E: after.D*before.B + after.E*before.E,
+		F: after.D*before.C + after.E*before.F + after.F,
+	}
+}
 func InvertAffineTransform(t AffineTransform) (AffineTransform, error) {
 	det := t.A*t.E - t.B*t.D
 	if math.Abs(det) < 1e-18 {
@@ -70,6 +94,16 @@ func WarpImage(targetPixels []float32, width, height int, t AffineTransform) []f
 
 func WarpImageToSize(targetPixels []float32, srcWidth, srcHeight, outWidth, outHeight int, t AffineTransform) []float32 {
 	out := make([]float32, outWidth*outHeight)
+	if srcWidth <= 0 || srcHeight <= 0 || len(targetPixels) == 0 {
+		return out
+	}
+	maxHeight := len(targetPixels) / srcWidth
+	if maxHeight <= 0 {
+		return out
+	}
+	if srcHeight > maxHeight {
+		srcHeight = maxHeight
+	}
 	for y := 0; y < outHeight; y++ {
 		for x := 0; x < outWidth; x++ {
 			srcX := t.A*float64(x) + t.B*float64(y) + t.C

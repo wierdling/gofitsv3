@@ -10,7 +10,7 @@ import (
 // Config controls bad-pixel cleaning behavior.
 type Config struct {
 	// BadBits selects which DQ bits mark a pixel as bad. If zero, any non-zero DQ marks bad.
-	BadBits uint16
+	BadBits uint32
 	// AllowMissingDQ permits processing even when no DQ extension is found; pixels are left unchanged.
 	AllowMissingDQ bool
 }
@@ -46,6 +46,6 @@ func Clean(path string, cfg Config) (*fitsio.ImageData, []bool, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	cleaned := badpix.InterpolateBicubic(sci.Data, mask)
+	cleaned := badpix.RepairMaskedPixels(sci.Data, mask)
 	return &cleaned, mask, nil
 }

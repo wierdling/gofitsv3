@@ -9,14 +9,7 @@ func TestAlignChannelResizesTargetToReferenceDimensions(t *testing.T) {
 	refW, refH := 80, 80
 	targetW, targetH := 40, 40
 
-	ref := makeSyntheticStarField(refW, refH, [][2]int{
-		{12, 14},
-		{52, 16},
-		{24, 34},
-		{63, 41},
-		{18, 60},
-		{57, 66},
-	})
+	ref := makeSyntheticStarField(refW, refH, [][2]int{{12, 14}, {52, 16}, {24, 34}, {63, 41}, {18, 60}, {57, 66}})
 	target := ResizeChannel(ref, refW, refH, targetW, targetH)
 
 	aligned, transform, err := AlignChannel(target, targetW, targetH, ref, refW, refH)

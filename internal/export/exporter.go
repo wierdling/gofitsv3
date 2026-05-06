@@ -7,6 +7,7 @@ import (
 	"image/png"
 	"os"
 
+	"gofitsv3/webpwriter"
 	"golang.org/x/image/tiff"
 )
 
@@ -17,6 +18,7 @@ const (
 	PNG  Format = "png"
 	JPEG Format = "jpeg"
 	TIFF Format = "tiff"
+	WEBP Format = "webp"
 )
 
 // Options controls export behavior.
@@ -40,6 +42,10 @@ func FromImage(path string, img image.Image, format Format, opt Options) error {
 }
 
 func saveImage(path string, img image.Image, format Format, opt Options) error {
+	if format == WEBP {
+		return webpwriter.WriteImageWebPLosslessFile(path, img)
+	}
+
 	f, err := os.Create(path)
 	if err != nil {
 		return err

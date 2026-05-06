@@ -4,6 +4,7 @@ import (
 	"image"
 	"math"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,87 +17,158 @@ import (
 	"gofitsv3/internal/utils"
 )
 
+const fitsLiberatorAutoScaledPeak = 10.0
+
+func AutoScaleLikeFitsLiberator(img *models.LoadedImage) {
+	if img == nil {
+		return
+	}
+
+	if img.White <= img.Black {
+		black, white, _, _ := SmartLevels(img.HDU.Data.Pixels)
+		img.Black = black
+		img.White = white
+	}
+
+	img.Background = img.Black
+	img.Peak = img.White
+	img.ScaledPeak = fitsLiberatorAutoScaledPeak
+
+	if img.Peak <= img.Background {
+		img.Peak = img.Background + 1
+	}
+}
+
 func ApplyStretchParallel(img *models.LoadedImage) (fitsio.ImageData, []byte) {
 	data := img.HDU.Data
 	numPixels := len(data.Pixels)
+
 	pixels := make([]float32, numPixels)
+
 	var mask []byte
 	if img.ShowClip {
 		mask = make([]byte, numPixels)
 	}
 
-	denom := img.Peak - img.Background
-	if denom <= 0 {
-		denom = 1
+	background := img.Background
+	peak := img.Peak
+	scaledPeak := img.ScaledPeak
+
+	if math.IsNaN(background) || math.IsInf(background, 0) {
+		background = 0
 	}
-	if img.ScaledPeak <= 0 {
-		img.ScaledPeak = 1
+
+	if math.IsNaN(peak) || math.IsInf(peak, 0) || peak <= background {
+		peak = background + 1
 	}
-	stretchMul := img.ScaledPeak / denom
-	invLogPeak := 1.0 / math.Log1p(img.ScaledPeak)
-	invAsinhPeak := 1.0 / math.Asinh(img.ScaledPeak)
-	invSqrtPeak := 1.0 / math.Sqrt(img.ScaledPeak)
-	invLinearPeak := 1.0 / img.ScaledPeak
+
+	if math.IsNaN(scaledPeak) || math.IsInf(scaledPeak, 0) || scaledPeak <= 0 {
+		// 1 is almost linear. For astronomy images, 100 is a better default.
+		scaledPeak = 100
+	}
+
+	denom := peak - background
+	stretchMul := scaledPeak / denom
+
+	invLogPeak := 1.0 / math.Log1p(scaledPeak)
+	invAsinhPeak := 1.0 / math.Asinh(scaledPeak)
+	invSqrtPeak := 1.0 / math.Sqrt(scaledPeak)
+	invLinearPeak := 1.0 / scaledPeak
+
+	mode := img.Mode
+	black := img.Black
+	white := img.White
+	useRawClipOverlay := mask != nil && white > black
 
 	numWorkers := runtime.NumCPU()
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
 	chunkSize := (numPixels + numWorkers - 1) / numWorkers
+
 	var wg sync.WaitGroup
+
 	for w := 0; w < numWorkers; w++ {
 		start := w * chunkSize
 		end := start + chunkSize
+
 		if start >= numPixels {
 			break
 		}
+
 		if end > numPixels {
 			end = numPixels
 		}
+
 		wg.Add(1)
+
 		go func(s, e int) {
 			defer wg.Done()
+
 			for i := s; i < e; i++ {
 				v := float64(data.Pixels[i])
-				if math.IsNaN(v) {
+
+				if math.IsNaN(v) || math.IsInf(v, 0) {
 					if mask != nil {
 						mask[i] = 3
 					}
 					pixels[i] = 0
 					continue
 				}
-				if v < img.Black {
-					if mask != nil {
+
+				// Black/White are now used only as a clip overlay.
+				// They do not change the value being stretched.
+				if useRawClipOverlay {
+					if v < black {
 						mask[i] = 1
-					}
-					v = img.Black
-				} else if v > img.White {
-					if mask != nil {
+					} else if v > white {
 						mask[i] = 2
 					}
-					v = img.White
 				}
-				val := (v - img.Background) * stretchMul
+
+				val := (v - background) * stretchMul
+
 				if val < 0 {
 					val = 0
 				}
-				result := val * invLinearPeak
-				switch img.Mode {
+
+				var result float64
+
+				switch mode {
 				case stretch.Log:
 					result = math.Log1p(val) * invLogPeak
+
 				case stretch.Asinh:
 					result = math.Asinh(val) * invAsinhPeak
+
 				case stretch.Sqrt:
 					result = math.Sqrt(val) * invSqrtPeak
+
+				default:
+					result = val * invLinearPeak
 				}
+
+				if math.IsNaN(result) || math.IsInf(result, 0) || result < 0 {
+					result = 0
+				}
+
 				if result > 1.0 {
 					result = 1.0
+					if mask != nil && mask[i] == 0 {
+						mask[i] = 2
+					}
 				}
+
 				pixels[i] = float32(result)
 			}
 		}(start, end)
 	}
+
 	wg.Wait()
 
-	if img.Mode == stretch.HistEq {
-		pixels = stretch.Apply(pixels, img.Mode)
+	if mode == stretch.HistEq {
+		pixels = stretch.Apply(pixels, stretch.HistEq)
 	}
 
 	return fitsio.ImageData{Width: data.Width, Height: data.Height, Pixels: pixels}, mask
@@ -124,6 +196,10 @@ func stretchForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 		return fitsio.ImageData{}
 	}
 	if img == ref {
+		data, _ := ApplyStretchParallel(img)
+		return data
+	}
+	if sharedDrizzleGrid(img, ref) {
 		data, _ := ApplyStretchParallel(img)
 		return data
 	}
@@ -159,18 +235,39 @@ func stretchForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 	return data
 }
 
+func sharedDrizzleGrid(img, ref *models.LoadedImage) bool {
+	if img == nil || ref == nil {
+		return false
+	}
+	if img.HDU.Data.Width != ref.HDU.Data.Width || img.HDU.Data.Height != ref.HDU.Data.Height {
+		return false
+	}
+	imgScale, ok1 := fitsio.HeaderFloat(img.HDU.Header, "DRIZSCAL")
+	refScale, ok2 := fitsio.HeaderFloat(ref.HDU.Header, "DRIZSCAL")
+	imgOffX, ok3 := fitsio.HeaderFloat(img.HDU.Header, "ORIGOFFX")
+	refOffX, ok4 := fitsio.HeaderFloat(ref.HDU.Header, "ORIGOFFX")
+	imgOffY, ok5 := fitsio.HeaderFloat(img.HDU.Header, "ORIGOFFY")
+	refOffY, ok6 := fitsio.HeaderFloat(ref.HDU.Header, "ORIGOFFY")
+	if !(ok1 && ok2 && ok3 && ok4 && ok5 && ok6) {
+		return false
+	}
+	const tol = 1e-6
+	return math.Abs(imgScale-refScale) <= tol &&
+		math.Abs(imgOffX-refOffX) <= tol &&
+		math.Abs(imgOffY-refOffY) <= tol
+}
+
 func ApplyRGBLevels(buf []byte, levels *models.RgbLevels) []byte {
 	if buf == nil || levels == nil {
 		return buf
 	}
-	out := make([]byte, len(buf))
 	for i := 0; i+3 < len(buf); i += 4 {
 		for c := 0; c < 3; c++ {
 			val := float64(buf[i+c])
 			minV := levels.Min[c]
 			maxV := levels.Max[c]
 			if maxV <= minV {
-				out[i+c] = clampByte(maxV)
+				buf[i+c] = clampByte(maxV)
 				continue
 			}
 			if val < minV {
@@ -180,11 +277,11 @@ func ApplyRGBLevels(buf []byte, levels *models.RgbLevels) []byte {
 				val = maxV
 			}
 			scaled := (val - minV) / (maxV - minV) * 255
-			out[i+c] = clampByte(scaled)
+			buf[i+c] = clampByte(scaled)
 		}
-		out[i+3] = 255
+		buf[i+3] = 255
 	}
-	return out
+	return buf
 }
 
 func HistogramRGB(buf []byte) [3]histogram.Stats {
@@ -231,6 +328,163 @@ func HistogramRGB(buf []byte) [3]histogram.Stats {
 	return stats
 }
 
+// SmartLevels returns initial stretch values for astronomical FITS data.
+//
+// For the current ApplyStretchParallel implementation, keep these paired:
+//
+//	black      == background
+//	white      == peak
+//
+// That avoids fighting between the pre-clamp step and the stretch step.
+func SmartLevels(pixels []float32) (black, white, background, peak float64) {
+	if len(pixels) == 0 {
+		return 0, 1, 0, 1
+	}
+
+	values := finiteSample(pixels, 1_000_000)
+	if len(values) == 0 {
+		return 0, 1, 0, 1
+	}
+
+	sort.Float64s(values)
+
+	q001 := percentileSorted(values, 0.01)
+	q01 := percentileSorted(values, 0.1)
+	q50 := percentileSorted(values, 50.0)
+	q995 := percentileSorted(values, 99.5)
+	q998 := percentileSorted(values, 99.8)
+	q999 := percentileSorted(values, 99.9)
+
+	bg, _ := EstimateBackground(pixels)
+	if math.IsNaN(bg) || math.IsInf(bg, 0) {
+		bg = q50
+	}
+
+	sigma := robustSigma(values, bg)
+
+	// Put the background/black point just below the estimated sky.
+	// This preserves faint signal above the background without letting
+	// extreme low outliers define the black point.
+	background = bg - 0.5*sigma
+
+	// Do not let a few extreme negative pixels pull the black point too far down.
+	if background < q01 {
+		background = q01
+	}
+
+	// But if the image has an unusually tight distribution, avoid collapse.
+	if background >= bg {
+		background = q001
+	}
+
+	// Peak controls where the stretch reaches white.
+	// 99.8 is usually a good initial compromise:
+	//   lower  = brighter faint nebulosity, more saturated stars
+	//   higher = less saturation, dimmer faint structure
+	peak = q998
+
+	// If 99.8 is too close to the background, fall back to 99.9 or 99.5.
+	if peak <= background {
+		peak = q999
+	}
+	if peak <= background {
+		peak = q995
+	}
+	if peak <= background {
+		peak = background + 1
+	}
+
+	black = background
+	white = peak
+
+	return black, white, background, peak
+}
+
+func finiteSample(pixels []float32, maxSamples int) []float64 {
+	if maxSamples <= 0 {
+		maxSamples = 1_000_000
+	}
+
+	stride := 1
+	if len(pixels) > maxSamples {
+		stride = (len(pixels) + maxSamples - 1) / maxSamples
+	}
+
+	values := make([]float64, 0, minInt(len(pixels)/stride+1, maxSamples))
+
+	for i := 0; i < len(pixels); i += stride {
+		v := float64(pixels[i])
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		values = append(values, v)
+	}
+
+	return values
+}
+
+func percentileSorted(sorted []float64, pct float64) float64 {
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+
+	if pct <= 0 {
+		return sorted[0]
+	}
+	if pct >= 100 {
+		return sorted[n-1]
+	}
+
+	pos := (pct / 100.0) * float64(n-1)
+	i := int(math.Floor(pos))
+	f := pos - float64(i)
+
+	if i >= n-1 {
+		return sorted[n-1]
+	}
+
+	return sorted[i]*(1.0-f) + sorted[i+1]*f
+}
+
+func robustSigma(sortedValues []float64, center float64) float64 {
+	if len(sortedValues) == 0 {
+		return 1
+	}
+
+	deviations := make([]float64, len(sortedValues))
+	for i, v := range sortedValues {
+		deviations[i] = math.Abs(v - center)
+	}
+
+	sort.Float64s(deviations)
+
+	medianAbsDeviation := percentileSorted(deviations, 50.0)
+	sigma := 1.4826 * medianAbsDeviation
+
+	if sigma > 0 && !math.IsNaN(sigma) && !math.IsInf(sigma, 0) {
+		return sigma
+	}
+
+	// Fallback if the image is very flat.
+	q16 := percentileSorted(sortedValues, 16.0)
+	q84 := percentileSorted(sortedValues, 84.0)
+	sigma = (q84 - q16) / 2.0
+
+	if sigma > 0 && !math.IsNaN(sigma) && !math.IsInf(sigma, 0) {
+		return sigma
+	}
+
+	return 1
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func AutoLevels(pixels []float32) (float64, float64) {
 	if len(pixels) == 0 {
 		return 0, 1
@@ -267,7 +521,11 @@ func ToGrayRGBA(data fitsio.ImageData, mask []byte) *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, data.Width, data.Height))
 	for i, v := range data.Pixels {
 		idx := i * 4
-		switch mask[i] {
+		var maskVal byte
+		if mask != nil && i < len(mask) {
+			maskVal = mask[i]
+		}
+		switch maskVal {
 		case 1:
 			img.Pix[idx], img.Pix[idx+1], img.Pix[idx+2] = 0, 0, 255
 		case 2:
@@ -285,42 +543,37 @@ func ToGrayRGBA(data fitsio.ImageData, mask []byte) *image.RGBA {
 
 func FlipImageData(data fitsio.ImageData) fitsio.ImageData {
 	w, h := data.Width, data.Height
-	out := make([]float32, len(data.Pixels))
-	maxIdx := len(data.Pixels)
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			srcIdx := (h-1-y)*w + x
-			dstIdx := y*w + x
-			if srcIdx >= 0 && srcIdx < maxIdx && dstIdx >= 0 && dstIdx < maxIdx {
-				out[dstIdx] = data.Pixels[srcIdx]
-			}
-		}
+	temp := make([]float32, w)
+	for y := 0; y < h/2; y++ {
+		copy(temp, data.Pixels[y*w:(y+1)*w])
+		copy(data.Pixels[y*w:(y+1)*w], data.Pixels[(h-1-y)*w:(h-y)*w])
+		copy(data.Pixels[(h-1-y)*w:(h-y)*w], temp)
 	}
-	return fitsio.ImageData{Width: w, Height: h, Pixels: out}
+	return data
 }
 
 func FlipMask(mask []byte, w, h int) []byte {
-	out := make([]byte, len(mask))
-	maskLen := len(mask)
-	for y := 0; y < h; y++ {
-		srcStart := (h - 1 - y) * w
-		srcEnd := srcStart + w
-		dstStart := y * w
-		dstEnd := dstStart + w
-		if srcStart >= 0 && srcEnd <= maskLen && dstStart >= 0 && dstEnd <= maskLen {
-			copy(out[dstStart:dstEnd], mask[srcStart:srcEnd])
-		}
+	if mask == nil {
+		return nil
 	}
-	return out
+	temp := make([]byte, w)
+	for y := 0; y < h/2; y++ {
+		copy(temp, mask[y*w:(y+1)*w])
+		copy(mask[y*w:(y+1)*w], mask[(h-1-y)*w:(h-y)*w])
+		copy(mask[(h-1-y)*w:(h-y)*w], temp)
+	}
+	return mask
 }
 
 func FlipRGBA(buf []byte, w, h int) []byte {
 	row := w * 4
-	out := make([]byte, len(buf))
-	for y := 0; y < h; y++ {
-		copy(out[y*row:(y+1)*row], buf[(h-1-y)*row:(h-y)*row])
+	temp := make([]byte, row)
+	for y := 0; y < h/2; y++ {
+		copy(temp, buf[y*row:(y+1)*row])
+		copy(buf[y*row:(y+1)*row], buf[(h-1-y)*row:(h-y)*row])
+		copy(buf[(h-1-y)*row:(h-y)*row], temp)
 	}
-	return out
+	return buf
 }
 
 func ResizeChannel(pixels []float32, oldW, oldH, newW, newH int) []float32 {

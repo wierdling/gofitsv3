@@ -31,6 +31,43 @@ func TestComposeRGBUsesGreenReferenceGrid(t *testing.T) {
 	}
 }
 
+func TestStretchForReferenceGridSkipsRewarpForSharedDrizzleGrid(t *testing.T) {
+	header := func(crpix1 string) fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1":   crpix1,
+			"CRPIX2":   "10",
+			"CRVAL1":   "100",
+			"CRVAL2":   "20",
+			"CDELT1":   "1",
+			"CDELT2":   "1",
+			"PC1_1":    "1",
+			"PC1_2":    "0",
+			"PC2_1":    "0",
+			"PC2_2":    "1",
+			"DRIZSCAL": "2",
+			"ORIGOFFX": "-123.5",
+			"ORIGOFFY": "48.25",
+		}}
+	}
+	ref := makeLoadedImageForCompose(3, 2, 0, header("10"))
+	img := makeLoadedImageForCompose(3, 2, 0, header("60"))
+	img.HDU.Data.Pixels = []float32{0, 0.25, 0.5, 0.75, 1, 0.4}
+	img.Background = 0
+	img.Peak = 1
+	img.ScaledPeak = 1
+
+	got := stretchForReferenceGrid(img, ref)
+	want := img.HDU.Data.Pixels
+	if got.Width != img.HDU.Data.Width || got.Height != img.HDU.Data.Height {
+		t.Fatalf("stretchForReferenceGrid size = %dx%d, want %dx%d", got.Width, got.Height, img.HDU.Data.Width, img.HDU.Data.Height)
+	}
+	for i, v := range want {
+		if got.Pixels[i] != v {
+			t.Fatalf("pixel[%d] = %v, want %v", i, got.Pixels[i], v)
+		}
+	}
+}
+
 func makeLoadedImageForCompose(w, h int, value float32, header fitsio.Header) *models.LoadedImage {
 	pixels := make([]float32, w*h)
 	for i := range pixels {

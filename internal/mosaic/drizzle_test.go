@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/processing"
 )
 
 func TestBuildSingleImageIdentity(t *testing.T) {
@@ -69,6 +70,53 @@ func TestBuildAveragesOverlappingInputs(t *testing.T) {
 		}
 		if math.Abs(float64(result.Weights[i]-2)) > 1e-6 {
 			t.Fatalf("weight[%d] = %v, want 2", i, result.Weights[i])
+		}
+	}
+}
+
+func TestBuildExposureWeightingNormalizesToRate(t *testing.T) {
+	ref := makeInput("ref_flc.fits", 2, 2, filledPixels(2, 2, 100), headerWithCRPIX(10, 10))
+	ref.ExposureTime = 100
+	ref.PrimaryHeader.Cards["EXPTIME"] = "100"
+	other := makeInput("other_flc.fits", 2, 2, filledPixels(2, 2, 110), headerWithCRPIX(10, 10))
+	other.ExposureTime = 110
+	other.PrimaryHeader.Cards["EXPTIME"] = "110"
+
+	result, err := Build([]Input{ref, other}, Options{Scale: 1, WeightingMode: WeightExposure})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+
+	for i := range result.Pixels {
+		if math.Abs(float64(result.Pixels[i]-1)) > 1e-6 {
+			t.Fatalf("pixel[%d] = %v, want 1", i, result.Pixels[i])
+		}
+		if math.Abs(float64(result.Weights[i]-210)) > 1e-6 {
+			t.Fatalf("weight[%d] = %v, want 210", i, result.Weights[i])
+		}
+	}
+}
+
+func TestBuildExposureWeightingWithDrizzleCRKeepsValidPixels(t *testing.T) {
+	ref := makeInput("ref_flc.fits", 2, 2, []float32{100, 110, 90, 100}, headerWithCRPIX(10, 10))
+	ref.ExposureTime = 100
+	ref.PrimaryHeader.Cards["EXPTIME"] = "100"
+	other := makeInput("other_flc.fits", 2, 2, []float32{110, 121, 99, 110}, headerWithCRPIX(10, 10))
+	other.ExposureTime = 110
+	other.PrimaryHeader.Cards["EXPTIME"] = "110"
+
+	result, err := Build([]Input{ref, other}, Options{Scale: 1, WeightingMode: WeightExposure, CRMethod: CRMethodDrizzle})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+
+	want := []float32{1, 1.1, 0.9, 1}
+	for i, w := range want {
+		if math.IsNaN(float64(result.Pixels[i])) {
+			t.Fatalf("pixel[%d] is NaN, want %v", i, w)
+		}
+		if math.Abs(float64(result.Pixels[i]-w)) > 1e-5 {
+			t.Fatalf("pixel[%d] = %v, want %v", i, result.Pixels[i], w)
 		}
 	}
 }
@@ -184,7 +232,8 @@ func TestLooksLikeFLC(t *testing.T) {
 func makeInput(path string, width, height int, pixels []float32, header fitsio.Header) Input {
 	return Input{
 		Path:          path,
-		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F502N'", "INSTRUME": "'WFC3'"}},
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F502N'", "INSTRUME": "'WFC3'", "EXPTIME": "100"}},
+		ExposureTime:  100,
 		HDU: fitsio.HDU{
 			Header: header,
 			Data:   fitsio.ImageData{Width: width, Height: height, Pixels: pixels},
@@ -213,6 +262,232 @@ func filledPixels(width, height int, value float32) []float32 {
 	return pixels
 }
 
+func TestAlignInputsBySelectedStarsAppliesAffineRefinement(t *testing.T) {
+	// 400×400 image; stars are >130 px apart so CentroidNear (radius 50) never
+	// confuses one star for another even after a small rotation+translation.
+	refStars := []processing.Star{
+		{X: 60, Y: 60},
+		{X: 220, Y: 60},
+		{X: 380, Y: 60},
+		{X: 140, Y: 220},
+		{X: 300, Y: 220},
+		{X: 220, Y: 340},
+	}
+	refPixels := makeTestStarField(400, 400, refStars)
+	targetStars := transformStarsAroundCenter(refStars, 200, 200, 3*math.Pi/180, 2.5, -1.75)
+	targetPixels := makeTestStarField(400, 400, targetStars)
+
+	// Use tiny CD scale (1e-4 deg/pix) so corner pixels stay within 0.02° of
+	// CRVAL, well inside the normalizeAngleDelta range.  Both images share the
+	// same header so ComputeWCSTransform returns the identity pixel→pixel map.
+	wcsHdr := func() fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "200", "CRPIX2": "200",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "0.0001", "CD1_2": "0", "CD2_1": "0", "CD2_2": "0.0001",
+		}}
+	}
+	inputs := []Input{
+		makeInput("ref_flc.fits", 400, 400, refPixels, wcsHdr()),
+		makeInput("target_flc.fits", 400, 400, targetPixels, wcsHdr()),
+	}
+
+	results, err := AlignInputsBySelectedStarsWithMode(inputs, refStars, 1, AlignmentModeRScale, 0)
+	if err != nil {
+		t.Fatalf("AlignInputsBySelectedStarsWithMode returned error: %v", err)
+	}
+	if !results[1].Applied {
+		t.Fatalf("target alignment was not applied")
+	}
+	if !results[1].HasManualTransform {
+		t.Fatalf("expected affine refinement to be recorded")
+	}
+
+	for i, ts := range targetStars {
+		x, y := processing.ApplyAffineTransform(results[1].ManualTransform, ts.X, ts.Y)
+		if math.Hypot(x-refStars[i].X, y-refStars[i].Y) > 2.0 {
+			t.Fatalf("star %d remapped to (%.2f, %.2f), want near (%.2f, %.2f)", i, x, y, refStars[i].X, refStars[i].Y)
+		}
+	}
+}
+
+func makeTestStarField(width, height int, stars []processing.Star) []float32 {
+	pixels := make([]float32, width*height)
+	for _, star := range stars {
+		cx := int(math.Round(star.X))
+		cy := int(math.Round(star.Y))
+		for dy := -2; dy <= 2; dy++ {
+			for dx := -2; dx <= 2; dx++ {
+				x := cx + dx
+				y := cy + dy
+				if x < 0 || x >= width || y < 0 || y >= height {
+					continue
+				}
+				dist2 := dx*dx + dy*dy
+				pixels[y*width+x] = float32(200 - 20*dist2)
+			}
+		}
+	}
+	return pixels
+}
+
+func transformStarsAroundCenter(stars []processing.Star, cx, cy, angle, dx, dy float64) []processing.Star {
+	sinA, cosA := math.Sin(angle), math.Cos(angle)
+	out := make([]processing.Star, len(stars))
+	for i, star := range stars {
+		sx := star.X - cx
+		sy := star.Y - cy
+		out[i] = processing.Star{
+			X: cx + (sx*cosA - sy*sinA) + dx,
+			Y: cy + (sx*sinA + sy*cosA) + dy,
+		}
+	}
+	return out
+}
 func TestMain(m *testing.M) {
 	os.Exit(m.Run())
+}
+
+func TestPlanInputsSameFileSCIChipsGetMapper(t *testing.T) {
+	// Same-file SCI chips now use a WCSMapper for per-pixel distortion-aware
+	// placement instead of the old translation-only affine hack. Verify that
+	// planInputs builds a mapper for chip2 and that the affine in sourceToRef
+	// (used for CR detection) reflects the full WCS rotation, not just a shift.
+	ref := Input{
+		Path:   "single_flc.fits",
+		SCIExt: 1,
+		HDU: fitsio.HDU{Header: fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "10", "CRPIX2": "10",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "1", "CD1_2": "0",
+			"CD2_1": "0", "CD2_2": "1",
+		}}, Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{1, 1, 1, 1}}},
+	}
+	chip2 := Input{
+		Path:   "single_flc.fits",
+		SCIExt: 2,
+		HDU: fitsio.HDU{Header: fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "8", "CRPIX2": "10",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "0", "CD1_2": "-1",
+			"CD2_1": "1", "CD2_2": "0",
+		}}, Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{2, 2, 2, 2}}},
+	}
+
+	planned, statuses, _, _, _, _, err := planInputs([]Input{ref, chip2}, 1)
+	if err != nil {
+		t.Fatalf("planInputs returned error: %v", err)
+	}
+	if len(planned) != 2 {
+		t.Fatalf("planned inputs = %d, want 2", len(planned))
+	}
+	if statuses[1].Status != "aligned" {
+		t.Fatalf("status = %q, want aligned", statuses[1].Status)
+	}
+	// Chip2 must have a mapper for per-pixel WCS placement.
+	if planned[1].mapper == nil {
+		t.Fatal("expected mapper for same-file chip2, got nil")
+	}
+	// The sourceToRef affine should reflect the full WCS rotation from chip2
+	// (90° rotation encoded in its CD matrix), not translation-only.
+	got := planned[1].sourceToRef
+	if got.B == 0 && got.D == 0 {
+		t.Fatalf("expected full WCS affine for chip2, got translation-only %+v", got)
+	}
+	// Sanity: reference has no mapper (it is at identity by definition).
+	if planned[0].mapper != nil {
+		t.Fatal("expected nil mapper for reference chip, got non-nil")
+	}
+	_ = processing.IdentityTransform() // keep import used
+}
+
+func TestEstimateSkyValueMedianIgnoresOutlier(t *testing.T) {
+	pixels := []float32{5, 5, 5, 5, 100}
+	sky, err := estimateSkyValue(pixels, SkysubOptions{Enabled: true, Stat: SkyStatMedian, Width: 0.1, Clip: 5, LSigma: 4, USigma: 4})
+	if err != nil {
+		t.Fatalf("estimateSkyValue returned error: %v", err)
+	}
+	if math.Abs(sky-5) > 1e-6 {
+		t.Fatalf("sky = %v, want 5", sky)
+	}
+}
+
+func TestEstimateSkyValueSkipsNaNsAndBounds(t *testing.T) {
+	pixels := []float32{float32(math.NaN()), 1, 2, 3, 50}
+	sky, err := estimateSkyValue(pixels, SkysubOptions{Enabled: true, Stat: SkyStatMean, Width: 0.1, Clip: 2, LSigma: 4, USigma: 4, Lower: 1.5, Upper: 3.5, HasLower: true, HasUpper: true})
+	if err != nil {
+		t.Fatalf("estimateSkyValue returned error: %v", err)
+	}
+	if math.Abs(sky-2.5) > 1e-6 {
+		t.Fatalf("sky = %v, want 2.5", sky)
+	}
+}
+
+func TestBuildSkysubDisabledIsNoOp(t *testing.T) {
+	inputs := []Input{
+		makeInput("a_flc.fits", 2, 2, filledPixels(2, 2, 10), headerWithCRPIX(10, 10)),
+		makeInput("b_flc.fits", 2, 2, filledPixels(2, 2, 14), headerWithCRPIX(10, 10)),
+	}
+
+	result, err := Build(inputs, Options{Scale: 1, Skysub: SkysubOptions{Enabled: false}})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+	for i, px := range result.Pixels {
+		if math.Abs(float64(px-12)) > 1e-6 {
+			t.Fatalf("pixel[%d] = %v, want 12", i, px)
+		}
+		if result.Inputs[i/4].SkySubtracted {
+			t.Fatalf("input %d unexpectedly marked sky-subtracted", i/4)
+		}
+	}
+}
+
+func TestBuildSkysubLocalMinSubtractsPerInput(t *testing.T) {
+	inputs := []Input{
+		makeInput("a_flc.fits", 2, 2, filledPixels(2, 2, 10), headerWithCRPIX(10, 10)),
+		makeInput("b_flc.fits", 2, 2, filledPixels(2, 2, 14), headerWithCRPIX(10, 10)),
+	}
+
+	result, err := Build(inputs, Options{Scale: 1, Skysub: SkysubOptions{Enabled: true, Method: SkyMethodLocalMin, Stat: SkyStatMedian, Width: 0.1, Clip: 5, LSigma: 4, USigma: 4}})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+	for i, px := range result.Pixels {
+		if math.Abs(float64(px)) > 1e-6 {
+			t.Fatalf("pixel[%d] = %v, want 0", i, px)
+		}
+	}
+	if !result.Inputs[0].SkySubtracted || !result.Inputs[1].SkySubtracted {
+		t.Fatalf("expected both inputs to be marked sky-subtracted: %+v", result.Inputs)
+	}
+	if math.Abs(result.Inputs[0].SkyValue-10) > 1e-6 || math.Abs(result.Inputs[1].SkyValue-14) > 1e-6 {
+		t.Fatalf("unexpected sky values: %+v", result.Inputs)
+	}
+	if result.Inputs[0].Status != "sky-subtracted and drizzled" {
+		t.Fatalf("status[0] = %q, want sky-subtracted and drizzled", result.Inputs[0].Status)
+	}
+}
+
+func TestPrepareSkysubWorkingPixelsLeavesReferenceOnlyUntouched(t *testing.T) {
+	planned := []plannedInput{
+		{input: Input{ReferenceOnly: true, HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: filledPixels(2, 2, 20)}}}},
+		{input: Input{Path: "data_flc.fits", HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: filledPixels(2, 2, 10)}}}},
+	}
+	working, applied, skyValues, err := prepareSkysubWorkingPixels(planned, SkysubOptions{Enabled: true, Method: SkyMethodLocalMin, Stat: SkyStatMedian, Width: 0.1, Clip: 5, LSigma: 4, USigma: 4})
+	if err != nil {
+		t.Fatalf("prepareSkysubWorkingPixels returned error: %v", err)
+	}
+	if applied[0] {
+		t.Fatal("reference-only input should not be sky-subtracted")
+	}
+	if !applied[1] {
+		t.Fatal("data input should be sky-subtracted")
+	}
+	if &working[0][0] != &planned[0].input.HDU.Data.Pixels[0] {
+		t.Fatal("reference-only pixels should reuse original slice")
+	}
+	if skyValues[0] == skyValues[0] {
+		t.Fatal("reference-only sky value should remain NaN")
+	}
 }

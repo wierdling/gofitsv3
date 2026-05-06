@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"math"
 	"strconv"
 	"strings"
@@ -11,8 +12,153 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
+
+// hpad returns a fixed-width invisible spacer for horizontal edge padding.
+func hpad(w float32) fyne.CanvasObject {
+	r := canvas.NewRectangle(color.Transparent)
+	r.SetMinSize(fyne.NewSize(w, 0))
+	return r
+}
+
+// vpad returns a fixed-height invisible spacer for vertical padding.
+func vpad(h float32) fyne.CanvasObject {
+	r := canvas.NewRectangle(color.Transparent)
+	r.SetMinSize(fyne.NewSize(0, h))
+	return r
+}
+
+// ─── chanBadge ───────────────────────────────────────────────────────────────
+
+type chanBadge struct {
+	widget.BaseWidget
+	letter string
+	col    color.Color
+}
+
+func newChanBadge(letter string, col color.Color) *chanBadge {
+	b := &chanBadge{letter: letter, col: col}
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+func (b *chanBadge) MinSize() fyne.Size {
+	s := theme.TextSize() + 2
+	return fyne.NewSize(s, s)
+}
+
+func (b *chanBadge) CreateRenderer() fyne.WidgetRenderer {
+	bg := canvas.NewRectangle(b.col)
+	bg.CornerRadius = 4
+	txt := canvas.NewText(b.letter, color.White)
+	txt.TextSize = theme.TextSize() - 1
+	txt.TextStyle = fyne.TextStyle{Bold: true}
+	return &chanBadgeRenderer{b: b, bg: bg, txt: txt}
+}
+
+type chanBadgeRenderer struct {
+	b   *chanBadge
+	bg  *canvas.Rectangle
+	txt *canvas.Text
+}
+
+func (r *chanBadgeRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.bg, r.txt}
+}
+func (r *chanBadgeRenderer) MinSize() fyne.Size {
+	s := theme.TextSize() + 2
+	return fyne.NewSize(s, s)
+}
+func (r *chanBadgeRenderer) Layout(size fyne.Size) {
+	s := theme.TextSize() + 2
+	x := (size.Width - s) / 2
+	y := (size.Height - s) / 2
+	r.bg.Move(fyne.NewPos(x, y))
+	r.bg.Resize(fyne.NewSize(s, s))
+	ts := r.txt.MinSize()
+	r.txt.Move(fyne.NewPos(x+(s-ts.Width)/2, y+(s-ts.Height)/2))
+	r.txt.Resize(ts)
+}
+func (r *chanBadgeRenderer) Refresh() {
+	r.bg.FillColor = r.b.col
+	r.txt.Color = color.White
+	r.bg.Refresh()
+	r.txt.Refresh()
+}
+func (r *chanBadgeRenderer) Destroy() {}
+
+// ─── compactBtn ──────────────────────────────────────────────────────────────
+
+const (
+	compactVPad float32 = 5
+	compactHPad float32 = 10
+)
+
+type compactBtn struct {
+	widget.BaseWidget
+	text  string
+	onTap func()
+}
+
+func newCompactBtn(text string, onTap func()) *compactBtn {
+	b := &compactBtn{text: text, onTap: onTap}
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+func (b *compactBtn) Tapped(_ *fyne.PointEvent) {
+	if b.onTap != nil {
+		b.onTap()
+	}
+}
+func (b *compactBtn) TappedSecondary(_ *fyne.PointEvent) {}
+
+func (b *compactBtn) CreateRenderer() fyne.WidgetRenderer {
+	bg := canvas.NewRectangle(theme.ButtonColor())
+	bg.CornerRadius = 4
+	txt := canvas.NewText(b.text, theme.ForegroundColor())
+	txt.TextSize = theme.TextSize()
+	return &compactBtnRenderer{btn: b, bg: bg, txt: txt}
+}
+
+type compactBtnRenderer struct {
+	btn *compactBtn
+	bg  *canvas.Rectangle
+	txt *canvas.Text
+}
+
+func (r *compactBtnRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.bg, r.txt}
+}
+func (r *compactBtnRenderer) MinSize() fyne.Size {
+	ts := r.txt.MinSize()
+	return fyne.NewSize(ts.Width+compactHPad*2, ts.Height+compactVPad*2)
+}
+func (r *compactBtnRenderer) Layout(size fyne.Size) {
+	ms := r.MinSize()
+	x := (size.Width - ms.Width) / 2
+	if x < 0 {
+		x = 0
+	}
+	y := (size.Height - ms.Height) / 2
+	if y < 0 {
+		y = 0
+	}
+	r.bg.Move(fyne.NewPos(x, y))
+	r.bg.Resize(ms)
+	ts := r.txt.MinSize()
+	r.txt.Move(fyne.NewPos(x+(ms.Width-ts.Width)/2, y+(ms.Height-ts.Height)/2))
+	r.txt.Resize(ts)
+}
+func (r *compactBtnRenderer) Refresh() {
+	r.bg.FillColor = theme.ButtonColor()
+	r.txt.Color = theme.ForegroundColor()
+	r.bg.Refresh()
+	r.txt.Refresh()
+}
+func (r *compactBtnRenderer) Destroy() {}
 
 type imagePoint struct {
 	X int
@@ -22,11 +168,11 @@ type imagePoint struct {
 type viewport struct {
 	image         *canvas.Image
 	histogram     *canvas.Raster
-	zoomLabel     *widget.Select
+	zoomLabel     *SafeSelect
 	zoomOut       *widget.Button
 	zoomIn        *widget.Button
-	blackBox      *widget.Entry
-	whiteBox      *widget.Entry
+	blackBox      *NumberEntry
+	whiteBox      *NumberEntry
 	container     fyne.CanvasObject
 	zoom          float64
 	origW         int
@@ -35,7 +181,9 @@ type viewport struct {
 	overlay       *viewerInteractionLayer
 	bins          [256]int
 	customZoom    string
+	histColor     [4]uint8 // bar color; if zero, use default white-bg/gray-bar style
 	StatsLabel    *widget.Label
+	actionRow     *fyne.Container
 	onViewChanged func()
 }
 
@@ -55,13 +203,9 @@ func newViewport() *viewport {
 	overlay.scroll = vp.scroll
 	vp.scroll.SetMinSize(fyne.NewSize(260, 180))
 
-	vp.blackBox = widget.NewEntry()
-	vp.blackBox.SetPlaceHolder("000000")
-	vp.blackBox.SetText("--")
-	vp.whiteBox = widget.NewEntry()
-	vp.whiteBox.SetPlaceHolder("000000")
-	vp.whiteBox.SetText("--")
-	vp.zoomLabel = widget.NewSelect([]string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}, func(s string) {
+	vp.blackBox = NewNumberEntry(0.001, 4)
+	vp.whiteBox = NewNumberEntry(0.001, 4)
+	vp.zoomLabel = NewSafeSelect([]string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}, func(s string) {
 		vp.setZoomFromSelect(s)
 	})
 	vp.zoomOut = widget.NewButton("-", func() { vp.stepZoom(0.95) })
@@ -71,26 +215,59 @@ func newViewport() *viewport {
 	vp.StatsLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.StatsLabel.Alignment = fyne.TextAlignCenter
 
+	vp.actionRow = container.NewHBox(layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer())
+
 	header := container.NewVBox(
+		vpad(4),
+		vp.actionRow,
+		vpad(4),
 		vp.histogram,
-		vp.StatsLabel,
-		container.NewHBox(
-			layout.NewSpacer(),
-			widget.NewLabel("Black"),
-			container.New(layout.NewGridWrapLayout(fyne.NewSize(110, vp.blackBox.MinSize().Height)), vp.blackBox),
-			vp.zoomOut,
-			vp.zoomLabel,
-			vp.zoomIn,
-			widget.NewLabel("White"),
-			container.New(layout.NewGridWrapLayout(fyne.NewSize(110, vp.whiteBox.MinSize().Height)), vp.whiteBox),
-			layout.NewSpacer(),
-		),
 	)
-	vp.container = container.NewBorder(header, nil, nil, nil, vp.scroll)
+	footerRow := container.NewHBox(
+		hpad(6),
+		layout.NewSpacer(),
+		widget.NewLabel("Black"),
+		vp.blackBox,
+		vp.zoomOut,
+		vp.zoomLabel,
+		vp.zoomIn,
+		widget.NewLabel("White"),
+		vp.whiteBox,
+		layout.NewSpacer(),
+		hpad(6),
+	)
+	footer := container.NewVBox(footerRow, vpad(5))
+	vp.container = container.NewBorder(header, footer, nil, nil, vp.scroll)
 
 	vp.zoomLabel.SetSelected("fit in preview")
 
 	return vp
+}
+
+func (vp *viewport) SetLoadSave(chanLabel, letter string, col color.Color, loadFn, saveFn func()) {
+	badge := newChanBadge(letter, col)
+	nameText := canvas.NewText(chanLabel, col)
+	nameText.TextSize = theme.TextSize()
+	nameText.TextStyle = fyne.TextStyle{Bold: true}
+	vp.actionRow.Objects = []fyne.CanvasObject{
+		hpad(6), badge, hpad(4), nameText,
+		layout.NewSpacer(),
+		vp.StatsLabel, hpad(6), newCompactBtn("Load", loadFn), newCompactBtn("Save", saveFn), hpad(6),
+	}
+	vp.actionRow.Refresh()
+}
+
+func (vp *viewport) SetCenterAction(chanLabel, letter string, col color.Color, actionLabel string, fn func()) {
+	badge := newChanBadge(letter, col)
+	nameText := canvas.NewText(chanLabel, col)
+	nameText.TextSize = theme.TextSize()
+	nameText.TextStyle = fyne.TextStyle{Bold: true}
+	vp.actionRow.Objects = []fyne.CanvasObject{
+		hpad(6), badge, hpad(4), nameText,
+		layout.NewSpacer(),
+		vp.StatsLabel, hpad(6), newCompactBtn(actionLabel, fn), hpad(6),
+	}
+	vp.actionRow.Refresh()
 }
 
 func isPresetZoom(option string) bool {
@@ -188,9 +365,20 @@ func (vp *viewport) fitZoom() float64 {
 
 func (vp *viewport) drawHist(w, h int) image.Image {
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	for i := range img.Pix {
-		img.Pix[i] = 255
+
+	colored := vp.histColor[3] > 0
+	if colored {
+		// black background — img.Pix is already zero (transparent), set alpha
+		for i := 3; i < len(img.Pix); i += 4 {
+			img.Pix[i] = 255
+		}
+	} else {
+		// white background
+		for i := range img.Pix {
+			img.Pix[i] = 255
+		}
 	}
+
 	maxCount := 0
 	for _, c := range vp.bins {
 		if c > maxCount {
@@ -200,14 +388,22 @@ func (vp *viewport) drawHist(w, h int) image.Image {
 	if maxCount == 0 {
 		return img
 	}
+
+	var r, g, b uint8
+	if colored {
+		r, g, b = vp.histColor[0], vp.histColor[1], vp.histColor[2]
+	} else {
+		r, g, b = 80, 80, 80
+	}
+
 	for i, c := range vp.bins {
 		x := i * w / len(vp.bins)
 		barH := int(float64(c) / float64(maxCount) * float64(h))
 		for y := h - 1; y >= h-barH; y-- {
-			idx := (y*img.Stride + x*4)
-			img.Pix[idx] = 80
-			img.Pix[idx+1] = 80
-			img.Pix[idx+2] = 80
+			idx := y*img.Stride + x*4
+			img.Pix[idx] = r
+			img.Pix[idx+1] = g
+			img.Pix[idx+2] = b
 			img.Pix[idx+3] = 255
 		}
 	}
