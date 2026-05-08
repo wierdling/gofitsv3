@@ -78,6 +78,7 @@ type AlignmentSettings struct {
 	AlignmentMode      int     `json:"alignmentMode"`
 	SearchRadiusArcsec float64 `json:"searchRadiusArcsec"`
 	NumRefs            int     `json:"numRefs"`
+	DebugAlignment     bool    `json:"debugAlignment"`
 }
 
 // SkysubSettings holds the AstroDrizzle-style sky-subtraction controls

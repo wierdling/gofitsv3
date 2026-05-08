@@ -53,6 +53,9 @@ func showAlignmentSettingsDialog(win fyne.Window, current models.AlignmentSettin
 	}
 	numRefsEntry.SetText(fmt.Sprintf("%d", numRefs))
 
+	debugCheck := widget.NewCheck("Show alignment debug after each image", nil)
+	debugCheck.SetChecked(current.DebugAlignment)
+
 	notes := widget.NewLabel(
 		"Alignment Mode: TweakReg modes use catalog matching via full WCS (recommended).\n" +
 			"  Legacy modes use image warping and are kept for backward compatibility.\n" +
@@ -69,6 +72,7 @@ func showAlignmentSettingsDialog(win fyne.Window, current models.AlignmentSettin
 		widget.NewFormItem("Alignment Mode", alignSelect),
 		widget.NewFormItem("Search Radius (arcsec)", searchRadiusEntry),
 		widget.NewFormItem("Num Reference Images", numRefsEntry),
+		widget.NewFormItem("Debug", debugCheck),
 	)
 
 	content := container.NewVBox(form, notes)
@@ -93,6 +97,7 @@ func showAlignmentSettingsDialog(win fyne.Window, current models.AlignmentSettin
 			AlignmentMode:      alignmentMode,
 			SearchRadiusArcsec: srVal,
 			NumRefs:            nrVal,
+			DebugAlignment:     debugCheck.Checked,
 		})
 	}, win)
 	d.Resize(fyne.NewSize(700, 380))

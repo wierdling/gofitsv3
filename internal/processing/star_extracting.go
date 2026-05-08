@@ -1,16 +1,20 @@
 package processing
 
 import (
+	"fmt"
 	"math"
 	"runtime"
 	"sort"
 	"sync"
+
+	"gofitsv3/internal/debuglog"
 )
 
 type Star struct {
 	X    float64
 	Y    float64
 	Flux float64
+	Peak float64 // peak net flux above background in a single pixel
 	Area int
 }
 
@@ -19,7 +23,10 @@ type Star struct {
 func ExtractAndLimitStars(pixels []float32, width, height int, thresholdSigma float64, minArea, maxStars int) []Star {
 	stars := ExtractStars(pixels, width, height, thresholdSigma, minArea)
 	if maxStars > 0 && len(stars) > maxStars {
+		debuglog.Log(fmt.Sprintf("ExtractAndLimitStars: %d sources found, capping at %d", len(stars), maxStars))
 		stars = stars[:maxStars]
+	} else {
+		debuglog.Log(fmt.Sprintf("ExtractAndLimitStars: %d sources found", len(stars)))
 	}
 	return stars
 }
@@ -50,6 +57,8 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 			visited[idx] = true
 			var blob [][2]int
 			var fluxSum, peakNetFlux float64
+			var smoothedAtOrigPeak float64
+			minOrigInBlob := math.Inf(1)
 
 			for len(q) > 0 {
 				curr := q[0]
@@ -57,12 +66,17 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 				blob = append(blob, curr)
 				cx, cy := curr[0], curr[1]
 				cIdx := cy*width + cx
-				netFlux := float64(pixels[cIdx]) - median
+				origVal := float64(pixels[cIdx])
+				if origVal < minOrigInBlob {
+					minOrigInBlob = origVal
+				}
+				netFlux := origVal - median
 				if netFlux < 0 {
 					netFlux = 0
 				}
 				if netFlux > peakNetFlux {
 					peakNetFlux = netFlux
+					smoothedAtOrigPeak = float64(smoothed[cIdx])
 				}
 				fluxSum += netFlux
 				for _, d := range dirs {
@@ -115,10 +129,55 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 				continue
 			}
 
-			// Reject compact spikes where a single pixel holds most of the flux.
-			// Cosmic rays deposit nearly all energy in 1-2 pixels; a real stellar
-			// PSF spreads flux across multiple pixels after the Gaussian pre-filter.
-			if fluxSum > 0 && peakNetFlux/fluxSum > 0.75 {
+			// Reject blobs too large to be a stellar PSF.
+			// Stars occupy 10–200 pixels at any realistic FWHM; extended nebula
+			// knots, galaxies, and partially-merged groups are much larger and
+			// produce unreliable centroids. Saturated stars are also excluded —
+			// they bleed and their centroids are biased.
+			if len(blob) > 400 {
+				continue
+			}
+
+			// Reject compact spikes where 1–2 pixels hold most of the flux.
+			// Single-pixel CRs produce ratio ≈ 0.9; 2-pixel CRs ≈ 0.5.
+			// A compact stellar PSF (σ ≈ 0.85 px, HST-like) spreads flux across
+			// ~25 pixels in the smoothed blob, giving ratio ≈ 0.20–0.25.
+			// Threshold at 0.45 catches both 1- and 2-pixel CR events while
+			// keeping all realistic stellar PSFs.
+			if fluxSum > 0 && peakNetFlux/fluxSum > 0.45 {
+				continue
+			}
+
+			// Use the minimum original pixel in the blob as a local background
+			// estimate. When a CR or hot pixel sits on bright nebula emission,
+			// the global median significantly underestimates the local sky level,
+			// which inflates the smoothed/original ratio and defeats the CR check.
+			// The blob minimum (the faintest boundary pixel) approximates the local
+			// sky level without requiring an expensive spatial background map.
+			// Clamp to median: if noise drives one blob pixel below the global
+			// median, using that as "local background" would inflate localOrigNet
+			// and weaken both filters. median is always a safe lower bound.
+			localBg := minOrigInBlob
+			if localBg < median {
+				localBg = median
+			}
+			localPeakNet := smoothedAtOrigPeak - localBg // smoothed excess above local sky
+			localOrigNet := peakNetFlux + median - localBg // original excess above local sky
+
+			// Reject cosmic rays via smoothed/original peak ratio relative to local sky.
+			// A sub-pixel CR is attenuated to ~14% of its local excess by the σ=1.5
+			// Gaussian kernel.  A stellar PSF with σ ≥ 1 px retains ≥ 31%.
+			// Computing both quantities relative to localBg removes the nebula-elevation
+			// bias that caused CRs on bright backgrounds to pass the global-median version.
+			if localOrigNet > 0 && localPeakNet/localOrigNet < 0.20 {
+				continue
+			}
+
+			// Require the source to be significantly above its local background.
+			// Sources that are only modest bumps on bright nebula (localOrigNet < 6σ)
+			// are not reliable alignment references; real stars must be well above
+			// both the local emission and the global noise floor.
+			if localOrigNet < 6.0*sigma {
 				continue
 			}
 
@@ -137,12 +196,16 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 			if fluxSum > 0 {
 				centerX /= fluxSum
 				centerY /= fluxSum
-				stars = append(stars, Star{X: centerX, Y: centerY, Flux: fluxSum, Area: len(blob)})
+				stars = append(stars, Star{X: centerX, Y: centerY, Flux: fluxSum, Peak: peakNetFlux, Area: len(blob)})
 			}
 		}
 	}
 
-	sort.Slice(stars, func(i, j int) bool { return stars[i].Flux > stars[j].Flux })
+	// Sort by peak pixel brightness, not integrated flux.
+	// In nebula fields, extended emission knots have high integrated flux but
+	// low peak brightness. Real stars are compact and bright per pixel, so
+	// peak-sorted lists contain mostly actual stars rather than nebula features.
+	sort.Slice(stars, func(i, j int) bool { return stars[i].Peak > stars[j].Peak })
 	return stars
 }
 
@@ -163,7 +226,8 @@ func EstimateBackground(pixels []float32) (float64, float64) {
 		return 0, 1
 	}
 
-	// Iterative 3-sigma clipping (3 passes), matching TweakReg sky estimation.
+	// Iterative sigma-clipping to remove bright sources (stars, nebula peaks).
+	// We clip around the mean to converge on the background population.
 	for range 3 {
 		var sum float64
 		for _, v := range sample {
@@ -175,12 +239,12 @@ func EstimateBackground(pixels []float32) (float64, float64) {
 			d := v - mean
 			varSum += d * d
 		}
-		sigma := math.Sqrt(varSum / float64(len(sample)))
-		if sigma <= 0 {
-			return mean, 1
+		clipSigma := math.Sqrt(varSum / float64(len(sample)))
+		if clipSigma <= 0 {
+			break
 		}
-		lo := mean - 3*sigma
-		hi := mean + 3*sigma
+		lo := mean - 3*clipSigma
+		hi := mean + 3*clipSigma
 		clipped := sample[:0]
 		for _, v := range sample {
 			if v >= lo && v <= hi {
@@ -188,26 +252,28 @@ func EstimateBackground(pixels []float32) (float64, float64) {
 			}
 		}
 		if len(clipped) == len(sample) {
-			return mean, sigma
+			break
 		}
 		sample = clipped
 	}
 
-	var sum float64
-	for _, v := range sample {
-		sum += v
+	// Return median and MAD-based sigma rather than mean and std.
+	// Median is robust to residual nebula emission; MAD gives a noise estimate
+	// that does not inflate when there is extended background structure.
+	// For a pure Gaussian background, MAD-sigma ≈ std, so flat-sky images are unaffected.
+	sort.Float64s(sample)
+	median := sample[len(sample)/2]
+	devs := make([]float64, len(sample))
+	for i, v := range sample {
+		devs[i] = math.Abs(v - median)
 	}
-	mean := sum / float64(len(sample))
-	var varSum float64
-	for _, v := range sample {
-		d := v - mean
-		varSum += d * d
-	}
-	sigma := math.Sqrt(varSum / float64(len(sample)))
+	sort.Float64s(devs)
+	mad := devs[len(devs)/2]
+	sigma := 1.4826 * mad
 	if sigma <= 0 {
 		sigma = 1
 	}
-	return mean, sigma
+	return median, sigma
 }
 
 // CentroidNear returns the flux-weighted centroid of the star nearest to (x, y).
