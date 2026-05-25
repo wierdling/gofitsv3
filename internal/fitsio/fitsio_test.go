@@ -1,6 +1,7 @@
 package fitsio
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -13,6 +14,12 @@ func TestLoadRealFits(t *testing.T) {
 		filepath.Join(base, "ick909030_drz.fits"),
 	}
 	for _, p := range paths {
+		if _, err := os.Stat(p); err != nil {
+			if os.IsNotExist(err) {
+				t.Skipf("sample FITS file not present: %s", p)
+			}
+			t.Fatalf("stat %s: %v", p, err)
+		}
 		f, err := LoadFile(p)
 		if err != nil {
 			t.Fatalf("load %s: %v", p, err)

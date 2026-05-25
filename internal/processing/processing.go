@@ -191,17 +191,16 @@ func ComposeRGB(imgs []*models.LoadedImage) ([]byte, int, int, [3]histogram.Stat
 	return buf, w, h, HistogramRGB(buf)
 }
 
-func stretchForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
+func ImageDataForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 	if img == nil || ref == nil {
 		return fitsio.ImageData{}
 	}
-	if img == ref {
-		data, _ := ApplyStretchParallel(img)
-		return data
-	}
-	if sharedDrizzleGrid(img, ref) {
-		data, _ := ApplyStretchParallel(img)
-		return data
+	if img == ref || sharedDrizzleGrid(img, ref) {
+		return fitsio.ImageData{
+			Width:  img.HDU.Data.Width,
+			Height: img.HDU.Data.Height,
+			Pixels: append([]float32(nil), img.HDU.Data.Pixels...),
+		}
 	}
 
 	alignedPixels, _, err := AlignChannelUsingWCS(
@@ -215,23 +214,34 @@ func stretchForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 		ref.HDU.Header,
 	)
 	if err == nil {
-		clone := *img
-		clone.HDU = img.HDU
-		clone.HDU.Data = fitsio.ImageData{Width: ref.HDU.Data.Width, Height: ref.HDU.Data.Height, Pixels: alignedPixels}
-		data, _ := ApplyStretchParallel(&clone)
-		return data
+		return fitsio.ImageData{Width: ref.HDU.Data.Width, Height: ref.HDU.Data.Height, Pixels: alignedPixels}
 	}
 
 	if img.HDU.Data.Width != ref.HDU.Data.Width || img.HDU.Data.Height != ref.HDU.Data.Height {
 		resized := ResizeChannel(img.HDU.Data.Pixels, img.HDU.Data.Width, img.HDU.Data.Height, ref.HDU.Data.Width, ref.HDU.Data.Height)
-		clone := *img
-		clone.HDU = img.HDU
-		clone.HDU.Data = fitsio.ImageData{Width: ref.HDU.Data.Width, Height: ref.HDU.Data.Height, Pixels: resized}
-		data, _ := ApplyStretchParallel(&clone)
-		return data
+		return fitsio.ImageData{Width: ref.HDU.Data.Width, Height: ref.HDU.Data.Height, Pixels: resized}
 	}
 
-	data, _ := ApplyStretchParallel(img)
+	return fitsio.ImageData{
+		Width:  img.HDU.Data.Width,
+		Height: img.HDU.Data.Height,
+		Pixels: append([]float32(nil), img.HDU.Data.Pixels...),
+	}
+}
+
+func stretchForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
+	if img == nil || ref == nil {
+		return fitsio.ImageData{}
+	}
+	if img == ref || sharedDrizzleGrid(img, ref) {
+		data, _ := ApplyStretchParallel(img)
+		return data
+	}
+	raw := ImageDataForReferenceGrid(img, ref)
+	clone := *img
+	clone.HDU = img.HDU
+	clone.HDU.Data = raw
+	data, _ := ApplyStretchParallel(&clone)
 	return data
 }
 

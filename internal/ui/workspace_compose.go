@@ -22,6 +22,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/export"
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
@@ -48,10 +49,15 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	headerWins := make([]fyne.Window, 3)
 	levels := defaultRGBLevels()
 	var levelsWin *rgbLevelsWindow
+	starlessSettings := defaultStarlessComposeSettings()
 
 	// Updated to track the new struct
 	var latestRGBStats [3]histogram.Stats
 	suspendRefresh := false
+	var lastStarlessResult *processing.StarlessResult
+	var composeRGBWithOptionalStarless func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)
+	var previewMu sync.Mutex
+	previewSeq := 0
 
 	flipCheck := NewToggle(nil)
 	flipCheck.SetChecked(true)
@@ -68,7 +74,55 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		if suspendRefresh {
 			return
 		}
-		updatePreviews(imgs, viewports, flipCheck.Checked, levels, pushRGBHist)
+		start := time.Now()
+		debuglog.Log("compose refresh: starting preview update")
+		data := buildComposePreviewData(imgs, flipCheck.Checked, levels, composeRGBWithOptionalStarless)
+		applyComposePreviewData(data, viewports, pushRGBHist)
+		if data.StarlessResult != nil {
+			lastStarlessResult = data.StarlessResult
+		}
+		debuglog.Log(fmt.Sprintf("compose refresh: finished preview update in %s", time.Since(start)))
+	}
+	refreshAsync := func(onDone func()) {
+		if suspendRefresh {
+			if onDone != nil {
+				onDone()
+			}
+			return
+		}
+		previewMu.Lock()
+		previewSeq++
+		seq := previewSeq
+		previewMu.Unlock()
+		imgSnapshot := append([]*models.LoadedImage(nil), imgs...)
+		levelsSnapshot := *levels
+		flip := flipCheck.Checked
+		go func() {
+			start := time.Now()
+			debuglog.Log("compose refresh async: starting preview computation")
+			data := buildComposePreviewData(imgSnapshot, flip, &levelsSnapshot, composeRGBWithOptionalStarless)
+			debuglog.Log(fmt.Sprintf("compose refresh async: preview computation took %s", time.Since(start)))
+			fyne.Do(func() {
+				previewMu.Lock()
+				currentSeq := previewSeq
+				previewMu.Unlock()
+				if seq != currentSeq {
+					debuglog.Log("compose refresh async: skipped stale preview result")
+					if onDone != nil {
+						onDone()
+					}
+					return
+				}
+				applyComposePreviewData(data, viewports, pushRGBHist)
+				if data.StarlessResult != nil {
+					lastStarlessResult = data.StarlessResult
+				}
+				debuglog.Log("compose refresh async: applied preview result")
+				if onDone != nil {
+					onDone()
+				}
+			})
+		}()
 	}
 	withSuspendedRefresh := func(fn func()) {
 		prev := suspendRefresh
@@ -90,6 +144,86 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		default:
 			return export.PNG
 		}
+	}
+
+	composeRGBWithOptionalStarless = func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+		if !starlessSettings.Enabled {
+			debuglog.Log("composeRGBWithOptionalStarless: starless disabled, using normal compose")
+			buf, w, h, stats := processing.ComposeRGB(imgs)
+			return buf, w, h, stats, nil, nil
+		}
+		if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+			debuglog.Log("composeRGBWithOptionalStarless: missing RGB channels")
+			return nil, 0, 0, [3]histogram.Stats{}, nil, nil
+		}
+		debuglog.Log("composeRGBWithOptionalStarless: building aligned reference-grid channel set")
+		ref := imgs[1]
+		blueRaw := processing.ImageDataForReferenceGrid(imgs[0], ref)
+		greenRaw := processing.ImageDataForReferenceGrid(imgs[1], ref)
+		redRaw := processing.ImageDataForReferenceGrid(imgs[2], ref)
+
+		maskSettings := processing.DefaultStarMaskSettings()
+		maskSettings.DetectionMode = starlessSettings.DetectionMode
+		maskSettings.DetectionPreprocessMode = starlessSettings.DetectionPreprocessMode
+		maskSettings.DetectionMergeMode = starlessSettings.DetectionMergeMode
+		maskSettings.DetectionSigma = starlessSettings.ThresholdSigma
+		maskSettings.BackgroundTileSize = starlessSettings.BackgroundTileSize
+		maskSettings.UseNoDataFloor = starlessSettings.UseNoDataFloor
+		maskSettings.NoDataFloor = float32(starlessSettings.NoDataFloor)
+		maskSettings.SeedMinProminence = starlessSettings.SeedMinProminence
+		maskSettings.MinDetectedChannels = starlessSettings.MinDetectedChannels
+		maskSettings.MinSeedFootprintArea = starlessSettings.MinSeedFootprintArea
+		maskSettings.MinSharedChannels = starlessSettings.MinSharedChannels
+		maskSettings.SuppressionRadius = starlessSettings.SuppressionRadius
+		maskSettings.MaskGrowRadius = starlessSettings.MaskBaseRadius
+		maskSettings.MaskMaxRadius = starlessSettings.MaxRadius
+		maskSettings.MaskSoftEdgeRadius = starlessSettings.FeatherRadius
+		maskSettings.InpaintRadius = starlessSettings.InpaintRadius
+		debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: pipeline settings mode=%s sigma=%.2f tile=%d base=%d max=%d feather=%d inpaint=%d",
+			maskSettings.DetectionMode,
+			maskSettings.DetectionSigma,
+			maskSettings.BackgroundTileSize,
+			maskSettings.MaskGrowRadius,
+			maskSettings.MaskMaxRadius,
+			maskSettings.MaskSoftEdgeRadius,
+			maskSettings.InpaintRadius,
+		))
+
+		result, err := processing.CreateStarlessChannels([][]float32{
+			redRaw.Pixels,
+			greenRaw.Pixels,
+			blueRaw.Pixels,
+		}, ref.HDU.Data.Width, ref.HDU.Data.Height, maskSettings)
+		if err != nil {
+			debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: pipeline failed: %v", err))
+			return nil, 0, 0, [3]histogram.Stats{}, nil, err
+		}
+		debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: pipeline produced %d components", len(result.Components)))
+		recombined, err := processing.RecombineStarlessRGB(result.Starless, result.Stars, result.AlphaMask, result.Width, result.Height, processing.StarRecombineSettings{
+			StarBrightness: float32(starlessSettings.StarBrightness),
+			StarSaturation: float32(starlessSettings.StarSaturation),
+			ValidMask:      result.RecombineValid,
+		})
+		if err != nil {
+			debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: recombine failed: %v", err))
+			return nil, 0, 0, [3]histogram.Stats{}, nil, err
+		}
+		debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: recombined stars brightness=%.2f saturation=%.2f", starlessSettings.StarBrightness, starlessSettings.StarSaturation))
+
+		makeClone := func(src *models.LoadedImage, pixels []float32) *models.LoadedImage {
+			clone := *src
+			clone.HDU = src.HDU
+			clone.HDU.Data = fitsio.ImageData{Width: result.Width, Height: result.Height, Pixels: pixels}
+			return &clone
+		}
+		composedImgs := []*models.LoadedImage{
+			makeClone(imgs[0], recombined[2]),
+			makeClone(imgs[1], recombined[1]),
+			makeClone(imgs[2], recombined[0]),
+		}
+		debuglog.Log("composeRGBWithOptionalStarless: composing final RGB preview")
+		buf, w, h, stats := processing.ComposeRGB(composedImgs)
+		return buf, w, h, stats, result, nil
 	}
 
 	saveChannelGray := func(idx int) {
@@ -361,7 +495,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	saveProject := func() {
 		hasChannel := false
-		project := models.ComposeProject{Flip: flipCheck.Checked}
+		project := models.ComposeProject{Flip: flipCheck.Checked, StarlessSettings: starlessSettings}
 		for i := 0; i < 3; i++ {
 			if imgs[i] == nil {
 				continue
@@ -467,6 +601,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}
 
 				fyne.Do(func() {
+					debuglog.Log("load compose project: applying loaded project state")
 					withSuspendedRefresh(func() {
 						for i, img := range imgs[:3] {
 							if img != nil {
@@ -474,9 +609,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 							}
 						}
 						flipCheck.SetChecked(project.Flip)
+						starlessSettings = normalizeStarlessComposeSettings(project.StarlessSettings)
 					})
-					progressDialog.Hide()
-					refresh()
+					debuglog.Log("load compose project: loaded images applied; refreshing previews asynchronously")
 					for idx := range headerWins {
 						closeHeaderWindow(idx)
 					}
@@ -486,6 +621,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					if len(errors) > 0 {
 						dialog.ShowError(fmt.Errorf("%s", strings.Join(errors, "\n")), win)
 					}
+					refreshAsync(func() {
+						progressDialog.Hide()
+						debuglog.Log("load compose project: previews refreshed")
+					})
 				})
 			}()
 		}, win)
@@ -716,9 +855,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	exportRGB := func() {
-		buf, w, h, _ := processing.ComposeRGB(imgs)
+		buf, w, h, _, starlessResult, err := composeRGBWithOptionalStarless()
 		if buf == nil {
 			dialog.ShowInformation("Missing", "Load three FITS first", win)
+			return
+		}
+		if err != nil {
+			dialog.ShowError(err, win)
 			return
 		}
 		finalBuf := processing.ApplyRGBLevels(buf, levels)
@@ -727,9 +870,22 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				return
 			}
 			path := uc.URI().Path()
+			_ = uc.Close()
 			format := detectExportFormat(path)
 			showExportOptionsDialog(format, win, func(opts export.Options) {
-				_ = export.FromRGBABytes(path, finalBuf, w, h, format, opts)
+				if err := export.FromRGBABytes(path, finalBuf, w, h, format, opts); err != nil {
+					dialog.ShowError(err, win)
+					return
+				}
+				debuglog.Log(fmt.Sprintf("exportRGB: wrote composite %s", path))
+				if starlessSettings.Enabled && starlessSettings.ExportDebugMasks && starlessResult != nil {
+					debugSettings := starlessDebugSettingsForRGBExport(path, format, opts)
+					if err := processing.ExportStarlessDebug(starlessResult, debugSettings); err != nil {
+						dialog.ShowError(err, win)
+						return
+					}
+					debuglog.Log(fmt.Sprintf("exportRGB: wrote starless debug images to %s", debugSettings.Dir))
+				}
 			})
 		}, win)
 		save.SetFileName("composite.png")
@@ -863,11 +1019,26 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
 	cleanChannelsItem := fyne.NewMenuItem("Cross-Channel Clean", crossChannelClean)
+	starlessSettingsItem := fyne.NewMenuItem("Starless Settings", func() {
+		showStarlessSettingsDialog(win, starlessSettings,
+			func(updated models.StarlessComposeSettings) {
+				starlessSettings = normalizeStarlessComposeSettings(updated)
+			},
+			func(updated models.StarlessComposeSettings) {
+				starlessSettings = normalizeStarlessComposeSettings(updated)
+				refresh()
+				if starlessSettings.Enabled && starlessSettings.ExportDebugMasks && lastStarlessResult != nil {
+					showStarlessDebugViewer(app, lastStarlessResult)
+				}
+			},
+		)
+	})
 	postRGBCleanItem := fyne.NewMenuItem("Post-RGB Clean in Edit", sendToEdit)
 	resetDataItem := fyne.NewMenuItem("Reset Data (Undo Align & Clean)", resetData)
 	processMenu := fyne.NewMenu("Process",
 		alignChannelsItem,
 		cleanChannelsItem,
+		starlessSettingsItem,
 		postRGBCleanItem,
 		fyne.NewMenuItemSeparator(),
 		resetDataItem,
@@ -1262,9 +1433,118 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 	}
 }
 
-// Updated signature to expect an array of histogram.Stats structs
-func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, levels *models.RgbLevels, pushHist func([3]histogram.Stats)) {
+type composeViewportPreview struct {
+	Image     *image.RGBA
+	Bins      [256]int
+	StatsText string
+	Black     float64
+	White     float64
+	OrigW     int
+	OrigH     int
+}
+
+type composePreviewData struct {
+	Views          [4]composeViewportPreview
+	RGBStats       [3]histogram.Stats
+	StarlessResult *processing.StarlessResult
+}
+
+func buildComposePreviewData(imgs []*models.LoadedImage, flip bool, levels *models.RgbLevels, composeRGB func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) composePreviewData {
+	start := time.Now()
+	defer func() {
+		debuglog.Log(fmt.Sprintf("buildComposePreviewData: total took %s", time.Since(start)))
+	}()
+	var out composePreviewData
 	for i := 0; i < 3; i++ {
+		if i >= len(imgs) || imgs[i] == nil {
+			out.Views[i] = composeViewportPreview{Image: blankImg(), StatsText: "Î¼ --  Ïƒ --"}
+			continue
+		}
+		channelStart := time.Now()
+		stretched, mask := processing.ApplyStretchParallel(imgs[i])
+		if flip {
+			stretched = processing.FlipImageData(stretched)
+			mask = processing.FlipMask(mask, stretched.Width, stretched.Height)
+		}
+		stats := histogram.Compute(stretched.Pixels)
+		out.Views[i] = composeViewportPreview{
+			Image:     processing.ToGrayRGBA(stretched, mask),
+			Bins:      stats.Hist,
+			StatsText: fmt.Sprintf("Î¼ %.3f  Ïƒ %.3f", stats.Mean, stats.Std),
+			Black:     imgs[i].Black,
+			White:     imgs[i].White,
+			OrigW:     stretched.Width,
+			OrigH:     stretched.Height,
+		}
+		debuglog.Log(fmt.Sprintf("buildComposePreviewData: channel %d took %s", i+1, time.Since(channelStart)))
+	}
+
+	buf, w, h, rgbStats := processing.ComposeRGB(imgs)
+	if composeRGB != nil {
+		starlessStart := time.Now()
+		if altBuf, altW, altH, altStats, starlessResult, err := composeRGB(); err == nil {
+			buf, w, h, rgbStats = altBuf, altW, altH, altStats
+			out.StarlessResult = starlessResult
+			debuglog.Log(fmt.Sprintf("buildComposePreviewData: optional starless compose took %s", time.Since(starlessStart)))
+		} else {
+			debuglog.Log(fmt.Sprintf("buildComposePreviewData: optional starless compose failed after %s: %v", time.Since(starlessStart), err))
+		}
+	}
+	if buf == nil {
+		out.Views[3] = composeViewportPreview{Image: blankImg(), StatsText: "Î¼ --  Ïƒ --"}
+		return out
+	}
+	out.RGBStats = rgbStats
+	buf = processing.ApplyRGBLevels(buf, levels)
+	if flip {
+		buf = processing.FlipRGBA(buf, w, h)
+	}
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	copy(img.Pix, buf)
+	out.Views[3] = composeViewportPreview{Image: img, StatsText: "Î¼ --  Ïƒ --", OrigW: w, OrigH: h}
+	return out
+}
+
+func applyComposePreviewData(data composePreviewData, views []*viewport, pushHist func([3]histogram.Stats)) {
+	for i := 0; i < 4 && i < len(views); i++ {
+		if views[i] == nil {
+			continue
+		}
+		item := data.Views[i]
+		if item.Image == nil {
+			item.Image = blankImg()
+		}
+		views[i].image.Image = item.Image
+		views[i].origW, views[i].origH = item.OrigW, item.OrigH
+		views[i].bins = item.Bins
+		views[i].blackBox.SetValue(item.Black)
+		views[i].whiteBox.SetValue(item.White)
+		if views[i].StatsLabel != nil {
+			if item.StatsText == "" {
+				item.StatsText = "Î¼ --  Ïƒ --"
+			}
+			views[i].StatsLabel.SetText(item.StatsText)
+		}
+		views[i].histogram.Refresh()
+		if views[i].zoomLabel.Selected == "fit in preview" {
+			views[i].zoom = views[i].fitZoom()
+		}
+		views[i].applyZoom()
+		views[i].image.Refresh()
+	}
+	if pushHist != nil {
+		pushHist(data.RGBStats)
+	}
+}
+
+// Updated signature to expect an array of histogram.Stats structs
+func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, levels *models.RgbLevels, pushHist func([3]histogram.Stats), composeRGB func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) {
+	start := time.Now()
+	defer func() {
+		debuglog.Log(fmt.Sprintf("updatePreviews: total took %s", time.Since(start)))
+	}()
+	for i := 0; i < 3; i++ {
+		channelStart := time.Now()
 		if imgs[i] == nil {
 			views[i].image.Image = blankImg()
 			views[i].bins = [256]int{}
@@ -1280,17 +1560,25 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 			continue
 		}
 
+		stretchStart := time.Now()
 		stretched, mask := processing.ApplyStretchParallel(imgs[i])
+		debuglog.Log(fmt.Sprintf("updatePreviews: channel %d stretch took %s", i+1, time.Since(stretchStart)))
 		if flip {
+			flipStart := time.Now()
 			stretched = processing.FlipImageData(stretched)
 			mask = processing.FlipMask(mask, stretched.Width, stretched.Height)
+			debuglog.Log(fmt.Sprintf("updatePreviews: channel %d flip took %s", i+1, time.Since(flipStart)))
 		}
 
+		rgbaStart := time.Now()
 		views[i].image.Image = processing.ToGrayRGBA(stretched, mask)
+		debuglog.Log(fmt.Sprintf("updatePreviews: channel %d gray RGBA took %s", i+1, time.Since(rgbaStart)))
 		views[i].origW, views[i].origH = stretched.Width, stretched.Height
 
 		// Use the new struct to compute data
+		histStart := time.Now()
 		stats := histogram.Compute(stretched.Pixels)
+		debuglog.Log(fmt.Sprintf("updatePreviews: channel %d histogram took %s", i+1, time.Since(histStart)))
 		views[i].bins = stats.Hist
 
 		if views[i].StatsLabel != nil {
@@ -1306,10 +1594,22 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 		}
 		views[i].applyZoom()
 		views[i].image.Refresh()
+		debuglog.Log(fmt.Sprintf("updatePreviews: channel %d total took %s", i+1, time.Since(channelStart)))
 	}
 
 	// NOTE: processing.ComposeRGB must be updated to return [3]histogram.Stats instead of [3][256]int
+	composeStart := time.Now()
 	buf, w, h, rgbStats := processing.ComposeRGB(imgs)
+	debuglog.Log(fmt.Sprintf("updatePreviews: ComposeRGB took %s", time.Since(composeStart)))
+	if composeRGB != nil {
+		starlessStart := time.Now()
+		if altBuf, altW, altH, altStats, _, err := composeRGB(); err == nil {
+			buf, w, h, rgbStats = altBuf, altW, altH, altStats
+			debuglog.Log(fmt.Sprintf("updatePreviews: optional starless compose took %s", time.Since(starlessStart)))
+		} else {
+			debuglog.Log(fmt.Sprintf("updatePreviews: optional starless compose failed after %s: %v", time.Since(starlessStart), err))
+		}
+	}
 
 	if buf == nil {
 		if pushHist != nil {
@@ -1328,6 +1628,7 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 		pushHist(rgbStats)
 	}
 
+	rgbLevelsStart := time.Now()
 	buf = processing.ApplyRGBLevels(buf, levels)
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 
@@ -1335,6 +1636,7 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 		buf = processing.FlipRGBA(buf, w, h)
 	}
 	copy(img.Pix, buf)
+	debuglog.Log(fmt.Sprintf("updatePreviews: RGB levels/final image took %s", time.Since(rgbLevelsStart)))
 
 	views[3].image.Image = img
 	views[3].origW, views[3].origH = w, h
@@ -1355,6 +1657,26 @@ func defaultRGBLevels() *models.RgbLevels {
 	return &models.RgbLevels{
 		Min: [3]float64{0, 0, 0},
 		Max: [3]float64{255, 255, 255},
+	}
+}
+
+func starlessDebugSettingsForRGBExport(path string, format export.Format, opts export.Options) processing.StarDebugExportSettings {
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	if strings.TrimSpace(base) == "" {
+		base = "composite"
+	}
+	dir := filepath.Dir(path)
+	if strings.TrimSpace(dir) == "" {
+		dir = "."
+	}
+	if format == "" {
+		format = export.PNG
+	}
+	return processing.StarDebugExportSettings{
+		Dir:     filepath.Join(dir, base),
+		Prefix:  "starless",
+		Format:  format,
+		Options: opts,
 	}
 }
 

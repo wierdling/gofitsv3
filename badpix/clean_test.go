@@ -14,7 +14,7 @@ func TestCleanWithDQ(t *testing.T) {
 
 	sci := []float32{
 		1, 2, 3,
-		4, 5, 6,
+		4, 50, 6,
 		7, 8, 9,
 	}
 	dq := []uint16{

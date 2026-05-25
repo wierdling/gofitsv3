@@ -161,7 +161,7 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 			if localBg < median {
 				localBg = median
 			}
-			localPeakNet := smoothedAtOrigPeak - localBg // smoothed excess above local sky
+			localPeakNet := smoothedAtOrigPeak - localBg   // smoothed excess above local sky
 			localOrigNet := peakNetFlux + median - localBg // original excess above local sky
 
 			// Reject cosmic rays via smoothed/original peak ratio relative to local sky.
@@ -169,7 +169,7 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 			// Gaussian kernel.  A stellar PSF with σ ≥ 1 px retains ≥ 31%.
 			// Computing both quantities relative to localBg removes the nebula-elevation
 			// bias that caused CRs on bright backgrounds to pass the global-median version.
-			if localOrigNet > 0 && localPeakNet/localOrigNet < 0.20 {
+			if localOrigNet > 0 && localPeakNet/localOrigNet < 0.15 {
 				continue
 			}
 

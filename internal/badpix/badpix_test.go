@@ -50,6 +50,7 @@ func TestInterpolateBicubic(t *testing.T) {
 			pixels[y*w+x] = float32(y*w + x)
 		}
 	}
+	pixels[2*w+2] = 100
 	mask := make([]bool, len(pixels))
 	mask[2*w+2] = true // center masked
 	img := fitsio.ImageData{Width: w, Height: h, Pixels: pixels}
@@ -62,7 +63,6 @@ func TestInterpolateBicubic(t *testing.T) {
 	if got == img.Pixels[2*w+2] {
 		t.Fatalf("expected masked pixel to change, stayed %v", got)
 	}
-	// ensure neighbors unchanged
 	for _, idx := range []int{2*w + 1, 2*w + 3, (2-1)*w + 2, (2+1)*w + 2} {
 		if out.Pixels[idx] != img.Pixels[idx] {
 			t.Fatalf("neighbor pixel %d changed", idx)
@@ -71,7 +71,7 @@ func TestInterpolateBicubic(t *testing.T) {
 }
 
 func TestInterpolateEdge(t *testing.T) {
-	img := fitsio.ImageData{Width: 3, Height: 3, Pixels: []float32{1, 2, 3, 4, 5, 6, 7, 8, 9}}
+	img := fitsio.ImageData{Width: 3, Height: 3, Pixels: []float32{100, 2, 3, 4, 5, 6, 7, 8, 9}}
 	mask := make([]bool, len(img.Pixels))
 	mask[0] = true // top-left corner
 	out := RepairMaskedPixels(img, mask)
