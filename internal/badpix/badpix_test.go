@@ -80,6 +80,104 @@ func TestInterpolateEdge(t *testing.T) {
 	}
 }
 
+func TestRepairMaskedPixelsReturnsOriginalForMaskLengthMismatchAndEmptyMask(t *testing.T) {
+	img := fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{1, 2, 3, 4}}
+
+	out := RepairMaskedPixels(img, []bool{true})
+	for i, want := range img.Pixels {
+		if out.Pixels[i] != want {
+			t.Fatalf("mismatch fallback pixel[%d] = %v, want %v", i, out.Pixels[i], want)
+		}
+	}
+
+	mask := make([]bool, len(img.Pixels))
+	out = RepairMaskedPixels(img, mask)
+	for i, want := range img.Pixels {
+		if out.Pixels[i] != want {
+			t.Fatalf("empty mask pixel[%d] = %v, want %v", i, out.Pixels[i], want)
+		}
+	}
+}
+
+func TestBicubicAtFallsBackToOriginalWhenMaskMalformedOrNoSamples(t *testing.T) {
+	img := fitsio.ImageData{Width: 1, Height: 1, Pixels: []float32{42}}
+
+	if got := bicubicAt(img, nil, 0, 0); got != 42 {
+		t.Fatalf("bicubicAt malformed mask = %v, want 42", got)
+	}
+
+	mask := []bool{true}
+	if got := bicubicAt(img, mask, 0, 0); got != 42 {
+		t.Fatalf("bicubicAt no samples fallback = %v, want 42", got)
+	}
+}
+
+func TestWeightedMedianFillAndMirrorHelpers(t *testing.T) {
+	img := fitsio.ImageData{
+		Width:  3,
+		Height: 3,
+		Pixels: []float32{
+			10, 20, 30,
+			40, 0, 60,
+			70, 80, 90,
+		},
+	}
+	mask := []bool{
+		false, false, false,
+		false, true, false,
+		false, false, false,
+	}
+
+	got, ok := weightedMedianFill(img, mask, 1, 1, 1)
+	if !ok {
+		t.Fatal("weightedMedianFill should find unmasked neighbors")
+	}
+	if got != 60 {
+		t.Fatalf("weightedMedianFill = %v, want 60", got)
+	}
+
+	allMasked := make([]bool, len(mask))
+	for i := range allMasked {
+		allMasked[i] = true
+	}
+	if _, ok := weightedMedianFill(img, allMasked, 1, 1, 1); ok {
+		t.Fatal("weightedMedianFill should fail with no valid neighbors")
+	}
+
+	tests := []struct {
+		value int
+		max   int
+		want  int
+	}{
+		{value: -1, max: 3, want: 0},
+		{value: -2, max: 3, want: 1},
+		{value: 3, max: 3, want: 2},
+		{value: 4, max: 3, want: 1},
+		{value: 0, max: 0, want: 0},
+	}
+	for _, tt := range tests {
+		if got := mirror(tt.value, tt.max); got != tt.want {
+			t.Fatalf("mirror(%d,%d) = %d, want %d", tt.value, tt.max, got, tt.want)
+		}
+	}
+}
+
+func TestMaskFromDQWithBitFilterSelectsMatchingBits(t *testing.T) {
+	sci := fitsio.HDU{Data: fitsio.ImageData{Width: 4, Height: 1, Pixels: []float32{0, 1, 2, 3}}}
+	dq := fitsio.HDU{Data: fitsio.ImageData{Width: 4, Height: 1, Pixels: []float32{1, 2, 3, 4}}}
+
+	mask, err := MaskFromDQ(sci, dq, 0x2)
+	if err != nil {
+		t.Fatalf("MaskFromDQ error = %v", err)
+	}
+	want := []bool{false, true, true, false}
+	for i, v := range want {
+		if mask[i] != v {
+			t.Fatalf("mask[%d] = %v, want %v", i, mask[i], v)
+		}
+	}
+}
+
 func contains(arr []int, v int) bool {
 	for _, x := range arr {
 		if x == v {

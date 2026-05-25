@@ -44,6 +44,7 @@ Prefer narrow, deliberate changes over broad exploration.
 
 ## Testing and validation
 - Follow `docs/unit-test-standards.md` as the repository definition of a good unit test and when deciding which code needs unit coverage.
+- Use `docs/unit-test-audit.md` as the living inventory of current test quality, missing coverage, and next high-value unit test additions.
 - Run the narrowest relevant test, build, or lint command first.
 - Do not run full-repo test suites unless the change warrants it or the user asks.
 - If a narrow validation passes, report that first.
