@@ -33,6 +33,23 @@ func showExportOptionsDialog(format export.Format, win fyne.Window, onConfirm fu
 		d.Resize(fyne.NewSize(320, 120))
 		d.Show()
 
+	case export.PNG:
+		bitDepth := 8
+		check := widget.NewCheck("16-bit depth", func(checked bool) {
+			if checked {
+				bitDepth = 16
+			} else {
+				bitDepth = 8
+			}
+		})
+		d := dialog.NewCustomConfirm("PNG Options", "Save", "Cancel", check, func(ok bool) {
+			if ok {
+				onConfirm(export.Options{BitDepth: bitDepth})
+			}
+		}, win)
+		d.Resize(fyne.NewSize(280, 100))
+		d.Show()
+
 	case export.WEBP:
 		label := widget.NewLabel("WebP lossless — no additional options.")
 		d := dialog.NewCustomConfirm("WebP Options", "Save", "Cancel", label, func(ok bool) {

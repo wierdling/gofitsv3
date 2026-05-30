@@ -1045,6 +1045,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			return
 		}
 		finalBuf := processing.ApplyRGBLevels(buf, levels)
+		// Pre-compute float32 channels for potential 16-bit PNG export.
+		rF, gF, bF, _, _ := processing.ComposeRGBFloat32(imgs)
 		save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
 			if err != nil || uc == nil {
 				return
@@ -1053,6 +1055,15 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			_ = uc.Close()
 			format := detectExportFormat(path)
 			showExportOptionsDialog(format, win, func(opts export.Options) {
+				if format == export.PNG && opts.BitDepth == 16 && rF != nil {
+					rA, gA, bA := processing.ApplyRGBLevelsFloat32(rF, gF, bF, levels)
+					if err := export.FromFloat32Channels(path, rA, gA, bA, w, h, format, opts); err != nil {
+						dialog.ShowError(err, win)
+						return
+					}
+					debuglog.Log(fmt.Sprintf("exportRGB: wrote 16-bit composite %s", path))
+					return
+				}
 				if err := export.FromRGBABytes(path, finalBuf, w, h, format, opts); err != nil {
 					dialog.ShowError(err, win)
 					return

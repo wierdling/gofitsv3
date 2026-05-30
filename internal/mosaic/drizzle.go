@@ -1,6 +1,8 @@
 package mosaic
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -9,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
@@ -241,6 +244,54 @@ type Options struct {
 	// Skysub controls optional AstroDrizzle-style sky subtraction applied to
 	// non-reference inputs before CR rejection and final drizzle.
 	Skysub SkysubOptions
+	// Progress, when non-nil, is invoked at each major phase of Build with a
+	// human-readable stage name and progress counters. total is 0 when a phase
+	// has no meaningful unit count (the UI should show indeterminate progress).
+	// It may be called from the Build goroutine; the callback must be safe to
+	// invoke off the UI thread.
+	Progress func(stage string, done, total int)
+	// Ctx, when non-nil, allows Build to be cancelled. Build checks Ctx.Err()
+	// between frames and returns ErrCancelled if the context is done.
+	Ctx context.Context
+}
+
+// ErrCancelled is returned by Build (or AlignInputsByStarsWithMode) when its
+// context is cancelled.
+var ErrCancelled = errors.New("operation cancelled")
+
+// AlignProgress carries optional progress reporting and cancellation for the
+// star-alignment routines. The zero value disables both.
+type AlignProgress struct {
+	// Progress, when non-nil, is invoked as each input finishes aligning.
+	Progress func(done, total int)
+	// Ctx, when non-nil, allows the alignment to be cancelled. Goroutines that
+	// have not yet started are skipped and ErrCancelled is returned.
+	Ctx context.Context
+}
+
+func (p AlignProgress) report(done, total int) {
+	if p.Progress != nil {
+		p.Progress(done, total)
+	}
+}
+
+func (p AlignProgress) cancelled() bool {
+	return p.Ctx != nil && p.Ctx.Err() != nil
+}
+
+// reportProgress invokes the Progress callback if one is set.
+func (o Options) reportProgress(stage string, done, total int) {
+	if o.Progress != nil {
+		o.Progress(stage, done, total)
+	}
+}
+
+// cancelled returns ErrCancelled if the context is set and done, else nil.
+func (o Options) cancelled() error {
+	if o.Ctx != nil && o.Ctx.Err() != nil {
+		return ErrCancelled
+	}
+	return nil
 }
 
 // WeightingMode selects the drizzle weighting scheme.
@@ -375,6 +426,10 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		options.PixFrac = 1
 	}
 
+	if err := options.cancelled(); err != nil {
+		return nil, err
+	}
+	options.reportProgress("Planning inputs", 0, 0)
 	debuglog.Log("Build: calling planInputs")
 	planned, statuses, minX, minY, maxX, maxY, err := planInputs(inputs, options.Scale)
 	if err != nil {
@@ -410,6 +465,10 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		return nil, fmt.Errorf("no data-bearing FITS inputs selected")
 	}
 
+	if err := options.cancelled(); err != nil {
+		return nil, err
+	}
+	options.reportProgress("Sky subtraction", 0, 0)
 	debuglog.Log("Build: calling prepareSkysubWorkingPixels")
 	workingPixels, skyApplied, skyValues, err := prepareSkysubWorkingPixels(planned, options.Skysub)
 	if err != nil {
@@ -465,9 +524,29 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		// model better fidelity than inverse-blot when the sep kernel is non-trivial.
 		debuglog.Log(fmt.Sprintf("Build: starting CR sep-drizzle pass, %d frames", len(dataPlanned)))
 		sepFrames := make([]SepFrame, len(dataPlanned))
+		// Each frame drizzles into its own buffers and is stored at a distinct
+		// slot, so the frames are independent and safe to build concurrently.
+		var sepWG sync.WaitGroup
+		sepSem := make(chan struct{}, runtime.NumCPU())
+		var sepDone int32
 		for slot, pi := range dataPlanned {
-			debuglog.Log(fmt.Sprintf("Build: sep frame %d/%d (%s)", slot+1, len(dataPlanned), InputKey(planned[pi].input)))
-			sepFrames[slot] = drizzleSepFrame(planned[pi], workingPixels[pi], width, height, minX, minY, options.Scale, dropSize, options.SepKernel, options.WeightingMode)
+			if err := options.cancelled(); err != nil {
+				break
+			}
+			sepWG.Add(1)
+			sepSem <- struct{}{}
+			go func(slot, pi int) {
+				defer sepWG.Done()
+				defer func() { <-sepSem }()
+				debuglog.Log(fmt.Sprintf("Build: sep frame %d/%d (%s)", slot+1, len(dataPlanned), InputKey(planned[pi].input)))
+				sepFrames[slot] = drizzleSepFrame(planned[pi], workingPixels[pi], width, height, minX, minY, options.Scale, dropSize, options.SepKernel, options.WeightingMode)
+				n := atomic.AddInt32(&sepDone, 1)
+				options.reportProgress("Cleaning cosmic rays", int(n), len(dataPlanned))
+			}(slot, pi)
+		}
+		sepWG.Wait()
+		if err := options.cancelled(); err != nil {
+			return nil, err
 		}
 		debuglog.Log("Build: sep-drizzle pass done, building median model")
 		model := buildMedianModel(sepFrames, width, height, len(dataPlanned))
@@ -513,6 +592,10 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		if planned[i].input.ReferenceOnly {
 			continue
 		}
+		if err := options.cancelled(); err != nil {
+			return nil, err
+		}
+		options.reportProgress("Drizzling", finalSlot, len(dataPlanned))
 		finalSlot++
 		debuglog.Log(fmt.Sprintf("Build: final drizzle frame %d (%s)", finalSlot, InputKey(planned[i].input)))
 		pixels := workingPixels[i]
@@ -549,6 +632,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		debuglog.Log(fmt.Sprintf("Build: frame %d done", finalSlot))
 	}
 
+	options.reportProgress("Finalizing", len(dataPlanned), len(dataPlanned))
 	debuglog.Log("Build: normalizing accumulated image")
 	normalizeAccumulatedImage(sums, weights)
 	debuglog.Log("Build: normalization done, computing footprints")
@@ -742,9 +826,13 @@ func sortedByDistFromRef(inputs []Input) []int {
 	return out
 }
 
-func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode, searchRadiusArcsec float64) ([]StarAlignmentResult, error) {
+func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode, searchRadiusArcsec float64, progress ...AlignProgress) ([]StarAlignmentResult, error) {
 	debuglog.Log("AlignInputsByStarsWithMode: starting")
 	defer debuglog.Log("AlignInputsByStarsWithMode: finished")
+	var prog AlignProgress
+	if len(progress) > 0 {
+		prog = progress[0]
+	}
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
 	}
@@ -944,10 +1032,14 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				continue
 			}
 
+			prog.report(0, len(toAlign))
 			ch := make(chan alignOneResult, len(toAlign))
 			sem := make(chan struct{}, runtime.NumCPU())
 			var wg sync.WaitGroup
 			for _, i := range toAlign {
+				if prog.cancelled() {
+					break
+				}
 				wg.Add(1)
 				sem <- struct{}{}
 				go func(i int) {
@@ -959,7 +1051,14 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			wg.Wait()
 			close(ch)
 
+			if prog.cancelled() {
+				return nil, ErrCancelled
+			}
+
+			done := 0
 			for r := range ch {
+				done++
+				prog.report(done, len(toAlign))
 				if r.ok {
 					results[r.i] = StarAlignmentResult{
 						OffsetX:            inputs[r.i].OffsetX,

@@ -3,7 +3,9 @@ package mosaic
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"sort"
+	"sync"
 )
 
 // SkyMethod selects the AstroDrizzle-style algorithm used to determine the
@@ -104,15 +106,36 @@ func prepareSkysubWorkingPixels(planned []plannedInput, options SkysubOptions) (
 
 	options = normalizeSkysubOptions(options)
 	rawSky := make([]float64, len(planned))
+	// Sky estimation is independent per input (each reads working[i] and writes
+	// a distinct rawSky[i]), so run them concurrently across CPUs.
+	var skyErr error
+	var skyErrMu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.NumCPU())
 	for i := range planned {
 		if planned[i].input.ReferenceOnly {
 			continue
 		}
-		sky, err := estimateSkyValue(working[i], options)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("estimate sky for %s: %w", InputKey(planned[i].input), err)
-		}
-		rawSky[i] = sky
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			sky, err := estimateSkyValue(working[i], options)
+			if err != nil {
+				skyErrMu.Lock()
+				if skyErr == nil {
+					skyErr = fmt.Errorf("estimate sky for %s: %w", InputKey(planned[i].input), err)
+				}
+				skyErrMu.Unlock()
+				return
+			}
+			rawSky[i] = sky
+		}(i)
+	}
+	wg.Wait()
+	if skyErr != nil {
+		return nil, nil, nil, skyErr
 	}
 
 	subtractSky := make([]float64, len(planned))

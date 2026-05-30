@@ -91,7 +91,9 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 				}
 			}
 
-			if len(blob) < minArea {
+			// Enforce a strict minimum area to reject 1-4 pixel cosmic ray hits,
+			// even if a caller requested a smaller minArea.
+			if len(blob) < minArea || len(blob) < 5 {
 				continue
 			}
 
@@ -124,8 +126,9 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 			if bboxH < shorter {
 				shorter = bboxH
 			}
-			// Reject blobs whose bounding box is more than 4:1 elongated.
-			if shorter == 0 || longer/shorter > 4 {
+			// Reject blobs whose bounding box is more than 2:1 elongated.
+			// Cosmic rays can be streaks, but real stars are round.
+			if shorter == 0 || longer/shorter > 2 {
 				continue
 			}
 
@@ -138,13 +141,12 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 				continue
 			}
 
-			// Reject compact spikes where 1–2 pixels hold most of the flux.
+			// Reject compact spikes where 1–3 pixels hold most of the flux.
 			// Single-pixel CRs produce ratio ≈ 0.9; 2-pixel CRs ≈ 0.5.
 			// A compact stellar PSF (σ ≈ 0.85 px, HST-like) spreads flux across
 			// ~25 pixels in the smoothed blob, giving ratio ≈ 0.20–0.25.
-			// Threshold at 0.45 catches both 1- and 2-pixel CR events while
-			// keeping all realistic stellar PSFs.
-			if fluxSum > 0 && peakNetFlux/fluxSum > 0.45 {
+			// Threshold at 0.35 catches thick cosmic rays while keeping all realistic stellar PSFs.
+			if fluxSum > 0 && peakNetFlux/fluxSum > 0.35 {
 				continue
 			}
 
@@ -169,7 +171,8 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 			// Gaussian kernel.  A stellar PSF with σ ≥ 1 px retains ≥ 31%.
 			// Computing both quantities relative to localBg removes the nebula-elevation
 			// bias that caused CRs on bright backgrounds to pass the global-median version.
-			if localOrigNet > 0 && localPeakNet/localOrigNet < 0.15 {
+			// Increased to 0.25 to aggressively filter thicker cosmic rays.
+			if localOrigNet > 0 && localPeakNet/localOrigNet < 0.25 {
 				continue
 			}
 
@@ -380,6 +383,28 @@ func CentroidNear(pixels []float32, width, height int, x, y float64, searchRadiu
 // gaussianConvolve applies a separable Gaussian blur (two 1-D passes).
 // NaN pixels are excluded from kernel sums so chip gaps don't bleed.
 // Both passes are parallelized across available CPUs.
+// blurBufPool recycles the intermediate buffer used by the separable Gaussian
+// convolution. Star extraction calls gaussianConvolve repeatedly (and
+// concurrently during alignment), so pooling the scratch buffer avoids a
+// full-frame allocation per call. The returned output buffer is caller-owned
+// and is never pooled.
+var blurBufPool sync.Pool
+
+func getBlurBuf(n int) []float32 {
+	if b, ok := blurBufPool.Get().([]float32); ok && cap(b) >= n {
+		b = b[:n]
+		clear(b) // convolution only writes covered pixels; clear stale values
+		return b
+	}
+	return make([]float32, n)
+}
+
+func putBlurBuf(b []float32) {
+	if b != nil {
+		blurBufPool.Put(b[:0])
+	}
+}
+
 func gaussianConvolve(pixels []float32, width, height int, sigma float64) []float32 {
 	radius := int(math.Ceil(3 * sigma))
 	size := 2*radius + 1
@@ -397,7 +422,8 @@ func gaussianConvolve(pixels []float32, width, height int, sigma float64) []floa
 	nWorkers := runtime.NumCPU()
 
 	// Horizontal pass: each row is independent.
-	tmp := make([]float32, width*height)
+	tmp := getBlurBuf(width * height)
+	defer putBlurBuf(tmp)
 	var wg sync.WaitGroup
 	rowsPerWorker := (height + nWorkers - 1) / nWorkers
 	for w := 0; w < nWorkers; w++ {

@@ -191,6 +191,50 @@ func ComposeRGB(imgs []*models.LoadedImage) ([]byte, int, int, [3]histogram.Stat
 	return buf, w, h, HistogramRGB(buf)
 }
 
+// ComposeRGBFloat32 returns per-channel float32 pixels (values in [0,1]) for
+// the three loaded images, aligned and stretched to the green reference grid.
+// Channel order: r, g, b matching imgs[2], imgs[1], imgs[0].
+func ComposeRGBFloat32(imgs []*models.LoadedImage) (r, g, b []float32, width, height int) {
+	if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+		return nil, nil, nil, 0, 0
+	}
+	ref := imgs[1]
+	rData := stretchForReferenceGrid(imgs[2], ref)
+	gData := stretchForReferenceGrid(ref, ref)
+	bData := stretchForReferenceGrid(imgs[0], ref)
+	return rData.Pixels, gData.Pixels, bData.Pixels, ref.HDU.Data.Width, ref.HDU.Data.Height
+}
+
+// ApplyRGBLevelsFloat32 applies RGB level adjustments to float32 channel data.
+// Input pixels are expected in [0,1]; levels.Min/Max are in the 0-255 scale
+// used by the 8-bit pipeline. Returns new slices with values clamped to [0,1].
+func ApplyRGBLevelsFloat32(r, g, b []float32, levels *models.RgbLevels) ([]float32, []float32, []float32) {
+	channels := [3][]float32{r, g, b}
+	out := [3][]float32{}
+	for c := 0; c < 3; c++ {
+		src := channels[c]
+		dst := make([]float32, len(src))
+		minF := float32(levels.Min[c]) / 255
+		maxF := float32(levels.Max[c]) / 255
+		rng := maxF - minF
+		if rng <= 0 {
+			out[c] = dst // zero-filled
+			continue
+		}
+		for i, v := range src {
+			scaled := (v - minF) / rng
+			if scaled < 0 {
+				scaled = 0
+			} else if scaled > 1 {
+				scaled = 1
+			}
+			dst[i] = scaled
+		}
+		out[c] = dst
+	}
+	return out[0], out[1], out[2]
+}
+
 func ImageDataForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 	if img == nil || ref == nil {
 		return fitsio.ImageData{}
