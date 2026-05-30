@@ -45,8 +45,36 @@ type ChannelState struct {
 }
 
 type ComposeProject struct {
-	Channels [3]ChannelState `json:"channels"`
-	Flip     bool            `json:"flip"`
+	Channels             [3]ChannelState         `json:"channels"`
+	Flip                 bool                    `json:"flip"`
+	SharedHistogramScale bool                    `json:"sharedHistogramScale,omitempty"`
+	MeasureComposite     bool                    `json:"measureComposite,omitempty"`
+	BlinkFilters         bool                    `json:"blinkFilters,omitempty"`
+	BlinkExcludedFilter  int                     `json:"blinkExcludedFilter,omitempty"`
+	StarlessSettings     StarlessComposeSettings `json:"starlessSettings"`
+}
+
+type StarlessComposeSettings struct {
+	Enabled                 bool    `json:"enabled"`
+	DetectionMode           string  `json:"detectionMode"`
+	DetectionPreprocessMode string  `json:"detectionPreprocessMode"`
+	DetectionMergeMode      string  `json:"detectionMergeMode"`
+	ThresholdSigma          float64 `json:"thresholdSigma"`
+	BackgroundTileSize      int     `json:"backgroundTileSize"`
+	UseNoDataFloor          bool    `json:"useNoDataFloor"`
+	NoDataFloor             float64 `json:"noDataFloor"`
+	SeedMinProminence       float64 `json:"seedMinProminence"`
+	MinDetectedChannels     int     `json:"minDetectedChannels"`
+	MinSeedFootprintArea    int     `json:"minSeedFootprintArea"`
+	MinSharedChannels       int     `json:"minSharedChannels"`
+	SuppressionRadius       int     `json:"suppressionRadius"`
+	MaskBaseRadius          int     `json:"maskBaseRadius"`
+	MaxRadius               int     `json:"maxRadius"`
+	FeatherRadius           int     `json:"featherRadius"`
+	InpaintRadius           int     `json:"inpaintRadius"`
+	StarBrightness          float64 `json:"starBrightness"`
+	StarSaturation          float64 `json:"starSaturation"`
+	ExportDebugMasks        bool    `json:"exportDebugMasks"`
 }
 
 // DrizzleSettings holds the mosaic.Options fields that the user configures
@@ -78,6 +106,7 @@ type AlignmentSettings struct {
 	AlignmentMode      int     `json:"alignmentMode"`
 	SearchRadiusArcsec float64 `json:"searchRadiusArcsec"`
 	NumRefs            int     `json:"numRefs"`
+	DebugAlignment     bool    `json:"debugAlignment"`
 }
 
 // SkysubSettings holds the AstroDrizzle-style sky-subtraction controls

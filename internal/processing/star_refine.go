@@ -40,7 +40,7 @@ func EstimateTranslationAfterWCS(targetPixels []float32, targetWidth, targetHeig
 	// Those stars have truncated PSFs whose flux-weighted centroids are biased
 	// toward the chip interior; they give inconsistent displacements between
 	// exposures and degrade the alignment estimate.
-	const nanGuard = 15
+	const nanGuard = 5
 	refStars := filterStarsNearNaN(
 		ExtractStars(maskedRef, refWidth, refHeight, 4.0, 3),
 		maskedRef, refWidth, refHeight, nanGuard,
@@ -634,7 +634,7 @@ func EstimateRScaleAfterWCS(
 		maskedTarget[i] = warpedTarget[i]
 	}
 
-	const nanGuard = 15
+	const nanGuard = 5
 	refStars := filterStarsNearNaN(
 		ExtractStars(maskedRef, refWidth, refHeight, 4.0, 3),
 		maskedRef, refWidth, refHeight, nanGuard,
@@ -692,7 +692,7 @@ func EstimateAffineAfterWCS(
 		maskedTarget[i] = warpedTarget[i]
 	}
 
-	const nanGuard = 15
+	const nanGuard = 5
 	refStars := filterStarsNearNaN(
 		ExtractStars(maskedRef, refWidth, refHeight, 4.0, 3),
 		maskedRef, refWidth, refHeight, nanGuard,

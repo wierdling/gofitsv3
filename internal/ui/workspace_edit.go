@@ -76,6 +76,7 @@ type editWorkspaceState struct {
 	cleanStatusLabel     *widget.Label
 	cleanBlobSlider      *widget.Slider
 	cleanIntensitySlider *widget.Slider
+
 }
 
 func (es *editWorkspaceState) applyEdits() {
@@ -300,6 +301,7 @@ func (es *editWorkspaceState) applyZoom() {
 	es.canvasImg.SetMinSize(fyne.NewSize(w, h))
 	es.canvasImg.Refresh()
 	es.updateHealBrushScreenRadius()
+
 }
 
 func (es *editWorkspaceState) stepZoom(factor float64) {
@@ -446,6 +448,7 @@ func editHistRaster(es *editWorkspaceState, ch int, col [3]uint8, getMin, getMax
 	r.SetMinSize(fyne.NewSize(200, 60))
 	return r
 }
+
 
 func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(image.Image)) {
 	es := &editWorkspaceState{zoom: 1.0, win: win}

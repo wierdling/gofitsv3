@@ -686,6 +686,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		progressDialog := dialog.NewCustom("Aligning By Selected Stars", "Matching selected stars across images...", widget.NewProgressBarInfinite(), win)
 		progressDialog.Show()
 		go func() {
+			if state.alignmentSettings.DebugAlignment {
+				defer installAlignmentDebugHook(win)()
+			}
 			alignInputs := inputsWithRef()
 			numRefs := state.alignmentSettings.NumRefs
 			if numRefs < 1 {
@@ -1554,6 +1557,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		progressDialog := dialog.NewCustom("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", widget.NewProgressBarInfinite(), win)
 		progressDialog.Show()
 		go func() {
+			if state.alignmentSettings.DebugAlignment {
+				defer installAlignmentDebugHook(win)()
+			}
 			alignInputs := inputsWithRef()
 			numRefs := state.alignmentSettings.NumRefs
 			if numRefs < 1 {

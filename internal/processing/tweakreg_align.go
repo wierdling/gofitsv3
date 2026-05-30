@@ -37,7 +37,7 @@ func EstimateTweakRegAlignment(
 	refStars := ExtractAndLimitStars(refPixels, refWidth, refHeight, 4.0, 3, maxCatalogStars)
 	return EstimateTweakRegAlignmentWithRefStars(
 		sourcePixels, sourceWidth, sourceHeight,
-		mapper, refStars, refWidth, refHeight, refHeader,
+		mapper, refPixels, refStars, refWidth, refHeight, refHeader,
 		searchRadiusArcsec, fitgeom,
 	)
 }
@@ -45,9 +45,12 @@ func EstimateTweakRegAlignment(
 // EstimateTweakRegAlignmentWithRefStars is like EstimateTweakRegAlignment but
 // accepts a pre-extracted reference catalog. Use this when aligning multiple
 // source images to the same reference so extraction only happens once.
+// refPixels is used only for the debug visualization (AlignmentDebugHook); pass
+// nil when not needed.
 func EstimateTweakRegAlignmentWithRefStars(
 	sourcePixels []float32, sourceWidth, sourceHeight int,
 	mapper *WCSMapper,
+	refPixels []float32,
 	refStars []Star,
 	refWidth, refHeight int, refHeader fitsio.Header,
 	searchRadiusArcsec float64,
@@ -55,6 +58,22 @@ func EstimateTweakRegAlignmentWithRefStars(
 ) (AffineTransform, error) {
 	if mapper == nil {
 		return AffineTransform{}, fmt.Errorf("WCSMapper is required for TweakReg alignment")
+	}
+
+	// Capture diagnostic data for the debug hook, regardless of success or failure.
+	var dbgRef, dbgSrc []Star
+	var dbgPairs []MatchedPair
+	if AlignmentDebugHook != nil {
+		defer func() {
+			AlignmentDebugHook(AlignmentDiag{
+				RefPixels:   refPixels,
+				RefW:        refWidth,
+				RefH:        refHeight,
+				RefStars:    dbgRef,
+				SourceStars: dbgSrc,
+				Pairs:       dbgPairs,
+			})
+		}()
 	}
 
 	plateScale, ok := plateScaleArcsecPerPixel(refHeader)
@@ -72,6 +91,7 @@ func EstimateTweakRegAlignmentWithRefStars(
 	if len(refStars) < 2 {
 		return AffineTransform{}, fmt.Errorf("too few stars in reference image (%d)", len(refStars))
 	}
+	dbgRef = refStars
 
 	// Project source stars to reference pixel space through the full WCS pipeline.
 	projected := make([]Star, 0, len(sourceStars))
@@ -83,6 +103,7 @@ func EstimateTweakRegAlignmentWithRefStars(
 		}
 		projected = append(projected, Star{X: rx, Y: ry, Flux: s.Flux})
 	}
+	dbgSrc = projected
 	debuglog.Log(fmt.Sprintf("EstimateTweakRegAlignmentWithRefStars: %d/%d source stars project into reference frame", len(projected), len(sourceStars)))
 	if len(projected) < 2 {
 		return AffineTransform{}, fmt.Errorf("too few source stars project into reference frame (%d)", len(projected))
@@ -110,6 +131,20 @@ func EstimateTweakRegAlignmentWithRefStars(
 		currentRadius = math.Max(searchRadiusPx/3.0, 5.0)
 	}
 
+	// Wider-radius fallback: if the iterative loop didn't yield enough pairs,
+	// try a single one-shot match at 2× the nominal radius before giving up.
+	// Only attempt this when there is substantial projected coverage; with fewer
+	// than 30 projected stars the matches are too ambiguous to be trusted.
+	if len(pairs) < 4 && len(projected) >= 30 {
+		wide := matchStarsByMutualProximity(projected, refStars, 80, searchRadiusPx*2, 0.80)
+		debuglog.Log(fmt.Sprintf("EstimateTweakRegAlignmentWithRefStars: wide-radius retry: %d pairs (was %d)", len(wide), len(pairs)))
+		if len(wide) > len(pairs) {
+			pairs = wide
+		}
+	}
+
+	dbgPairs = pairs
+
 	minPairs := 3
 	if fitgeom == "rscale" {
 		minPairs = 2
@@ -119,6 +154,7 @@ func EstimateTweakRegAlignmentWithRefStars(
 		return AffineTransform{}, fmt.Errorf("insufficient matched pairs after TweakReg matching (%d, need %d)", len(pairs), minPairs)
 	}
 
+	var result AffineTransform
 	if fitgeom == "rscale" {
 		rscale, err := SolveRScaleTransformationRANSAC(pairs, 300, 1.5)
 		if err != nil {
@@ -129,11 +165,28 @@ func EstimateTweakRegAlignmentWithRefStars(
 			rRMS, rMax := residualStats(pairs, rscale)
 			gRMS, gMax := residualStats(pairs, general)
 			debuglog.Log(fmt.Sprintf("EstimateTweakRegAlignmentWithRefStars: upgrading fitgeom from rscale to general (pairs=%d, rscale rms=%.2f max=%.2f, general rms=%.2f max=%.2f)", len(pairs), rRMS, rMax, gRMS, gMax))
-			return general, nil
+			result = general
+		} else {
+			result = rscale
 		}
-		return rscale, nil
+	} else {
+		var err error
+		result, err = SolveTransformationRANSAC(pairs, 2000, 1.5)
+		if err != nil {
+			return AffineTransform{}, err
+		}
 	}
-	return SolveTransformationRANSAC(pairs, 2000, 1.5)
+
+	// Sanity-check: a TweakReg residual correction must be near-identity.
+	// Any computed transform with scale far from 1.0 or a large rotation is
+	// evidence of false star matches, not a real WCS residual.
+	if !tweakRegTransformIsPhysical(result) {
+		det := result.A*result.E - result.B*result.D
+		angle := math.Atan2(result.D-result.B, result.A+result.E) * 180.0 / math.Pi
+		debuglog.Log(fmt.Sprintf("EstimateTweakRegAlignmentWithRefStars: transform rejected (det=%.4f angle=%.1f°) — likely false star matches", det, angle))
+		return AffineTransform{}, fmt.Errorf("TweakReg transform implausible (scale or rotation out of range): likely false star matches")
+	}
+	return result, nil
 }
 
 func shouldUpgradeTweakRegFit(pairs []MatchedPair, rscale, general AffineTransform, refWidth, refHeight int) bool {
@@ -156,6 +209,26 @@ func shouldUpgradeTweakRegFit(pairs []MatchedPair, rscale, general AffineTransfo
 	minShortAxis := math.Max(120, 0.20*math.Min(float64(refWidth), float64(refHeight)))
 	minDiag := math.Max(250, 0.35*math.Hypot(float64(refWidth), float64(refHeight)))
 	return shortAxis >= minShortAxis && diag >= minDiag
+}
+
+// tweakRegTransformIsPhysical returns true when the transform looks like a
+// plausible WCS residual correction. TweakReg refines a small offset on top
+// of the WCS; the result should be nearly identity: scale ≈ 1 and rotation
+// < 10°. Transforms with large rotation or extreme scale are almost certainly
+// caused by false star-pair matches and should be rejected.
+func tweakRegTransformIsPhysical(t AffineTransform) bool {
+	det := t.A*t.E - t.B*t.D
+	if det <= 0 {
+		return false // mirroring is never a valid residual correction
+	}
+	scale := math.Sqrt(det)
+	if scale < 0.85 || scale > 1.15 {
+		return false
+	}
+	// Rotation angle via polar decomposition approximation: atan2((D-B)/2, (A+E)/2).
+	// For a pure rscale [a,-b; b,a]: A+E=2a, D-B=2b → atan2(b,a) = rotation. ✓
+	angle := math.Atan2(t.D-t.B, t.A+t.E) * 180.0 / math.Pi
+	return math.Abs(angle) < 10.0
 }
 
 func residualStats(pairs []MatchedPair, t AffineTransform) (rms, maxErr float64) {
