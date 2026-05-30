@@ -1,5 +1,9 @@
 package processing
 
+// The starless/white-star pipeline is currently disabled from Compose.
+// Keep this implementation available for future experiments, but do not add
+// new callers without first reworking the behavior and re-enabling the UI.
+
 import (
 	"fmt"
 	"math"
@@ -500,6 +504,7 @@ func RecombineStarlessRGB(starless [][]float32, stars [][]float32, alpha []float
 	for i := 0; i < 3; i++ {
 		out[i] = append([]float32(nil), starless[i]...)
 	}
+	whiteningWeights := starSignalWhiteningWeights(stars, alpha, width, height)
 	for idx := 0; idx < total; idx++ {
 		if settings.ValidMask != nil && !settings.ValidMask[idx] {
 			continue
@@ -512,13 +517,105 @@ func RecombineStarlessRGB(starless [][]float32, stars [][]float32, alpha []float
 		sg := stars[1][idx]
 		sb := stars[2][idx]
 		starL := maxStarFloat32(sr, maxStarFloat32(sg, sb))
+		if starL <= 0 || !isFiniteStar32(starL) {
+			continue
+		}
 		for ch := 0; ch < 3; ch++ {
 			origStar := stars[ch][idx]
+			if !isFiniteStar32(origStar) || origStar < 0 {
+				origStar = 0
+			}
 			mixedStar := starL + saturation*(origStar-starL)
 			out[ch][idx] += a * brightness * mixedStar
 		}
+		neutralize := whiteningWeights[idx] * (1 - saturation)
+		if neutralize > 0 {
+			lum := maxStarFloat32(out[0][idx], maxStarFloat32(out[1][idx], out[2][idx]))
+			for ch := 0; ch < 3; ch++ {
+				out[ch][idx] += neutralize * (lum - out[ch][idx])
+			}
+		}
 	}
 	return out, nil
+}
+
+func starSignalWhiteningWeights(stars [][]float32, alpha []float32, width, height int) []float32 {
+	total := width * height
+	weights := make([]float32, total)
+	if len(stars) != 3 || len(alpha) != total {
+		return weights
+	}
+	for ch := 0; ch < 3; ch++ {
+		if len(stars[ch]) != total {
+			return weights
+		}
+	}
+	visited := make([]bool, total)
+	queue := make([]int, 0, 64)
+	component := make([]int, 0, 64)
+	for start := 0; start < total; start++ {
+		if visited[start] || alpha[start] <= 0 {
+			continue
+		}
+		visited[start] = true
+		queue = append(queue[:0], start)
+		component = component[:0]
+		maxSignal := float32(0)
+		for len(queue) > 0 {
+			idx := queue[0]
+			queue = queue[1:]
+			component = append(component, idx)
+			signal := maxStarFloat32(stars[0][idx], maxStarFloat32(stars[1][idx], stars[2][idx]))
+			if isFiniteStar32(signal) && signal > maxSignal {
+				maxSignal = signal
+			}
+			x := idx % width
+			y := idx / width
+			for dy := -1; dy <= 1; dy++ {
+				for dx := -1; dx <= 1; dx++ {
+					if dx == 0 && dy == 0 {
+						continue
+					}
+					nx, ny := x+dx, y+dy
+					if nx < 0 || nx >= width || ny < 0 || ny >= height {
+						continue
+					}
+					nIdx := ny*width + nx
+					if visited[nIdx] || alpha[nIdx] <= 0 {
+						continue
+					}
+					visited[nIdx] = true
+					queue = append(queue, nIdx)
+				}
+			}
+		}
+		if maxSignal <= 0 {
+			continue
+		}
+		if len(component) < 2 {
+			continue
+		}
+		for _, idx := range component {
+			signal := maxStarFloat32(stars[0][idx], maxStarFloat32(stars[1][idx], stars[2][idx]))
+			if !isFiniteStar32(signal) || signal <= 0 {
+				continue
+			}
+			ratio := signal / maxSignal
+			weight := (ratio - 0.04) / 0.16
+			if weight <= 0 {
+				continue
+			}
+			if weight > 1 {
+				weight = 1
+			}
+			a := alpha[idx]
+			if a > 1 {
+				a = 1
+			}
+			weights[idx] = a * weight
+		}
+	}
+	return weights
 }
 
 func EstimateLocalBackgroundMAD(pixels []float32, width, height int, tileSize int) BackgroundModel {
@@ -1517,13 +1614,14 @@ func detectStarSeedsWithFootprint(pixels []float32, valid []bool, width, height 
 				rejectedSmallMask[seedIdx] = true
 				continue
 			}
-			if !saturatedPlateau && footprintArea > 80 {
+			bg := float64(model.Background[seedIdx])
+			sigma := math.Max(float64(model.Sigma[seedIdx]), localSigmaFloor)
+			largeBrightStar := isLargeBrightStarCandidate(pixels, valid, width, height, seedX, seedY, peak, peakCount, bg, sigma, minProminence)
+			if !saturatedPlateau && !largeBrightStar && footprintArea > 80 {
 				rejectedMask[seedIdx] = true
 				rejectedDiffuseMask[seedIdx] = true
 				continue
 			}
-			bg := float64(model.Background[seedIdx])
-			sigma := math.Max(float64(model.Sigma[seedIdx]), localSigmaFloor)
 			coreMean, okCore := localMeanWithinRadius(pixels, valid, width, height, seedX, seedY, 1.25)
 			ringMedian, okRing := localAnnulusMedian(pixels, valid, width, height, seedX, seedY, 2.0, 4.5)
 			if !okCore || !okRing {
@@ -1531,28 +1629,31 @@ func detectStarSeedsWithFootprint(pixels []float32, valid []bool, width, height 
 				continue
 			}
 			prominence := peak - ringMedian
-			if prominence < math.Max(minProminence, 1.5*sigma) {
+			if largeBrightStar && prominence < minProminence {
+				prominence = peak - bg
+			}
+			if !largeBrightStar && prominence < math.Max(minProminence, 1.5*sigma) {
 				rejectedMask[seedIdx] = true
 				rejectedLowProminenceMask[seedIdx] = true
 				continue
 			}
-			if coreMean-ringMedian < math.Max(0.02, sigma) {
+			if !largeBrightStar && coreMean-ringMedian < math.Max(0.02, sigma) {
 				rejectedMask[seedIdx] = true
 				rejectedLowProminenceMask[seedIdx] = true
 				continue
 			}
-			if ringMedian > 0 && peak/ringMedian < 1.08 {
+			if !largeBrightStar && ringMedian > 0 && peak/ringMedian < 1.08 {
 				rejectedMask[seedIdx] = true
 				rejectedLowProminenceMask[seedIdx] = true
 				continue
 			}
 			starLikeScore := pointSourceScore(pixels, valid, width, height, seedX, seedY, peak, ringMedian)
-			if !saturatedPlateau && localCandidateElongation(pixels, valid, width, height, seedX, seedY, 0) > 2.5 {
+			if !saturatedPlateau && !largeBrightStar && localCandidateElongation(pixels, valid, width, height, seedX, seedY, 0) > 2.5 {
 				rejectedMask[seedIdx] = true
 				rejectedDiffuseMask[seedIdx] = true
 				continue
 			}
-			if !saturatedPlateau && starLikeScore < 0.015 {
+			if !saturatedPlateau && !largeBrightStar && starLikeScore < 0.015 {
 				farRingMedian, okFarRing := localAnnulusMedian(pixels, valid, width, height, seedX, seedY, 6.0, 10.0)
 				if !(okFarRing && peak >= 0.95 && peak-farRingMedian >= 0.05) {
 					rejectedMask[seedIdx] = true
@@ -1560,7 +1661,7 @@ func detectStarSeedsWithFootprint(pixels []float32, valid []bool, width, height 
 					continue
 				}
 			}
-			if peak >= 0.98 && !saturatedPlateau {
+			if peak >= 0.98 && !saturatedPlateau && !largeBrightStar {
 				farRingMedian, okFarRing := localAnnulusMedian(pixels, valid, width, height, seedX, seedY, 5.0, 9.0)
 				if okFarRing && peak-farRingMedian < 0.04 {
 					rejectedMask[seedIdx] = true
@@ -1967,8 +2068,62 @@ func pointSourceScore(pixels []float32, valid []bool, width, height, x, y int, p
 	return annulusContrast * math.Min(2.0, peakContrast)
 }
 
+func isLargeBrightStarCandidate(pixels []float32, valid []bool, width, height, x, y int, peak float64, peakCount int, bg, sigma, minProminence float64) bool {
+	if peak < 0.45 {
+		return false
+	}
+	if localCandidateElongationWithinRadius(pixels, valid, width, height, x, y, 4, bg) > 2.5 {
+		return false
+	}
+	if localCandidateElongationWithinRadius(pixels, valid, width, height, x, y, 10, bg) > 3.0 {
+		return false
+	}
+	rings := make([]float64, 0, 5)
+	for _, radii := range [][2]float64{
+		{3, 6},
+		{7, 11},
+		{14, 20},
+		{26, 36},
+		{42, 56},
+	} {
+		median, ok := localAnnulusMedian(pixels, valid, width, height, x, y, radii[0], radii[1])
+		if ok {
+			rings = append(rings, median)
+		}
+	}
+	if len(rings) < 2 {
+		return false
+	}
+	baseline := rings[len(rings)-1]
+	contrast := peak - baseline
+	if contrast < math.Max(math.Max(0.08, minProminence), 4*sigma) {
+		return false
+	}
+	nearCoreDrop := peak - rings[0]
+	if peak < 0.85 {
+		if nearCoreDrop < math.Max(0.04, contrast*0.18) {
+			return false
+		}
+	} else if peakCount < 80 && nearCoreDrop < math.Max(0.03, contrast*0.10) {
+		return false
+	}
+	dropThreshold := math.Max(0.01, contrast*0.05)
+	prev := peak
+	drops := 0
+	for _, ring := range rings {
+		if prev-ring >= dropThreshold {
+			drops++
+		}
+		prev = ring
+	}
+	return drops >= 2 || baseline <= peak*0.75
+}
+
 func localCandidateElongation(pixels []float32, valid []bool, width, height, cx, cy int, floor float64) float64 {
-	const radius = 4
+	return localCandidateElongationWithinRadius(pixels, valid, width, height, cx, cy, 4, floor)
+}
+
+func localCandidateElongationWithinRadius(pixels []float32, valid []bool, width, height, cx, cy, radius int, floor float64) float64 {
 	var sumW, sumX, sumY float64
 	for y := maxStarInt(0, cy-radius); y <= minInt(height-1, cy+radius); y++ {
 		for x := maxStarInt(0, cx-radius); x <= minInt(width-1, cx+radius); x++ {
@@ -2026,7 +2181,13 @@ func estimateSeedRadius(detection []float32, valid []bool, width, height int, mo
 		baseRadius = 1
 	}
 	effectiveMaxRadius := maxRadius
-	if seed.PeakValue < 0.95 {
+	if seed.PeakValue >= 0.95 {
+		if seed.FootprintArea < 20 {
+			effectiveMaxRadius = minInt(maxRadius, maxStarInt(baseRadius, 12))
+		} else if seed.FootprintArea < 80 {
+			effectiveMaxRadius = minInt(maxRadius, maxStarInt(baseRadius, 20))
+		}
+	} else {
 		limit := 24
 		if seed.StarLikeScore < 0.08 {
 			limit = 16
@@ -2052,11 +2213,11 @@ func estimateSeedRadius(detection []float32, valid []bool, width, height int, mo
 	if last < float64(baseRadius) {
 		last = float64(baseRadius)
 	}
-	if seed.PeakValue >= 0.95 {
+	if seed.PeakValue >= 0.95 && seed.FootprintArea >= 80 {
 		saturatedMin := minInt(20, maxStarInt(baseRadius, minInt(width, height)/3))
 		last = math.Max(last, float64(minInt(maxRadius, saturatedMin)))
 	}
-	if last > float64(effectiveMaxRadius) && seed.PeakValue < 0.95 {
+	if last > float64(effectiveMaxRadius) {
 		last = float64(effectiveMaxRadius)
 	} else if last > float64(maxRadius) {
 		last = float64(maxRadius)

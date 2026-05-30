@@ -183,8 +183,13 @@ type viewport struct {
 	customZoom    string
 	histColor     [4]uint8 // bar color; if zero, use default white-bg/gray-bar style
 	StatsLabel    *widget.Label
+	pickerLabel   *widget.Label
+	pickerBox     fyne.CanvasObject
 	actionRow     *fyne.Container
 	onViewChanged func()
+	histMax       int
+	onPickBlack   func()
+	onPickWhite   func()
 }
 
 var presetZoomOptions = []string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}
@@ -211,9 +216,12 @@ func newViewport() *viewport {
 	vp.zoomOut = widget.NewButton("-", func() { vp.stepZoom(0.95) })
 	vp.zoomIn = widget.NewButton("+", func() { vp.stepZoom(1.05) })
 
-	vp.StatsLabel = widget.NewLabel("Mean: -- | Std: --")
+	vp.StatsLabel = widget.NewLabel("Sky --  μ --  σ --")
 	vp.StatsLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.StatsLabel.Alignment = fyne.TextAlignCenter
+	vp.pickerLabel = widget.NewLabel("Value: --")
+	vp.pickerLabel.TextStyle = fyne.TextStyle{Monospace: true}
+	vp.pickerBox = container.New(layout.NewGridWrapLayout(fyne.NewSize(135, vp.pickerLabel.MinSize().Height)), vp.pickerLabel)
 
 	vp.actionRow = container.NewHBox(layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer())
 
@@ -244,16 +252,45 @@ func newViewport() *viewport {
 	return vp
 }
 
+func (vp *viewport) SetLevelPickers(blackFn, whiteFn func()) {
+	vp.onPickBlack = blackFn
+	vp.onPickWhite = whiteFn
+}
+
+func (vp *viewport) SetPickerValueText(text string) {
+	if vp == nil || vp.pickerLabel == nil {
+		return
+	}
+	if text == "" {
+		text = "Value: --"
+	}
+	vp.pickerLabel.SetText(text)
+	vp.pickerLabel.Refresh()
+	if vp.pickerBox != nil {
+		vp.pickerBox.Refresh()
+		canvas.Refresh(vp.pickerBox)
+	}
+}
+
 func (vp *viewport) SetLoadSave(chanLabel, letter string, col color.Color, loadFn, saveFn func()) {
 	badge := newChanBadge(letter, col)
 	nameText := canvas.NewText(chanLabel, col)
 	nameText.TextSize = theme.TextSize()
 	nameText.TextStyle = fyne.TextStyle{Bold: true}
-	vp.actionRow.Objects = []fyne.CanvasObject{
+	objects := []fyne.CanvasObject{
 		hpad(6), badge, hpad(4), nameText,
 		layout.NewSpacer(),
-		vp.StatsLabel, hpad(6), newCompactBtn("Load", loadFn), newCompactBtn("Save", saveFn), hpad(6),
+		vp.StatsLabel,
 	}
+	if vp.onPickBlack != nil && vp.onPickWhite != nil {
+		objects = append(objects,
+			hpad(6), vp.pickerBox,
+			hpad(6), newCompactBtn("B", vp.onPickBlack),
+			newCompactBtn("W", vp.onPickWhite),
+		)
+	}
+	objects = append(objects, hpad(6), newCompactBtn("Load", loadFn), newCompactBtn("Save", saveFn), hpad(6))
+	vp.actionRow.Objects = objects
 	vp.actionRow.Refresh()
 }
 
@@ -380,9 +417,13 @@ func (vp *viewport) drawHist(w, h int) image.Image {
 	}
 
 	maxCount := 0
-	for _, c := range vp.bins {
-		if c > maxCount {
-			maxCount = c
+	if vp.histMax > 0 {
+		maxCount = vp.histMax
+	} else {
+		for _, c := range vp.bins {
+			if c > maxCount {
+				maxCount = c
+			}
 		}
 	}
 	if maxCount == 0 {

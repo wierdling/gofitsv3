@@ -229,6 +229,10 @@ func ImageDataForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 	}
 }
 
+func StretchedImageDataForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
+	return stretchForReferenceGrid(img, ref)
+}
+
 func stretchForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 	if img == nil || ref == nil {
 		return fitsio.ImageData{}

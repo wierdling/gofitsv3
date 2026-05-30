@@ -1,5 +1,8 @@
 package ui
 
+// Starless settings UI is retained for future investigation, but the menu
+// entry is currently removed and Compose forcibly bypasses the pipeline.
+
 import (
 	"fmt"
 	"strconv"

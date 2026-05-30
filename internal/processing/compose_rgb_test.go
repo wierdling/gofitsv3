@@ -68,6 +68,29 @@ func TestStretchForReferenceGridSkipsRewarpForSharedDrizzleGrid(t *testing.T) {
 	}
 }
 
+func TestStretchedImageDataForReferenceGridUsesDisplayStretch(t *testing.T) {
+	header := fitsio.Header{Cards: map[string]string{
+		"DRIZSCAL": "1",
+		"ORIGOFFX": "0",
+		"ORIGOFFY": "0",
+	}}
+	ref := makeLoadedImageForCompose(2, 1, 0, header)
+	img := makeLoadedImageForCompose(2, 1, 0, header)
+	img.HDU.Data.Pixels = []float32{0, 10}
+	img.Background = 0
+	img.Peak = 10
+	img.ScaledPeak = 1
+	img.Mode = stretch.Linear
+
+	got := StretchedImageDataForReferenceGrid(img, ref)
+	if got.Width != 2 || got.Height != 1 {
+		t.Fatalf("size = %dx%d, want 2x1", got.Width, got.Height)
+	}
+	if got.Pixels[0] != 0 || got.Pixels[1] != 1 {
+		t.Fatalf("pixels = %v, want [0 1]", got.Pixels)
+	}
+}
+
 func makeLoadedImageForCompose(w, h int, value float32, header fitsio.Header) *models.LoadedImage {
 	pixels := make([]float32, w*h)
 	for i := range pixels {

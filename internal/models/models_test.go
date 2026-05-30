@@ -8,7 +8,11 @@ import (
 
 func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T) {
 	project := ComposeProject{
-		Flip: true,
+		Flip:                 true,
+		SharedHistogramScale: true,
+		MeasureComposite:     true,
+		BlinkFilters:         true,
+		BlinkExcludedFilter:  2,
 		Channels: [3]ChannelState{
 			{
 				Path:       "blue.fits",
@@ -90,6 +94,12 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 	}
 	if decoded.Channels[0].Path != "blue.fits" || !decoded.Channels[0].ShowClip {
 		t.Fatalf("Channels[0] = %+v, want preserved compose channel state", decoded.Channels[0])
+	}
+	if !decoded.SharedHistogramScale || !decoded.MeasureComposite {
+		t.Fatalf("compose UI settings = shared:%v measure:%v, want both true", decoded.SharedHistogramScale, decoded.MeasureComposite)
+	}
+	if !decoded.BlinkFilters || decoded.BlinkExcludedFilter != 2 {
+		t.Fatalf("blink settings = enabled:%v excluded:%d, want enabled true excluded 2", decoded.BlinkFilters, decoded.BlinkExcludedFilter)
 	}
 }
 
@@ -220,7 +230,7 @@ func TestMosaicProjectJSONOmitsOptionalZeroFieldsAndDecodesDefaults(t *testing.T
 
 func TestChannelStateAndMosaicInputStateZeroAndNegativeValuesRoundTrip(t *testing.T) {
 	type stateEnvelope struct {
-		Channel ChannelState    `json:"channel"`
+		Channel ChannelState     `json:"channel"`
 		Input   MosaicInputState `json:"input"`
 	}
 

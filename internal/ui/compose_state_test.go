@@ -2,8 +2,10 @@ package ui
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"fyne.io/fyne/v2/driver/desktop"
 	fynetest "fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 
@@ -274,7 +276,7 @@ func TestChannelStateRoundTripAndApplyChannelState(t *testing.T) {
 func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing.T) {
 	levels := defaultRGBLevels()
 
-	missing := buildComposePreviewData(make([]*models.LoadedImage, 3), false, levels, nil)
+	missing := buildComposePreviewData(make([]*models.LoadedImage, 3), false, false, levels, nil)
 	for i := 0; i < 4; i++ {
 		if missing.Views[i].Image == nil {
 			t.Fatalf("missing.Views[%d].Image is nil", i)
@@ -290,7 +292,7 @@ func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing
 		makeLoadedImageForUITest(1, 2, []float32{1, 0}),
 	}
 	overrideResult := &processing.StarlessResult{Width: 1, Height: 2}
-	data := buildComposePreviewData(imgs, true, levels, func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+	data := buildComposePreviewData(imgs, true, false, levels, func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
 		return []byte{
 			1, 2, 3, 255,
 			10, 20, 30, 255,
@@ -309,8 +311,87 @@ func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing
 	if got := data.Views[3].Image.RGBAAt(0, 0); got.R != 10 || got.G != 20 || got.B != 30 {
 		t.Fatalf("flipped compose first pixel = %#v, want R=10 G=20 B=30", got)
 	}
+	if data.Views[3].Bins[18] != 1 {
+		t.Fatalf("composite luminance bin 18 = %d, want 1", data.Views[3].Bins[18])
+	}
+	if data.Views[3].StatsText == "Sky --  μ --  σ --" || data.Views[3].StatsText == "" {
+		t.Fatalf("composite StatsText = %q, want luminance stats", data.Views[3].StatsText)
+	}
+	if !strings.Contains(data.Views[0].StatsText, "Sky ") ||
+		!strings.Contains(data.Views[0].StatsText, "μ ") ||
+		!strings.Contains(data.Views[0].StatsText, "σ ") {
+		t.Fatalf("channel StatsText = %q, want sky, mean, and sigma labels", data.Views[0].StatsText)
+	}
 	if got := data.Views[0].OrigH; got != 2 {
 		t.Fatalf("channel preview height = %d, want 2", got)
+	}
+}
+
+func TestBuildComposePreviewDataSharedHistogramScaleRebinsChannels(t *testing.T) {
+	levels := defaultRGBLevels()
+	imgs := []*models.LoadedImage{
+		makeLoadedImageForUITest(1, 3, []float32{0, 0, 0.05}),
+		makeLoadedImageForUITest(1, 3, []float32{0.5, 0.55, 0.55}),
+		makeLoadedImageForUITest(1, 3, []float32{0.95, 1, 1}),
+	}
+
+	data := buildComposePreviewData(imgs, false, true, levels, nil)
+
+	for i := 0; i < 3; i++ {
+		if data.Views[i].HistMax != 2 {
+			t.Fatalf("Views[%d].HistMax = %d, want shared max 2", i, data.Views[i].HistMax)
+		}
+	}
+	if data.Views[0].Bins[255] != 0 {
+		t.Fatalf("blue high value stayed in per-channel max bin; got bin255=%d, want 0", data.Views[0].Bins[255])
+	}
+	if data.Views[2].Bins[255] != 2 {
+		t.Fatalf("red top shared bin = %d, want 2", data.Views[2].Bins[255])
+	}
+}
+
+func TestComposeBlinkPairExcludesSelectedFilter(t *testing.T) {
+	tests := []struct {
+		excluded int
+		wantA    int
+		wantB    int
+	}{
+		{excluded: 0, wantA: 1, wantB: 2},
+		{excluded: 1, wantA: 0, wantB: 2},
+		{excluded: 2, wantA: 0, wantB: 1},
+		{excluded: 99, wantA: 1, wantB: 2},
+	}
+	for _, tt := range tests {
+		gotA, gotB := composeBlinkPair(tt.excluded)
+		if gotA != tt.wantA || gotB != tt.wantB {
+			t.Fatalf("composeBlinkPair(%d) = (%d,%d), want (%d,%d)", tt.excluded, gotA, gotB, tt.wantA, tt.wantB)
+		}
+	}
+}
+
+func TestComposePixelValueAtReturnsRawChannelValue(t *testing.T) {
+	img := makeLoadedImageForUITest(3, 2, []float32{
+		1, 2, 3,
+		4, 5, 6,
+	})
+
+	got, ok := composePixelValueAt(img, imagePoint{X: 1, Y: 1})
+	if !ok || got != 5 {
+		t.Fatalf("composePixelValueAt = (%v,%v), want (5,true)", got, ok)
+	}
+	if _, ok := composePixelValueAt(img, imagePoint{X: 3, Y: 0}); ok {
+		t.Fatal("composePixelValueAt out-of-bounds ok = true, want false")
+	}
+}
+
+func TestViewerInteractionLayerUsesCrosshairForPicker(t *testing.T) {
+	layer := newViewerInteractionLayer()
+	if got := layer.Cursor(); got != desktop.PointerCursor {
+		t.Fatalf("default cursor = %v, want pointer", got)
+	}
+	layer.pickerActive = true
+	if got := layer.Cursor(); got != desktop.CrosshairCursor {
+		t.Fatalf("picker cursor = %v, want crosshair", got)
 	}
 }
 

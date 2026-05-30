@@ -45,9 +45,13 @@ type ChannelState struct {
 }
 
 type ComposeProject struct {
-	Channels         [3]ChannelState         `json:"channels"`
-	Flip             bool                    `json:"flip"`
-	StarlessSettings StarlessComposeSettings `json:"starlessSettings"`
+	Channels             [3]ChannelState         `json:"channels"`
+	Flip                 bool                    `json:"flip"`
+	SharedHistogramScale bool                    `json:"sharedHistogramScale,omitempty"`
+	MeasureComposite     bool                    `json:"measureComposite,omitempty"`
+	BlinkFilters         bool                    `json:"blinkFilters,omitempty"`
+	BlinkExcludedFilter  int                     `json:"blinkExcludedFilter,omitempty"`
+	StarlessSettings     StarlessComposeSettings `json:"starlessSettings"`
 }
 
 type StarlessComposeSettings struct {

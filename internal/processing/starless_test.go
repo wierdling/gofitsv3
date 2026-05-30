@@ -101,6 +101,30 @@ func TestRecombineStarlessRGBWhiteStarsWhenSaturationZero(t *testing.T) {
 	}
 }
 
+func TestRecombineStarlessRGBDesaturatesStrongStarSignalOnly(t *testing.T) {
+	starless := [][]float32{
+		{100, 100},
+		{20, 20},
+		{20, 20},
+	}
+	stars := [][]float32{
+		{100, 2},
+		{0, 0},
+		{0, 0},
+	}
+	alpha := []float32{1, 1}
+	out, err := RecombineStarlessRGB(starless, stars, alpha, 2, 1, StarRecombineSettings{StarBrightness: 1, StarSaturation: 0})
+	if err != nil {
+		t.Fatalf("RecombineStarlessRGB error = %v", err)
+	}
+	if out[0][0] != out[1][0] || out[1][0] != out[2][0] {
+		t.Fatalf("strong star pixel = %v,%v,%v, want neutral", out[0][0], out[1][0], out[2][0])
+	}
+	if out[0][1] <= out[1][1] {
+		t.Fatalf("weak residual pixel was over-neutralized: %v,%v,%v", out[0][1], out[1][1], out[2][1])
+	}
+}
+
 func TestCreateStarlessChannelsStoresRawStarDeltaAndRecombineAppliesAlphaOnce(t *testing.T) {
 	const w, h = 11, 11
 	channels := make([][]float32, 3)
@@ -1012,6 +1036,83 @@ func TestCreateStarlessChannelsLargeSaturatedStarAccepted(t *testing.T) {
 	}
 }
 
+func TestCreateStarlessChannelsDetectsStarsAcrossSizeContinuum(t *testing.T) {
+	const w, h = 220, 180
+	channels := newFlatStarlessChannels(3, w, h, 0.1)
+	addStar := func(pixels []float32, cx, cy int, radius float64, peak float32, saturatedCore float64) {
+		for y := maxStarInt(0, int(math.Floor(float64(cy)-radius-2))); y <= minInt(h-1, int(math.Ceil(float64(cy)+radius+2))); y++ {
+			for x := maxStarInt(0, int(math.Floor(float64(cx)-radius-2))); x <= minInt(w-1, int(math.Ceil(float64(cx)+radius+2))); x++ {
+				dx := float64(x - cx)
+				dy := float64(y - cy)
+				r := math.Sqrt(dx*dx + dy*dy)
+				if r > radius {
+					continue
+				}
+				profile := math.Exp(-(r * r) / (2 * (radius / 2.7) * (radius / 2.7)))
+				boost := float32(float64(peak) * profile)
+				if saturatedCore > 0 && r <= saturatedCore {
+					boost = peak
+				}
+				pixels[y*w+x] += boost
+			}
+		}
+	}
+	addNebulaKnot := func(pixels []float32) {
+		for y := 10; y < 70; y++ {
+			for x := 145; x < 210; x++ {
+				dx := float64(x - 176)
+				dy := float64(y - 39)
+				r2 := dx*dx/36 + dy*dy/280
+				pixels[y*w+x] += float32(0.7 * math.Exp(-r2/2))
+			}
+		}
+	}
+	for _, ch := range channels {
+		addStar(ch, 26, 26, 4, 2.8, 0)
+		addStar(ch, 82, 48, 16, 5.5, 3)
+		addStar(ch, 94, 124, 56, 8.0, 12)
+		addNebulaKnot(ch)
+	}
+
+	settings := DefaultStarMaskSettings()
+	settings.DetectionMergeMode = "per-channel-merged"
+	settings.DetectionPreprocessMode = "none"
+	settings.DetectionSigma = 3
+	settings.SeedMinProminence = 0.03
+	settings.SuppressionRadius = 8
+	settings.MaskGrowRadius = 2
+	settings.MaskMaxRadius = 70
+	settings.InpaintRadius = 8
+	settings.MinDetectedChannels = 2
+	settings.MinSeedFootprintArea = 3
+	result, err := CreateStarlessChannels(channels, w, h, settings)
+	if err != nil {
+		t.Fatalf("CreateStarlessChannels error = %v", err)
+	}
+	targets := []struct {
+		name      string
+		x, y      int
+		minRadius float64
+	}{
+		{name: "small star", x: 26, y: 26, minRadius: 2},
+		{name: "medium star", x: 82, y: 48, minRadius: 8},
+		{name: "large star", x: 94, y: 124, minRadius: 40},
+	}
+	for _, target := range targets {
+		seed, ok := nearestSeed(result.Seeds, target.x, target.y, 8)
+		if !ok {
+			t.Fatalf("missing %s near (%d,%d); seeds=%+v", target.name, target.x, target.y, result.Seeds)
+		}
+		if seed.Radius < target.minRadius {
+			t.Fatalf("%s radius = %.2f, want at least %.2f", target.name, seed.Radius, target.minRadius)
+		}
+	}
+	nebulaIdx := 176 + 39*w
+	if result.HardMask[nebulaIdx] {
+		t.Fatal("expected elongated nebula knot center to remain unmasked")
+	}
+}
+
 func TestDetectStarSeedsCollapsesSaturatedPlateau(t *testing.T) {
 	const w, h = 25, 25
 	pixels := make([]float32, w*h)
@@ -1452,6 +1553,22 @@ func addThreePixelSource(pixels []float32, width, cx, cy int, peak float32) {
 	pixels[cy*width+cx] = peak
 	pixels[cy*width+cx-1] = peak * 0.65
 	pixels[(cy-1)*width+cx] = peak * 0.6
+}
+
+func nearestSeed(seeds []StarSeed, x, y int, maxDistance float64) (StarSeed, bool) {
+	maxDist2 := maxDistance * maxDistance
+	bestDist2 := math.Inf(1)
+	var best StarSeed
+	for _, seed := range seeds {
+		dx := float64(seed.X - x)
+		dy := float64(seed.Y - y)
+		dist2 := dx*dx + dy*dy
+		if dist2 <= maxDist2 && dist2 < bestDist2 {
+			best = seed
+			bestDist2 = dist2
+		}
+	}
+	return best, bestDist2 < math.Inf(1)
 }
 
 func addSaturatedTestStar(pixels []float32, width, height, cx, cy int, peak float32) {

@@ -21,6 +21,7 @@ type viewerInteractionLayer struct {
 	onPointerMove func(fyne.Position)
 	onPointerOut  func()
 	onTapped      func(fyne.Position)
+	pickerActive  bool
 	start         *fyne.Position
 	end           *fyne.Position
 }
@@ -104,6 +105,9 @@ func (d *viewerInteractionLayer) MouseOut() {
 }
 
 func (d *viewerInteractionLayer) Cursor() desktop.Cursor {
+	if d.pickerActive {
+		return desktop.CrosshairCursor
+	}
 	return desktop.PointerCursor
 }
 
