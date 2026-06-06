@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -253,6 +254,9 @@ type Options struct {
 	// Ctx, when non-nil, allows Build to be cancelled. Build checks Ctx.Err()
 	// between frames and returns ErrCancelled if the context is done.
 	Ctx context.Context
+	// DebugOutputDir, when not empty, causes the drizzle process to output an individual
+	// FITS file for each input chip, exactly matching the footprint of the final combined mosaic.
+	DebugOutputDir string
 }
 
 // ErrCancelled is returned by Build (or AlignInputsByStarsWithMode) when its
@@ -588,6 +592,14 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	finalKernel := options.FinalKernel
 	finalSlot := 0
 
+	var debugBaseHeader fitsio.Header
+	if options.DebugOutputDir != "" {
+		if err := os.MkdirAll(options.DebugOutputDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create debug output directory: %w", err)
+		}
+		debugBaseHeader = buildOutputHeader(wcsReferenceInput(inputs), width, height, minX, minY, options.Scale, 1)
+	}
+
 	for i := range planned {
 		if planned[i].input.ReferenceOnly {
 			continue
@@ -630,6 +642,26 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		drizzlePlannedInput(planned[i], sums, weights, width, height, minX, minY,
 			options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY)
 		debuglog.Log(fmt.Sprintf("Build: frame %d done", finalSlot))
+
+		if options.DebugOutputDir != "" {
+			dbgSums := make([]float32, width*height)
+			dbgWeights := make([]float32, width*height)
+			drizzlePlannedInput(planned[i], dbgSums, dbgWeights, width, height, minX, minY,
+				options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY)
+			normalizeAccumulatedImage(dbgSums, dbgWeights)
+
+			safeName := strings.ReplaceAll(InputLabel(planned[i].input), "[", "_")
+			safeName = strings.ReplaceAll(safeName, "]", "_")
+			safeName = strings.ReplaceAll(safeName, ",", "_")
+			debugPath := filepath.Join(options.DebugOutputDir, fmt.Sprintf("debug_%s.fits", safeName))
+
+			err := fitsio.WriteFloat32Image(debugPath, debugBaseHeader, fitsio.ImageData{Pixels: dbgSums, Width: width, Height: height})
+			if err != nil {
+				debuglog.Log(fmt.Sprintf("Build: failed to write debug image %s: %v", debugPath, err))
+			} else {
+				debuglog.Log(fmt.Sprintf("Build: wrote debug image %s", debugPath))
+			}
+		}
 	}
 
 	options.reportProgress("Finalizing", len(dataPlanned), len(dataPlanned))

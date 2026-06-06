@@ -91,18 +91,19 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 		weightingMode = mosaic.WeightERR
 	}
 	result, err := mosaic.Build(ws.inputsWithRef(), mosaic.Options{
-		Scale:         s.Scale,
-		FinalScale:    s.FinalScale,
-		PixFrac:       s.PixFrac,
-		CRMethod:      mosaic.CRMethod(s.CRMethod),
-		SepKernel:     mosaic.DrizzleKernel(s.SepKernel),
-		FinalKernel:   mosaic.DrizzleKernel(s.FinalKernel),
-		WeightingMode: weightingMode,
-		CRSeedSNR:     s.CRSeedSNR,
-		CRDerivScale:  s.CRDerivScale,
-		Skysub:        skysubOptionsFromSettings(ws.state.skysubSettings),
-		Progress:      pt.progress,
-		Ctx:           pt.ctx,
+		Scale:          s.Scale,
+		FinalScale:     s.FinalScale,
+		PixFrac:        s.PixFrac,
+		CRMethod:       mosaic.CRMethod(s.CRMethod),
+		SepKernel:      mosaic.DrizzleKernel(s.SepKernel),
+		FinalKernel:    mosaic.DrizzleKernel(s.FinalKernel),
+		WeightingMode:  weightingMode,
+		CRSeedSNR:      s.CRSeedSNR,
+		CRDerivScale:   s.CRDerivScale,
+		DebugOutputDir: s.DebugOutputDir,
+		Skysub:         skysubOptionsFromSettings(ws.state.skysubSettings),
+		Progress:       pt.progress,
+		Ctx:            pt.ctx,
 	})
 
 	pt.hide()

@@ -42,8 +42,8 @@ var composeBlinkFilterNames = []string{"Blue", "Green", "Red"}
 var globalSendToChannel func(channelIdx int, img *models.LoadedImage)
 
 func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*fyne.Menu) {
-	imgs := make([]*models.LoadedImage, 3)
-	var origPixels [3][]float32
+	imgs := make([]*models.LoadedImage, 4)
+	origPixels := make([][]float32, 4)
 	viewports := []*viewport{newViewport(), newViewport(), newViewport(), newViewport()}
 	// Channel histograms: black background, channel-colored bars; compose: white bars.
 	viewports[0].histColor = [4]uint8{100, 149, 237, 255} // blue
@@ -54,6 +54,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	levels := defaultRGBLevels()
 	var levelsWin *rgbLevelsWindow
 	starlessSettings := defaultStarlessComposeSettings()
+	orangeSettings := defaultOrangeLayerSettings()
+	var orangeWin fyne.Window
+	var orangeViewport *viewport
+	var orangeControl *models.ChannelControl
 
 	// Updated to track the new struct
 	var latestRGBStats [3]histogram.Stats
@@ -87,6 +91,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		if levelsWin != nil {
 			levelsWin.setHistogram(stats)
 		}
+	}
+
+	composeRGBCurrent := func(composeImgs []*models.LoadedImage) ([]byte, int, int, [3]histogram.Stats) {
+		if orangeWin != nil && imgs[3] != nil {
+			return processing.ComposeRGBWithOrange(composeImgs, imgs[3], orangeSettings)
+		}
+		return processing.ComposeRGB(composeImgs)
 	}
 
 	refresh := func() {
@@ -275,13 +286,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			if starlessSettings.Enabled {
 				debuglog.Log("composeRGBWithOptionalStarless: starless temporarily disabled, using normal compose")
 			}
-			buf, w, h, stats := processing.ComposeRGB(imgs)
+			buf, w, h, stats := composeRGBCurrent(imgs)
 			return buf, w, h, stats, nil, nil
 		}
 
 		if !starlessSettings.Enabled {
 			debuglog.Log("composeRGBWithOptionalStarless: starless disabled, using normal compose")
-			buf, w, h, stats := processing.ComposeRGB(imgs)
+			buf, w, h, stats := composeRGBCurrent(imgs)
 			return buf, w, h, stats, nil, nil
 		}
 		if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
@@ -362,7 +373,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			makeClone(imgs[2], recombined[0]),
 		}
 		debuglog.Log("composeRGBWithOptionalStarless: composing final RGB preview")
-		buf, w, h, stats := processing.ComposeRGB(composedImgs)
+		buf, w, h, stats := composeRGBCurrent(composedImgs)
 		return buf, w, h, stats, result, nil
 	}
 
@@ -563,6 +574,189 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		fd.Show()
 	}
 
+	refreshOrangePreview := func() {
+		if orangeViewport == nil {
+			refresh()
+			return
+		}
+		if imgs[3] == nil {
+			orangeViewport.image.Image = blankImg()
+			orangeViewport.bins = [256]int{}
+			orangeViewport.histMax = 0
+			orangeViewport.blackBox.SetValue(0)
+			orangeViewport.whiteBox.SetValue(0)
+			if orangeViewport.StatsLabel != nil {
+				orangeViewport.StatsLabel.SetText("Sky --  μ --  σ --")
+			}
+			orangeViewport.histogram.Refresh()
+			orangeViewport.image.Refresh()
+			refresh()
+			return
+		}
+		stretched, mask := processing.ApplyStretchParallel(imgs[3])
+		stats := histogram.Compute(stretched.Pixels)
+		sky, _ := processing.EstimateBackground(stretched.Pixels)
+		orangeViewport.image.Image = processing.ToGrayRGBA(stretched, mask)
+		orangeViewport.bins = stats.Hist
+		orangeViewport.histMax = 0
+		orangeViewport.origW = stretched.Width
+		orangeViewport.origH = stretched.Height
+		orangeViewport.blackBox.SetValue(imgs[3].Black)
+		orangeViewport.whiteBox.SetValue(imgs[3].White)
+		if orangeViewport.StatsLabel != nil {
+			orangeViewport.StatsLabel.SetText(fmt.Sprintf("Sky %.3f  μ %.3f  σ %.3f", sky, stats.Mean, stats.Std))
+		}
+		orangeViewport.histogram.Refresh()
+		if orangeViewport.zoomLabel.Selected == "fit in preview" {
+			orangeViewport.zoom = orangeViewport.fitZoom()
+		}
+		orangeViewport.applyZoom()
+		orangeViewport.image.Refresh()
+		refresh()
+	}
+
+	saveOrangeGray := func() {
+		if imgs[3] == nil {
+			dialog.ShowInformation("Missing", "Load the orange image first", win)
+			return
+		}
+		save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
+			if err != nil || uc == nil {
+				return
+			}
+			path := uc.URI().Path()
+			_ = uc.Close()
+			format := detectExportFormat(path)
+			stretched, _ := processing.ApplyStretchParallel(imgs[3])
+			gray := processing.ToGrayRGBA(stretched, make([]byte, len(stretched.Pixels)))
+			showExportOptionsDialog(format, win, func(opts export.Options) {
+				if err := export.FromImage(path, gray, format, opts); err != nil {
+					dialog.ShowError(err, win)
+				}
+			})
+		}, win)
+		save.SetFileName("orange_gray.png")
+		save.Show()
+	}
+
+	loadOrange := func() {
+		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+			if err != nil || r == nil {
+				return
+			}
+			path := r.URI().Path()
+			app.Preferences().SetString("lastDir", filepath.Dir(path))
+			progressDialog := dialog.NewCustom("Loading Orange Image", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
+			progressDialog.Show()
+			go func() {
+				img, loadErr := loadImageFromPath(path)
+				if loadErr != nil {
+					progressDialog.Hide()
+					dialog.ShowError(loadErr, win)
+					return
+				}
+				imgs[3] = img
+				clearComposeOrigPixels(&origPixels, 3)
+				fyne.Do(func() {
+					if orangeControl != nil {
+						orangeViews := []*viewport{nil, nil, nil, orangeViewport}
+						applyChannelState(3, channelStateFromImage(img), imgs, orangeViews, []*models.ChannelControl{nil, nil, nil, orangeControl})
+					}
+					progressDialog.Hide()
+					refreshOrangePreview()
+					if updateMenus != nil {
+						updateMenus()
+					}
+				})
+			}()
+		}, win)
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
+		if last := app.Preferences().String("lastDir"); last != "" {
+			uri := storage.NewFileURI(last)
+			if l, err := storage.ListerForURI(uri); err == nil {
+				fd.SetLocation(l)
+			}
+		}
+		fd.SetView(dialog.ListView)
+		fd.Show()
+	}
+
+	openOrangeWindow := func() {
+		if orangeWin != nil {
+			orangeWin.Show()
+			orangeWin.RequestFocus()
+			refresh()
+			return
+		}
+		orangeViewport = newViewport()
+		orangeViewport.histColor = [4]uint8{orangeSettings.ColorR, orangeSettings.ColorG, orangeSettings.ColorB, 255}
+		orangeViewport.SetLoadSave("Orange", "O", color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255}, loadOrange, saveOrangeGray)
+		orangeViews := []*viewport{nil, nil, nil, orangeViewport}
+		orangeControl = channelControls("Orange Image", color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255}, 3, imgs, &origPixels, orangeViews, refreshOrangePreview)
+
+		swatch := canvas.NewRectangle(color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255})
+		swatch.SetMinSize(fyne.NewSize(36, 18))
+		updateSwatch := func() {
+			col := color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255}
+			swatch.FillColor = col
+			swatch.Refresh()
+			orangeViewport.histColor = [4]uint8{orangeSettings.ColorR, orangeSettings.ColorG, orangeSettings.ColorB, 255}
+			refreshOrangePreview()
+		}
+		colorSlider := func(label string, value uint8, set func(uint8)) fyne.CanvasObject {
+			slider := widget.NewSlider(0, 255)
+			slider.Step = 1
+			slider.Value = float64(value)
+			valueLabel := widget.NewLabel(fmt.Sprintf("%d", value))
+			slider.OnChanged = func(v float64) {
+				n := uint8(math.Round(v))
+				set(n)
+				valueLabel.SetText(fmt.Sprintf("%d", n))
+				updateSwatch()
+			}
+			return container.NewBorder(nil, nil, widget.NewLabel(label), valueLabel, slider)
+		}
+		opacitySlider := widget.NewSlider(0, 100)
+		opacitySlider.Step = 1
+		opacitySlider.Value = orangeSettings.Opacity * 100
+		opacityValue := widget.NewLabel(fmt.Sprintf("%.0f%%", opacitySlider.Value))
+		opacitySlider.OnChanged = func(v float64) {
+			orangeSettings.Opacity = v / 100
+			opacityValue.SetText(fmt.Sprintf("%.0f%%", v))
+			refresh()
+		}
+
+		if imgs[3] != nil {
+			applyChannelState(3, channelStateFromImage(imgs[3]), imgs, orangeViews, []*models.ChannelControl{nil, nil, nil, orangeControl})
+		}
+		colorControls := container.NewVBox(
+			canvas.NewText("Overlay", color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255}),
+			container.NewHBox(widget.NewLabel("Color"), swatch),
+			colorSlider("Red", orangeSettings.ColorR, func(v uint8) { orangeSettings.ColorR = v }),
+			colorSlider("Green", orangeSettings.ColorG, func(v uint8) { orangeSettings.ColorG = v }),
+			colorSlider("Blue", orangeSettings.ColorB, func(v uint8) { orangeSettings.ColorB = v }),
+			container.NewBorder(nil, nil, widget.NewLabel("Opacity"), opacityValue, opacitySlider),
+		)
+		controls := container.NewVScroll(container.NewVBox(orangeControl.Content, colorControls))
+		controls.SetMinSize(fyne.NewSize(260, 200))
+		orangeWin = app.NewWindow("Orange Image")
+		orangeWin.SetContent(container.NewBorder(nil, nil, controls, nil, orangeViewport.container))
+		orangeWin.Resize(fyne.NewSize(900, 600))
+		orangeWin.SetCloseIntercept(func() {
+			orangeWin.SetCloseIntercept(nil)
+			orangeWin.Close()
+			orangeWin = nil
+			orangeViewport = nil
+			orangeControl = nil
+			refresh()
+			if updateMenus != nil {
+				updateMenus()
+			}
+		})
+		refreshOrangePreview()
+		orangeWin.Show()
+	}
+
 	controlSets = []*models.ChannelControl{
 		channelControls("Channel 1 (Blue)", color.RGBA{R: 100, G: 149, B: 237, A: 255}, 0, imgs, &origPixels, viewports, refresh),
 		channelControls("Channel 2 (Green)", color.RGBA{R: 80, G: 200, B: 80, A: 255}, 1, imgs, &origPixels, viewports, refresh),
@@ -659,6 +853,14 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				ShowClip:   imgs[i].ShowClip,
 			}
 		}
+		if orangeWin != nil {
+			project.OrangeLayer = orangeSettings
+			project.OrangeLayer.Open = true
+			if imgs[3] != nil {
+				hasChannel = true
+				project.OrangeLayer.Channel = channelStateFromImage(imgs[3])
+			}
+		}
 		if !hasChannel {
 			dialog.ShowInformation("Nothing to save", "Load at least one channel before saving", win)
 			return
@@ -711,11 +913,16 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					err   error
 				}
 
-				results := make(chan loadResult, 3)
+				results := make(chan loadResult, 4)
 				var wg sync.WaitGroup
 
-				for i := 0; i < 3; i++ {
-					state := project.Channels[i]
+				for i := 0; i < 4; i++ {
+					state := models.ChannelState{}
+					if i < 3 {
+						state = project.Channels[i]
+					} else if project.OrangeLayer.Open {
+						state = project.OrangeLayer.Channel
+					}
 					if state.Path == "" {
 						results <- loadResult{idx: i, state: state}
 						continue
@@ -733,14 +940,18 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					close(results)
 				}()
 
-				errors := make([]string, 0, 3)
+				errors := make([]string, 0, 4)
 				for res := range results {
 					if res.state.Path == "" {
 						imgs[res.idx] = nil
 						continue
 					}
 					if res.err != nil {
-						errors = append(errors, fmt.Sprintf("Channel %d: %v", res.idx+1, res.err))
+						label := fmt.Sprintf("Channel %d", res.idx+1)
+						if res.idx == 3 {
+							label = "Orange"
+						}
+						errors = append(errors, fmt.Sprintf("%s: %v", label, res.err))
 						continue
 					}
 					imgs[res.idx] = res.img
@@ -754,6 +965,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 							if img != nil {
 								applyChannelState(i, project.Channels[i], imgs, viewports, controlSets)
 							}
+						}
+						orangeSettings = project.OrangeLayer
+						if orangeSettings.ColorR == 0 && orangeSettings.ColorG == 0 && orangeSettings.ColorB == 0 && orangeSettings.Opacity == 0 {
+							orangeSettings = defaultOrangeLayerSettings()
 						}
 						flipCheck.SetChecked(project.Flip)
 						sharedHistCheck.SetChecked(project.SharedHistogramScale)
@@ -792,8 +1007,23 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					for idx := range headerWins {
 						closeHeaderWindow(idx)
 					}
+					if !project.OrangeLayer.Open && orangeWin != nil {
+						orangeWin.SetCloseIntercept(nil)
+						orangeWin.Close()
+						orangeWin = nil
+						orangeViewport = nil
+						orangeControl = nil
+					}
 					if updateMenus != nil {
 						updateMenus()
+					}
+					if project.OrangeLayer.Open {
+						openOrangeWindow()
+						if imgs[3] != nil && orangeControl != nil && orangeViewport != nil {
+							orangeViews := []*viewport{nil, nil, nil, orangeViewport}
+							applyChannelState(3, project.OrangeLayer.Channel, imgs, orangeViews, []*models.ChannelControl{nil, nil, nil, orangeControl})
+							refreshOrangePreview()
+						}
 					}
 					if len(errors) > 0 {
 						dialog.ShowError(fmt.Errorf("%s", strings.Join(errors, "\n")), win)
@@ -1314,6 +1544,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 Settings to 2 & 3", copySettings)
+	addOrangeItem := fyne.NewMenuItem("Add Orange Image...", openOrangeWindow)
 	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
 	sendToEditItem := fyne.NewMenuItem("Send Composite to Edit", sendToEdit)
 	channelsMenu := fyne.NewMenu("Channels",
@@ -1326,6 +1557,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		saveHeaderItems[2],
 		fyne.NewMenuItemSeparator(),
 		copySettingsItem,
+		addOrangeItem,
 		normalizeScaleItem,
 		fyne.NewMenuItemSeparator(),
 		sendToEditItem,
@@ -1383,7 +1615,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		// 	crossCleanBtn.Disable()
 		// }
 
-		saveProjectItem.Disabled = imgs[0] == nil && imgs[1] == nil && imgs[2] == nil
+		saveProjectItem.Disabled = imgs[0] == nil && imgs[1] == nil && imgs[2] == nil && !(orangeWin != nil && imgs[3] != nil)
 		if m := win.MainMenu(); m != nil {
 			m.Refresh()
 		}
@@ -1610,7 +1842,7 @@ func applyChannelState(idx int, state models.ChannelState, imgs []*models.Loaded
 	views[idx].whiteBox.SetValue(img.White)
 }
 
-func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[3][]float32, views []*viewport, refresh func()) *models.ChannelControl {
+func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func()) *models.ChannelControl {
 	selectBox := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
 		if imgs[idx] == nil {
 			return
@@ -1692,11 +1924,11 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		if imgs[idx] == nil {
 			return
 		}
-		if origPixels[idx] == nil {
+		if (*origPixels)[idx] == nil {
 			src := imgs[idx].HDU.Data.Pixels
 			cp := make([]float32, len(src))
 			copy(cp, src)
-			origPixels[idx] = cp
+			(*origPixels)[idx] = cp
 		}
 		dx := xOffsetEntry.Value()
 		dy := yOffsetEntry.Value()
@@ -1717,7 +1949,7 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		applyOffset.SetText("Working…")
 		applyOffset.Disable()
 		go func() {
-			pixels := processing.WarpImage(origPixels[idx], w, h, t)
+			pixels := processing.WarpImage((*origPixels)[idx], w, h, t)
 			fyne.Do(func() {
 				imgs[idx].HDU.Data.Pixels = pixels
 				refresh()
@@ -1901,6 +2133,15 @@ func clampComposeBlinkFilter(idx int) int {
 		return 0
 	}
 	return idx
+}
+
+func defaultOrangeLayerSettings() models.OrangeLayerState {
+	return models.OrangeLayerState{
+		ColorR:  159,
+		ColorG:  140,
+		ColorB:  80,
+		Opacity: 1,
+	}
 }
 
 func composeBlinkPair(excluded int) (int, int) {

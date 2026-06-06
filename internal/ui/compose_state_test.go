@@ -18,7 +18,7 @@ import (
 )
 
 func TestClearComposeOrigPixels(t *testing.T) {
-	orig := [3][]float32{
+	orig := [][]float32{
 		{1},
 		{2},
 		{3},

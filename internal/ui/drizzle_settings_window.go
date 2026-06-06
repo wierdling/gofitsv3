@@ -16,15 +16,16 @@ import (
 
 func defaultDrizzleSettings() models.DrizzleSettings {
 	return models.DrizzleSettings{
-		FinalScale:    0,
-		Scale:         1.0,
-		PixFrac:       1.0,
-		CRMethod:      int(mosaic.CRMethodNone),
-		SepKernel:     int(mosaic.KernelTurbo),
-		FinalKernel:   int(mosaic.KernelSquare),
-		WeightingMode: int(mosaic.WeightUniform),
-		CRSeedSNR:     4.0,
-		CRDerivScale:  1.2,
+		FinalScale:     0,
+		Scale:          1.0,
+		PixFrac:        1.0,
+		CRMethod:       int(mosaic.CRMethodNone),
+		SepKernel:      int(mosaic.KernelTurbo),
+		FinalKernel:    int(mosaic.KernelSquare),
+		WeightingMode:  int(mosaic.WeightUniform),
+		CRSeedSNR:      4.0,
+		CRDerivScale:   1.2,
+		DebugOutputDir: "",
 	}
 }
 
@@ -128,6 +129,10 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 	}
 	crDerivScaleEntry.SetText(fmt.Sprintf("%.2f", crDerivScale))
 
+	debugDirEntry := widget.NewEntry()
+	debugDirEntry.SetText(current.DebugOutputDir)
+	debugDirEntry.SetPlaceHolder("Optional: path to save debug chip FITS")
+
 	notes := widget.NewLabel(
 		"Output Scale: desired plate scale in arcsec/pixel (AstroDrizzle final_scale).\n" +
 			"  Smaller value = finer sampling = larger output image.\n" +
@@ -157,6 +162,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		widget.NewFormItem("Weighting", weightSelect),
 		widget.NewFormItem("CR Seed SNR", crSeedSNREntry),
 		widget.NewFormItem("CR Deriv Scale", crDerivScaleEntry),
+		widget.NewFormItem("Debug Output Dir", debugDirEntry),
 	)
 
 	content := container.NewVBox(form, notes)
@@ -202,15 +208,16 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 
 		onSave(models.DrizzleSettings{
-			FinalScale:    finalScale,
-			Scale:         scale,
-			PixFrac:       pixFrac,
-			CRMethod:      crMethod,
-			SepKernel:     sepKernel,
-			FinalKernel:   finalKernel,
-			WeightingMode: weightingMode,
-			CRSeedSNR:     crSNRVal,
-			CRDerivScale:  crDSVal,
+			FinalScale:     finalScale,
+			Scale:          scale,
+			PixFrac:        pixFrac,
+			CRMethod:       crMethod,
+			SepKernel:      sepKernel,
+			FinalKernel:    finalKernel,
+			WeightingMode:  weightingMode,
+			CRSeedSNR:      crSNRVal,
+			CRDerivScale:   crDSVal,
+			DebugOutputDir: strings.TrimSpace(debugDirEntry.Text),
 		})
 	}, win)
 	d.Show()

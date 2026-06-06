@@ -143,6 +143,17 @@ func EstimateTweakRegAlignmentWithRefStars(
 		}
 	}
 
+	// Translation-invariant (Triangle) fallback: if the WCS offset is significantly larger
+	// than the search radius (e.g. severe HST gyroscope drift), proximity matching fails entirely.
+	// We fall back to the triangle matcher which is invariant to translation, rotation, and scale.
+	if len(pairs) < 4 {
+		trianglePairs := MatchStars(projected, refStars, 80, 0.01)
+		debuglog.Log(fmt.Sprintf("EstimateTweakRegAlignmentWithRefStars: triangle fallback: %d pairs", len(trianglePairs)))
+		if len(trianglePairs) > len(pairs) {
+			pairs = trianglePairs
+		}
+	}
+
 	dbgPairs = pairs
 
 	minPairs := 3

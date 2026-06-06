@@ -548,9 +548,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			dialog.ShowInformation("Missing Inputs", "Load at least two FITS files before star alignment.", win)
 			return
 		}
-		pt := newProgressTracker("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", win)
-		progressDialog := pt.dialog
 		go func() {
+			pt := newProgressTracker("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", win)
 			if state.alignmentSettings.DebugAlignment {
 				defer installAlignmentDebugHook(win)()
 			}
@@ -565,7 +564,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			})
 			if errors.Is(err, mosaic.ErrCancelled) {
 				debuglog.Log("starAlign: cancelled by user")
-				fyne.Do(func() { progressDialog.Hide() })
+				pt.hide()
 				return
 			}
 
@@ -599,8 +598,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				}
 			}
 
+			pt.hide()
 			fyne.Do(func() {
-				progressDialog.Hide()
 				if err != nil {
 					dialog.ShowError(err, win)
 					return
@@ -620,7 +619,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 							t := r.result.ManualTransform
 							rot = math.Atan2(t.D, t.A) * 180 / math.Pi
 						}
-						label := fmt.Sprintf("%s  X: %.2f  Y: %.2f  RotÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°: %.4f", name, r.result.OffsetX, r.result.OffsetY, rot)
+						label := fmt.Sprintf("%s  X: %.2f  Y: %.2f  Rot (deg): %.4f", name, r.result.OffsetX, r.result.OffsetY, rot)
 						chk := widget.NewCheck(label, nil)
 						chk.SetChecked(true)
 						checks[i] = chk
@@ -686,6 +685,16 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			return
 		}
 		go ws.buildDrizzlePreview()
+	})
+
+	openBlinkerBtn := widget.NewButton("Open Blinker", func() {
+		dir := strings.TrimSpace(state.drizzleSettings.DebugOutputDir)
+		if dir == "" {
+			dialog.ShowInformation("No Debug Dir", "Debug Output Dir is not set in Drizzle Settings. Set it and build a preview first.", win)
+			return
+		}
+		black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
+		showBlinkerWindow(app, dir, black, white, bg, peak, scaledPeak, ws.stretchMode)
 	})
 
 	saveBtn.OnTapped = func() {
@@ -896,8 +905,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			container.NewGridWithColumns(2, setRefBtn, clearRefBtn),
 			container.NewGridWithColumns(2, starAlignBtn, selectStarsBtn),
 			container.NewGridWithColumns(2, measureBtn, buildBtn),
-			container.NewGridWithColumns(2, saveOffsetsBtn, loadOffsetsBtn),
-			container.NewGridWithColumns(2, clearOffsetsBtn, clearBtn),
+			container.NewGridWithColumns(2, openBlinkerBtn, saveOffsetsBtn),
+			container.NewGridWithColumns(2, loadOffsetsBtn, clearOffsetsBtn),
+			container.NewGridWithColumns(2, clearBtn, layout.NewSpacer()),
 		),
 		widget.NewSeparator(),
 		inputTabs,

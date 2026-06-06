@@ -25,6 +25,23 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 				ShowClip:   true,
 			},
 		},
+		OrangeLayer: OrangeLayerState{
+			Open: true,
+			Channel: ChannelState{
+				Path:       "ha.fits",
+				Mode:       "Asinh",
+				Black:      0.1,
+				White:      2.5,
+				Background: 0.2,
+				Peak:       1.8,
+				ScaledPeak: 9,
+				ShowClip:   true,
+			},
+			ColorR:  159,
+			ColorG:  140,
+			ColorB:  80,
+			Opacity: 0.65,
+		},
 		StarlessSettings: StarlessComposeSettings{
 			Enabled:                 true,
 			DetectionMode:           "median",
@@ -100,6 +117,9 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 	}
 	if !decoded.BlinkFilters || decoded.BlinkExcludedFilter != 2 {
 		t.Fatalf("blink settings = enabled:%v excluded:%d, want enabled true excluded 2", decoded.BlinkFilters, decoded.BlinkExcludedFilter)
+	}
+	if !decoded.OrangeLayer.Open || decoded.OrangeLayer.Channel.Path != "ha.fits" || decoded.OrangeLayer.ColorR != 159 || decoded.OrangeLayer.Opacity != 0.65 {
+		t.Fatalf("orange layer = %+v, want preserved optional layer state", decoded.OrangeLayer)
 	}
 }
 

@@ -46,12 +46,22 @@ type ChannelState struct {
 
 type ComposeProject struct {
 	Channels             [3]ChannelState         `json:"channels"`
+	OrangeLayer          OrangeLayerState        `json:"orangeLayer,omitempty"`
 	Flip                 bool                    `json:"flip"`
 	SharedHistogramScale bool                    `json:"sharedHistogramScale,omitempty"`
 	MeasureComposite     bool                    `json:"measureComposite,omitempty"`
 	BlinkFilters         bool                    `json:"blinkFilters,omitempty"`
 	BlinkExcludedFilter  int                     `json:"blinkExcludedFilter,omitempty"`
 	StarlessSettings     StarlessComposeSettings `json:"starlessSettings"`
+}
+
+type OrangeLayerState struct {
+	Open    bool         `json:"open,omitempty"`
+	Channel ChannelState `json:"channel"`
+	ColorR  uint8        `json:"colorR"`
+	ColorG  uint8        `json:"colorG"`
+	ColorB  uint8        `json:"colorB"`
+	Opacity float64      `json:"opacity"`
 }
 
 type StarlessComposeSettings struct {
@@ -98,6 +108,9 @@ type DrizzleSettings struct {
 	// CRDerivScale scales the derivative (sharpness) term in the rejection test.
 	CRSeedSNR    float64 `json:"crSeedSNR"`
 	CRDerivScale float64 `json:"crDerivScale"`
+	// DebugOutputDir, when set, is the directory where the drizzle process
+	// writes individual output-scale chip images for blinking.
+	DebugOutputDir string `json:"debugOutputDir,omitempty"`
 }
 
 // AlignmentSettings holds the star-alignment controls configured through the

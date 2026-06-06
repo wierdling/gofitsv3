@@ -191,6 +191,50 @@ func ComposeRGB(imgs []*models.LoadedImage) ([]byte, int, int, [3]histogram.Stat
 	return buf, w, h, HistogramRGB(buf)
 }
 
+func ComposeRGBWithOrange(imgs []*models.LoadedImage, orange *models.LoadedImage, settings models.OrangeLayerState) ([]byte, int, int, [3]histogram.Stats) {
+	if len(imgs) < 3 {
+		return nil, 0, 0, [3]histogram.Stats{}
+	}
+	buf, w, h, _ := ComposeRGB(imgs)
+	if buf == nil || orange == nil || imgs[1] == nil {
+		return buf, w, h, HistogramRGB(buf)
+	}
+
+	opacity := settings.Opacity
+	if opacity < 0 {
+		opacity = 0
+	} else if opacity > 1 {
+		opacity = 1
+	}
+	if opacity == 0 {
+		return buf, w, h, HistogramRGB(buf)
+	}
+
+	ref := imgs[1]
+	orangeData := stretchForReferenceGrid(orange, ref)
+	rTint := float64(settings.ColorR) / 255
+	gTint := float64(settings.ColorG) / 255
+	bTint := float64(settings.ColorB) / 255
+
+	for i, v := range orangeData.Pixels {
+		idx := i * 4
+		if idx+2 >= len(buf) {
+			break
+		}
+		strength := utils.Clamp01(float64(v)) * opacity
+		screenChannel := func(base byte, tint float64) byte {
+			baseF := float64(base) / 255
+			layerF := strength * tint
+			out := 1 - (1-baseF)*(1-layerF)
+			return byte(utils.Clamp01(out)*255 + 0.5)
+		}
+		buf[idx] = screenChannel(buf[idx], rTint)
+		buf[idx+1] = screenChannel(buf[idx+1], gTint)
+		buf[idx+2] = screenChannel(buf[idx+2], bTint)
+	}
+	return buf, w, h, HistogramRGB(buf)
+}
+
 // ComposeRGBFloat32 returns per-channel float32 pixels (values in [0,1]) for
 // the three loaded images, aligned and stretched to the green reference grid.
 // Channel order: r, g, b matching imgs[2], imgs[1], imgs[0].
