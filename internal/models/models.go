@@ -49,6 +49,7 @@ type ComposeProject struct {
 	OrangeLayer          OrangeLayerState        `json:"orangeLayer,omitempty"`
 	Flip                 bool                    `json:"flip"`
 	SharedHistogramScale bool                    `json:"sharedHistogramScale,omitempty"`
+	DisableComposite     bool                    `json:"disableComposite,omitempty"`
 	MeasureComposite     bool                    `json:"measureComposite,omitempty"`
 	BlinkFilters         bool                    `json:"blinkFilters,omitempty"`
 	BlinkExcludedFilter  int                     `json:"blinkExcludedFilter,omitempty"`

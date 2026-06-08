@@ -10,6 +10,7 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 	project := ComposeProject{
 		Flip:                 true,
 		SharedHistogramScale: true,
+		DisableComposite:     true,
 		MeasureComposite:     true,
 		BlinkFilters:         true,
 		BlinkExcludedFilter:  2,
@@ -114,6 +115,9 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 	}
 	if !decoded.SharedHistogramScale || !decoded.MeasureComposite {
 		t.Fatalf("compose UI settings = shared:%v measure:%v, want both true", decoded.SharedHistogramScale, decoded.MeasureComposite)
+	}
+	if !decoded.DisableComposite {
+		t.Fatal("DisableComposite = false, want true")
 	}
 	if !decoded.BlinkFilters || decoded.BlinkExcludedFilter != 2 {
 		t.Fatalf("blink settings = enabled:%v excluded:%d, want enabled true excluded 2", decoded.BlinkFilters, decoded.BlinkExcludedFilter)

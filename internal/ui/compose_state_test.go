@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -276,7 +277,7 @@ func TestChannelStateRoundTripAndApplyChannelState(t *testing.T) {
 func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing.T) {
 	levels := defaultRGBLevels()
 
-	missing := buildComposePreviewData(make([]*models.LoadedImage, 3), false, false, levels, nil)
+	missing := buildComposePreviewData(make([]*models.LoadedImage, 3), false, false, true, levels, nil)
 	for i := 0; i < 4; i++ {
 		if missing.Views[i].Image == nil {
 			t.Fatalf("missing.Views[%d].Image is nil", i)
@@ -292,7 +293,7 @@ func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing
 		makeLoadedImageForUITest(1, 2, []float32{1, 0}),
 	}
 	overrideResult := &processing.StarlessResult{Width: 1, Height: 2}
-	data := buildComposePreviewData(imgs, true, false, levels, func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+	data := buildComposePreviewData(imgs, true, false, true, levels, func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
 		return []byte{
 			1, 2, 3, 255,
 			10, 20, 30, 255,
@@ -335,7 +336,7 @@ func TestBuildComposePreviewDataSharedHistogramScaleRebinsChannels(t *testing.T)
 		makeLoadedImageForUITest(1, 3, []float32{0.95, 1, 1}),
 	}
 
-	data := buildComposePreviewData(imgs, false, true, levels, nil)
+	data := buildComposePreviewData(imgs, false, true, true, levels, nil)
 
 	for i := 0; i < 3; i++ {
 		if data.Views[i].HistMax != 2 {
@@ -347,6 +348,31 @@ func TestBuildComposePreviewDataSharedHistogramScaleRebinsChannels(t *testing.T)
 	}
 	if data.Views[2].Bins[255] != 2 {
 		t.Fatalf("red top shared bin = %d, want 2", data.Views[2].Bins[255])
+	}
+}
+
+func TestBuildComposePreviewDataSkipsCompositeWhenDisabled(t *testing.T) {
+	levels := defaultRGBLevels()
+	imgs := []*models.LoadedImage{
+		makeLoadedImageForUITest(1, 1, []float32{0.1}),
+		makeLoadedImageForUITest(1, 1, []float32{0.2}),
+		makeLoadedImageForUITest(1, 1, []float32{0.3}),
+	}
+	called := false
+
+	data := buildComposePreviewData(imgs, false, false, false, levels, func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+		called = true
+		return nil, 0, 0, [3]histogram.Stats{}, nil, nil
+	})
+
+	if called {
+		t.Fatal("composeRGB should not be called when composite preview is disabled")
+	}
+	if data.Views[3].OrigW != 0 || data.Views[3].OrigH != 0 {
+		t.Fatalf("disabled composite size = %dx%d, want 0x0", data.Views[3].OrigW, data.Views[3].OrigH)
+	}
+	if data.Views[3].StatsText != "Composite: off" {
+		t.Fatalf("disabled composite StatsText = %q, want Composite: off", data.Views[3].StatsText)
 	}
 }
 
@@ -381,6 +407,46 @@ func TestComposePixelValueAtReturnsRawChannelValue(t *testing.T) {
 	}
 	if _, ok := composePixelValueAt(img, imagePoint{X: 3, Y: 0}); ok {
 		t.Fatal("composePixelValueAt out-of-bounds ok = true, want false")
+	}
+}
+
+func TestMatchComposeChannelStretchCopiesModeAndScalesPeak(t *testing.T) {
+	refPixels := make([]float32, 101)
+	targetPixels := make([]float32, 101)
+	for i := range refPixels {
+		refPixels[i] = float32(i)
+		targetPixels[i] = float32(i * 5)
+	}
+	ref := makeLoadedImageForUITest(101, 1, refPixels)
+	ref.Mode = stretch.Asinh
+	ref.Background = 10
+	ref.Peak = 80
+	ref.Black = 10
+	ref.White = 80
+	ref.ScaledPeak = 10
+
+	target := makeLoadedImageForUITest(101, 1, targetPixels)
+	target.Mode = stretch.Linear
+	target.Background = 0
+	target.Peak = 1
+	target.Black = 0
+	target.White = 1
+	target.ScaledPeak = 1
+
+	if err := matchComposeChannelStretch(ref, target, false); err != nil {
+		t.Fatalf("matchComposeChannelStretch error = %v", err)
+	}
+	if target.Mode != stretch.Asinh {
+		t.Fatalf("target.Mode = %v, want %v", target.Mode, stretch.Asinh)
+	}
+	if target.ScaledPeak != ref.ScaledPeak {
+		t.Fatalf("target.ScaledPeak = %v, want %v", target.ScaledPeak, ref.ScaledPeak)
+	}
+	if math.Abs(target.Background-50) > 1e-6 || math.Abs(target.Peak-400) > 1e-6 {
+		t.Fatalf("target levels = bg %.6f peak %.6f, want 50 and 400", target.Background, target.Peak)
+	}
+	if target.Black != target.Background || target.White != target.Peak {
+		t.Fatalf("black/white = (%v,%v), want paired with background/peak (%v,%v)", target.Black, target.White, target.Background, target.Peak)
 	}
 }
 

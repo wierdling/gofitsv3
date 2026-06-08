@@ -241,21 +241,12 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		if state.img == nil {
 			return
 		}
-		blackVal := vp.blackBox.Value()
-		whiteVal := vp.whiteBox.Value()
-		if whiteVal == 0 {
-			_, whiteVal = processing.AutoLevels(state.img.HDU.Data.Pixels)
-		}
-		state.img.Background = blackVal
-		state.img.Peak = whiteVal
-		state.img.ScaledPeak = 10
-		state.img.White = whiteVal
-		state.img.Black = 0
-		vp.blackBox.SetValue(0)
-		vp.whiteBox.SetValue(whiteVal)
-		bgEntry.SetValue(blackVal)
-		peakEntry.SetValue(whiteVal)
-		sPeakEntry.SetValue(10)
+		processing.AutoScaleLikeFitsLiberator(state.img)
+		vp.blackBox.SetValue(state.img.Black)
+		vp.whiteBox.SetValue(state.img.White)
+		bgEntry.SetValue(state.img.Background)
+		peakEntry.SetValue(state.img.Peak)
+		sPeakEntry.SetValue(state.img.ScaledPeak)
 		refresh()
 	})
 

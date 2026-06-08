@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -70,6 +71,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	flipCheck.SetChecked(true)
 	sharedHistCheck := NewToggle(nil)
 	sharedHistCheck.SetChecked(false)
+	buildCompositeCheck := NewToggle(nil)
+	buildCompositeCheck.SetChecked(true)
 	blinkCheck := NewToggle(nil)
 	blinkCheck.SetChecked(false)
 	blinkExcludedIdx := 0
@@ -106,7 +109,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 		start := time.Now()
 		debuglog.Log("compose refresh: starting preview update")
-		data := buildComposePreviewData(imgs, flipCheck.Checked, sharedHistCheck.Checked, levels, composeRGBWithOptionalStarless)
+		data := buildComposePreviewData(imgs, flipCheck.Checked, sharedHistCheck.Checked, buildCompositeCheck.Checked, levels, composeRGBWithOptionalStarless)
 		applyComposePreviewData(data, viewports, pushRGBHist)
 		if refreshBlinkFrame != nil {
 			refreshBlinkFrame()
@@ -117,6 +120,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		if updateHistScaleLabel != nil {
 			updateHistScaleLabel()
 		}
+		refresh()
+	}
+	buildCompositeCheck.OnChanged = func(bool) {
 		refresh()
 	}
 	refreshAsync := func(onDone func()) {
@@ -134,10 +140,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		levelsSnapshot := *levels
 		flip := flipCheck.Checked
 		sharedHistScale := sharedHistCheck.Checked
+		buildComposite := buildCompositeCheck.Checked
 		go func() {
 			start := time.Now()
 			debuglog.Log("compose refresh async: starting preview computation")
-			data := buildComposePreviewData(imgSnapshot, flip, sharedHistScale, &levelsSnapshot, composeRGBWithOptionalStarless)
+			data := buildComposePreviewData(imgSnapshot, flip, sharedHistScale, buildComposite, &levelsSnapshot, composeRGBWithOptionalStarless)
 			debuglog.Log(fmt.Sprintf("compose refresh async: preview computation took %s", time.Since(start)))
 			fyne.Do(func() {
 				previewMu.Lock()
@@ -769,12 +776,30 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		func() { loadChannel(1) }, func() { saveChannelGray(1) })
 	viewports[2].SetLoadSave("Red", "R", color.RGBA{R: 237, G: 80, B: 80, A: 255},
 		func() { loadChannel(2) }, func() { saveChannelGray(2) })
+	compositeImageForEdit := func() *image.RGBA {
+		if buildCompositeCheck.Checked {
+			if img, ok := viewports[3].image.Image.(*image.RGBA); ok && img != nil {
+				return img
+			}
+		}
+		buf, w, h, _, _, err := composeRGBWithOptionalStarless()
+		if err != nil || buf == nil {
+			return nil
+		}
+		buf = processing.ApplyRGBLevels(buf, levels)
+		if flipCheck.Checked {
+			buf = processing.FlipRGBA(buf, w, h)
+		}
+		img := image.NewRGBA(image.Rect(0, 0, w, h))
+		copy(img.Pix, buf)
+		return img
+	}
 	viewports[3].SetCenterAction("Composite", "C", color.RGBA{R: 200, G: 110, B: 30, A: 255},
 		"Export to Edit", func() {
 			if globalExportToEdit == nil {
 				return
 			}
-			img := viewports[3].image.Image
+			img := compositeImageForEdit()
 			if img == nil {
 				dialog.ShowInformation("Nothing to export", "Compose all three channels first.", win)
 				return
@@ -827,11 +852,119 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		refresh()
 	}
 
+	matchChannelStretch := func(refIdx int, matchStarCores bool) {
+		if refIdx < 0 || refIdx >= 3 || imgs[refIdx] == nil {
+			dialog.ShowInformation("Missing", "Load the reference channel first", win)
+			return
+		}
+		refSnapshot := cloneLoadedImageForStretchMatch(imgs[refIdx])
+		targetSnapshots := make([]*models.LoadedImage, 3)
+		targetCount := 0
+		for idx := 0; idx < 3; idx++ {
+			if idx == refIdx || imgs[idx] == nil {
+				continue
+			}
+			targetSnapshots[idx] = cloneLoadedImageForStretchMatch(imgs[idx])
+			targetCount++
+		}
+		if targetCount == 0 {
+			dialog.ShowInformation("No Targets", "Load at least one other channel to match.", win)
+			return
+		}
+
+		progressDialog := dialog.NewCustom("Matching Channel Stretch", "Matching channel levels...", widget.NewProgressBarInfinite(), win)
+		progressDialog.Show()
+		go func() {
+			type matchResult struct {
+				idx   int
+				state models.ChannelState
+				err   error
+			}
+			results := make([]matchResult, 0, targetCount)
+			for idx, target := range targetSnapshots {
+				if target == nil {
+					continue
+				}
+				err := matchComposeChannelStretch(refSnapshot, target, matchStarCores)
+				results = append(results, matchResult{idx: idx, state: channelStateFromImage(target), err: err})
+			}
+			fyne.Do(func() {
+				progressDialog.Hide()
+				applied := 0
+				failed := make([]string, 0, len(results))
+				withSuspendedRefresh(func() {
+					for _, res := range results {
+						if res.err != nil {
+							failed = append(failed, fmt.Sprintf("Channel %d: %v", res.idx+1, res.err))
+							continue
+						}
+						if imgs[res.idx] == nil {
+							failed = append(failed, fmt.Sprintf("Channel %d: no longer loaded", res.idx+1))
+							continue
+						}
+						applyChannelState(res.idx, res.state, imgs, viewports, controlSets)
+						applied++
+					}
+				})
+				refresh()
+				if len(failed) > 0 {
+					dialog.ShowError(fmt.Errorf("%s", strings.Join(failed, "\n")), win)
+					return
+				}
+				if applied == 0 {
+					dialog.ShowInformation("No Targets", "No channels were matched.", win)
+				}
+			})
+		}()
+	}
+
+	showMatchStretchDialog := func() {
+		options := []string{}
+		optionIdx := []int{}
+		for i, name := range composeBlinkFilterNames {
+			if imgs[i] == nil {
+				continue
+			}
+			options = append(options, name)
+			optionIdx = append(optionIdx, i)
+		}
+		if len(options) == 0 {
+			dialog.ShowInformation("Missing", "Load a reference channel first.", win)
+			return
+		}
+		refIdx := optionIdx[0]
+		refSelect := NewSafeSelect(options, func(s string) {
+			for i, name := range options {
+				if name == s {
+					refIdx = optionIdx[i]
+					return
+				}
+			}
+		})
+		refSelect.SetSelected(options[0])
+		starCoreCheck := NewToggle(nil)
+		starCoreCheck.SetChecked(true)
+
+		content := container.NewVBox(
+			widget.NewForm(widget.NewFormItem("Reference", refSelect)),
+			container.NewHBox(starCoreCheck, widget.NewLabel("Match star cores")),
+			widget.NewLabel("Saturated star cores are ignored automatically."),
+		)
+		d := dialog.NewCustomConfirm("Match Channel Stretch", "Apply", "Cancel", content, func(ok bool) {
+			if !ok {
+				return
+			}
+			matchChannelStretch(refIdx, starCoreCheck.Checked)
+		}, win)
+		d.Show()
+	}
+
 	saveProject := func() {
 		hasChannel := false
 		project := models.ComposeProject{
 			Flip:                 flipCheck.Checked,
 			SharedHistogramScale: sharedHistCheck.Checked,
+			DisableComposite:     !buildCompositeCheck.Checked,
 			MeasureComposite:     measureEnabled,
 			BlinkFilters:         blinkCheck.Checked,
 			BlinkExcludedFilter:  blinkExcludedIdx,
@@ -972,6 +1105,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						}
 						flipCheck.SetChecked(project.Flip)
 						sharedHistCheck.SetChecked(project.SharedHistogramScale)
+						buildCompositeCheck.SetChecked(!project.DisableComposite)
 						if stopBlink != nil {
 							stopBlink()
 						}
@@ -1513,7 +1647,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		if globalExportToEdit == nil {
 			return
 		}
-		img := viewports[3].image.Image
+		img := compositeImageForEdit()
 		if img == nil {
 			dialog.ShowInformation("Nothing to send", "Compose all three channels first.", win)
 			return
@@ -1544,6 +1678,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 Settings to 2 & 3", copySettings)
+	matchStretchItem := fyne.NewMenuItem("Match Channel Stretch...", showMatchStretchDialog)
 	addOrangeItem := fyne.NewMenuItem("Add Orange Image...", openOrangeWindow)
 	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
 	sendToEditItem := fyne.NewMenuItem("Send Composite to Edit", sendToEdit)
@@ -1557,6 +1692,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		saveHeaderItems[2],
 		fyne.NewMenuItemSeparator(),
 		copySettingsItem,
+		matchStretchItem,
 		addOrangeItem,
 		normalizeScaleItem,
 		fyne.NewMenuItemSeparator(),
@@ -1596,6 +1732,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			saveHeaderItems[i].Disabled = disabled
 		}
 		copySettingsItem.Disabled = imgs[0] == nil
+		matchStretchItem.Disabled = imgs[0] == nil && imgs[1] == nil && imgs[2] == nil
 
 		allLoaded := imgs[0] != nil && imgs[1] != nil && imgs[2] != nil
 
@@ -1662,6 +1799,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		container.NewHBox(flipCheck, widget.NewLabel("Flip image vertically")),
 		container.NewHBox(sharedHistCheck, widget.NewLabel("Shared histogram scale")),
 		histScaleStatus,
+		container.NewHBox(buildCompositeCheck, widget.NewLabel("Build color composite")),
 		container.NewHBox(blinkCheck, widget.NewLabel("Blink filters")),
 		container.NewBorder(nil, nil, widget.NewLabel("Off"), nil, blinkExcludeSelect),
 		blinkStatus,
@@ -2006,7 +2144,7 @@ type composePreviewData struct {
 	StarlessResult *processing.StarlessResult
 }
 
-func buildComposePreviewData(imgs []*models.LoadedImage, flip bool, sharedHistScale bool, levels *models.RgbLevels, composeRGB func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) composePreviewData {
+func buildComposePreviewData(imgs []*models.LoadedImage, flip bool, sharedHistScale bool, buildComposite bool, levels *models.RgbLevels, composeRGB func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) composePreviewData {
 	start := time.Now()
 	defer func() {
 		debuglog.Log(fmt.Sprintf("buildComposePreviewData: total took %s", time.Since(start)))
@@ -2051,6 +2189,10 @@ func buildComposePreviewData(imgs []*models.LoadedImage, flip bool, sharedHistSc
 				out.Views[i].HistMax = sharedMax
 			}
 		}
+	}
+	if !buildComposite {
+		out.Views[3] = composeViewportPreview{Image: blankImg(), StatsText: "Composite: off"}
+		return out
 	}
 
 	buf, w, h, rgbStats := processing.ComposeRGB(imgs)
@@ -2431,6 +2573,204 @@ func offsetRow(name string, entry *NumberEntry) fyne.CanvasObject {
 	lbl := canvas.NewText(name, theme.ForegroundColor())
 	lbl.TextSize = theme.TextSize() - 2
 	return container.NewBorder(nil, nil, lbl, nil, entry)
+}
+
+func matchComposeChannelStretch(ref, target *models.LoadedImage, matchStarCores bool) error {
+	if ref == nil || target == nil {
+		return fmt.Errorf("missing channel")
+	}
+	refPixels := ref.HDU.Data.Pixels
+	targetPixels := target.HDU.Data.Pixels
+	if len(refPixels) == 0 || len(targetPixels) == 0 {
+		return fmt.Errorf("empty image data")
+	}
+
+	refLow, ok := composePercentile(refPixels, 50)
+	if !ok {
+		return fmt.Errorf("reference has no finite pixels")
+	}
+	targetLow, ok := composePercentile(targetPixels, 50)
+	if !ok {
+		return fmt.Errorf("target has no finite pixels")
+	}
+
+	refHigh, targetHigh, ok := composeStarCoreAnchors(ref, target, matchStarCores)
+	if !ok {
+		refHigh, ok = composePercentile(refPixels, 99.8)
+		if !ok {
+			return fmt.Errorf("reference high anchor unavailable")
+		}
+		targetHigh, ok = composePercentile(targetPixels, 99.8)
+		if !ok {
+			return fmt.Errorf("target high anchor unavailable")
+		}
+	}
+
+	refScaledPeak := ref.ScaledPeak
+	if math.IsNaN(refScaledPeak) || math.IsInf(refScaledPeak, 0) || refScaledPeak <= 0 {
+		refScaledPeak = 10
+	}
+	target.Mode = ref.Mode
+	target.ScaledPeak = refScaledPeak
+	target.ShowClip = ref.ShowClip
+
+	zLow := composeScaledInput(refLow, ref.Background, ref.Peak, refScaledPeak)
+	zHigh := composeScaledInput(refHigh, ref.Background, ref.Peak, refScaledPeak)
+	a := zLow / refScaledPeak
+	b := zHigh / refScaledPeak
+	if !isFinite64(a) || !isFinite64(b) || math.Abs(b-a) < 1e-9 || targetHigh <= targetLow {
+		black, white, background, peak := processing.SmartLevels(targetPixels)
+		target.Black = black
+		target.White = white
+		target.Background = background
+		target.Peak = peak
+		return nil
+	}
+
+	denom := (targetHigh - targetLow) / (b - a)
+	background := targetLow - a*denom
+	peak := background + denom
+	if !isFinite64(background) || !isFinite64(peak) || peak <= background {
+		black, white, smartBackground, smartPeak := processing.SmartLevels(targetPixels)
+		target.Black = black
+		target.White = white
+		target.Background = smartBackground
+		target.Peak = smartPeak
+		return nil
+	}
+
+	target.Background = background
+	target.Peak = peak
+	target.Black = background
+	target.White = peak
+	return nil
+}
+
+func cloneLoadedImageForStretchMatch(img *models.LoadedImage) *models.LoadedImage {
+	if img == nil {
+		return nil
+	}
+	clone := *img
+	clone.HDU = img.HDU
+	clone.HDU.Data = img.HDU.Data
+	if img.HDU.Data.Pixels != nil {
+		clone.HDU.Data.Pixels = append([]float32(nil), img.HDU.Data.Pixels...)
+	}
+	return &clone
+}
+
+func composeScaledInput(raw, background, peak, scaledPeak float64) float64 {
+	if !isFinite64(background) {
+		background = 0
+	}
+	if !isFinite64(peak) || peak <= background {
+		peak = background + 1
+	}
+	if !isFinite64(scaledPeak) || scaledPeak <= 0 {
+		scaledPeak = 10
+	}
+	v := (raw - background) * scaledPeak / (peak - background)
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+func composeStarCoreAnchors(ref, target *models.LoadedImage, enabled bool) (float64, float64, bool) {
+	if !enabled || ref.HDU.Data.Width <= 0 || ref.HDU.Data.Height <= 0 {
+		return 0, 0, false
+	}
+	refPixels := ref.HDU.Data.Pixels
+	targetPixels := target.HDU.Data.Pixels
+	refWhite := ref.White
+	if refWhite <= ref.Black {
+		refWhite = ref.Peak
+	}
+	stars := processing.ExtractStars(refPixels, ref.HDU.Data.Width, ref.HDU.Data.Height, 4, 5)
+	refCores := make([]float64, 0, 64)
+	targetCores := make([]float64, 0, 64)
+	for _, star := range stars {
+		if len(refCores) >= 64 {
+			break
+		}
+		x := int(math.Round(star.X))
+		y := int(math.Round(star.Y))
+		if x < 0 || y < 0 || x >= ref.HDU.Data.Width || y >= ref.HDU.Data.Height {
+			continue
+		}
+		refIdx := y*ref.HDU.Data.Width + x
+		if refIdx < 0 || refIdx >= len(refPixels) {
+			continue
+		}
+		refCore := float64(refPixels[refIdx])
+		if !isFinite64(refCore) || refCore >= refWhite*0.98 {
+			continue
+		}
+		tx := x
+		ty := y
+		if ref.HDU.Data.Width != target.HDU.Data.Width || ref.HDU.Data.Height != target.HDU.Data.Height {
+			tx = int(math.Round(float64(x) * float64(target.HDU.Data.Width) / float64(ref.HDU.Data.Width)))
+			ty = int(math.Round(float64(y) * float64(target.HDU.Data.Height) / float64(ref.HDU.Data.Height)))
+		}
+		if tx < 0 || ty < 0 || tx >= target.HDU.Data.Width || ty >= target.HDU.Data.Height {
+			continue
+		}
+		targetIdx := ty*target.HDU.Data.Width + tx
+		if targetIdx < 0 || targetIdx >= len(targetPixels) {
+			continue
+		}
+		targetCore := float64(targetPixels[targetIdx])
+		if !isFinite64(targetCore) {
+			continue
+		}
+		refCores = append(refCores, refCore)
+		targetCores = append(targetCores, targetCore)
+	}
+	if len(refCores) < 5 || len(targetCores) < 5 {
+		return 0, 0, false
+	}
+	sort.Float64s(refCores)
+	sort.Float64s(targetCores)
+	return composePercentileSorted(refCores, 75), composePercentileSorted(targetCores, 75), true
+}
+
+func composePercentile(pixels []float32, p float64) (float64, bool) {
+	values := make([]float64, 0, len(pixels))
+	for _, v := range pixels {
+		fv := float64(v)
+		if isFinite64(fv) {
+			values = append(values, fv)
+		}
+	}
+	if len(values) == 0 {
+		return 0, false
+	}
+	sort.Float64s(values)
+	return composePercentileSorted(values, p), true
+}
+
+func composePercentileSorted(values []float64, p float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return values[0]
+	}
+	if p >= 100 {
+		return values[len(values)-1]
+	}
+	pos := (p / 100) * float64(len(values)-1)
+	lo := int(math.Floor(pos))
+	hi := int(math.Ceil(pos))
+	if lo == hi {
+		return values[lo]
+	}
+	frac := pos - float64(lo)
+	return values[lo]*(1-frac) + values[hi]*frac
+}
+
+func isFinite64(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
 func modeToLabel(m stretch.Mode) string {
