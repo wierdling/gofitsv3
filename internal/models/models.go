@@ -104,6 +104,9 @@ type DrizzleSettings struct {
 	FinalKernel     int     `json:"finalKernel"`
 	WeightingMode   int     `json:"weightingMode"`
 	UseERRWeighting bool    `json:"useERRWeighting,omitempty"`
+	// SurfaceBrightnessNorm normalizes mixed-scale chips by their mapped pixel
+	// area before drizzle. Useful for WFPC2 PC+WF mosaics.
+	SurfaceBrightnessNorm bool `json:"surfaceBrightnessNorm,omitempty"`
 	// CRSeedSNR and CRDerivScale control the drizzle-style CR detection thresholds.
 	// CRSeedSNR is the signal-to-noise ratio threshold for seeding a CR candidate.
 	// CRDerivScale scales the derivative (sharpness) term in the rejection test.

@@ -224,8 +224,57 @@ func TestLooksLikeFLC(t *testing.T) {
 	if !LooksLikeFLC(filepath.Join("TestImages", "HST", "ick909c1q_flc.fits")) {
 		t.Fatalf("expected _flc path to be recognized")
 	}
+	if !LooksLikeFLC(filepath.Join("TestImages", "WFPC2", "u6l60101m_flt.fits")) {
+		t.Fatalf("expected _flt path to be recognized")
+	}
 	if LooksLikeFLC(filepath.Join("TestImages", "HST", "ick909030_drz.fits")) {
-		t.Fatalf("did not expect _drz path to be recognized as flc")
+		t.Fatalf("did not expect _drz path to be recognized as calibrated input")
+	}
+}
+
+func TestEffectiveEdgeTrimForWFPC2UsesInstrumentBorderTrim(t *testing.T) {
+	p := plannedInput{input: Input{
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{
+			"INSTRUME": "'WFPC2'",
+			"DETECTOR": "'PC'",
+		}},
+		HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 800, Height: 800}},
+	}}
+	if got := effectiveEdgeTrimForInput(p, 800, 1); got != 35 {
+		t.Fatalf("effectiveEdgeTrimForInput(WFPC2) = %d, want 35", got)
+	}
+
+	p.input.PrimaryHeader = fitsio.Header{Cards: map[string]string{
+		"INSTRUME": "'WFC3'",
+		"DETECTOR": "'UVIS'",
+	}}
+	if got := effectiveEdgeTrimForInput(p, 800, 1); got != edgeTrim {
+		t.Fatalf("effectiveEdgeTrimForInput(WFC3/UVIS) = %d, want %d", got, edgeTrim)
+	}
+}
+
+func TestNormalizeSurfaceBrightnessInputsScalesSCIAndERRByMappedArea(t *testing.T) {
+	planned := []plannedInput{
+		{
+			sourcePixelScale: 2,
+			input: Input{
+				HDU:       fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 1, Pixels: []float32{8, float32(math.NaN())}}},
+				ERRPixels: []float32{4, 8},
+			},
+		},
+	}
+	normalized := normalizeSurfaceBrightnessInputs(planned)
+	if got := normalized[0].input.HDU.Data.Pixels[0]; got != 2 {
+		t.Fatalf("normalized SCI pixel = %v, want 2", got)
+	}
+	if !math.IsNaN(float64(normalized[0].input.HDU.Data.Pixels[1])) {
+		t.Fatalf("normalized SCI NaN changed to %v", normalized[0].input.HDU.Data.Pixels[1])
+	}
+	if got := normalized[0].input.ERRPixels[0]; got != 1 {
+		t.Fatalf("normalized ERR pixel = %v, want 1", got)
+	}
+	if planned[0].input.HDU.Data.Pixels[0] != 8 || planned[0].input.ERRPixels[0] != 4 {
+		t.Fatal("normalizeSurfaceBrightnessInputs mutated original input")
 	}
 }
 

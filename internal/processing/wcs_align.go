@@ -115,6 +115,25 @@ func NewWCSMapper(srcHeader fitsio.Header, srcD2IX, srcD2IY *D2ITable, refHeader
 	return &WCSMapper{sourceWCS: src, refWCS: ref}, nil
 }
 
+// NewWCSMapperToLinearRef constructs a mapper for drizzle output. Source pixels
+// are corrected through their own distortion model, then projected onto the
+// reference image's linear tangent plane without applying the reference chip's
+// inverse detector distortion. This avoids extrapolating a reference chip SIP
+// solution across other chips in multi-detector instruments such as WFPC2.
+func NewWCSMapperToLinearRef(srcHeader fitsio.Header, srcD2IX, srcD2IY *D2ITable, refHeader fitsio.Header) (*WCSMapper, error) {
+	mapper, err := NewWCSMapper(srcHeader, srcD2IX, srcD2IY, refHeader, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	mapper.refWCS.a = sipPoly{}
+	mapper.refWCS.b = sipPoly{}
+	mapper.refWCS.ap = sipPoly{}
+	mapper.refWCS.bp = sipPoly{}
+	mapper.refWCS.d2iX = nil
+	mapper.refWCS.d2iY = nil
+	return mapper, nil
+}
+
 // MapPixel maps a 0-indexed source pixel (x, y) to a 0-indexed reference
 // pixel using the full SIP + D2I pipeline.
 func (m *WCSMapper) MapPixel(x, y float64) (float64, float64) {
@@ -486,7 +505,7 @@ func applyInverseSIP(w linearWCS, u, v float64) (float64, float64) {
 		guessU += u - fwdU
 		guessV += v - fwdV
 	}
-	if isFinite64(guessU) && isFinite64(guessV) {
+	if isFinite64(guessU) && isFinite64(guessV) && math.Abs(guessU-u) < 1000 && math.Abs(guessV-v) < 1000 {
 		return guessU, guessV
 	}
 	return u, v

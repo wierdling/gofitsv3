@@ -62,6 +62,10 @@ var detectors = map[key]Info{
 	{"ACS", "WFC"}:   {PixelScale: 0.05, Chips: 2, ChipInnerTrim: 25, HasSIP: true, BadDQBits: acsBadDQ},
 	{"ACS", "HRC"}:   {PixelScale: 0.027, Chips: 1, ChipInnerTrim: 10, HasSIP: true, BadDQBits: acsBadDQ},
 	{"ACS", "SBC"}:   {PixelScale: 0.034, Chips: 1, ChipInnerTrim: 10, HasSIP: false, BadDQBits: acsBadDQ},
+	// WFPC2 FLT files contain four SCI chips. The PC and WF chips have different
+	// native scales, so drizzle should prefer per-chip WCS; this fallback scale is
+	// only used when WCS scale cannot be read.
+	{"WFPC2", "PC"}: {PixelScale: 0.0996, Chips: 4, ChipInnerTrim: 35, HasSIP: false, BadDQBits: 0},
 }
 
 type key struct {

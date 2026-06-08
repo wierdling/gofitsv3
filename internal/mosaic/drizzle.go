@@ -16,6 +16,7 @@ import (
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/instrument"
 	"gofitsv3/internal/processing"
 )
 
@@ -149,6 +150,10 @@ func isFinite32(v float32) bool {
 	return math.Float32bits(v)&0x7f800000 != 0x7f800000
 }
 
+func isFinite64(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
 // DrizzleKernel selects how each input pixel's flux is distributed onto the
 // output grid during the drizzle step.
 type DrizzleKernel int
@@ -232,6 +237,10 @@ type Options struct {
 	FinalKernel DrizzleKernel
 	// WeightingMode selects how each valid input pixel is weighted.
 	WeightingMode WeightingMode
+	// SurfaceBrightnessNorm converts each input from source-pixel count rate to
+	// reference-grid pixel-area count rate before sky subtraction and drizzle.
+	// This is useful for mixed-scale instruments such as WFPC2 PC+WF.
+	SurfaceBrightnessNorm bool
 	// KeepWeights retains the final output weight/coverage image in Result.Weights.
 	// Leave false for lower memory use. The final drizzle pass still allocates
 	// weights while normalizing the image, but setting this to false releases that
@@ -362,10 +371,11 @@ type StarAlignmentResult struct {
 }
 
 type plannedInput struct {
-	input       Input
-	sourceToRef processing.AffineTransform // affine approximation, used for CR detection
-	mapper      *processing.WCSMapper      // per-pixel WCS projection, used for drizzle
-	statusIndex int
+	input            Input
+	sourceToRef      processing.AffineTransform // affine approximation, used for CR detection
+	mapper           *processing.WCSMapper      // per-pixel WCS projection, used for drizzle
+	sourcePixelScale float64                    // source pixel size in reference-pixel units
+	statusIndex      int
 }
 
 // mapPixel projects a 0-indexed source pixel through the full WCS pipeline
@@ -450,7 +460,6 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		height = 1
 	}
 
-	dropSize := options.Scale * options.PixFrac
 	includedCount := 0
 
 	effectiveCR := options.CRMethod
@@ -467,6 +476,9 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	}
 	if len(dataPlanned) == 0 {
 		return nil, fmt.Errorf("no data-bearing FITS inputs selected")
+	}
+	if options.SurfaceBrightnessNorm {
+		planned = normalizeSurfaceBrightnessInputs(planned)
 	}
 
 	if err := options.cancelled(); err != nil {
@@ -543,7 +555,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 				defer sepWG.Done()
 				defer func() { <-sepSem }()
 				debuglog.Log(fmt.Sprintf("Build: sep frame %d/%d (%s)", slot+1, len(dataPlanned), InputKey(planned[pi].input)))
-				sepFrames[slot] = drizzleSepFrame(planned[pi], workingPixels[pi], width, height, minX, minY, options.Scale, dropSize, options.SepKernel, options.WeightingMode)
+				sepFrames[slot] = drizzleSepFrame(planned[pi], workingPixels[pi], width, height, minX, minY, options.Scale, inputDropSize(planned[pi], options.Scale, options.PixFrac), options.SepKernel, options.WeightingMode)
 				n := atomic.AddInt32(&sepDone, 1)
 				options.reportProgress("Cleaning cosmic rays", int(n), len(dataPlanned))
 			}(slot, pi)
@@ -635,10 +647,11 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 		includedCount++
 
-		trimX := effectiveEdgeTrim(planned[i].input.HDU.Data.Width, options.Scale)
-		trimY := effectiveEdgeTrim(planned[i].input.HDU.Data.Height, options.Scale)
+		trimX := effectiveEdgeTrimForInput(planned[i], planned[i].input.HDU.Data.Width, options.Scale)
+		trimY := effectiveEdgeTrimForInput(planned[i], planned[i].input.HDU.Data.Height, options.Scale)
 		debuglog.Log(fmt.Sprintf("Build: frame %d input %dx%d kernel=%d trimX=%d trimY=%d", finalSlot,
 			planned[i].input.HDU.Data.Width, planned[i].input.HDU.Data.Height, int(finalKernel), trimX, trimY))
+		dropSize := inputDropSize(planned[i], options.Scale, options.PixFrac)
 		drizzlePlannedInput(planned[i], sums, weights, width, height, minX, minY,
 			options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY)
 		debuglog.Log(fmt.Sprintf("Build: frame %d done", finalSlot))
@@ -680,8 +693,8 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 		chipCorners := p.input.ChipFootprints
 		if len(chipCorners) == 0 {
-			trimX := float64(effectiveEdgeTrim(p.input.HDU.Data.Width, options.Scale))
-			trimY := float64(effectiveEdgeTrim(p.input.HDU.Data.Height, options.Scale))
+			trimX := float64(effectiveEdgeTrimForInput(p, p.input.HDU.Data.Width, options.Scale))
+			trimY := float64(effectiveEdgeTrimForInput(p, p.input.HDU.Data.Height, options.Scale))
 			w := float64(p.input.HDU.Data.Width)
 			h := float64(p.input.HDU.Data.Height)
 			chipCorners = [][4][2]float64{{
@@ -1442,10 +1455,7 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 			// This replaces the old chipPlacementTransform hack which stripped
 			// inter-chip rotation and produced a rotational offset in SCI[2].
 			var mapperErr error
-			mapper, mapperErr = processing.NewWCSMapper(
-				input.HDU.Header, input.D2IX, input.D2IY,
-				ref.HDU.Header, ref.D2IX, ref.D2IY,
-			)
+			mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
 			if mapperErr != nil {
 				statuses[idx].Status = "failed"
 				statuses[idx].Error = mapperErr.Error()
@@ -1476,6 +1486,10 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 
 		statuses[idx].Included = true
 		p := plannedInput{input: input, sourceToRef: transform, mapper: mapper, statusIndex: idx}
+		p.sourcePixelScale = mappedSourcePixelScale(p)
+		if !isFinite64(p.sourcePixelScale) || p.sourcePixelScale <= 0 {
+			p.sourcePixelScale = 1
+		}
 		planned = append(planned, p)
 
 		// Reference-only inputs anchor the coordinate system but don't contribute
@@ -1550,7 +1564,12 @@ func buildOutputHeader(ref Input, width, height int, originX, originY, scale flo
 		if strings.HasPrefix(key, "NAXIS") && key != "NAXIS1" && key != "NAXIS2" {
 			delete(cards, key)
 		}
+		if isDistortionHeaderCard(key) {
+			delete(cards, key)
+		}
 	}
+	cards["CTYPE1"] = stripSIPSuffix(cards["CTYPE1"])
+	cards["CTYPE2"] = stripSIPSuffix(cards["CTYPE2"])
 
 	cards["OBJECT"] = firstNonEmpty(cards["OBJECT"], quotedString(filepath.Base(ref.Path)))
 	cards["IMAGETYP"] = quotedString("DRIZZLE")
@@ -1592,6 +1611,23 @@ func buildOutputHeader(ref Input, width, height int, originX, originY, scale flo
 	return fitsio.Header{Cards: cards}
 }
 
+func isDistortionHeaderCard(key string) bool {
+	return key == "A_ORDER" || key == "B_ORDER" || key == "AP_ORDER" || key == "BP_ORDER" ||
+		strings.HasPrefix(key, "A_") || strings.HasPrefix(key, "B_") ||
+		strings.HasPrefix(key, "AP_") || strings.HasPrefix(key, "BP_") ||
+		strings.HasPrefix(key, "D2IM")
+}
+
+func stripSIPSuffix(value string) string {
+	if value == "" {
+		return value
+	}
+	if strings.Contains(value, "TAN-SIP") {
+		return strings.Replace(value, "TAN-SIP", "TAN", 1)
+	}
+	return value
+}
+
 func mergeHeaders(headers ...fitsio.Header) fitsio.Header {
 	merged := fitsio.Header{Cards: map[string]string{}}
 	for _, header := range headers {
@@ -1608,15 +1644,33 @@ func imageCorners(width, height int) [4][2]float64 {
 	return [4][2]float64{{0, 0}, {maxX, 0}, {0, maxY}, {maxX, maxY}}
 }
 
-// effectiveEdgeTrim returns the number of input pixels to exclude from each
-// edge so that the trim covers edgeTrim output pixels regardless of scale.
-// It is capped at 10 % of the image dimension to avoid over-trimming at very
-// small scale values.
-func effectiveEdgeTrim(size int, scale float64) int {
-	if scale <= 0 {
-		scale = 1
+func effectiveEdgeTrimForInput(p plannedInput, size int, scale float64) int {
+	sourceScale := p.sourcePixelScale
+	if !isFinite64(sourceScale) || sourceScale <= 0 {
+		sourceScale = 1
 	}
-	t := int(math.Ceil(float64(edgeTrim) / scale))
+	t := effectiveEdgeTrim(size, scale*sourceScale)
+	if inst, ok := instrument.FromHeader(p.input.PrimaryHeader); ok && inst.Chips > 1 && inst.ChipInnerTrim > t {
+		t = inst.ChipInnerTrim
+	}
+	if max := size / 10; t > max {
+		t = max
+	}
+	if size <= t*2 {
+		return 0
+	}
+	return t
+}
+
+// effectiveEdgeTrim returns the number of input pixels to exclude from each
+// edge so the trim covers edgeTrim output pixels at the supplied output-pixels
+// per source-pixel scale. It is capped by callers when detector-specific trims
+// are folded in.
+func effectiveEdgeTrim(size int, outputPixelsPerSourcePixel float64) int {
+	if outputPixelsPerSourcePixel <= 0 {
+		outputPixelsPerSourcePixel = 1
+	}
+	t := int(math.Ceil(float64(edgeTrim) / outputPixelsPerSourcePixel))
 	if max := size / 10; t > max {
 		t = max
 	}
@@ -1752,6 +1806,83 @@ func drizzlePlannedInput(p plannedInput, sums, weights []float32, width, height 
 	default:
 		drizzlePlannedInputSquare(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY)
 	}
+}
+
+func inputDropSize(p plannedInput, outputScale, pixFrac float64) float64 {
+	if pixFrac <= 0 {
+		pixFrac = 1
+	}
+	sourceScale := p.sourcePixelScale
+	if !isFinite64(sourceScale) || sourceScale <= 0 {
+		sourceScale = 1
+	}
+	return sourceScale * outputScale * pixFrac
+}
+
+func mappedSourcePixelScale(p plannedInput) float64 {
+	data := p.input.HDU.Data
+	x := float64(data.Width-1) / 2
+	y := float64(data.Height-1) / 2
+	if data.Width < 2 || data.Height < 2 {
+		return 1
+	}
+
+	x0, y0 := p.mapPixel(x, y)
+	x1, y1 := p.mapPixel(x+1, y)
+	x2, y2 := p.mapPixel(x, y+1)
+	dx := math.Hypot(x1-x0, y1-y0)
+	dy := math.Hypot(x2-x0, y2-y0)
+	switch {
+	case isFinite64(dx) && dx > 0 && isFinite64(dy) && dy > 0:
+		return 0.5 * (dx + dy)
+	case isFinite64(dx) && dx > 0:
+		return dx
+	case isFinite64(dy) && dy > 0:
+		return dy
+	default:
+		return 1
+	}
+}
+
+func normalizeSurfaceBrightnessInputs(planned []plannedInput) []plannedInput {
+	out := make([]plannedInput, len(planned))
+	copy(out, planned)
+	for i := range out {
+		if out[i].input.ReferenceOnly {
+			continue
+		}
+		area := out[i].sourcePixelScale * out[i].sourcePixelScale
+		if !isFinite64(area) || area <= 0 {
+			continue
+		}
+		if math.Abs(area-1) < 1e-6 {
+			continue
+		}
+		inPixels := out[i].input.HDU.Data.Pixels
+		pixels := make([]float32, len(inPixels))
+		scale := float32(1.0 / area)
+		for j, v := range inPixels {
+			if isFinite32(v) {
+				pixels[j] = v * scale
+			} else {
+				pixels[j] = v
+			}
+		}
+		out[i].input.HDU.Data.Pixels = pixels
+
+		if len(out[i].input.ERRPixels) > 0 {
+			errPixels := make([]float32, len(out[i].input.ERRPixels))
+			for j, v := range out[i].input.ERRPixels {
+				if isFinite32(v) {
+					errPixels[j] = v * scale
+				} else {
+					errPixels[j] = v
+				}
+			}
+			out[i].input.ERRPixels = errPixels
+		}
+	}
+	return out
 }
 
 func inputExposureTime(input Input) float64 {
@@ -2252,7 +2383,8 @@ func drizzleBuildStatus(skysubApplied, cleaned bool) string {
 }
 
 func LooksLikeFLC(path string) bool {
-	return strings.Contains(strings.ToLower(filepath.Base(path)), "_flc")
+	base := strings.ToLower(filepath.Base(path))
+	return strings.Contains(base, "_flc") || strings.Contains(base, "_flt")
 }
 
 func formatFloat(v float64) string {

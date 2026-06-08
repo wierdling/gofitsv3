@@ -148,16 +148,17 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 		ReferencePath:   "ref_flc.fits",
 		ReferenceSCIExt: 2,
 		DrizzleSettings: DrizzleSettings{
-			FinalScale:      0.04,
-			Scale:           1.5,
-			PixFrac:         0.8,
-			CRMethod:        2,
-			SepKernel:       3,
-			FinalKernel:     4,
-			WeightingMode:   1,
-			UseERRWeighting: true,
-			CRSeedSNR:       4.2,
-			CRDerivScale:    1.6,
+			FinalScale:            0.04,
+			Scale:                 1.5,
+			PixFrac:               0.8,
+			CRMethod:              2,
+			SepKernel:             3,
+			FinalKernel:           4,
+			WeightingMode:         1,
+			UseERRWeighting:       true,
+			SurfaceBrightnessNorm: true,
+			CRSeedSNR:             4.2,
+			CRDerivScale:          1.6,
 		},
 		DrizzleSettingsSet: true,
 		AlignmentSettings: AlignmentSettings{
@@ -210,6 +211,9 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 	}
 	if decoded.ReferencePath != "ref_flc.fits" || decoded.ActiveFilter != "F502N" {
 		t.Fatalf("reference/filter = (%q,%q), want preserved values", decoded.ReferencePath, decoded.ActiveFilter)
+	}
+	if !decoded.DrizzleSettings.SurfaceBrightnessNorm {
+		t.Fatal("SurfaceBrightnessNorm = false, want true")
 	}
 }
 

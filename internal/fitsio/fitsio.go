@@ -111,7 +111,7 @@ func (f *File) GetHDUByExtVer(name, extver string) *HDU {
 		if extver == "" {
 			return h
 		}
-		if v, ok := h.Header.Cards["EXTVER"]; ok && strings.TrimSpace(v) == strings.TrimSpace(extver) {
+		if HeaderString(h.Header, "EXTVER") == strings.TrimSpace(extver) {
 			return h
 		}
 	}
@@ -213,9 +213,7 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 	}
 
 	hdu := HDU{Header: hdr, Data: ImageData{Width: width, Height: height, Pixels: pixels}}
-	if ext, ok := hdr.Cards["EXTNAME"]; ok {
-		hdu.ExtName = strings.Trim(ext, " '=")
-	}
+	hdu.ExtName = HeaderString(hdr, "EXTNAME")
 	return hdu, dataBytes, nil
 }
 

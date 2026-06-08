@@ -495,7 +495,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					filterSelect.SetSelected(options[0])
 
 					content := container.NewVBox(
-						widget.NewLabel("Select the filter to load from the discovered raw _flc inputs:"),
+						widget.NewLabel("Select the filter to load from the discovered calibrated _flc/_flt inputs:"),
 						filterSelect,
 						filesScroll,
 					)

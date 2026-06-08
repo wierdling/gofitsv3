@@ -271,7 +271,7 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 				newInputs = append(newInputs, input)
 				status := mosaic.InputStatus{Path: mosaic.InputKey(input), Included: true, Status: "loaded"}
 				if !mosaic.LooksLikeFLC(path) {
-					status.Status = "loaded (warning: not _flc)"
+					status.Status = "loaded (warning: not _flc/_flt)"
 					warnings++
 				}
 				newStatuses = append(newStatuses, status)
@@ -293,7 +293,7 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 
 		messages := make([]string, 0, len(offsetMessages)+1)
 		if warnings > 0 {
-			messages = append(messages, "Some loaded files are not standard _flc inputs. They were kept, but this workflow is tuned for HST _flc science files.")
+			messages = append(messages, "Some loaded files are not standard _flc/_flt inputs. They were kept, but this workflow is tuned for HST calibrated science files.")
 		}
 		messages = append(messages, offsetMessages...)
 		fyne.DoAndWait(func() {

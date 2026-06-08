@@ -49,7 +49,7 @@ func DiscoverFilters(dir string) (map[string][]string, error) {
 		sort.Strings(groups[filter])
 	}
 	if len(groups) == 0 {
-		return nil, fmt.Errorf("no matching raw _flc.fits files with filter headers found in %s", dir)
+		return nil, fmt.Errorf("no matching calibrated _flc/_flt FITS files with filter headers found in %s", dir)
 	}
 	return groups, nil
 }
