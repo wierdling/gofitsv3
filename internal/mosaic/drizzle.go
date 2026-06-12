@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
@@ -266,6 +265,13 @@ type Options struct {
 	// DebugOutputDir, when not empty, causes the drizzle process to output an individual
 	// FITS file for each input chip, exactly matching the footprint of the final combined mosaic.
 	DebugOutputDir string
+	// FrameLoader, when non-nil, supplies a frame's SCI (and optional ERR) pixels
+	// on demand instead of reading them from disk. Build uses it only for inputs
+	// whose in-memory pixels are nil, so callers can stream large mosaics without
+	// holding every input array at once. When nil, such inputs are reloaded from
+	// their FITS file via LoadInputsFromPath. Inputs that already carry pixels are
+	// used directly regardless of this field.
+	FrameLoader func(in Input) (sci []float32, errPix []float32, err error)
 }
 
 // ErrCancelled is returned by Build (or AlignInputsByStarsWithMode) when its
@@ -419,6 +425,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
 	}
+	logMemStats("before planning")
 
 	// Resolve FinalScale (arcsec/pixel) → internal Scale multiplier.
 	// Use the same WCS anchor that will be used for the output header, so a
@@ -477,20 +484,20 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	if len(dataPlanned) == 0 {
 		return nil, fmt.Errorf("no data-bearing FITS inputs selected")
 	}
-	if options.SurfaceBrightnessNorm {
-		planned = normalizeSurfaceBrightnessInputs(planned)
-	}
+	// Surface-brightness normalization is now applied per frame inside
+	// prepareFramePixels (streamed), so no whole-slice copy is made here.
 
 	if err := options.cancelled(); err != nil {
 		return nil, err
 	}
+	logMemStats("after planning")
 	options.reportProgress("Sky subtraction", 0, 0)
-	debuglog.Log("Build: calling prepareSkysubWorkingPixels")
-	workingPixels, skyApplied, skyValues, err := prepareSkysubWorkingPixels(planned, options.Skysub)
+	debuglog.Log("Build: calling planSkysub")
+	skyOffset, skyApplied, skyValues, err := planSkysub(planned, options)
 	if err != nil {
 		return nil, err
 	}
-	debuglog.Log("Build: prepareSkysubWorkingPixels done")
+	debuglog.Log("Build: planSkysub done")
 	for i := range planned {
 		if planned[i].input.ReferenceOnly || !skyApplied[i] {
 			continue
@@ -508,93 +515,18 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		crMaskIndex[pi] = slot
 	}
 
-	// Build per-frame FrameInfo for any multi-frame CR method.
-	var frameInfos []processing.FrameInfo
-	if effectiveCR != CRMethodNone && len(dataPlanned) > 1 {
-		frameInfos = make([]processing.FrameInfo, len(dataPlanned))
-		for slot, pi := range dataPlanned {
-			refToSource, err := processing.InvertAffineTransform(planned[pi].sourceToRef)
-			if err != nil {
-				refToSource = processing.IdentityTransform()
-			}
-			crPixels := normalizedPixelsForWeighting(planned[pi].input, workingPixels[pi], options.WeightingMode)
-			_, sigma := processing.EstimateBackground(crPixels)
-			frameInfos[slot] = processing.FrameInfo{
-				Pixels:      crPixels,
-				Width:       planned[pi].input.HDU.Data.Width,
-				Height:      planned[pi].input.HDU.Data.Height,
-				SourceToRef: planned[pi].sourceToRef,
-				RefToSource: refToSource,
-				OffsetX:     0,
-				OffsetY:     0,
-				Sigma:       sigma,
-			}
-		}
-	}
-
+	// Cosmic-ray rejection (streamed, temp-file backed): the separate-drizzle
+	// products are written to disk and median-combined band-by-band so we never
+	// hold one output-size image per frame in memory at once.
 	var crMasks []BitMask
-	switch {
-	case effectiveCR == CRMethodDrizzle && len(dataPlanned) > 1:
-		// Separate pass: drizzle each frame individually with SepKernel to build
-		// per-frame images, then median-combine into a clean model. This gives the
-		// model better fidelity than inverse-blot when the sep kernel is non-trivial.
-		debuglog.Log(fmt.Sprintf("Build: starting CR sep-drizzle pass, %d frames", len(dataPlanned)))
-		sepFrames := make([]SepFrame, len(dataPlanned))
-		// Each frame drizzles into its own buffers and is stored at a distinct
-		// slot, so the frames are independent and safe to build concurrently.
-		var sepWG sync.WaitGroup
-		sepSem := make(chan struct{}, runtime.NumCPU())
-		var sepDone int32
-		for slot, pi := range dataPlanned {
-			if err := options.cancelled(); err != nil {
-				break
-			}
-			sepWG.Add(1)
-			sepSem <- struct{}{}
-			go func(slot, pi int) {
-				defer sepWG.Done()
-				defer func() { <-sepSem }()
-				debuglog.Log(fmt.Sprintf("Build: sep frame %d/%d (%s)", slot+1, len(dataPlanned), InputKey(planned[pi].input)))
-				sepFrames[slot] = drizzleSepFrame(planned[pi], workingPixels[pi], width, height, minX, minY, options.Scale, inputDropSize(planned[pi], options.Scale, options.PixFrac), options.SepKernel, options.WeightingMode)
-				n := atomic.AddInt32(&sepDone, 1)
-				options.reportProgress("Cleaning cosmic rays", int(n), len(dataPlanned))
-			}(slot, pi)
-		}
-		sepWG.Wait()
-		if err := options.cancelled(); err != nil {
+	if effectiveCR == CRMethodDrizzle && len(dataPlanned) > 1 {
+		logMemStats("CR start")
+		debuglog.Log(fmt.Sprintf("Build: starting streamed CR drizzle, %d frames", len(dataPlanned)))
+		crMasks, err = buildCRMasksDrizzle(planned, dataPlanned, skyOffset, options, width, height, minX, minY, options.Scale)
+		if err != nil {
 			return nil, err
 		}
-		debuglog.Log("Build: sep-drizzle pass done, building median model")
-		model := buildMedianModel(sepFrames, width, height, len(dataPlanned))
-		debuglog.Log("Build: median model done")
-		sepFrames = nil // allow GC before final drizzle pass
-		// Wire full WCS mappers into each FrameInfo so BuildCRMasksFromModel
-		// blots using the same per-pixel mapping as drizzleSepFrame did.
-		// Without this, the affine SourceToRef approximation can be off by
-		// several pixels when SIP distortion is present, causing stars to be
-		// falsely flagged (blot samples background instead of the star peak).
-		for slot, pi := range dataPlanned {
-			pi := pi // capture for closure
-			frameInfos[slot].MapFunc = func(x, y float64) (float64, float64) {
-				return planned[pi].mapPixel(x, y)
-			}
-		}
-		crSeedSNR := options.CRSeedSNR
-		if crSeedSNR <= 0 {
-			crSeedSNR = 4.0
-		}
-		crDerivScale := options.CRDerivScale
-		if crDerivScale <= 0 {
-			crDerivScale = 1.2
-		}
-		debuglog.Log(fmt.Sprintf("Build: calling BuildCRMasksFromModel, %d frames", len(frameInfos)))
-		boolMasks := processing.BuildCRMasksFromModel(
-			frameInfos, model, width, height, minX, minY, options.Scale,
-			processing.DrizzleStyleCROptions{SeedSNR: crSeedSNR, DerivScale: crDerivScale},
-		)
-		debuglog.Log("Build: BuildCRMasksFromModel done, compressing masks")
-		crMasks = compressCRMasks(boolMasks)
-		boolMasks = nil
+		logMemStats("CR done")
 	}
 
 	// Final drizzle pass: accumulate all frames into the output using FinalKernel.
@@ -622,7 +554,12 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		options.reportProgress("Drizzling", finalSlot, len(dataPlanned))
 		finalSlot++
 		debuglog.Log(fmt.Sprintf("Build: final drizzle frame %d (%s)", finalSlot, InputKey(planned[i].input)))
-		pixels := workingPixels[i]
+		pixels, errPix, perr := prepareFramePixels(planned[i], options, skyOffset[i])
+		if perr != nil {
+			return nil, fmt.Errorf("load frame %s: %w", InputKey(planned[i].input), perr)
+		}
+		// drizzlePlannedInput reads ERR weights from planned[i].input.ERRPixels.
+		planned[i].input.ERRPixels = errPix
 		var crMask BitMask
 		cleaned := false
 
@@ -675,11 +612,20 @@ func Build(inputs []Input, options Options) (*Result, error) {
 				debuglog.Log(fmt.Sprintf("Build: wrote debug image %s", debugPath))
 			}
 		}
+
+		// Release this frame's pixels before loading the next one so peak memory
+		// stays at roughly one input frame plus the output accumulators.
+		pixels = nil
+		planned[i].input.ERRPixels = nil
+		if finalSlot%8 == 0 {
+			logMemStats(fmt.Sprintf("drizzled %d/%d frames", finalSlot, len(dataPlanned)))
+		}
 	}
 
 	options.reportProgress("Finalizing", len(dataPlanned), len(dataPlanned))
 	debuglog.Log("Build: normalizing accumulated image")
 	normalizeAccumulatedImage(sums, weights)
+	logMemStats("finalized")
 	debuglog.Log("Build: normalization done, computing footprints")
 
 	// Compute output-space footprints for preview border drawing.
@@ -1680,18 +1626,16 @@ func effectiveEdgeTrim(size int, outputPixelsPerSourcePixel float64) int {
 	return t
 }
 
-// SepFrame holds a singly drizzled frame and a compact coverage mask used by
-// the drizzle-style CR median model. A bitset keeps the median model from
-// treating uncovered pixels as real samples without retaining a second full
-// weight image per input.
+// SepFrame holds a single drizzled frame in output space, normalized to flux
+// units. Uncovered pixels are marked NaN so the median-model builder can ignore
+// them without a separate coverage map.
 type SepFrame struct {
-	Image   []float32
-	Covered BitMask
+	Image []float32
 }
 
 // drizzleSepFrame drizzles a single planned input into its own output-size
-// accumulator and returns the normalized image plus a compact coverage mask.
-// Used to build per-frame images for the AstroDrizzle-style separate pass.
+// accumulator and returns the normalized image (NaN where uncovered). Used to
+// build per-frame images for the AstroDrizzle-style separate CR pass.
 func drizzleSepFrame(p plannedInput, pixels []float32, outW, outH int, minX, minY, scale, dropSize float64, kernel DrizzleKernel, weightingMode WeightingMode) SepFrame {
 	// Use out as the flux accumulator directly; weights tracks coverage.
 	// This avoids allocating a separate sums array.
@@ -1701,63 +1645,14 @@ func drizzleSepFrame(p plannedInput, pixels []float32, outW, outH int, minX, min
 	trimX, trimY := 0, 0
 	drizzlePlannedInput(p, out, weights, outW, outH, minX, minY, scale, dropSize, kernel, weightingMode, nil, pixels, trimX, trimY)
 
-	covered := NewBitMask(len(out))
 	for i := range out {
 		if abs32(weights[i]) <= weightEpsilon {
 			out[i] = float32(math.NaN())
 			continue
 		}
-		covered.Set(i)
 		out[i] /= weights[i]
 	}
-	return SepFrame{Image: out, Covered: covered}
-}
-
-// buildMedianModel combines n per-frame drizzled images into a single clean
-// model using minmed (n ≤ 3) or a true median (n > 3) at each pixel. The
-// per-frame coverage mask prevents uncovered sep-frame pixels from biasing the
-// model, while avoiding full retained weight maps for every input.
-func buildMedianModel(frames []SepFrame, outW, outH, n int) []float32 {
-	model := make([]float32, outW*outH)
-	vals := make([]float32, 0, n)
-	for i := range model {
-		vals = vals[:0]
-		for _, frame := range frames {
-			if len(frame.Image) <= i || !frame.Covered.Get(i) {
-				continue
-			}
-			v := frame.Image[i]
-			if isFinite32(v) {
-				vals = append(vals, v)
-			}
-		}
-		if len(vals) == 0 {
-			model[i] = float32(math.NaN())
-			continue
-		}
-		// sort in-place using a simple insertion sort (n is small)
-		for j := 1; j < len(vals); j++ {
-			for k := j; k > 0 && vals[k] < vals[k-1]; k-- {
-				vals[k], vals[k-1] = vals[k-1], vals[k]
-			}
-		}
-		median := medianSorted(vals)
-		if n <= 3 {
-			var sum float32
-			for _, v := range vals {
-				sum += v
-			}
-			mean := sum / float32(len(vals))
-			if mean < median {
-				model[i] = mean
-			} else {
-				model[i] = median
-			}
-		} else {
-			model[i] = median
-		}
-	}
-	return model
+	return SepFrame{Image: out}
 }
 
 func medianSorted(vals []float32) float32 {
@@ -1842,47 +1737,6 @@ func mappedSourcePixelScale(p plannedInput) float64 {
 	default:
 		return 1
 	}
-}
-
-func normalizeSurfaceBrightnessInputs(planned []plannedInput) []plannedInput {
-	out := make([]plannedInput, len(planned))
-	copy(out, planned)
-	for i := range out {
-		if out[i].input.ReferenceOnly {
-			continue
-		}
-		area := out[i].sourcePixelScale * out[i].sourcePixelScale
-		if !isFinite64(area) || area <= 0 {
-			continue
-		}
-		if math.Abs(area-1) < 1e-6 {
-			continue
-		}
-		inPixels := out[i].input.HDU.Data.Pixels
-		pixels := make([]float32, len(inPixels))
-		scale := float32(1.0 / area)
-		for j, v := range inPixels {
-			if isFinite32(v) {
-				pixels[j] = v * scale
-			} else {
-				pixels[j] = v
-			}
-		}
-		out[i].input.HDU.Data.Pixels = pixels
-
-		if len(out[i].input.ERRPixels) > 0 {
-			errPixels := make([]float32, len(out[i].input.ERRPixels))
-			for j, v := range out[i].input.ERRPixels {
-				if isFinite32(v) {
-					errPixels[j] = v * scale
-				} else {
-					errPixels[j] = v
-				}
-			}
-			out[i].input.ERRPixels = errPixels
-		}
-	}
-	return out
 }
 
 func inputExposureTime(input Input) float64 {

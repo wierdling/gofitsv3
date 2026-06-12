@@ -17,8 +17,8 @@ func TestFromHeaderRecognizesWFPC2FLT(t *testing.T) {
 	if info.Chips != 4 {
 		t.Fatalf("Chips = %d, want 4", info.Chips)
 	}
-	if info.ChipInnerTrim != 35 {
-		t.Fatalf("ChipInnerTrim = %d, want 35 to reject noisy WFPC2 chip borders", info.ChipInnerTrim)
+	if info.ChipInnerTrim != 0 {
+		t.Fatalf("ChipInnerTrim = %d, want 0", info.ChipInnerTrim)
 	}
 	if info.BadDQBits != 0 {
 		t.Fatalf("BadDQBits = %d, want 0 to treat any non-zero WFPC2 DQ as bad", info.BadDQBits)

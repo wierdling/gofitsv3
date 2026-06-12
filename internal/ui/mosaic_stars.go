@@ -46,6 +46,12 @@ func (ws *mosaicWorkspace) enterStarMode() {
 	if ws.state.result != nil {
 		refResult = ws.state.result
 	} else {
+		// No drizzle result yet: the reference preview comes from input[0]'s
+		// pixels, which may have been freed by a prior build. Reload on demand.
+		if err := ws.ensureInputPixelsLoaded(); err != nil {
+			dialog.ShowError(err, ws.win)
+			return
+		}
 		ref := ws.state.inputs[0]
 		refResult = &mosaic.Result{
 			Pixels: ref.HDU.Data.Pixels,

@@ -292,6 +292,13 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			if state.alignmentSettings.DebugAlignment {
 				defer installAlignmentDebugHook(win)()
 			}
+			if err := ws.ensureInputPixelsLoaded(); err != nil {
+				fyne.Do(func() {
+					progressDialog.Hide()
+					dialog.ShowError(err, win)
+				})
+				return
+			}
 			alignInputs := ws.inputsWithRef()
 			numRefs := state.alignmentSettings.NumRefs
 			if numRefs < 1 {
@@ -472,6 +479,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						checked bool
 					}
 					var fileChecks []fileCheck
+					var checkBoxes []*widget.Check
 					checkContainer := container.NewVBox()
 					filesScroll := container.NewVScroll(checkContainer)
 					filesScroll.SetMinSize(fyne.NewSize(420, 220))
@@ -479,6 +487,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					updateSelectedFiles := func(option string) {
 						paths := mosaic.PathsForFilterOption(groups, option)
 						fileChecks = make([]fileCheck, len(paths))
+						checkBoxes = make([]*widget.Check, len(paths))
 						checkContainer.Objects = nil
 						for i, path := range paths {
 							i, path := i, path
@@ -487,16 +496,30 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 								fileChecks[i].checked = v
 							})
 							chk.SetChecked(true)
+							checkBoxes[i] = chk
 							checkContainer.Add(chk)
 						}
 						checkContainer.Refresh()
 					}
 					filterSelect.OnChanged = updateSelectedFiles
 					filterSelect.SetSelected(options[0])
+					setAllFilesChecked := func(checked bool) {
+						for i, chk := range checkBoxes {
+							if chk == nil {
+								continue
+							}
+							fileChecks[i].checked = checked
+							chk.SetChecked(checked)
+						}
+					}
 
 					content := container.NewVBox(
 						widget.NewLabel("Select the filter to load from the discovered calibrated _flc/_flt inputs:"),
 						filterSelect,
+						container.NewGridWithColumns(2,
+							widget.NewButton("Check All", func() { setAllFilesChecked(true) }),
+							widget.NewButton("Uncheck All", func() { setAllFilesChecked(false) }),
+						),
 						filesScroll,
 					)
 					confirm := dialog.NewCustomConfirm("Load Filter Batch", "Load Files", "Cancel", content, func(ok bool) {
@@ -552,6 +575,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			pt := newProgressTracker("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", win)
 			if state.alignmentSettings.DebugAlignment {
 				defer installAlignmentDebugHook(win)()
+			}
+			if err := ws.ensureInputPixelsLoaded(); err != nil {
+				pt.hide()
+				fyne.Do(func() { dialog.ShowError(err, win) })
+				return
 			}
 			alignInputs := ws.inputsWithRef()
 			numRefs := state.alignmentSettings.NumRefs

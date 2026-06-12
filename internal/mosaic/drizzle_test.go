@@ -232,7 +232,7 @@ func TestLooksLikeFLC(t *testing.T) {
 	}
 }
 
-func TestEffectiveEdgeTrimForWFPC2UsesInstrumentBorderTrim(t *testing.T) {
+func TestEffectiveEdgeTrimForWFPC2UsesGenericTrimWhenInstrumentTrimIsSmaller(t *testing.T) {
 	p := plannedInput{input: Input{
 		PrimaryHeader: fitsio.Header{Cards: map[string]string{
 			"INSTRUME": "'WFPC2'",
@@ -240,8 +240,8 @@ func TestEffectiveEdgeTrimForWFPC2UsesInstrumentBorderTrim(t *testing.T) {
 		}},
 		HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 800, Height: 800}},
 	}}
-	if got := effectiveEdgeTrimForInput(p, 800, 1); got != 35 {
-		t.Fatalf("effectiveEdgeTrimForInput(WFPC2) = %d, want 35", got)
+	if got := effectiveEdgeTrimForInput(p, 800, 1); got != edgeTrim {
+		t.Fatalf("effectiveEdgeTrimForInput(WFPC2) = %d, want %d", got, edgeTrim)
 	}
 
 	p.input.PrimaryHeader = fitsio.Header{Cards: map[string]string{
@@ -263,18 +263,21 @@ func TestNormalizeSurfaceBrightnessInputsScalesSCIAndERRByMappedArea(t *testing.
 			},
 		},
 	}
-	normalized := normalizeSurfaceBrightnessInputs(planned)
-	if got := normalized[0].input.HDU.Data.Pixels[0]; got != 2 {
+	sci, errPix, err := prepareFramePixels(planned[0], Options{SurfaceBrightnessNorm: true}, 0)
+	if err != nil {
+		t.Fatalf("prepareFramePixels returned error: %v", err)
+	}
+	if got := sci[0]; got != 2 {
 		t.Fatalf("normalized SCI pixel = %v, want 2", got)
 	}
-	if !math.IsNaN(float64(normalized[0].input.HDU.Data.Pixels[1])) {
-		t.Fatalf("normalized SCI NaN changed to %v", normalized[0].input.HDU.Data.Pixels[1])
+	if !math.IsNaN(float64(sci[1])) {
+		t.Fatalf("normalized SCI NaN changed to %v", sci[1])
 	}
-	if got := normalized[0].input.ERRPixels[0]; got != 1 {
+	if got := errPix[0]; got != 1 {
 		t.Fatalf("normalized ERR pixel = %v, want 1", got)
 	}
 	if planned[0].input.HDU.Data.Pixels[0] != 8 || planned[0].input.ERRPixels[0] != 4 {
-		t.Fatal("normalizeSurfaceBrightnessInputs mutated original input")
+		t.Fatal("prepareFramePixels mutated original input")
 	}
 }
 
@@ -518,14 +521,14 @@ func TestBuildSkysubLocalMinSubtractsPerInput(t *testing.T) {
 	}
 }
 
-func TestPrepareSkysubWorkingPixelsLeavesReferenceOnlyUntouched(t *testing.T) {
+func TestPlanSkysubLeavesReferenceOnlyUntouched(t *testing.T) {
 	planned := []plannedInput{
 		{input: Input{ReferenceOnly: true, HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: filledPixels(2, 2, 20)}}}},
 		{input: Input{Path: "data_flc.fits", HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: filledPixels(2, 2, 10)}}}},
 	}
-	working, applied, skyValues, err := prepareSkysubWorkingPixels(planned, SkysubOptions{Enabled: true, Method: SkyMethodLocalMin, Stat: SkyStatMedian, Width: 0.1, Clip: 5, LSigma: 4, USigma: 4})
+	skyOffset, applied, skyValues, err := planSkysub(planned, Options{Skysub: SkysubOptions{Enabled: true, Method: SkyMethodLocalMin, Stat: SkyStatMedian, Width: 0.1, Clip: 5, LSigma: 4, USigma: 4}})
 	if err != nil {
-		t.Fatalf("prepareSkysubWorkingPixels returned error: %v", err)
+		t.Fatalf("planSkysub returned error: %v", err)
 	}
 	if applied[0] {
 		t.Fatal("reference-only input should not be sky-subtracted")
@@ -533,10 +536,15 @@ func TestPrepareSkysubWorkingPixelsLeavesReferenceOnlyUntouched(t *testing.T) {
 	if !applied[1] {
 		t.Fatal("data input should be sky-subtracted")
 	}
-	if &working[0][0] != &planned[0].input.HDU.Data.Pixels[0] {
-		t.Fatal("reference-only pixels should reuse original slice")
+	if skyOffset[0] != 0 {
+		t.Fatalf("reference-only sky offset = %v, want 0", skyOffset[0])
 	}
-	if skyValues[0] == skyValues[0] {
+	if !math.IsNaN(skyValues[0]) {
 		t.Fatal("reference-only sky value should remain NaN")
+	}
+	// The data frame's pixels must not have been mutated in place (sky is applied
+	// later, per frame, in prepareFramePixels).
+	if planned[1].input.HDU.Data.Pixels[0] != 10 {
+		t.Fatalf("planSkysub mutated source pixels: %v", planned[1].input.HDU.Data.Pixels[0])
 	}
 }

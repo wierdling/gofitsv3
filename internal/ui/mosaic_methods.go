@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"math"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,76 @@ import (
 	"gofitsv3/internal/mosaic"
 	"gofitsv3/internal/processing"
 )
+
+// freeInputPixels releases the full-resolution SCI and ERR pixel arrays held by
+// every loaded input (and the reference baseline), keeping only lightweight
+// metadata (header, dimensions, transforms). This is called after a drizzle
+// build so the workspace does not pin one array per input in memory; the arrays
+// are reloaded on demand via ensureInputPixelsLoaded when alignment or the star
+// picker needs them.
+func (ws *mosaicWorkspace) freeInputPixels() {
+	for i := range ws.state.inputs {
+		ws.state.inputs[i].HDU.Data.Pixels = nil
+		ws.state.inputs[i].ERRPixels = nil
+	}
+	if ws.state.referenceInput != nil {
+		ws.state.referenceInput.HDU.Data.Pixels = nil
+		ws.state.referenceInput.ERRPixels = nil
+	}
+}
+
+// ensureInputPixelsLoaded reloads pixel data for any input whose arrays were
+// previously freed (e.g. after a drizzle build). Files are read once per path
+// even when they contribute multiple SCI chips. Offsets, transforms, and
+// exclusion flags on the in-memory inputs are preserved; only the pixel arrays
+// are restored.
+func (ws *mosaicWorkspace) ensureInputPixelsLoaded() error {
+	cache := map[string][]mosaic.Input{}
+	load := func(path string) ([]mosaic.Input, error) {
+		if v, ok := cache[path]; ok {
+			return v, nil
+		}
+		v, err := mosaic.LoadInputsFromPath(path)
+		if err != nil {
+			return nil, err
+		}
+		cache[path] = v
+		return v, nil
+	}
+	restore := func(dst *mosaic.Input) error {
+		if dst.HDU.Data.Pixels != nil {
+			return nil
+		}
+		loaded, err := load(dst.Path)
+		if err != nil {
+			return fmt.Errorf("reload %s: %w", dst.Path, err)
+		}
+		for i := range loaded {
+			if loaded[i].SCIExt == dst.SCIExt {
+				dst.HDU.Data.Pixels = loaded[i].HDU.Data.Pixels
+				dst.ERRPixels = loaded[i].ERRPixels
+				return nil
+			}
+		}
+		if len(loaded) == 1 {
+			dst.HDU.Data.Pixels = loaded[0].HDU.Data.Pixels
+			dst.ERRPixels = loaded[0].ERRPixels
+			return nil
+		}
+		return fmt.Errorf("reload %s: no SCI ext %d", dst.Path, dst.SCIExt)
+	}
+	for i := range ws.state.inputs {
+		if err := restore(&ws.state.inputs[i]); err != nil {
+			return err
+		}
+	}
+	if ws.state.referenceInput != nil {
+		if err := restore(ws.state.referenceInput); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // inputsWithRef returns ws.state.inputs prepended with the reference baseline
 // (if set). The reference is marked ReferenceOnly so Build() uses it only for

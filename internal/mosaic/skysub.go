@@ -82,36 +82,41 @@ func normalizeSkysubOptions(options SkysubOptions) SkysubOptions {
 	return options
 }
 
-func prepareSkysubWorkingPixels(planned []plannedInput, options SkysubOptions) ([][]float32, []bool, []float64, error) {
-	working := make([][]float32, len(planned))
-	applied := make([]bool, len(planned))
-	skyValues := make([]float64, len(planned))
+// planSkysub computes the per-frame sky offset to subtract without retaining any
+// full-size pixel arrays. It streams each contributing frame from the loader,
+// estimates its sky (and, for the matched methods, builds a small downsampled
+// overlap sample map), then releases the pixels. The returned skyOffset[i] is
+// applied per frame at drizzle time via prepareFramePixels; only scalars (and
+// the tiny overlap maps) are held during planning.
+func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, applied []bool, skyValues []float64, err error) {
+	n := len(planned)
+	skyOffset = make([]float64, n)
+	applied = make([]bool, n)
+	skyValues = make([]float64, n)
 	for i := range skyValues {
 		skyValues[i] = math.NaN()
 	}
-
-	for i := range planned {
-		pixels := planned[i].input.HDU.Data.Pixels
-		if planned[i].input.ReferenceOnly || !options.Enabled {
-			working[i] = pixels
-			continue
-		}
-		dup := make([]float32, len(pixels))
-		copy(dup, pixels)
-		working[i] = dup
-	}
-	if !options.Enabled {
-		return working, applied, skyValues, nil
+	if !opts.Skysub.Enabled {
+		return skyOffset, applied, skyValues, nil
 	}
 
-	options = normalizeSkysubOptions(options)
-	rawSky := make([]float64, len(planned))
-	// Sky estimation is independent per input (each reads working[i] and writes
-	// a distinct rawSky[i]), so run them concurrently across CPUs.
+	options := normalizeSkysubOptions(opts.Skysub)
+	rawSky := make([]float64, n)
+	needMaps := options.Method == SkyMethodMatch || options.Method == SkyMethodGlobalMinMatch
+	var maps []map[int64]float64
+	if needMaps {
+		maps = make([]map[int64]float64, n)
+	}
+
+	// Stream per frame with bounded concurrency: each worker loads one frame,
+	// estimates its sky (+ overlap map), then drops the pixels. This keeps at
+	// most NumCPU frames resident rather than all of them.
 	var skyErr error
 	var skyErrMu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, runtime.NumCPU())
+	// Each worker holds a full loaded frame plus its sky sample buffer, so cap
+	// concurrency to keep peak memory bounded (the loads are I/O-bound anyway).
+	sem := make(chan struct{}, skyConcurrency())
 	for i := range planned {
 		if planned[i].input.ReferenceOnly {
 			continue
@@ -121,16 +126,28 @@ func prepareSkysubWorkingPixels(planned []plannedInput, options SkysubOptions) (
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			sky, err := estimateSkyValue(working[i], options)
-			if err != nil {
+			pixels, _, perr := prepareFramePixels(planned[i], opts, 0)
+			if perr != nil {
 				skyErrMu.Lock()
 				if skyErr == nil {
-					skyErr = fmt.Errorf("estimate sky for %s: %w", InputKey(planned[i].input), err)
+					skyErr = fmt.Errorf("load frame for sky estimate %s: %w", InputKey(planned[i].input), perr)
+				}
+				skyErrMu.Unlock()
+				return
+			}
+			sky, serr := estimateSkyValue(pixels, options)
+			if serr != nil {
+				skyErrMu.Lock()
+				if skyErr == nil {
+					skyErr = fmt.Errorf("estimate sky for %s: %w", InputKey(planned[i].input), serr)
 				}
 				skyErrMu.Unlock()
 				return
 			}
 			rawSky[i] = sky
+			if needMaps {
+				maps[i] = buildOverlapSampleMap(planned[i], pixels, options)
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -138,7 +155,7 @@ func prepareSkysubWorkingPixels(planned []plannedInput, options SkysubOptions) (
 		return nil, nil, nil, skyErr
 	}
 
-	subtractSky := make([]float64, len(planned))
+	subtractSky := make([]float64, n)
 	switch options.Method {
 	case SkyMethodGlobalMin:
 		globalMin := math.Inf(1)
@@ -156,7 +173,7 @@ func prepareSkysubWorkingPixels(planned []plannedInput, options SkysubOptions) (
 			}
 		}
 	case SkyMethodMatch, SkyMethodGlobalMinMatch:
-		rel := computeMatchedSkyOffsets(planned, working, options)
+		rel := computeMatchedSkyOffsets(planned, maps, options)
 		if options.Method == SkyMethodMatch {
 			copy(subtractSky, rel)
 		} else {
@@ -208,11 +225,25 @@ func prepareSkysubWorkingPixels(planned []plannedInput, options SkysubOptions) (
 		if planned[i].input.ReferenceOnly {
 			continue
 		}
-		applySkySubInPlace(working[i], subtractSky[i])
+		skyOffset[i] = subtractSky[i]
 		applied[i] = true
 		skyValues[i] = subtractSky[i]
 	}
-	return working, applied, skyValues, nil
+	return skyOffset, applied, skyValues, nil
+}
+
+// skyConcurrency bounds how many frames are sky-estimated at once. Each worker
+// holds one loaded frame plus a sky sample buffer, so this is capped well below
+// NumCPU on many-core machines to keep peak memory in check.
+func skyConcurrency() int {
+	workers := runtime.NumCPU()
+	if workers > 4 {
+		workers = 4
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	return workers
 }
 
 func applySkySubInPlace(pixels []float32, sky float64) {
@@ -228,9 +259,25 @@ func applySkySubInPlace(pixels []float32, sky float64) {
 	}
 }
 
+// skyMaxSamples caps how many pixels estimateSkyValue collects from a single
+// frame. Beyond this it samples a strided subset: the clipped background
+// statistic is unchanged within noise, but the float64 working buffer stays
+// bounded instead of growing to 8 bytes per input pixel (≥130 MB for a full ACS
+// chip). Frames at or below this size are sampled in full, so small/medium
+// inputs and tests are unaffected.
+const skyMaxSamples = 2_000_000
+
 func estimateSkyValue(pixels []float32, options SkysubOptions) (float64, error) {
-	values := make([]float64, 0, len(pixels))
-	for _, px := range pixels {
+	stride := 1
+	if len(pixels) > skyMaxSamples {
+		stride = len(pixels) / skyMaxSamples
+		if stride < 1 {
+			stride = 1
+		}
+	}
+	values := make([]float64, 0, len(pixels)/stride+1)
+	for i := 0; i < len(pixels); i += stride {
+		px := pixels[i]
 		if !isFinite32(px) {
 			continue
 		}
@@ -250,7 +297,9 @@ func estimateSkyFromValues(values []float64, options SkysubOptions) (float64, er
 	if len(values) == 0 {
 		return 0, fmt.Errorf("no usable pixels for sky estimate")
 	}
-	work := append([]float64(nil), values...)
+	// Sigma-clip in place. Every caller passes a freshly built, disposable
+	// slice, so duplicating it (tens of MB for a full frame) is wasteful.
+	work := values
 	for iter := 0; iter < options.Clip; iter++ {
 		if len(work) == 0 {
 			break
@@ -357,16 +406,13 @@ func medianFloat64(values []float64) float64 {
 	return 0.5 * (values[mid-1] + values[mid])
 }
 
-func computeMatchedSkyOffsets(planned []plannedInput, working [][]float32, options SkysubOptions) []float64 {
+// computeMatchedSkyOffsets solves for the relative sky offset between
+// overlapping frames given each frame's precomputed (downsampled) overlap sample
+// map. The maps are built once by planSkysub so no full-size pixel arrays are
+// retained here.
+func computeMatchedSkyOffsets(planned []plannedInput, maps []map[int64]float64, options SkysubOptions) []float64 {
 	offsets := make([]float64, len(planned))
 	edges := make([]skyEdge, 0)
-	maps := make([]map[int64]float64, len(planned))
-	for i := range planned {
-		if planned[i].input.ReferenceOnly {
-			continue
-		}
-		maps[i] = buildOverlapSampleMap(planned[i], working[i], options)
-	}
 	for i := 0; i < len(planned); i++ {
 		if planned[i].input.ReferenceOnly || len(maps[i]) == 0 {
 			continue

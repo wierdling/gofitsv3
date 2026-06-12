@@ -90,7 +90,16 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 	if weightingMode == mosaic.WeightUniform && s.UseERRWeighting {
 		weightingMode = mosaic.WeightERR
 	}
-	result, err := mosaic.Build(ws.inputsWithRef(), mosaic.Options{
+
+	// Drop the full-resolution input arrays before drizzling. Build streams each
+	// frame's pixels back from disk one at a time, so peak memory stays near
+	// "one input + output" instead of holding all inputs at once. inputsWithRef
+	// is captured after freeing, so it carries metadata only (nil pixels), which
+	// triggers Build's on-demand disk loader.
+	ws.freeInputPixels()
+	buildInputs := ws.inputsWithRef()
+
+	result, err := mosaic.Build(buildInputs, mosaic.Options{
 		Scale:                 s.Scale,
 		FinalScale:            s.FinalScale,
 		PixFrac:               s.PixFrac,
