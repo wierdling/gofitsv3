@@ -463,7 +463,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			progressDialog.Show()
 
 			go func() {
-				groups, scanErr := mosaic.DiscoverFilters(dir)
+				filesByFilter, scanErr := mosaic.DiscoverFilterFiles(dir)
 				fyne.Do(func() {
 					progressDialog.Hide()
 					if scanErr != nil {
@@ -471,8 +471,49 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						return
 					}
 
-					options := mosaic.FilterOptions(groups)
-					filterSelect := NewSafeSelect(options, nil)
+					// Independent, order-independent facets: each constrains the
+					// same flattened file list; none cascades into another.
+					files := mosaic.AllFilterFiles(filesByFilter)
+					filterSelect := NewSafeSelect(mosaic.FilterFacetOptions(files), nil)
+					proposalSelect := NewSafeSelect(mosaic.ProposalFacetOptions(files), nil)
+					exposureSelect := NewSafeSelect(mosaic.ExposureFacetOptions(files), nil)
+
+					// Date range is bounded by the actual observation dates, as a
+					// min/max pair of selects (omitted when no DATE-OBS is present).
+					dates := mosaic.DateValues(files)
+					var dateMinSelect, dateMaxSelect *SafeSelect
+					if len(dates) > 0 {
+						dateMinSelect = NewSafeSelect(append([]string(nil), dates...), nil)
+						dateMaxSelect = NewSafeSelect(append([]string(nil), dates...), nil)
+					}
+
+					// typeRadio selects which calibrated product to load (_flc vs _flt).
+					var typeRadio *widget.RadioGroup
+					productType := func() string {
+						if typeRadio == nil {
+							return ""
+						}
+						return strings.TrimPrefix(typeRadio.Selected, ".")
+					}
+					criteria := func() mosaic.FileCriteria {
+						c := mosaic.FileCriteria{
+							Filter:      mosaic.FacetValue(filterSelect.Selected),
+							ProposalID:  mosaic.FacetValue(proposalSelect.Selected),
+							Exposure:    mosaic.FacetValue(exposureSelect.Selected),
+							ProductType: productType(),
+						}
+						if dateMinSelect != nil {
+							c.DateMin = dateMinSelect.Selected
+							c.DateMax = dateMaxSelect.Selected
+						}
+						return c
+					}
+
+					// Observation date per path, shown alongside the file name.
+					dateByPath := make(map[string]string, len(files))
+					for _, f := range files {
+						dateByPath[f.Path] = f.DateObs
+					}
 
 					type fileCheck struct {
 						path    string
@@ -484,15 +525,19 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					filesScroll := container.NewVScroll(checkContainer)
 					filesScroll.SetMinSize(fyne.NewSize(420, 220))
 
-					updateSelectedFiles := func(option string) {
-						paths := mosaic.PathsForFilterOption(groups, option)
+					updateSelectedFiles := func() {
+						paths := mosaic.MatchFiles(files, criteria())
 						fileChecks = make([]fileCheck, len(paths))
 						checkBoxes = make([]*widget.Check, len(paths))
 						checkContainer.Objects = nil
 						for i, path := range paths {
 							i, path := i, path
 							fileChecks[i] = fileCheck{path: path, checked: true}
-							chk := widget.NewCheck(filepath.Base(path), func(v bool) {
+							label := filepath.Base(path)
+							if date := dateByPath[path]; date != "" {
+								label += "  —  " + date
+							}
+							chk := widget.NewCheck(label, func(v bool) {
 								fileChecks[i].checked = v
 							})
 							chk.SetChecked(true)
@@ -501,8 +546,44 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						}
 						checkContainer.Refresh()
 					}
-					filterSelect.OnChanged = updateSelectedFiles
-					filterSelect.SetSelected(options[0])
+
+					filterSelect.OnChanged = func(string) { updateSelectedFiles() }
+					proposalSelect.OnChanged = func(string) { updateSelectedFiles() }
+					exposureSelect.OnChanged = func(string) { updateSelectedFiles() }
+					if dateMinSelect != nil {
+						dateMinSelect.OnChanged = func(string) { updateSelectedFiles() }
+						dateMaxSelect.OnChanged = func(string) { updateSelectedFiles() }
+					}
+
+					hasFLC, hasFLT := mosaic.AvailableProductTypes(filesByFilter)
+					typeRadio = widget.NewRadioGroup([]string{".flc", ".flt"}, nil)
+					typeRadio.Horizontal = true
+					if hasFLC {
+						typeRadio.SetSelected(".flc")
+					} else {
+						typeRadio.SetSelected(".flt")
+					}
+					// Only one product type present: lock the choice to it.
+					if !(hasFLC && hasFLT) {
+						typeRadio.Disable()
+					}
+					typeRadio.OnChanged = func(string) { updateSelectedFiles() }
+
+					// Default to a concrete filter (preserving the prior
+					// single-filter workflow) and the full available date range.
+					if len(filterSelect.Options) > 1 {
+						filterSelect.SetSelected(filterSelect.Options[1])
+					} else {
+						filterSelect.SetSelected(filterSelect.Options[0])
+					}
+					proposalSelect.SetSelected(proposalSelect.Options[0])
+					exposureSelect.SetSelected(exposureSelect.Options[0])
+					if dateMinSelect != nil {
+						dateMinSelect.SetSelected(dates[0])
+						dateMaxSelect.SetSelected(dates[len(dates)-1])
+					}
+					updateSelectedFiles()
+
 					setAllFilesChecked := func(checked bool) {
 						for i, chk := range checkBoxes {
 							if chk == nil {
@@ -513,9 +594,22 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						}
 					}
 
+					formItems := []*widget.FormItem{
+						widget.NewFormItem("Image Type", typeRadio),
+						widget.NewFormItem("Filter", filterSelect),
+						widget.NewFormItem("Proposal ID", proposalSelect),
+						widget.NewFormItem("Exposure Time", exposureSelect),
+					}
+					if dateMinSelect != nil {
+						formItems = append(formItems,
+							widget.NewFormItem("Date From", dateMinSelect),
+							widget.NewFormItem("Date To", dateMaxSelect),
+						)
+					}
+
 					content := container.NewVBox(
-						widget.NewLabel("Select the filter to load from the discovered calibrated _flc/_flt inputs:"),
-						filterSelect,
+						widget.NewLabel("Filter the discovered calibrated _flc/_flt inputs (each facet is optional):"),
+						widget.NewForm(formItems...),
 						container.NewGridWithColumns(2,
 							widget.NewButton("Check All", func() { setAllFilesChecked(true) }),
 							widget.NewButton("Uncheck All", func() { setAllFilesChecked(false) }),
@@ -526,13 +620,12 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						if !ok {
 							return
 						}
-						selected := filterSelect.Selected
-						// Extract bare filter name (strip " (N files)" suffix).
-						if idx := strings.LastIndex(selected, " ("); idx >= 0 {
-							selected = selected[:idx]
+						// "Any" filter loads a mixed-filter batch; activeFilter is
+						// left empty so per-filter prefs/save names are skipped.
+						ws.activeFilter = mosaic.FacetValue(filterSelect.Selected)
+						if ws.activeFilter != "" {
+							ws.loadLevelPrefsAndMode(ws.activeFilter)
 						}
-						ws.activeFilter = selected
-						ws.loadLevelPrefsAndMode(ws.activeFilter)
 						var paths []string
 						for _, fc := range fileChecks {
 							if fc.checked {
@@ -544,7 +637,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						}
 						ws.loadPaths(paths, "Loading Filter Batch")
 					}, win)
-					confirm.Resize(fyne.NewSize(540, 420))
+					confirm.Resize(fyne.NewSize(540, 480))
 					confirm.Show()
 				})
 			}()

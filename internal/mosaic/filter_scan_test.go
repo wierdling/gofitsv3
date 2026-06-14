@@ -61,6 +61,103 @@ func TestDiscoverFiltersGroupsWFPC2FLTFiles(t *testing.T) {
 	}
 }
 
+func TestDiscoverFilterFilesTracksProposalIDs(t *testing.T) {
+	dir := t.TempDir()
+	writeMinimalFITSWithProposal(t, filepath.Join(dir, "rawa_flc.fits"), "F606W", "9978")
+	writeMinimalFITSWithProposal(t, filepath.Join(dir, "rawb_flc.fits"), "F606W", "9978")
+	writeMinimalFITSWithProposal(t, filepath.Join(dir, "rawc_flc.fits"), "F606W", "12060")
+	writeMinimalFITSWithProposal(t, filepath.Join(dir, "rawd_flc.fits"), "F814W", "12060")
+
+	filesByFilter, err := DiscoverFilterFiles(dir)
+	if err != nil {
+		t.Fatalf("DiscoverFilterFiles returned error: %v", err)
+	}
+
+	files := AllFilterFiles(filesByFilter)
+
+	filterOptions := FilterFacetOptions(files)
+	wantFilters := []string{"Any (4 files)", "F606W (3 files)", "F814W (1 files)"}
+	if !reflect.DeepEqual(filterOptions, wantFilters) {
+		t.Fatalf("FilterFacetOptions = %v, want %v", filterOptions, wantFilters)
+	}
+
+	// Proposal facet spans all files independently of the filter selection.
+	proposalOptions := ProposalFacetOptions(files)
+	wantProposals := []string{"Any (4 files)", "12060 (2 files)", "9978 (2 files)"}
+	if !reflect.DeepEqual(proposalOptions, wantProposals) {
+		t.Fatalf("ProposalFacetOptions = %v, want %v", proposalOptions, wantProposals)
+	}
+
+	paths := MatchFiles(files, FileCriteria{Filter: "F606W", ProposalID: "9978"})
+	got := []string{filepath.Base(paths[0]), filepath.Base(paths[1])}
+	want := []string{"rawa_flc.fits", "rawb_flc.fits"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("MatchFiles(F606W,9978) = %v, want %v", got, want)
+	}
+}
+
+func TestDiscoverFilterFilesTracksExposureTimes(t *testing.T) {
+	dir := t.TempDir()
+	writeMinimalFITSFull(t, filepath.Join(dir, "rawa_flc.fits"), "F606W", "9978", "1230.0")
+	writeMinimalFITSFull(t, filepath.Join(dir, "rawb_flc.fits"), "F606W", "9978", "500.0")
+	writeMinimalFITSFull(t, filepath.Join(dir, "rawc_flc.fits"), "F606W", "12060", "1230.0")
+
+	filesByFilter, err := DiscoverFilterFiles(dir)
+	if err != nil {
+		t.Fatalf("DiscoverFilterFiles returned error: %v", err)
+	}
+
+	files := AllFilterFiles(filesByFilter)
+
+	// Exposure facet across all files, sorted ascending.
+	expAll := ExposureFacetOptions(files)
+	wantAll := []string{"Any (3 files)", "500s (1 files)", "1230s (2 files)"}
+	if !reflect.DeepEqual(expAll, wantAll) {
+		t.Fatalf("ExposureFacetOptions = %v, want %v", expAll, wantAll)
+	}
+
+	// Filter + a specific exposure (independent facets).
+	paths := MatchFiles(files, FileCriteria{Filter: "F606W", Exposure: "1230s"})
+	got := []string{filepath.Base(paths[0]), filepath.Base(paths[1])}
+	want := []string{"rawa_flc.fits", "rawc_flc.fits"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("MatchFiles(F606W,1230s) = %v, want %v", got, want)
+	}
+
+	// Proposal + exposure combined.
+	paths = MatchFiles(files, FileCriteria{ProposalID: "9978", Exposure: "1230s"})
+	if len(paths) != 1 || filepath.Base(paths[0]) != "rawa_flc.fits" {
+		t.Fatalf("MatchFiles(9978,1230s) = %v, want [rawa_flc.fits]", paths)
+	}
+}
+
+func TestDiscoverFilterFilesTracksObservationDates(t *testing.T) {
+	dir := t.TempDir()
+	writeMinimalFITSDated(t, filepath.Join(dir, "rawa_flc.fits"), "F606W", "2009-07-25T14:03:11")
+	writeMinimalFITSDated(t, filepath.Join(dir, "rawb_flc.fits"), "F606W", "2009-07-26")
+	writeMinimalFITSDated(t, filepath.Join(dir, "rawc_flc.fits"), "F606W", "2010-01-02")
+
+	filesByFilter, err := DiscoverFilterFiles(dir)
+	if err != nil {
+		t.Fatalf("DiscoverFilterFiles returned error: %v", err)
+	}
+	files := AllFilterFiles(filesByFilter)
+
+	dates := DateValues(files)
+	wantDates := []string{"2009-07-25", "2009-07-26", "2010-01-02"}
+	if !reflect.DeepEqual(dates, wantDates) {
+		t.Fatalf("DateValues = %v, want %v", dates, wantDates)
+	}
+
+	// Inclusive range bounded to the two July nights.
+	paths := MatchFiles(files, FileCriteria{DateMin: "2009-07-25", DateMax: "2009-07-26"})
+	got := []string{filepath.Base(paths[0]), filepath.Base(paths[1])}
+	want := []string{"rawa_flc.fits", "rawb_flc.fits"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("MatchFiles(date range) = %v, want %v", got, want)
+	}
+}
+
 func TestDiscoverFiltersGroupsRealWFPC2FLTFiles(t *testing.T) {
 	dir := filepath.Join("..", "..", "TestImages", "WFPC2")
 	if _, err := os.Stat(dir); err != nil {
@@ -88,6 +185,55 @@ func writeMinimalFITS(t *testing.T, path string, filter string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("writeMinimalFITS: %v", err)
+	}
+}
+
+func writeMinimalFITSWithProposal(t *testing.T, path string, filter string, proposalID string) {
+	t.Helper()
+	content := makeHeaderCard("SIMPLE", "=                    T") +
+		makeHeaderCard("BITPIX", "=                    8") +
+		makeHeaderCard("NAXIS", "=                    0") +
+		makeHeaderCard("FILTER", "= '"+padFilter(filter)+"'") +
+		makeHeaderCard("PROPOSID", "= "+proposalID) +
+		makeHeaderCard("END", "")
+	for len(content)%2880 != 0 {
+		content += strings.Repeat(" ", 2880-(len(content)%2880))
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("writeMinimalFITSWithProposal: %v", err)
+	}
+}
+
+func writeMinimalFITSFull(t *testing.T, path, filter, proposalID, exptime string) {
+	t.Helper()
+	content := makeHeaderCard("SIMPLE", "=                    T") +
+		makeHeaderCard("BITPIX", "=                    8") +
+		makeHeaderCard("NAXIS", "=                    0") +
+		makeHeaderCard("FILTER", "= '"+padFilter(filter)+"'") +
+		makeHeaderCard("PROPOSID", "= "+proposalID) +
+		makeHeaderCard("EXPTIME", "= "+exptime) +
+		makeHeaderCard("END", "")
+	for len(content)%2880 != 0 {
+		content += strings.Repeat(" ", 2880-(len(content)%2880))
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("writeMinimalFITSFull: %v", err)
+	}
+}
+
+func writeMinimalFITSDated(t *testing.T, path, filter, dateObs string) {
+	t.Helper()
+	content := makeHeaderCard("SIMPLE", "=                    T") +
+		makeHeaderCard("BITPIX", "=                    8") +
+		makeHeaderCard("NAXIS", "=                    0") +
+		makeHeaderCard("FILTER", "= '"+padFilter(filter)+"'") +
+		makeHeaderCard("DATE-OBS", "= '"+dateObs+"'") +
+		makeHeaderCard("END", "")
+	for len(content)%2880 != 0 {
+		content += strings.Repeat(" ", 2880-(len(content)%2880))
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("writeMinimalFITSDated: %v", err)
 	}
 }
 
