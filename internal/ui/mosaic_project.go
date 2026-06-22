@@ -177,6 +177,7 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 				ws.resetPreview()
 				ws.rebuildOffsetControls()
 				ws.updateStatus()
+				ws.updateActionButtons()
 			})
 		}()
 	}, ws.win)

@@ -232,7 +232,9 @@ func TestLooksLikeFLC(t *testing.T) {
 	}
 }
 
-func TestEffectiveEdgeTrimForWFPC2UsesGenericTrimWhenInstrumentTrimIsSmaller(t *testing.T) {
+func TestEffectiveEdgeTrimForInputIsDisabled(t *testing.T) {
+	// Edge trimming is disabled: no input loses border data during drizzle,
+	// regardless of detector or scale.
 	p := plannedInput{input: Input{
 		PrimaryHeader: fitsio.Header{Cards: map[string]string{
 			"INSTRUME": "'WFPC2'",
@@ -240,16 +242,16 @@ func TestEffectiveEdgeTrimForWFPC2UsesGenericTrimWhenInstrumentTrimIsSmaller(t *
 		}},
 		HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 800, Height: 800}},
 	}}
-	if got := effectiveEdgeTrimForInput(p, 800, 1); got != edgeTrim {
-		t.Fatalf("effectiveEdgeTrimForInput(WFPC2) = %d, want %d", got, edgeTrim)
+	if got := effectiveEdgeTrimForInput(p, 800, 1); got != 0 {
+		t.Fatalf("effectiveEdgeTrimForInput(WFPC2) = %d, want 0", got)
 	}
 
 	p.input.PrimaryHeader = fitsio.Header{Cards: map[string]string{
 		"INSTRUME": "'WFC3'",
 		"DETECTOR": "'UVIS'",
 	}}
-	if got := effectiveEdgeTrimForInput(p, 800, 1); got != edgeTrim {
-		t.Fatalf("effectiveEdgeTrimForInput(WFC3/UVIS) = %d, want %d", got, edgeTrim)
+	if got := effectiveEdgeTrimForInput(p, 800, 2); got != 0 {
+		t.Fatalf("effectiveEdgeTrimForInput(WFC3/UVIS) = %d, want 0", got)
 	}
 }
 
@@ -304,6 +306,58 @@ func headerWithCRPIX(crpix1, crpix2 float64) fitsio.Header {
 		"CD2_1":  "0",
 		"CD2_2":  "1",
 	}}
+}
+
+func TestPropagateSameExposureAlignment(t *testing.T) {
+	inputs := []Input{
+		{Path: "a_flc.fits", SCIExt: 1},
+		{Path: "a_flc.fits", SCIExt: 2}, // same exposure, unaligned sibling
+		{Path: "b_flc.fits", SCIExt: 1},
+	}
+	results := make([]StarAlignmentResult, 3)
+	results[0] = StarAlignmentResult{OffsetX: 5, OffsetY: -3, ManualTransform: processing.IdentityTransform(), HasManualTransform: true, Applied: true}
+	results[2] = StarAlignmentResult{OffsetX: 99, OffsetY: 99, Applied: true}
+	aligned := []bool{true, false, true}
+
+	filled := propagateSameExposureAlignment(inputs, results, aligned)
+	if filled != 1 {
+		t.Fatalf("filled = %d, want 1", filled)
+	}
+	if !aligned[1] {
+		t.Fatal("sci,2 sibling should be marked aligned after propagation")
+	}
+	if results[1].OffsetX != 5 || results[1].OffsetY != -3 || !results[1].Applied || !results[1].HasManualTransform {
+		t.Fatalf("sci,2 did not inherit sibling alignment: %+v", results[1])
+	}
+	// Must not pull from a different exposure.
+	if results[1].OffsetX == 99 {
+		t.Fatal("sci,2 incorrectly inherited from a different file")
+	}
+}
+
+func TestFramesMayOverlap(t *testing.T) {
+	hdr := func(crval1 string) fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "5", "CRPIX2": "5",
+			"CRVAL1": crval1, "CRVAL2": "22",
+			"CD1_1": "1", "CD1_2": "0", "CD2_1": "0", "CD2_2": "1",
+		}}
+	}
+	a := makeInput("a.fits", 10, 10, nil, hdr("100"))
+	b := makeInput("b.fits", 10, 10, nil, hdr("100")) // same pointing → overlaps
+	c := makeInput("c.fits", 10, 10, nil, hdr("160")) // 60° away → cannot overlap
+
+	if !framesMayOverlap(a, b) {
+		t.Fatal("co-pointed frames should be reported as possibly overlapping")
+	}
+	if framesMayOverlap(a, c) {
+		t.Fatal("frames 60° apart should be reported as non-overlapping")
+	}
+	// Missing WCS must be treated as "may overlap" (never skip when unsure).
+	noWCS := makeInput("d.fits", 10, 10, nil, fitsio.Header{Cards: map[string]string{}})
+	if !framesMayOverlap(a, noWCS) {
+		t.Fatal("frames with unparseable WCS must not be skipped")
+	}
 }
 
 func filledPixels(width, height int, value float32) []float32 {

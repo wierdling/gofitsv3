@@ -15,13 +15,8 @@ import (
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
-	"gofitsv3/internal/instrument"
 	"gofitsv3/internal/processing"
 )
-
-// edgeTrim is the number of pixels to exclude from each edge of every input
-// image before drizzling, to avoid border artifacts.
-const edgeTrim = 20
 
 // weightEpsilon is used when normalizing signed-kernel accumulators such as Lanczos.
 // Very small denominators are treated as uncovered to avoid edge blow-ups.
@@ -33,6 +28,7 @@ type Input struct {
 	PrimaryHeader      fitsio.Header
 	HDU                fitsio.HDU
 	ExposureTime       float64
+	DateObs            string
 	OffsetX            float64
 	OffsetY            float64
 	ManualTransform    processing.AffineTransform
@@ -56,6 +52,19 @@ type Input struct {
 	// alignment and coordinate-system setup but its pixels are not drizzled into
 	// the output. Use this to align a new filter to a previously drizzled baseline.
 	ReferenceOnly bool
+	// BUnit is the BUNIT header value (e.g. "ELECTRONS", "ELECTRONS/S"), used to
+	// decide automatically whether the pixels are total counts that must be
+	// divided by exposure time. Empty when the header has no BUNIT.
+	BUnit string
+	// NormalizeExposure, when true, causes prepareFramePixels to convert this
+	// frame's SCI (and ERR) pixels to a rate (per-second) by multiplying by
+	// ExposureScale before any drizzle weighting. This is independent of
+	// Options.WeightingMode. Off by default to preserve existing behavior.
+	NormalizeExposure bool
+	// ExposureScale is the per-frame normalization factor (1/EXPTIME) applied when
+	// NormalizeExposure is set. Zero or non-finite disables normalization for the
+	// frame even when NormalizeExposure is true.
+	ExposureScale float64
 }
 
 func InputKey(input Input) string {
@@ -817,6 +826,62 @@ func sortedByDistFromRef(inputs []Input) []int {
 	return out
 }
 
+// propagateSameExposureAlignment gives any still-unaligned chip the alignment
+// solution of an aligned sibling chip from the same exposure (same file Path,
+// different SCIExt). The chips of one exposure are rigid on the focal plane and
+// share a single pointing residual, but adjacent chips barely overlap each other
+// so they cannot be star-matched directly — without this, a chip that doesn't
+// overlap the reference is either left unrefined or, worse, pushed by a false
+// cross-chip match. It returns the number of chips filled in.
+func propagateSameExposureAlignment(inputs []Input, results []StarAlignmentResult, aligned []bool) int {
+	filled := 0
+	for i := range inputs {
+		if aligned[i] || inputs[i].Excluded {
+			continue
+		}
+		for j := range inputs {
+			if j == i || !aligned[j] || inputs[j].Excluded {
+				continue
+			}
+			if inputs[j].Path != inputs[i].Path {
+				continue
+			}
+			results[i] = StarAlignmentResult{
+				OffsetX:            results[j].OffsetX,
+				OffsetY:            results[j].OffsetY,
+				ManualTransform:    results[j].ManualTransform,
+				HasManualTransform: results[j].HasManualTransform,
+				Applied:            true,
+				MatchedStars:       results[j].MatchedStars,
+				RMS:                results[j].RMS,
+				MaxError:           results[j].MaxError,
+			}
+			aligned[i] = true
+			filled++
+			break
+		}
+	}
+	return filled
+}
+
+// framesMayOverlap reports whether two inputs' footprints could share any
+// pixels, using a cheap WCS center-distance test (bounding-circle criterion, no
+// image warp). It is deliberately conservative — it never rules out a genuine
+// overlap, only skips pairs clearly too far apart — so it is safe to gate the
+// expensive warp+star-match chain fallback on it.
+func framesMayOverlap(a, b Input) bool {
+	dist, err := processing.CenterDistInRefPixels(
+		a.HDU.Header, a.HDU.Data.Width, a.HDU.Data.Height,
+		b.HDU.Header, b.HDU.Data.Width, b.HDU.Data.Height,
+	)
+	if err != nil {
+		return true // can't determine geometry → don't skip
+	}
+	diagA := math.Hypot(float64(a.HDU.Data.Width), float64(a.HDU.Data.Height))
+	diagB := math.Hypot(float64(b.HDU.Data.Width), float64(b.HDU.Data.Height))
+	return dist <= (diagA+diagB)/2
+}
+
 func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode, searchRadiusArcsec float64, progress ...AlignProgress) ([]StarAlignmentResult, error) {
 	debuglog.Log("AlignInputsByStarsWithMode: starting")
 	defer debuglog.Log("AlignInputsByStarsWithMode: finished")
@@ -937,6 +1002,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	type alignOneResult struct {
 		i          int
 		refinement processing.AffineTransform
+		stats      processing.AlignStats
 		errMsg     string
 		ok         bool
 	}
@@ -949,6 +1015,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			}
 			var (
 				refinement processing.AffineTransform
+				stats      processing.AlignStats
 				err        error
 			)
 			switch mode {
@@ -961,7 +1028,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 					err = fmt.Errorf("WCSMapper: %v", mapErr)
 					break
 				}
-				refinement, err = processing.EstimateTweakRegAlignmentWithRefStars(
+				refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
 					inputs[i].HDU.Data.Pixels,
 					inputs[i].HDU.Data.Width,
 					inputs[i].HDU.Data.Height,
@@ -995,13 +1062,36 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				refinement = processing.ComposeAffineTransforms(rc.wRto0,
 					processing.ComposeAffineTransforms(refinement, rc.w0toR))
 			}
-			return alignOneResult{i: i, refinement: refinement, ok: true}
+			return alignOneResult{i: i, refinement: refinement, stats: stats, ok: true}
 		}
 		return alignOneResult{i: i, errMsg: lastErr[i]}
 	}
 
+	// triedChain records (intermediate, image) pairs already attempted in the
+	// chain fallback so a genuinely-unalignable image is not re-matched against
+	// every aligned intermediate — the O(aligned × unaligned) blow-up that made
+	// auto-alignment hang on large, partially-overlapping mosaics.
+	triedChain := make(map[[2]int]bool)
+
+	// starCatalog caches each input's extracted star catalog so the chain
+	// fallback matches against pre-extracted catalogs (cheap, no image warp and
+	// no repeated extraction) instead of re-warping + re-extracting per pair.
+	starCatalog := make(map[int][]processing.Star)
+	getStars := func(idx int) []processing.Star {
+		if s, ok := starCatalog[idx]; ok {
+			return s
+		}
+		s := processing.ExtractAndLimitStars(
+			inputs[idx].HDU.Data.Pixels, inputs[idx].HDU.Data.Width, inputs[idx].HDU.Data.Height, 4.0, 3, 200)
+		starCatalog[idx] = s
+		return s
+	}
+
 	primaryPassDone := false
 	for len(queue) > 0 {
+		if prog.cancelled() {
+			return nil, ErrCancelled
+		}
 		refIdx := queue[0]
 		queue = queue[1:]
 
@@ -1057,6 +1147,9 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 						ManualTransform:    r.refinement,
 						HasManualTransform: true,
 						Applied:            true,
+						MatchedStars:       r.stats.MatchedStars,
+						RMS:                r.stats.RMS,
+						MaxError:           r.stats.MaxError,
 					}
 					aligned[r.i] = true
 					queue = append(queue, r.i)
@@ -1071,10 +1164,33 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				if aligned[i] || inputs[i].Excluded {
 					continue
 				}
-				dx, dy, err := processing.EstimateTranslationAfterWCS(
-					inputs[i].HDU.Data.Pixels, inputs[i].HDU.Data.Width, inputs[i].HDU.Data.Height, inputs[i].HDU.Header,
-					inputs[refIdx].HDU.Data.Pixels, inputs[refIdx].HDU.Data.Width, inputs[refIdx].HDU.Data.Height, inputs[refIdx].HDU.Header,
-					0, 0,
+				if prog.cancelled() {
+					return nil, ErrCancelled
+				}
+				// Skip pairs already attempted, and pairs whose WCS footprints
+				// cannot overlap (cheap center-distance test, no image warp). For
+				// a mosaic most intermediate/image pairs are far apart, so this
+				// avoids the expensive warp+star-match on pairs that can never align.
+				if triedChain[[2]int{refIdx, i}] {
+					continue
+				}
+				triedChain[[2]int{refIdx, i}] = true
+				// Chips of the same exposure (same file, different SCIExt) are rigid
+				// and barely overlap each other; never star-match them across chips —
+				// propagateSameExposureAlignment gives the sibling its solution later.
+				if inputs[i].Path == inputs[refIdx].Path {
+					continue
+				}
+				if !framesMayOverlap(inputs[i], inputs[refIdx]) {
+					continue
+				}
+				// Catalog-based residual translation against the already-aligned
+				// intermediate: projects cached star catalogs through the WCS, no
+				// full-image warp or re-extraction (which previously made this
+				// path hang on large mosaics).
+				dx, dy, _, err := processing.EstimateTranslationFromCatalogs(
+					getStars(i), inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
+					getStars(refIdx), inputs[refIdx].HDU.Header, inputs[refIdx].D2IX, inputs[refIdx].D2IY,
 				)
 				if err != nil {
 					lastErr[i] = err.Error()
@@ -1096,6 +1212,13 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				queue = append(queue, i)
 			}
 		}
+	}
+
+	// Chips of a multi-chip exposure are rigid and share one residual; let an
+	// unaligned chip inherit an aligned sibling's solution rather than be left
+	// unrefined (or, before the chain-fallback gate, mis-shoved by a false match).
+	if filled := propagateSameExposureAlignment(inputs, results, aligned); filled > 0 {
+		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: propagated alignment to %d same-exposure sibling chip(s)", filled))
 	}
 
 	for i := 1; i < len(inputs); i++ {
@@ -1237,6 +1360,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 
 			var (
 				refinement processing.AffineTransform
+				stats      processing.AlignStats
 				err        error
 			)
 			switch mode {
@@ -1249,7 +1373,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 					err = fmt.Errorf("WCSMapper: %v", mapErr)
 					break
 				}
-				refinement, err = processing.EstimateTweakRegAlignmentWithRefStars(
+				refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
 					inputs[i].HDU.Data.Pixels,
 					inputs[i].HDU.Data.Width,
 					inputs[i].HDU.Data.Height,
@@ -1308,6 +1432,9 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 				ManualTransform:    manualT,
 				HasManualTransform: true,
 				Applied:            true,
+				MatchedStars:       stats.MatchedStars,
+				RMS:                stats.RMS,
+				MaxError:           stats.MaxError,
 			}
 			aligned = true
 		}
@@ -1590,40 +1717,12 @@ func imageCorners(width, height int) [4][2]float64 {
 	return [4][2]float64{{0, 0}, {maxX, 0}, {0, maxY}, {maxX, maxY}}
 }
 
+// effectiveEdgeTrimForInput reports how many pixels to exclude from each edge of
+// an input before drizzling. Edge trimming is disabled: every input contributes
+// all of its data, so this always returns 0. Kept as the single chokepoint so a
+// trim can be reinstated here without touching the drizzle loops or footprints.
 func effectiveEdgeTrimForInput(p plannedInput, size int, scale float64) int {
-	sourceScale := p.sourcePixelScale
-	if !isFinite64(sourceScale) || sourceScale <= 0 {
-		sourceScale = 1
-	}
-	t := effectiveEdgeTrim(size, scale*sourceScale)
-	if inst, ok := instrument.FromHeader(p.input.PrimaryHeader); ok && inst.Chips > 1 && inst.ChipInnerTrim > t {
-		t = inst.ChipInnerTrim
-	}
-	if max := size / 10; t > max {
-		t = max
-	}
-	if size <= t*2 {
-		return 0
-	}
-	return t
-}
-
-// effectiveEdgeTrim returns the number of input pixels to exclude from each
-// edge so the trim covers edgeTrim output pixels at the supplied output-pixels
-// per source-pixel scale. It is capped by callers when detector-specific trims
-// are folded in.
-func effectiveEdgeTrim(size int, outputPixelsPerSourcePixel float64) int {
-	if outputPixelsPerSourcePixel <= 0 {
-		outputPixelsPerSourcePixel = 1
-	}
-	t := int(math.Ceil(float64(edgeTrim) / outputPixelsPerSourcePixel))
-	if max := size / 10; t > max {
-		t = max
-	}
-	if size <= t*2 {
-		return 0
-	}
-	return t
+	return 0
 }
 
 // SepFrame holds a single drizzled frame in output space, normalized to flux
@@ -1746,7 +1845,21 @@ func inputExposureTime(input Input) float64 {
 	return 0
 }
 
+// frameExposureNormalized reports whether prepareFramePixels already converted
+// this frame's SCI (and ERR) pixels to a per-second rate. When true, the drizzle
+// weighting must NOT divide by EXPTIME a second time, otherwise exposure
+// normalization combined with Exposure/ERR weighting double-divides and (for ERR)
+// skews the inter-frame weighting. Mirrors the gate prepareFramePixels applies.
+func frameExposureNormalized(input Input) bool {
+	return input.NormalizeExposure && !input.ReferenceOnly &&
+		isFinite64(input.ExposureScale) && input.ExposureScale > 0
+}
+
 func normalizedPixelsForWeighting(input Input, pixels []float32, weightingMode WeightingMode) []float32 {
+	if frameExposureNormalized(input) {
+		// Pixels are already a rate; no further per-exptime scaling.
+		return pixels
+	}
 	switch weightingMode {
 	case WeightExposure, WeightERR:
 		if exptime := inputExposureTime(input); exptime > 0 {
@@ -1775,7 +1888,9 @@ func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) fl
 	case WeightERR:
 		if errPix := p.input.ERRPixels; errPix != nil && idx < len(errPix) {
 			if e := errPix[idx]; e > 0 && isFinite32(e) {
-				if exptime > 0 {
+				// When the frame is already exposure-normalized, ERR is in rate
+				// units too, so use it directly. Otherwise convert to a rate sigma.
+				if !frameExposureNormalized(p.input) && exptime > 0 {
 					rateErr := e / float32(exptime)
 					if rateErr > 0 && isFinite32(rateErr) {
 						return 1.0 / (rateErr * rateErr)
@@ -1789,6 +1904,11 @@ func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) fl
 }
 
 func drizzlePixelValue(p plannedInput, idx int, value float32, weightingMode WeightingMode) float32 {
+	if frameExposureNormalized(p.input) {
+		// Pixels were already converted to a rate by prepareFramePixels; do not
+		// divide by EXPTIME again.
+		return value
+	}
 	switch weightingMode {
 	case WeightExposure, WeightERR:
 		if exptime := inputExposureTime(p.input); exptime > 0 {

@@ -18,10 +18,23 @@ type triangle struct {
 	RatioY     float64 // b/c
 }
 
+// triangleMatchHardCap bounds the number of stars the triangle matcher will
+// consider. Its cost grows as roughly C(n,3)² (triangles compared pairwise), so
+// large n is catastrophic: n=100 is ~2.6e10 comparisons (tens of seconds) per
+// call, which made auto-alignment appear to hang. The brightest ~40 stars carry
+// more than enough geometric information to anchor a match, so this is both a
+// performance guard and a robustness improvement (fewer faint-star false votes).
+const triangleMatchHardCap = 40
+
 // MatchStars uses a triangle-matching voting algorithm to pair stars.
-// tolerance is usually between 0.005 and 0.01.
+// tolerance is usually between 0.005 and 0.01. maxStars caps how many of the
+// (brightest-first) stars are used; it is additionally clamped to
+// triangleMatchHardCap to keep the cost bounded.
 func MatchStars(refStars, targetStars []Star, maxStars int, tolerance float64) []MatchedPair {
-	// 1. Limit to the brightest stars to prevent combinatorial explosion
+	// 1. Limit to the brightest stars to prevent combinatorial explosion.
+	if maxStars <= 0 || maxStars > triangleMatchHardCap {
+		maxStars = triangleMatchHardCap
+	}
 	if len(refStars) > maxStars {
 		refStars = refStars[:maxStars]
 	}
@@ -54,29 +67,53 @@ func MatchStars(refStars, targetStars []Star, maxStars int, tolerance float64) [
 		}
 	}
 
-	// 5. Extract the winning pairs
-	var pairs []MatchedPair
+	// 5. Extract the winning pairs using mutual best-match.
+	//
+	// For each ref star pick its highest-voted target, and for each target pick
+	// its highest-voted ref. Keep a pair only when both agree (ref→target and
+	// target→ref point at each other). This enforces a one-to-one matching and
+	// rejects the common false-match failure where several unrelated ref stars
+	// all vote for one target (or a target accumulates a couple of coincidental
+	// votes), which previously slipped through and could seed a confident but
+	// completely wrong transform.
+	bestTargetForRef := make([]int, len(refStars))
+	bestTargetVotes := make([]int, len(refStars))
+	for r := range bestTargetForRef {
+		bestTargetForRef[r] = -1
+	}
+	bestRefForTarget := make([]int, len(targetStars))
+	bestRefVotes := make([]int, len(targetStars))
+	for t := range bestRefForTarget {
+		bestRefForTarget[t] = -1
+	}
 	for rIdx, targetVotes := range votes {
-		bestTargetIdx := -1
-		maxVotes := 0
-
 		for tIdx, v := range targetVotes {
-			if v > maxVotes {
-				maxVotes = v
-				bestTargetIdx = tIdx
+			if v > bestTargetVotes[rIdx] {
+				bestTargetVotes[rIdx] = v
+				bestTargetForRef[rIdx] = tIdx
+			}
+			if v > bestRefVotes[tIdx] {
+				bestRefVotes[tIdx] = v
+				bestRefForTarget[tIdx] = rIdx
 			}
 		}
+	}
 
-		// Require at least 2 votes to prevent random coincidence
-		if maxVotes > 1 && bestTargetIdx != -1 {
-			pairs = append(pairs, MatchedPair{
-				RefX:    refStars[rIdx].X,
-				RefY:    refStars[rIdx].Y,
-				TargetX: targetStars[bestTargetIdx].X,
-				TargetY: targetStars[bestTargetIdx].Y,
-				Votes:   maxVotes,
-			})
+	var pairs []MatchedPair
+	for rIdx := range refStars {
+		tIdx := bestTargetForRef[rIdx]
+		// Require mutual agreement and at least 2 votes (guards against random
+		// triangle-ratio coincidences).
+		if tIdx < 0 || bestTargetVotes[rIdx] < 2 || bestRefForTarget[tIdx] != rIdx {
+			continue
 		}
+		pairs = append(pairs, MatchedPair{
+			RefX:    refStars[rIdx].X,
+			RefY:    refStars[rIdx].Y,
+			TargetX: targetStars[tIdx].X,
+			TargetY: targetStars[tIdx].Y,
+			Votes:   bestTargetVotes[rIdx],
+		})
 	}
 
 	return pairs

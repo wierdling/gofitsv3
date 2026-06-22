@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/widget"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
 	"gofitsv3/internal/processing"
@@ -158,6 +159,52 @@ func (ws *mosaicWorkspace) updateOffsetButtons() {
 	}
 }
 
+func (ws *mosaicWorkspace) updateActionButtons() {
+	hasInputs := len(ws.state.inputs) > 0
+	hasRef := ws.state.referenceInput != nil
+
+	if ws.batchBtn != nil {
+		if hasInputs {
+			ws.batchBtn.Importance = widget.MediumImportance
+		} else {
+			ws.batchBtn.Importance = widget.HighImportance
+		}
+		ws.batchBtn.Refresh()
+	}
+	if ws.buildBtn != nil {
+		if hasInputs {
+			ws.buildBtn.Importance = widget.HighImportance
+		} else {
+			ws.buildBtn.Importance = widget.MediumImportance
+		}
+		ws.buildBtn.Refresh()
+	}
+	if ws.clearBtn != nil {
+		if hasInputs {
+			ws.clearBtn.Enable()
+		} else {
+			ws.clearBtn.Disable()
+		}
+		ws.clearBtn.Refresh()
+	}
+	if ws.setRefBtn != nil {
+		if hasRef {
+			ws.setRefBtn.Importance = widget.MediumImportance
+		} else {
+			ws.setRefBtn.Importance = widget.HighImportance
+		}
+		ws.setRefBtn.Refresh()
+	}
+	if ws.clearRefBtn != nil {
+		if hasRef {
+			ws.clearRefBtn.Enable()
+		} else {
+			ws.clearRefBtn.Disable()
+		}
+		ws.clearRefBtn.Refresh()
+	}
+}
+
 func (ws *mosaicWorkspace) updateStatus() {
 	ws.syncStatusOffsets()
 	ws.statusLabel.SetText(strings.Join(mosaic.FormatStatusLines(ws.state.statuses), "\n"))
@@ -272,5 +319,12 @@ func (ws *mosaicWorkspace) openSkysubSettings() {
 	showSkysubSettingsDialog(ws.win, ws.state.skysubSettings, func(s models.SkysubSettings) {
 		ws.state.skysubSettings = s
 		ws.state.skysubSettingsSet = true
+	})
+}
+
+func (ws *mosaicWorkspace) openExposureReview() {
+	showExposureReviewDialog(ws.win, ws.state.inputs, ws.state.exposureNormMode, func(mode mosaic.NormalizationMode) {
+		ws.state.exposureNormMode = mode
+		ws.updateStatus()
 	})
 }

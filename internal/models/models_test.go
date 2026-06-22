@@ -24,6 +24,9 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 				Peak:       8.8,
 				ScaledPeak: 7.7,
 				ShowClip:   true,
+				OffsetX:    -12.5,
+				OffsetY:    33.25,
+				OffsetRot:  -1.5,
 			},
 		},
 		OrangeLayer: OrangeLayerState{
@@ -112,6 +115,9 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 	}
 	if decoded.Channels[0].Path != "blue.fits" || !decoded.Channels[0].ShowClip {
 		t.Fatalf("Channels[0] = %+v, want preserved compose channel state", decoded.Channels[0])
+	}
+	if decoded.Channels[0].OffsetX != -12.5 || decoded.Channels[0].OffsetY != 33.25 || decoded.Channels[0].OffsetRot != -1.5 {
+		t.Fatalf("Channels[0] offsets = (%v,%v,%v), want (-12.5,33.25,-1.5)", decoded.Channels[0].OffsetX, decoded.Channels[0].OffsetY, decoded.Channels[0].OffsetRot)
 	}
 	if !decoded.SharedHistogramScale || !decoded.MeasureComposite {
 		t.Fatalf("compose UI settings = shared:%v measure:%v, want both true", decoded.SharedHistogramScale, decoded.MeasureComposite)

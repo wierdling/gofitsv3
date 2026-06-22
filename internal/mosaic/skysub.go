@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+
+	"gofitsv3/internal/debuglog"
 )
 
 // SkyMethod selects the AstroDrizzle-style algorithm used to determine the
@@ -44,8 +46,9 @@ type SkysubOptions struct {
 }
 
 type skyEdge struct {
-	i, j  int
-	delta float64
+	i, j   int
+	delta  float64
+	weight float64
 }
 
 type sampleAccum struct {
@@ -173,9 +176,22 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, appl
 			}
 		}
 	case SkyMethodMatch, SkyMethodGlobalMinMatch:
-		rel := computeMatchedSkyOffsets(planned, maps, options)
+		rel, matched := computeMatchedSkyOffsets(planned, maps, options)
 		if options.Method == SkyMethodMatch {
-			copy(subtractSky, rel)
+			for i := range planned {
+				if planned[i].input.ReferenceOnly {
+					continue
+				}
+				if matched[i] {
+					subtractSky[i] = rel[i]
+				} else {
+					// If a chip/frame could not be connected to the match graph,
+					// fall back to its own measured sky instead of leaving it
+					// unsubtracted. This is especially important for ACS/WFC
+					// chip-to-chip pedestal differences.
+					subtractSky[i] = rawSky[i]
+				}
+			}
 		} else {
 			globalMin := math.Inf(1)
 			for i := range planned {
@@ -186,20 +202,28 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, appl
 					globalMin = rawSky[i]
 				}
 			}
+
 			minRel := math.Inf(1)
 			for i := range planned {
-				if planned[i].input.ReferenceOnly {
+				if planned[i].input.ReferenceOnly || !matched[i] {
 					continue
 				}
 				if rel[i] < minRel {
 					minRel = rel[i]
 				}
 			}
+
 			for i := range planned {
 				if planned[i].input.ReferenceOnly {
 					continue
 				}
-				subtractSky[i] = globalMin + (rel[i] - minRel)
+				if matched[i] && isFiniteSky64(minRel) && isFiniteSky64(globalMin) {
+					subtractSky[i] = globalMin + (rel[i] - minRel)
+				} else {
+					// A disconnected chip/frame should not inherit the global minimum.
+					// Use its own measured sky so per-chip pedestals still get removed.
+					subtractSky[i] = rawSky[i]
+				}
 			}
 		}
 	default:
@@ -208,7 +232,7 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, appl
 			if planned[i].input.ReferenceOnly {
 				continue
 			}
-			key := planned[i].input.Path
+			key := InputKey(planned[i].input)
 			if minVal, ok := groupMin[key]; !ok || rawSky[i] < minVal {
 				groupMin[key] = rawSky[i]
 			}
@@ -217,9 +241,11 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, appl
 			if planned[i].input.ReferenceOnly {
 				continue
 			}
-			subtractSky[i] = groupMin[planned[i].input.Path]
+			subtractSky[i] = groupMin[InputKey(planned[i].input)]
 		}
 	}
+
+	logSkysubPlan(planned, rawSky, subtractSky, maps)
 
 	for i := range planned {
 		if planned[i].input.ReferenceOnly {
@@ -256,6 +282,35 @@ func applySkySubInPlace(pixels []float32, sky float64) {
 			continue
 		}
 		pixels[i] = v - delta
+	}
+}
+
+func isFiniteSky64(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+// skyDebugLog can be temporarily enabled while diagnosing per-chip sky matching.
+const skyDebugLog = true
+
+func logSkysubPlan(planned []plannedInput, rawSky, subtractSky []float64, maps []map[int64]float64) {
+	if !skyDebugLog {
+		return
+	}
+	for i := range planned {
+		if planned[i].input.ReferenceOnly {
+			continue
+		}
+		mapCells := 0
+		if i < len(maps) {
+			mapCells = len(maps[i])
+		}
+		debuglog.Log(fmt.Sprintf(
+			"SKYSUB input=%s rawSky=%.6f subtractSky=%.6f mapCells=%d",
+			InputKey(planned[i].input),
+			rawSky[i],
+			subtractSky[i],
+			mapCells,
+		))
 	}
 }
 
@@ -409,9 +464,13 @@ func medianFloat64(values []float64) float64 {
 // computeMatchedSkyOffsets solves for the relative sky offset between
 // overlapping frames given each frame's precomputed (downsampled) overlap sample
 // map. The maps are built once by planSkysub so no full-size pixel arrays are
-// retained here.
-func computeMatchedSkyOffsets(planned []plannedInput, maps []map[int64]float64, options SkysubOptions) []float64 {
+// retained here. It returns matched[i]=true only for frames/chips that are
+// connected to at least one usable overlap edge. Callers should fall back to
+// rawSky[i] for unmatched inputs rather than treating their relative offset as
+// a valid zero.
+func computeMatchedSkyOffsets(planned []plannedInput, maps []map[int64]float64, options SkysubOptions) ([]float64, []bool) {
 	offsets := make([]float64, len(planned))
+	matched := make([]bool, len(planned))
 	edges := make([]skyEdge, 0)
 	for i := 0; i < len(planned); i++ {
 		if planned[i].input.ReferenceOnly || len(maps[i]) == 0 {
@@ -421,24 +480,34 @@ func computeMatchedSkyOffsets(planned []plannedInput, maps []map[int64]float64, 
 			if planned[j].input.ReferenceOnly || len(maps[j]) == 0 {
 				continue
 			}
-			var diffs []float64
-			if len(maps[i]) > len(maps[j]) {
-				diffs = overlapDiffs(maps[j], maps[i], true)
-			} else {
-				diffs = overlapDiffs(maps[i], maps[j], false)
-			}
-			if len(diffs) == 0 {
+			diffs := overlapDiffsForEdge(maps[i], maps[j])
+			if len(diffs) < skyMinOverlapCells {
 				continue
 			}
 			delta, err := estimateSkyFromValues(diffs, options)
 			if err != nil {
 				continue
 			}
-			edges = append(edges, skyEdge{i: i, j: j, delta: delta})
+			// Weight each edge by its overlap support so well-measured interior
+			// edges dominate the solve and edge chips, which typically connect
+			// through one or two small overlaps, inherit a consistent level
+			// through the chain instead of being pinned by a single noisy edge.
+			// sqrt keeps one huge overlap from completely swamping several
+			// medium ones.
+			edges = append(edges, skyEdge{i: i, j: j, delta: delta, weight: math.Sqrt(float64(len(diffs)))})
+			if skyDebugLog {
+				debuglog.Log(fmt.Sprintf(
+					"SKYSUB EDGE i=%s j=%s cells=%d delta=%.6f",
+					InputKey(planned[i].input),
+					InputKey(planned[j].input),
+					len(diffs),
+					delta,
+				))
+			}
 		}
 	}
 	if len(edges) == 0 {
-		return offsets
+		return offsets, matched
 	}
 	components := connectedSkyComponents(len(planned), edges)
 	for _, component := range components {
@@ -458,35 +527,61 @@ func computeMatchedSkyOffsets(planned []plannedInput, maps []map[int64]float64, 
 			}
 		}
 		compOffsets := solveSkyComponent(component, compEdges)
+		for _, idx := range component {
+			matched[idx] = true
+		}
 		for idx, val := range compOffsets {
 			offsets[idx] = val
 		}
 	}
-	return offsets
+	return offsets, matched
 }
 
-func overlapDiffs(primary, secondary map[int64]float64, invert bool) []float64 {
-	diffs := make([]float64, 0, minInt(len(primary), len(secondary)))
-	for key, a := range primary {
-		b, ok := secondary[key]
-		if !ok {
-			continue
+// overlapDiffsForEdge returns per-cell differences for one edge in the sky
+// match graph. The returned value is always mapJ - mapI, regardless of which
+// map is smaller and therefore cheaper to iterate.
+func overlapDiffsForEdge(mapI, mapJ map[int64]float64) []float64 {
+	diffs := make([]float64, 0, minInt(len(mapI), len(mapJ)))
+	if len(mapI) <= len(mapJ) {
+		for key, vi := range mapI {
+			vj, ok := mapJ[key]
+			if !ok {
+				continue
+			}
+			diffs = append(diffs, vj-vi)
 		}
-		if invert {
-			diffs = append(diffs, b-a)
-		} else {
-			diffs = append(diffs, b-a)
+	} else {
+		for key, vj := range mapJ {
+			vi, ok := mapI[key]
+			if !ok {
+				continue
+			}
+			diffs = append(diffs, vj-vi)
 		}
 	}
 	return diffs
 }
 
+const (
+	// skyOverlapMaxSamples limits how many samples from one chip/frame are used
+	// to build the coarse overlap map.
+	skyOverlapMaxSamples = 20_000
+
+	// skyOverlapCellSize is in output mosaic pixels. Coarse cells make overlap
+	// matching robust against dithers, distortion, and non-identical sampling.
+	skyOverlapCellSize = 32.0
+
+	// skyMinOverlapCells avoids solving a sky edge from one or two accidental
+	// matching cells.
+	skyMinOverlapCells = 8
+)
+
 func buildOverlapSampleMap(p plannedInput, pixels []float32, options SkysubOptions) map[int64]float64 {
 	width := p.input.HDU.Data.Width
 	height := p.input.HDU.Data.Height
 	stride := 1
-	if total := width * height; total > 20000 {
-		stride = int(math.Ceil(math.Sqrt(float64(total) / 20000.0)))
+	if total := width * height; total > skyOverlapMaxSamples {
+		stride = int(math.Ceil(math.Sqrt(float64(total) / float64(skyOverlapMaxSamples))))
 		if stride < 1 {
 			stride = 1
 		}
@@ -525,8 +620,8 @@ func buildOverlapSampleMap(p plannedInput, pixels []float32, options SkysubOptio
 }
 
 func overlapCellKey(x, y float64) int64 {
-	ix := int32(math.Round(x))
-	iy := int32(math.Round(y))
+	ix := int32(math.Floor(x / skyOverlapCellSize))
+	iy := int32(math.Floor(y / skyOverlapCellSize))
 	return (int64(ix) << 32) | int64(uint32(iy))
 }
 
@@ -603,10 +698,14 @@ func solveSkyComponent(component []int, edges []skyEdge) map[int]float64 {
 		if edge.j != root {
 			coeffs[varIndex[edge.j]] = 1
 		}
+		w := edge.weight
+		if w <= 0 {
+			w = 1
+		}
 		for a, ca := range coeffs {
-			atb[a] += ca * edge.delta
+			atb[a] += w * ca * edge.delta
 			for b, cb := range coeffs {
-				ata[a][b] += ca * cb
+				ata[a][b] += w * ca * cb
 			}
 		}
 	}

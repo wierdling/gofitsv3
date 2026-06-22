@@ -64,6 +64,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var latestRGBStats [3]histogram.Stats
 	suspendRefresh := false
 	var composeRGBWithOptionalStarless func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)
+	// renderImages returns an offset-applied view of imgs (Manual Offsets applied
+	// at render time). Forward-declared so refresh/compose can use it; assigned
+	// once controlSets exists.
+	var renderImages func() []*models.LoadedImage
 	var previewMu sync.Mutex
 	previewSeq := 0
 
@@ -109,7 +113,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 		start := time.Now()
 		debuglog.Log("compose refresh: starting preview update")
-		data := buildComposePreviewData(imgs, flipCheck.Checked, sharedHistCheck.Checked, buildCompositeCheck.Checked, levels, composeRGBWithOptionalStarless)
+		data := buildComposePreviewData(renderImages(), flipCheck.Checked, sharedHistCheck.Checked, buildCompositeCheck.Checked, levels, composeRGBWithOptionalStarless)
 		applyComposePreviewData(data, viewports, pushRGBHist)
 		if refreshBlinkFrame != nil {
 			refreshBlinkFrame()
@@ -136,7 +140,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		previewSeq++
 		seq := previewSeq
 		previewMu.Unlock()
-		imgSnapshot := append([]*models.LoadedImage(nil), imgs...)
+		imgSnapshot := renderImages()
 		levelsSnapshot := *levels
 		flip := flipCheck.Checked
 		sharedHistScale := sharedHistCheck.Checked
@@ -285,6 +289,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	composeRGBWithOptionalStarless = func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+		// Apply Manual Offsets at render time; imgs stays original.
+		rimgs := renderImages()
 		if starlessComposeTemporarilyDisabled {
 			// Starless/white-star processing is intentionally disabled for now.
 			// The implementation below remains in the codebase so it can be
@@ -293,24 +299,24 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			if starlessSettings.Enabled {
 				debuglog.Log("composeRGBWithOptionalStarless: starless temporarily disabled, using normal compose")
 			}
-			buf, w, h, stats := composeRGBCurrent(imgs)
+			buf, w, h, stats := composeRGBCurrent(rimgs)
 			return buf, w, h, stats, nil, nil
 		}
 
 		if !starlessSettings.Enabled {
 			debuglog.Log("composeRGBWithOptionalStarless: starless disabled, using normal compose")
-			buf, w, h, stats := composeRGBCurrent(imgs)
+			buf, w, h, stats := composeRGBCurrent(rimgs)
 			return buf, w, h, stats, nil, nil
 		}
-		if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+		if rimgs[0] == nil || rimgs[1] == nil || rimgs[2] == nil {
 			debuglog.Log("composeRGBWithOptionalStarless: missing RGB channels")
 			return nil, 0, 0, [3]histogram.Stats{}, nil, nil
 		}
 		debuglog.Log("composeRGBWithOptionalStarless: building aligned reference-grid channel set")
-		ref := imgs[1]
-		blueStretched := processing.StretchedImageDataForReferenceGrid(imgs[0], ref)
-		greenStretched := processing.StretchedImageDataForReferenceGrid(imgs[1], ref)
-		redStretched := processing.StretchedImageDataForReferenceGrid(imgs[2], ref)
+		ref := rimgs[1]
+		blueStretched := processing.StretchedImageDataForReferenceGrid(rimgs[0], ref)
+		greenStretched := processing.StretchedImageDataForReferenceGrid(rimgs[1], ref)
+		redStretched := processing.StretchedImageDataForReferenceGrid(rimgs[2], ref)
 
 		maskSettings := processing.DefaultStarMaskSettings()
 		maskSettings.DetectionMode = starlessSettings.DetectionMode
@@ -770,6 +776,73 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		channelControls("Channel 3 (Red)", color.RGBA{R: 237, G: 80, B: 80, A: 255}, 2, imgs, &origPixels, viewports, refresh),
 	}
 
+	// The Manual Offset (X/Y/Rot) fields are the source of truth for each channel's
+	// placement, applied at RENDER time only — imgs[idx] always holds the original
+	// loaded pixels and is never warped/baked. renderImages() returns an
+	// offset-applied view used for the composite (merge) and the per-channel
+	// previews the blink shows. Results are cached so an unchanged offset isn't
+	// re-warped on every refresh.
+	channelOffsetFields := func(idx int) (dx, dy, rot float64, ok bool) {
+		if idx < 0 || idx >= len(controlSets) || controlSets[idx] == nil {
+			return 0, 0, 0, false
+		}
+		cc := controlSets[idx]
+		if cc.XOffsetEntry == nil || cc.YOffsetEntry == nil {
+			return 0, 0, 0, false
+		}
+		dx = cc.XOffsetEntry.Value()
+		dy = cc.YOffsetEntry.Value()
+		if cc.RotOffsetEntry != nil {
+			rot = cc.RotOffsetEntry.Value()
+		}
+		return dx, dy, rot, true
+	}
+	renderCache := make([]composeRenderCache, len(imgs))
+	var renderMu sync.Mutex
+	// renderImage returns imgs[idx] with the channel's Manual Offset applied at
+	// render time (or imgs[idx] unchanged when there is no offset). It never
+	// mutates imgs[idx].
+	renderImage := func(idx int) *models.LoadedImage {
+		if idx < 0 || idx >= len(imgs) || imgs[idx] == nil {
+			return nil
+		}
+		dx, dy, rot, ok := channelOffsetFields(idx)
+		if !ok || (dx == 0 && dy == 0 && rot == 0) {
+			return imgs[idx]
+		}
+		src := imgs[idx].HDU.Data.Pixels
+		var warpedPixels []float32
+		if idx < len(renderCache) {
+			renderMu.Lock()
+			c := renderCache[idx]
+			if c.pixels != nil && c.dx == dx && c.dy == dy && c.rot == rot && sameFloatSlice(c.src, src) {
+				warpedPixels = c.pixels
+			}
+			renderMu.Unlock()
+		}
+		if warpedPixels == nil {
+			w := imgs[idx].HDU.Data.Width
+			h := imgs[idx].HDU.Data.Height
+			t := composeManualOffsetTransform(w, h, dx, dy, rot)
+			warpedPixels = processing.WarpImage(src, w, h, t)
+			if idx < len(renderCache) {
+				renderMu.Lock()
+				renderCache[idx] = composeRenderCache{dx: dx, dy: dy, rot: rot, src: src, pixels: warpedPixels}
+				renderMu.Unlock()
+			}
+		}
+		warped := *imgs[idx]
+		warped.HDU.Data.Pixels = warpedPixels
+		return &warped
+	}
+	renderImages = func() []*models.LoadedImage {
+		out := make([]*models.LoadedImage, len(imgs))
+		for i := range imgs {
+			out[i] = renderImage(i)
+		}
+		return out
+	}
+
 	viewports[0].SetLoadSave("Blue", "B", color.RGBA{R: 100, G: 149, B: 237, A: 255},
 		func() { loadChannel(0) }, func() { saveChannelGray(0) })
 	viewports[1].SetLoadSave("Green", "G", color.RGBA{R: 80, G: 200, B: 80, A: 255},
@@ -975,6 +1048,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				continue
 			}
 			hasChannel = true
+			dx, dy, rot, _ := channelOffsetFields(i)
 			project.Channels[i] = models.ChannelState{
 				Path:       imgs[i].Path,
 				Mode:       modeToLabel(imgs[i].Mode),
@@ -984,6 +1058,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				Peak:       imgs[i].Peak,
 				ScaledPeak: imgs[i].ScaledPeak,
 				ShowClip:   imgs[i].ShowClip,
+				OffsetX:    dx,
+				OffsetY:    dy,
+				OffsetRot:  rot,
 			}
 		}
 		if orangeWin != nil {
@@ -1218,78 +1295,88 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			return
 		}
 
+		// Reference is Channel 2 (green); align Channel 1 (blue) and Channel 3 (red)
+		// to it. imgs always holds the ORIGINAL pixels (offsets are applied only at
+		// render time), so the computed offset is absolute. Store it in the Manual
+		// Offset fields (the source of truth); the refresh below renders it.
+		width := imgs[1].HDU.Data.Width
+		height := imgs[1].HDU.Data.Height
+		refBase := imgs[1].HDU.Data.Pixels
+		baseBlue := imgs[0].HDU.Data.Pixels
+		baseRed := imgs[2].HDU.Data.Pixels
+		bw, bh := imgs[0].HDU.Data.Width, imgs[0].HDU.Data.Height
+		rw, rh := imgs[2].HDU.Data.Width, imgs[2].HDU.Data.Height
+
 		progressDialog := dialog.NewCustom("Aligning", "Please wait...", widget.NewProgressBarInfinite(), win)
 		progressDialog.Show()
 
 		go func() {
-			refImg := imgs[1]
-			width := refImg.HDU.Data.Width
-			height := refImg.HDU.Data.Height
-
-			alignWithFallback := func(target *models.LoadedImage) ([]float32, processing.AffineTransform, string, error) {
-				aligned, transform, err := processing.AlignChannelUsingWCS(
-					target.HDU.Data.Pixels,
-					target.HDU.Data.Width,
-					target.HDU.Data.Height,
-					target.HDU.Header,
-					refImg.HDU.Data.Pixels,
-					width,
-					height,
-					refImg.HDU.Header,
-				)
-				if err == nil {
-					return aligned, transform, "WCS", nil
+			// alignOne returns the backward (output→source) transform that registers
+			// base to the reference, using the same robust pixel-space star matcher
+			// the mosaic builder uses (WCS-independent: channel WCS headers can
+			// disagree with the real pixel registration by ~100 px).
+			alignOne := func(base []float32, w, h int) (processing.AffineTransform, string, error) {
+				_, t, stats, err := processing.AlignChannelByStars(base, w, h, refBase, width, height, 30.0, "rscale")
+				if err != nil {
+					return processing.AffineTransform{}, "", err
 				}
-				aligned, transform, starErr := processing.AlignChannel(
-					target.HDU.Data.Pixels,
-					target.HDU.Data.Width,
-					target.HDU.Data.Height,
-					refImg.HDU.Data.Pixels,
-					width,
-					height,
-				)
-				if starErr != nil {
-					return nil, processing.AffineTransform{}, "", fmt.Errorf("WCS failed: %v; star match failed: %w", err, starErr)
+				back, ierr := processing.InvertAffineTransform(t)
+				if ierr != nil {
+					return processing.AffineTransform{}, "", ierr
 				}
-				return aligned, transform, "stars", nil
+				return back, fmt.Sprintf("matched=%d inliers=%d rms=%.2f", stats.MatchedStars, stats.GlobalInliers, stats.RMS), nil
 			}
 
-			alignedBlue, transformBlue, blueMethod, errBlue := alignWithFallback(imgs[0])
-			alignedRed, transformRed, redMethod, errRed := alignWithFallback(imgs[2])
+			backBlue, blueDetail, errBlue := alignOne(baseBlue, bw, bh)
+			backRed, redDetail, errRed := alignOne(baseRed, rw, rh)
 
-			if errBlue != nil || errRed != nil {
-				errMsg := ""
-				if errBlue != nil {
-					errMsg += fmt.Sprintf("Channel 1 alignment failed: %v\n", errBlue)
-				}
-				if errRed != nil {
-					errMsg += fmt.Sprintf("Channel 3 alignment failed: %v", errRed)
-				}
-				fyne.Do(func() {
-					progressDialog.Hide()
-					dialog.ShowError(fmt.Errorf("%s", errMsg), win)
-				})
-				return
-			}
-
-			imgs[0].HDU.Data.Pixels = alignedBlue
-			imgs[0].HDU.Data.Width = width
-			imgs[0].HDU.Data.Height = height
-			clearComposeOrigPixels(&origPixels, 0)
-
-			imgs[2].HDU.Data.Pixels = alignedRed
-			imgs[2].HDU.Data.Width = width
-			imgs[2].HDU.Data.Height = height
-			clearComposeOrigPixels(&origPixels, 2)
-
-			msg := fmt.Sprintf("Alignment Complete.\n\nBlue Method: %s\nBlue Shift:\n  X: %+.2f px\n  Y: %+.2f px\n\nRed Method: %s\nRed Shift:\n  X: %+.2f px\n  Y: %+.2f px",
-				blueMethod,
-				transformBlue.C, transformBlue.F,
-				redMethod,
-				transformRed.C, transformRed.F)
 			fyne.Do(func() {
 				progressDialog.Hide()
+
+				// Write the alignment into the Manual Offset fields; the offset is
+				// applied at render time (not baked) by the refresh below.
+				setAndApply := func(idx int, back processing.AffineTransform) (dx, dy, rot float64) {
+					w := imgs[idx].HDU.Data.Width
+					h := imgs[idx].HDU.Data.Height
+					dx, dy, rot = extractManualOffset(back, w, h)
+					if idx < len(controlSets) && controlSets[idx] != nil {
+						if controlSets[idx].XOffsetEntry != nil {
+							controlSets[idx].XOffsetEntry.SetValue(dx)
+						}
+						if controlSets[idx].YOffsetEntry != nil {
+							controlSets[idx].YOffsetEntry.SetValue(dy)
+						}
+						if controlSets[idx].RotOffsetEntry != nil {
+							controlSets[idx].RotOffsetEntry.SetValue(rot)
+						}
+					}
+					return dx, dy, rot
+				}
+
+				blueLine := blueDetail
+				var bdx, bdy, brot float64
+				if errBlue == nil {
+					bdx, bdy, brot = setAndApply(0, backBlue)
+				} else {
+					blueLine = "FAILED: " + errBlue.Error()
+				}
+				redLine := redDetail
+				var rdx, rdy, rrot float64
+				if errRed == nil {
+					rdx, rdy, rrot = setAndApply(2, backRed)
+				} else {
+					redLine = "FAILED: " + errRed.Error()
+				}
+
 				refresh()
+
+				if errBlue != nil && errRed != nil {
+					dialog.ShowError(fmt.Errorf("Blue: %v\nRed: %v", errBlue, errRed), win)
+					return
+				}
+				msg := fmt.Sprintf("Alignment Complete.\n\nBlue (Channel 1):\n  X: %+.2f  Y: %+.2f  Rot: %+.2f°\n  %s\n\nRed (Channel 3):\n  X: %+.2f  Y: %+.2f  Rot: %+.2f°\n  %s",
+					bdx, bdy, brot, blueLine,
+					rdx, rdy, rrot, redLine)
 				dialog.ShowInformation("Alignment Data", msg, win)
 			})
 		}()
@@ -1570,6 +1657,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			updateBlinkStatus()
 			return
 		}
+		// Rebuild the per-channel previews so the blink reflects the current Manual
+		// Offsets (applied at render time by renderImages).
+		refresh()
 		blinkMu.Lock()
 		blinkSeq++
 		seq := blinkSeq
@@ -1865,6 +1955,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			borders[i].Refresh()
 		}
 		maximizedIdx = idx
+		if idx >= 0 && idx < 3 {
+			channelTabs.SetActive(idx)
+		}
 		borders[idx].Objects = []fyne.CanvasObject{borderRects[idx]}
 		borders[idx].Refresh()
 
@@ -1976,6 +2069,19 @@ func applyChannelState(idx int, state models.ChannelState, imgs []*models.Loaded
 	controls[idx].ScaledPeakEntry.SetValue(img.ScaledPeak)
 	controls[idx].ShowClip.SetChecked(img.ShowClip)
 
+	// Manual Offset fields are the source of truth for placement. Restore them from
+	// the state (saved projects carry offsets); a freshly loaded/reset channel has
+	// zero offsets in its state, so no stale shift is carried over.
+	if controls[idx].XOffsetEntry != nil {
+		controls[idx].XOffsetEntry.SetValue(state.OffsetX)
+	}
+	if controls[idx].YOffsetEntry != nil {
+		controls[idx].YOffsetEntry.SetValue(state.OffsetY)
+	}
+	if controls[idx].RotOffsetEntry != nil {
+		controls[idx].RotOffsetEntry.SetValue(state.OffsetRot)
+	}
+
 	views[idx].blackBox.SetValue(img.Black)
 	views[idx].whiteBox.SetValue(img.White)
 }
@@ -2053,48 +2159,18 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		refresh()
 	})
 
-	xOffsetEntry := NewNumberEntry(1, 0)
-	yOffsetEntry := NewNumberEntry(1, 0)
+	xOffsetEntry := NewNumberEntry(1, 2)
+	yOffsetEntry := NewNumberEntry(1, 2)
 	rotOffsetEntry := NewNumberEntry(0.1, 1)
 
-	var applyOffset *widget.Button
-	applyOffset = widget.NewButton("Apply Offset", func() {
+	// Manual Offsets are applied at render time (never baked into the pixels), so
+	// "Apply Offset" simply re-renders the previews and composite with the current
+	// X/Y/Rot field values.
+	applyOffset := widget.NewButton("Apply Offset", func() {
 		if imgs[idx] == nil {
 			return
 		}
-		if (*origPixels)[idx] == nil {
-			src := imgs[idx].HDU.Data.Pixels
-			cp := make([]float32, len(src))
-			copy(cp, src)
-			(*origPixels)[idx] = cp
-		}
-		dx := xOffsetEntry.Value()
-		dy := yOffsetEntry.Value()
-		rot := rotOffsetEntry.Value()
-		w := imgs[idx].HDU.Data.Width
-		h := imgs[idx].HDU.Data.Height
-		cx := float64(w) / 2
-		cy := float64(h) / 2
-		rad := rot * math.Pi / 180
-		cosA := math.Cos(rad)
-		sinA := math.Sin(rad)
-		t := processing.AffineTransform{
-			A: cosA, B: sinA,
-			C: -cosA*(cx+dx) - sinA*(cy+dy) + cx,
-			D: -sinA, E: cosA,
-			F: sinA*(cx+dx) - cosA*(cy+dy) + cy,
-		}
-		applyOffset.SetText("Working…")
-		applyOffset.Disable()
-		go func() {
-			pixels := processing.WarpImage((*origPixels)[idx], w, h, t)
-			fyne.Do(func() {
-				imgs[idx].HDU.Data.Pixels = pixels
-				refresh()
-				applyOffset.SetText("Apply Offset")
-				applyOffset.Enable()
-			})
-		}()
+		refresh()
 	})
 
 	return &models.ChannelControl{
@@ -2123,6 +2199,9 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		BackgroundEntry: backgroundEntry,
 		PeakEntry:       peakEntry,
 		ScaledPeakEntry: scaledPeakEntry,
+		XOffsetEntry:    xOffsetEntry,
+		YOffsetEntry:    yOffsetEntry,
+		RotOffsetEntry:  rotOffsetEntry,
 		ShowClip:        showClip,
 	}
 }
@@ -2573,6 +2652,64 @@ func offsetRow(name string, entry *NumberEntry) fyne.CanvasObject {
 	lbl := canvas.NewText(name, theme.ForegroundColor())
 	lbl.TextSize = theme.TextSize() - 2
 	return container.NewBorder(nil, nil, lbl, nil, entry)
+}
+
+// composeRenderCache memoises a channel's offset-applied pixels so an unchanged
+// Manual Offset isn't re-warped on every render. src is the original pixel slice
+// the warp was based on; if the channel is reloaded (new slice) the cache misses.
+type composeRenderCache struct {
+	dx, dy, rot float64
+	src         []float32
+	pixels      []float32
+}
+
+// sameFloatSlice reports whether a and b share the same backing array (and
+// length) — used to detect that a channel's original pixels were replaced.
+func sameFloatSlice(a, b []float32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	return &a[0] == &b[0]
+}
+
+// composeManualOffsetTransform builds the backward (output→source) sampling
+// transform for a channel's Manual Offset: a rotation by rot degrees about the
+// image centre followed by a (dx, dy) pixel shift of the image content. It is
+// the single definition shared by Apply Offset, Auto-Align, and blink so the
+// Manual Offset fields are the one source of truth for a channel's placement.
+func composeManualOffsetTransform(w, h int, dx, dy, rot float64) processing.AffineTransform {
+	cx := float64(w) / 2
+	cy := float64(h) / 2
+	rad := rot * math.Pi / 180
+	cosA := math.Cos(rad)
+	sinA := math.Sin(rad)
+	return processing.AffineTransform{
+		A: cosA, B: sinA,
+		C: -cosA*(cx+dx) - sinA*(cy+dy) + cx,
+		D: -sinA, E: cosA,
+		F: sinA*(cx+dx) - cosA*(cy+dy) + cy,
+	}
+}
+
+// extractManualOffset is the inverse of composeManualOffsetTransform: given a
+// backward sampling transform, it recovers the (dx, dy, rot) Manual Offset
+// fields that reproduce it. It is exact for a rotation+translation (scale 1);
+// any scale component is ignored (Auto-Align is captured as translation+rotation
+// per the fields-as-source-of-truth model).
+func extractManualOffset(t processing.AffineTransform, w, h int) (dx, dy, rot float64) {
+	cx := float64(w) / 2
+	cy := float64(h) / 2
+	rad := math.Atan2(t.B, t.A)
+	cosA := math.Cos(rad)
+	sinA := math.Sin(rad)
+	// Solve composeManualOffsetTransform's C/F equations for u=cx+dx, v=cy+dy.
+	// The 2×2 system has determinant 1 (cos²+sin²).
+	u := -cosA*(t.C-cx) + sinA*(t.F-cy)
+	v := -sinA*(t.C-cx) - cosA*(t.F-cy)
+	return u - cx, v - cy, rad * 180 / math.Pi
 }
 
 func matchComposeChannelStretch(ref, target *models.LoadedImage, matchStarCores bool) error {

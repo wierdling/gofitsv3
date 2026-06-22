@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
@@ -142,21 +141,7 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 	stats := histogram.Compute(result.Pixels)
 
 	debuglog.Log("buildDrizzlePreview: submitting UI update to main thread")
-	uiDone := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-uiDone:
-				return
-			case <-ticker.C:
-				debuglog.Log("buildDrizzlePreview: still waiting for main thread...")
-			}
-		}
-	}()
-	fyne.DoAndWait(func() {
-		close(uiDone)
+	fyne.Do(func() {
 		debuglog.Log("buildDrizzlePreview: UI update start (on main thread)")
 		ws.state.statuses = result.Inputs
 		ws.saveBtn.Enable()

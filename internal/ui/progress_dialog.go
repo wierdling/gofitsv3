@@ -62,7 +62,7 @@ func (pt *progressTracker) progress(stage string, done, total int) {
 
 // hide dismisses the dialog on the main thread.
 func (pt *progressTracker) hide() {
-	fyne.DoAndWait(func() {
+	fyne.Do(func() {
 		if pt.dialog != nil {
 			pt.dialog.Hide()
 		}

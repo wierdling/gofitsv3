@@ -4,12 +4,42 @@ import (
 	"errors"
 	"math"
 	"math/rand"
-	"time"
 
 	"gonum.org/v1/gonum/mat"
 
 	"gofitsv3/internal/debuglog"
 )
+
+// deterministicSeed derives a stable RANSAC seed from the matched pairs so the
+// solver returns the same transform for the same input on every run. Previously
+// the seed came from the wall clock, which made alignment non-reproducible: with
+// any ambiguous matches one run could lock onto the true consensus and the next
+// onto a false one, producing wildly different (sometimes >100 px off) results
+// for identical inputs. Determinism is required for reliable alignment.
+func deterministicSeed(pairs []MatchedPair) int64 {
+	const (
+		offset uint64 = 1469598103934665603
+		prime  uint64 = 1099511628211
+	)
+	h := offset
+	mix := func(f float64) {
+		// Quantize to 1/100 px so trivial float noise can't change the seed.
+		bits := math.Float64bits(math.Round(f*100) / 100)
+		for s := 0; s < 64; s += 8 {
+			h ^= (bits >> uint(s)) & 0xff
+			h *= prime
+		}
+	}
+	h ^= uint64(len(pairs))
+	h *= prime
+	for _, p := range pairs {
+		mix(p.RefX)
+		mix(p.RefY)
+		mix(p.TargetX)
+		mix(p.TargetY)
+	}
+	return int64(h)
+}
 
 // SolveTransformationRANSAC calculates the optimal Affine matrix while aggressively rejecting false matches.
 // iterations: typically 2000 for geometric matching.
@@ -27,7 +57,7 @@ func SolveTransformationRANSAC(pairs []MatchedPair, iterations int, threshold fl
 		return solveLeastSquares(pairs)
 	}
 
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng := rand.New(rand.NewSource(deterministicSeed(pairs)))
 	var bestInliers []MatchedPair
 	maxInlierCount := 0
 
@@ -123,7 +153,7 @@ func SolveRScaleTransformationRANSAC(pairs []MatchedPair, iterations int, thresh
 		return solveRScaleLeastSquares(pairs)
 	}
 
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng := rand.New(rand.NewSource(deterministicSeed(pairs)))
 	thresholdSq := threshold * threshold
 	minInliers := 3
 	if n >= 8 {

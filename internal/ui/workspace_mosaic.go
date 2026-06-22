@@ -41,6 +41,9 @@ type mosaicState struct {
 	alignmentSettingsSet bool
 	skysubSettings       models.SkysubSettings
 	skysubSettingsSet    bool
+	// exposureNormMode controls per-frame exposure-time normalization applied
+	// before drizzle. Defaults to Off so existing behavior is preserved.
+	exposureNormMode mosaic.NormalizationMode
 }
 
 func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu) {
@@ -525,6 +528,57 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					filesScroll := container.NewVScroll(checkContainer)
 					filesScroll.SetMinSize(fyne.NewSize(420, 220))
 
+					filteredFiles := func() []mosaic.FilterFile {
+						filter := mosaic.FacetValue(filterSelect.Selected)
+						product := productType()
+						if filter == "" && product == "" {
+							return files
+						}
+						filtered := make([]mosaic.FilterFile, 0, len(files))
+						for _, f := range files {
+							if filter != "" && f.Filter != filter {
+								continue
+							}
+							if product != "" && mosaic.ProductType(f.Path) != product {
+								continue
+							}
+							filtered = append(filtered, f)
+						}
+						return filtered
+					}
+
+					setSelectSelection := func(sel *SafeSelect, options []string, selected string) {
+						sel.Options = options
+						sel.Refresh()
+						if selected != "" {
+							sel.SetSelected(selected)
+							return
+						}
+						if len(options) > 0 {
+							sel.SetSelected(options[0])
+						}
+					}
+
+					updateDependentOptions := func() {
+						filtered := filteredFiles()
+						setSelectSelection(proposalSelect, mosaic.ProposalFacetOptions(filtered), "Any ("+fmt.Sprintf("%d files", len(filtered))+")")
+						setSelectSelection(exposureSelect, mosaic.ExposureFacetOptions(filtered), "Any ("+fmt.Sprintf("%d files", len(filtered))+")")
+						if dateMinSelect != nil {
+							dates := mosaic.DateValues(filtered)
+							dateMinSelect.Options = append([]string(nil), dates...)
+							dateMaxSelect.Options = append([]string(nil), dates...)
+							dateMinSelect.Refresh()
+							dateMaxSelect.Refresh()
+							if len(dates) > 0 {
+								dateMinSelect.SetSelected(dates[0])
+								dateMaxSelect.SetSelected(dates[len(dates)-1])
+							} else {
+								dateMinSelect.SetSelected("")
+								dateMaxSelect.SetSelected("")
+							}
+						}
+					}
+
 					updateSelectedFiles := func() {
 						paths := mosaic.MatchFiles(files, criteria())
 						fileChecks = make([]fileCheck, len(paths))
@@ -547,7 +601,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						checkContainer.Refresh()
 					}
 
-					filterSelect.OnChanged = func(string) { updateSelectedFiles() }
+					filterSelect.OnChanged = func(string) {
+						updateDependentOptions()
+						updateSelectedFiles()
+					}
 					proposalSelect.OnChanged = func(string) { updateSelectedFiles() }
 					exposureSelect.OnChanged = func(string) { updateSelectedFiles() }
 					if dateMinSelect != nil {
@@ -567,7 +624,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					if !(hasFLC && hasFLT) {
 						typeRadio.Disable()
 					}
-					typeRadio.OnChanged = func(string) { updateSelectedFiles() }
+					typeRadio.OnChanged = func(string) {
+						updateDependentOptions()
+						updateSelectedFiles()
+					}
 
 					// Default to a concrete filter (preserving the prior
 					// single-filter workflow) and the full available date range.
@@ -576,12 +636,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					} else {
 						filterSelect.SetSelected(filterSelect.Options[0])
 					}
-					proposalSelect.SetSelected(proposalSelect.Options[0])
-					exposureSelect.SetSelected(exposureSelect.Options[0])
-					if dateMinSelect != nil {
-						dateMinSelect.SetSelected(dates[0])
-						dateMaxSelect.SetSelected(dates[len(dates)-1])
-					}
+					updateDependentOptions()
 					updateSelectedFiles()
 
 					setAllFilesChecked := func(checked bool) {
@@ -650,6 +705,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		}
 		fd.Show()
 	})
+	ws.batchBtn = batchBtn
 
 	savePreviewToggle := NewToggle(func(v bool) {
 		state.savePreview = v
@@ -807,6 +863,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		}
 		go ws.buildDrizzlePreview()
 	})
+	ws.buildBtn = buildBtn
 
 	openBlinkerBtn := widget.NewButton("Open Blinker", func() {
 		dir := strings.TrimSpace(state.drizzleSettings.DebugOutputDir)
@@ -923,8 +980,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		ws.updateStatus()
 		ws.resetPreview()
 		ws.rebuildOffsetControls()
+		ws.updateActionButtons()
 	})
 	clearBtn.Importance = widget.DangerImportance
+	ws.clearBtn = clearBtn
 
 	statusScroll := container.NewVScroll(statusLabel)
 	statusScroll.SetMinSize(fyne.NewSize(260, 160))
@@ -987,19 +1046,27 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			state.referenceInput = &inp
 			refLabel.SetText("Reference: " + filepath.Base(path))
 			ws.resetPreview()
+			ws.updateActionButtons()
 		}, win)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
 		ws.configureLastDir(fd)
 		fd.SetView(dialog.ListView)
 		fd.Show()
 	})
+	ws.setRefBtn = setRefBtn
 
 	clearRefBtn := widget.NewButton("Clear Reference", func() {
 		state.referenceInput = nil
 		refLabel.SetText("Reference: none")
 		ws.resetPreview()
+		ws.updateActionButtons()
 	})
 	clearRefBtn.Importance = widget.DangerImportance
+	ws.clearRefBtn = clearRefBtn
+
+	inputFramesBtn := widget.NewButton("Input Frames...", func() {
+		ws.openInputFramesPopup()
+	})
 
 	inputTabs := container.NewAppTabs(
 		container.NewTabItem("Input Frames", container.NewBorder(offsetHeader, nil, nil, nil, offsetScroll)),
@@ -1023,14 +1090,15 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		widget.NewLabel("Baseline Reference"),
 		refLabel,
 		container.New(&fixedVSpacingLayout{15},
-			container.NewGridWithColumns(2, setRefBtn, clearRefBtn),
-			container.NewGridWithColumns(2, starAlignBtn, selectStarsBtn),
-			container.NewGridWithColumns(2, measureBtn, buildBtn),
-			container.NewGridWithColumns(2, openBlinkerBtn, saveOffsetsBtn),
-			container.NewGridWithColumns(2, loadOffsetsBtn, clearOffsetsBtn),
-			container.NewGridWithColumns(2, clearBtn, layout.NewSpacer()),
+		container.NewGridWithColumns(2, setRefBtn, clearRefBtn),
+		container.NewGridWithColumns(2, starAlignBtn, selectStarsBtn),
+		container.NewGridWithColumns(2, measureBtn, buildBtn),
+		container.NewGridWithColumns(2, openBlinkerBtn, saveOffsetsBtn),
+		container.NewGridWithColumns(2, loadOffsetsBtn, clearOffsetsBtn),
+		container.NewGridWithColumns(2, clearBtn, layout.NewSpacer()),
 		),
 		widget.NewSeparator(),
+		inputFramesBtn,
 		inputTabs,
 	)
 
@@ -1120,6 +1188,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 	ws.rebuildOffsetControls()
 	ws.updateStatus()
+	ws.updateActionButtons()
 
 	// ---- Project save/load -----------------------------------------------
 
@@ -1132,6 +1201,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		fyne.NewMenuItem("Drizzle Settings", ws.openDrizzleSettings),
 		fyne.NewMenuItem("Alignment Settings", ws.openAlignmentSettings),
 		fyne.NewMenuItem("Skysub Settings", ws.openSkysubSettings),
+		fyne.NewMenuItem("Exposure Normalization", ws.openExposureReview),
 	)
 	footerBottomPad := canvas.NewRectangle(color.Transparent)
 	footerBottomPad.SetMinSize(fyne.NewSize(1, 20))

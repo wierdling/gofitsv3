@@ -24,7 +24,9 @@ var blinkerWin fyne.Window
 
 type blinkFrame struct {
 	Name    string
+	Path    string
 	Image   *image.RGBA
+	ci      *canvas.Image
 	Checked bool
 }
 
@@ -39,42 +41,21 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 		return
 	}
 
+	// Enumerate candidate frames by filename only. Nothing is read into memory
+	// until the user selects (checks) a frame.
 	var frames []*blinkFrame
 	for _, f := range files {
 		if f.IsDir() || !strings.HasPrefix(f.Name(), "debug_") || filepath.Ext(f.Name()) != ".fits" {
 			continue
 		}
-		path := filepath.Join(debugDir, f.Name())
-		// Read FITS
-		fitsFile, err := fitsio.LoadFile(path)
-		if err != nil || len(fitsFile.HDUs) == 0 {
-			continue
-		}
-		hdu := fitsFile.HDUs[0]
-
-		img := &models.LoadedImage{
-			HDU:        hdu,
-			Mode:       stretchMode,
-			Black:      black,
-			White:      white,
-			Background: bg,
-			Peak:       peak,
-			ScaledPeak: scaledPeak,
-		}
-		stretched, mask := processing.ApplyStretchParallel(img)
-		if mask == nil {
-			mask = make([]byte, len(stretched.Pixels))
-		}
-		rgba := processing.ToGrayRGBA(stretched, mask)
-
 		name := f.Name()
 		if len(name) > 11 {
 			name = name[6 : len(name)-5] // trim "debug_" and ".fits"
 		}
 		frames = append(frames, &blinkFrame{
 			Name:    name,
-			Image:   rgba,
-			Checked: true,
+			Path:    filepath.Join(debugDir, f.Name()),
+			Checked: false,
 		})
 	}
 
@@ -91,6 +72,15 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 	isPaused := false
 	stopCh := make(chan struct{})
 
+	// cimgs[i] mirrors frames[i].ci so the blink/zoom loops can iterate cheaply.
+	// Entries are nil until the corresponding frame is loaded.
+	cimgs := make([]*canvas.Image, len(frames))
+
+	// Image sizing is discovered from the first loaded frame.
+	var origW, origH float32
+	haveSize := false
+	zoomFactor := float32(1)
+
 	blinkerWin.SetCloseIntercept(func() {
 		close(stopCh)
 		blinkerWin.SetCloseIntercept(nil)
@@ -98,39 +88,141 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 		blinkerWin = nil
 	})
 
-	var cimgs []*canvas.Image
-	imgStack := container.NewMax()
-
-	bounds := frames[0].Image.Bounds()
-	origW := float32(bounds.Dx())
-	origH := float32(bounds.Dy())
-
-	for i, fr := range frames {
-		ci := canvas.NewImageFromImage(fr.Image)
-		ci.FillMode = canvas.ImageFillContain
-		ci.SetMinSize(fyne.NewSize(origW, origH))
-		if i != 0 {
-			ci.Hidden = true
-		}
-		cimgs = append(cimgs, ci)
-		imgStack.Add(ci)
-	}
-
+	// imgLayer holds the (lazily added) frame images; overlay stays on top.
+	imgLayer := container.NewMax()
 	overlay := newViewerInteractionLayer()
-	imgStack.Add(overlay)
+	imgStack := container.NewMax(imgLayer, overlay)
 	imgContainer := container.NewScroll(imgStack)
 	overlay.scroll = imgContainer
 
-	// Sidebar with checks
+	// advanceFrame shows the next selected+loaded frame, hiding the rest.
+	advanceFrame := func() {
+		mu.Lock()
+		var disp []int
+		for i, fr := range frames {
+			if fr.Checked && fr.ci != nil {
+				disp = append(disp, i)
+			}
+		}
+		targetIdx := -1
+		if len(disp) > 0 {
+			targetIdx = disp[0]
+			for _, idx := range disp {
+				if idx > currentIndex {
+					targetIdx = idx
+					break
+				}
+			}
+			currentIndex = targetIdx
+		}
+		mu.Unlock()
+
+		if targetIdx < 0 {
+			return
+		}
+		fyne.Do(func() {
+			mu.Lock()
+			defer mu.Unlock()
+			for i, ci := range cimgs {
+				if ci == nil {
+					continue
+				}
+				if i == targetIdx {
+					if ci.Hidden {
+						ci.Hidden = false
+						ci.Refresh()
+					}
+				} else if !ci.Hidden {
+					ci.Hidden = true
+					ci.Refresh()
+				}
+			}
+		})
+	}
+
+	// loadFrame reads + stretches a frame's FITS and installs its canvas image.
+	// Runs on a background goroutine; UI mutations are marshalled onto the main thread.
+	loadFrame := func(i int) {
+		fr := frames[i]
+		fitsFile, err := fitsio.LoadFile(fr.Path)
+		if err != nil || len(fitsFile.HDUs) == 0 {
+			return
+		}
+		hdu := fitsFile.HDUs[0]
+		img := &models.LoadedImage{
+			HDU:        hdu,
+			Mode:       stretchMode,
+			Black:      black,
+			White:      white,
+			Background: bg,
+			Peak:       peak,
+			ScaledPeak: scaledPeak,
+		}
+		stretched, mask := processing.ApplyStretchParallel(img)
+		if mask == nil {
+			mask = make([]byte, len(stretched.Pixels))
+		}
+		rgba := processing.ToGrayRGBA(stretched, mask)
+
+		fyne.Do(func() {
+			mu.Lock()
+			if !fr.Checked {
+				// Deselected while loading; discard.
+				mu.Unlock()
+				return
+			}
+			if !haveSize {
+				b := rgba.Bounds()
+				origW = float32(b.Dx())
+				origH = float32(b.Dy())
+				haveSize = true
+			}
+			ci := canvas.NewImageFromImage(rgba)
+			ci.FillMode = canvas.ImageFillContain
+			ci.SetMinSize(fyne.NewSize(origW*zoomFactor, origH*zoomFactor))
+			ci.Hidden = true
+			fr.Image = rgba
+			fr.ci = ci
+			cimgs[i] = ci
+			imgLayer.Add(ci)
+			mu.Unlock()
+			imgLayer.Refresh()
+		})
+		advanceFrame()
+	}
+
+	// unloadFrame drops a frame's image and removes its canvas image, freeing memory.
+	unloadFrame := func(i int) {
+		mu.Lock()
+		fr := frames[i]
+		ci := fr.ci
+		fr.ci = nil
+		fr.Image = nil
+		cimgs[i] = nil
+		mu.Unlock()
+		if ci != nil {
+			fyne.Do(func() {
+				imgLayer.Remove(ci)
+				imgLayer.Refresh()
+			})
+		}
+	}
+
+	// Sidebar with checks (all unselected by default).
 	checkList := container.NewVBox()
-	for _, fr := range frames {
-		fr := fr
+	for i, fr := range frames {
+		i, fr := i, fr
 		check := widget.NewCheck(fr.Name, func(v bool) {
 			mu.Lock()
 			fr.Checked = v
 			mu.Unlock()
+			if v {
+				go loadFrame(i)
+			} else {
+				unloadFrame(i)
+			}
 		})
-		check.SetChecked(true)
+		check.SetChecked(false)
 		checkList.Add(check)
 	}
 	checkScroll := container.NewVScroll(checkList)
@@ -151,11 +243,15 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 	zoomSlider.SetValue(100)
 	zoomValLabel := widget.NewLabel("100 %")
 	zoomSlider.OnChanged = func(v float64) {
-		zoom := v / 100.0
-		newSize := fyne.NewSize(origW*float32(zoom), origH*float32(zoom))
+		mu.Lock()
+		zoomFactor = float32(v / 100.0)
+		newSize := fyne.NewSize(origW*zoomFactor, origH*zoomFactor)
 		for _, ci := range cimgs {
-			ci.SetMinSize(newSize)
+			if ci != nil {
+				ci.SetMinSize(newSize)
+			}
 		}
+		mu.Unlock()
 		imgContainer.Refresh()
 		zoomValLabel.SetText(fmt.Sprintf("%d %%", int(v)))
 	}
@@ -165,50 +261,6 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 		isPaused = v
 		mu.Unlock()
 	})
-
-	advanceFrame := func() {
-		mu.Lock()
-		checkedCount := 0
-		for _, fr := range frames {
-			if fr.Checked {
-				checkedCount++
-			}
-		}
-
-		targetIdx := -1
-		if checkedCount > 0 {
-			startIdx := currentIndex
-			for {
-				currentIndex = (currentIndex + 1) % len(frames)
-				if frames[currentIndex].Checked {
-					targetIdx = currentIndex
-					break
-				}
-				if currentIndex == startIdx {
-					break
-				}
-			}
-		}
-		mu.Unlock()
-
-		if targetIdx >= 0 {
-			fyne.Do(func() {
-				for i, ci := range cimgs {
-					if i == targetIdx {
-						if ci.Hidden {
-							ci.Hidden = false
-							ci.Refresh()
-						}
-					} else {
-						if !ci.Hidden {
-							ci.Hidden = true
-							ci.Refresh()
-						}
-					}
-				}
-			})
-		}
-	}
 
 	nextBtn := widget.NewButton("Next >", func() {
 		pauseCheck.SetChecked(true)

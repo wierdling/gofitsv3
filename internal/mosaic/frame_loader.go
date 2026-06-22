@@ -97,9 +97,22 @@ func prepareFramePixels(p plannedInput, opts Options, skyOffset float64) (sci, e
 	if opts.SurfaceBrightnessNorm && !p.input.ReferenceOnly {
 		sbScale, needSB = surfaceBrightnessScale(p)
 	}
+
+	// Exposure normalization: convert total-count pixels to a per-second rate by
+	// multiplying by ExposureScale (1/EXPTIME). Independent of WeightingMode and
+	// applied to both SCI and ERR (which is in the same units). Disabled unless
+	// the frame opted in with a finite, positive scale.
+	var expScale float32
+	needExp := false
+	if p.input.NormalizeExposure && !p.input.ReferenceOnly {
+		if s := p.input.ExposureScale; isFinite64(s) && s > 0 {
+			expScale = float32(s)
+			needExp = true
+		}
+	}
 	needSky := skyOffset != 0 && isFinite64(skyOffset)
 
-	if (needSB || needSky) && !owned {
+	if (needSB || needExp || needSky) && !owned {
 		sci = append([]float32(nil), sci...)
 		if errPix != nil {
 			errPix = append([]float32(nil), errPix...)
@@ -108,6 +121,12 @@ func prepareFramePixels(p plannedInput, opts Options, skyOffset float64) (sci, e
 	if needSB {
 		applyScaleInPlace(sci, sbScale)
 		applyScaleInPlace(errPix, sbScale)
+	}
+	if needExp {
+		applyScaleInPlace(sci, expScale)
+		applyScaleInPlace(errPix, expScale)
+		debuglog.Log(fmt.Sprintf("prepareFramePixels: %s exposure-normalized scale=%.6g errNormalized=%t",
+			InputKey(p.input), expScale, errPix != nil))
 	}
 	if needSky {
 		applySkySubInPlace(sci, skyOffset)

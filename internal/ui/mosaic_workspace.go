@@ -59,6 +59,11 @@ type mosaicWorkspace struct {
 	sendToExamineBtn *widget.Button
 	saveOffsetsBtn   *widget.Button
 	loadOffsetsBtn   *widget.Button
+	batchBtn         *widget.Button
+	buildBtn         *widget.Button
+	clearBtn         *widget.Button
+	setRefBtn        *widget.Button
+	clearRefBtn      *widget.Button
 	refLabel         *widget.Label
 
 	// --- level entry widgets ---

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"strings"
 
 	"gofitsv3/internal/badpix"
 	"gofitsv3/internal/fitsio"
@@ -28,7 +29,14 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 	sci := file.SelectSCI()
 	if len(sci) == 0 {
 		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst.BadDQBits)
-		return []Input{{Path: path, PrimaryHeader: primary, HDU: hdu}}, nil
+		return []Input{{
+			Path:          path,
+			PrimaryHeader: primary,
+			HDU:           hdu,
+			ExposureTime:  loadExposureTime(primary, hdu.Header),
+			DateObs:       loadDateObs(primary, hdu.Header),
+			BUnit:         loadBUnit(hdu.Header, primary),
+		}}, nil
 	}
 
 	inputs := make([]Input, 0, len(sci))
@@ -42,6 +50,8 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 			PrimaryHeader: primary,
 			HDU:           hdu,
 			ExposureTime:  loadExposureTime(primary, hdu.Header),
+			DateObs:       loadDateObs(primary, hdu.Header),
+			BUnit:         loadBUnit(hdu.Header, primary),
 			D2IX:          d2iX,
 			D2IY:          d2iY,
 			ERRPixels:     loadERRPixels(file, extver),
@@ -116,6 +126,31 @@ func loadExposureTime(headers ...fitsio.Header) float64 {
 		}
 	}
 	return 0
+}
+
+// loadBUnit returns the BUNIT header value (data unit) from the first header
+// that has one, normally the SCI extension header. Returns "" when absent.
+func loadBUnit(headers ...fitsio.Header) string {
+	for _, header := range headers {
+		if v := fitsio.HeaderString(header, "BUNIT"); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func loadDateObs(headers ...fitsio.Header) string {
+	for _, header := range headers {
+		raw := fitsio.HeaderString(header, "DATE-OBS", "DATEOBS")
+		if raw == "" {
+			continue
+		}
+		if len(raw) >= 10 {
+			return raw[:10]
+		}
+		return strings.TrimSpace(raw)
+	}
+	return ""
 }
 
 func loadERRPixels(file *fitsio.File, sciExtver int) []float32 {
@@ -196,7 +231,11 @@ func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *
 	// so a small value here is fine.  The value is taken from the instrument
 	// metadata so that detectors with wider inter-chip gaps (e.g. ACS/WFC)
 	// get a larger trim.
-	chipInnerTrim := inst.ChipInnerTrim
+	// Temporarily disabled to test whether the geometric chip-edge erosion is
+	// still needed now that DQ masking handles bad pixels. Restore by reverting
+	// to the commented assignment if boundary ringing reappears.
+	// chipInnerTrim := inst.ChipInnerTrim
+	chipInnerTrim := 0
 
 	sums := make([]float32, width*height)
 	weights := make([]float32, width*height)

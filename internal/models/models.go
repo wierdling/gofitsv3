@@ -42,6 +42,9 @@ type ChannelState struct {
 	Peak       float64 `json:"peak"`
 	ScaledPeak float64 `json:"scaledPeak"`
 	ShowClip   bool    `json:"showClip"`
+	OffsetX    float64 `json:"offsetX,omitempty"`
+	OffsetY    float64 `json:"offsetY,omitempty"`
+	OffsetRot  float64 `json:"offsetRot,omitempty"`
 }
 
 type ComposeProject struct {
@@ -180,6 +183,9 @@ type ChannelControl struct {
 	BackgroundEntry NumberField
 	PeakEntry       NumberField
 	ScaledPeakEntry NumberField
+	XOffsetEntry    NumberField
+	YOffsetEntry    NumberField
+	RotOffsetEntry  NumberField
 	ShowClip        CheckField
 }
 

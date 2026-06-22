@@ -2,6 +2,7 @@ package ui
 
 import (
 	"image/color"
+	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -233,6 +234,232 @@ func (ws *mosaicWorkspace) rebuildOffsetControls() {
 	ws.offsetControls.Refresh()
 }
 
+func (ws *mosaicWorkspace) openInputFramesPopup() {
+	if len(ws.state.inputs) == 0 {
+		dialog.ShowInformation("Input Frames", "Load at least one FITS file first.", ws.win)
+		return
+	}
+
+	desc := widget.NewLabel("Select records by exposure or date. Changes update the Input Frames tab immediately.")
+
+	nameCell := func(obj fyne.CanvasObject) fyne.CanvasObject {
+		return container.New(&minWidthLayout{160}, obj)
+	}
+	hdrLabel := func(text string) fyne.CanvasObject {
+		return widget.NewLabelWithStyle(text, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	}
+	hdrCell := func(text string, w float32) fyne.CanvasObject {
+		return container.New(&minWidthLayout{w: w}, hdrLabel(text))
+	}
+	hdrSpace := func(w float32) fyne.CanvasObject {
+		r := canvas.NewRectangle(color.Transparent)
+		r.SetMinSize(fyne.NewSize(w, 1))
+		return r
+	}
+
+	compactEntry := NewNumberEntry(1, 2)
+	compactEntry.MinWidth = 1
+	entryColW := compactEntry.MinSize().Width
+	btnUpW := widget.NewButton("↑", nil).MinSize().Width
+	flashBtnW := widget.NewButton("Flash", nil).MinSize().Width
+	applyBtnW := widget.NewButton("Apply", nil).MinSize().Width
+	checkNatW := container.NewCenter(widget.NewCheck("", nil)).MinSize().Width
+	lockColW := hdrLabel("Lock").MinSize().Width
+	if lockColW < checkNatW {
+		lockColW = checkNatW
+	}
+	inclColW := hdrLabel("Incl.").MinSize().Width
+	if inclColW < checkNatW {
+		inclColW = checkNatW
+	}
+	dateColW := hdrLabel("Date").MinSize().Width
+	expColW := hdrLabel("Exp").MinSize().Width
+
+	header := container.NewHBox(
+		hdrSpace(btnUpW), hdrSpace(btnUpW),
+		nameCell(hdrLabel("Name")),
+		hdrCell("X", entryColW),
+		hdrCell("Y", entryColW),
+		hdrCell("Rot°", entryColW),
+		hdrCell("Date", dateColW),
+		hdrCell("Exp", expColW),
+		hdrCell("Flash", flashBtnW),
+		hdrCell("Apply", applyBtnW),
+		hdrCell("Lock", lockColW),
+		hdrCell("Incl.", inclColW),
+	)
+	rows := container.NewVBox()
+	for idx := range ws.state.inputs {
+		input := ws.state.inputs[idx]
+		name := mosaic.InputLabel(input)
+		xEntry := NewNumberEntry(1, 2)
+		xEntry.MinWidth = 1
+		xEntry.SetValue(input.OffsetX)
+		yEntry := NewNumberEntry(1, 2)
+		yEntry.MinWidth = 1
+		yEntry.SetValue(input.OffsetY)
+		rotEntry := NewNumberEntry(0.01, 4)
+		rotEntry.MinWidth = 1
+		if input.HasManualTransform {
+			t := input.ManualTransform
+			rotEntry.SetValue(math.Atan2(t.D, t.A) * 180 / math.Pi)
+		}
+		dateLabel := widget.NewLabel(input.DateObs)
+		if dateLabel.Text == "" {
+			dateLabel.SetText("-")
+		}
+		expLabel := widget.NewLabel("")
+		if input.ExposureTime > 0 {
+			expLabel.SetText(strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.4f", input.ExposureTime), "0"), "."))
+		} else {
+			expLabel.SetText("-")
+		}
+
+		includeCheck := widget.NewCheck("", func(index int) func(bool) {
+			return func(included bool) {
+				ws.state.inputs[index].Excluded = !included
+			}
+		}(idx))
+		includeCheck.SetChecked(!input.Excluded)
+
+		lockCheck := widget.NewCheck("", func(index int) func(bool) {
+			return func(locked bool) {
+				ws.state.inputs[index].OffsetLocked = locked
+			}
+		}(idx))
+		lockCheck.SetChecked(input.OffsetLocked)
+
+		applyBtn := widget.NewButton("Apply", func(index int, xBox, yBox, rotBox *NumberEntry) func() {
+			return func() {
+				xVal := xBox.Value()
+				yVal := yBox.Value()
+				rotVal := rotBox.Value()
+				ws.state.inputs[index].OffsetX = xVal
+				ws.state.inputs[index].OffsetY = yVal
+				if rotVal != 0 {
+					rad := rotVal * math.Pi / 180
+					cx := float64(ws.state.inputs[index].HDU.Data.Width-1) / 2
+					cy := float64(ws.state.inputs[index].HDU.Data.Height-1) / 2
+					ws.state.inputs[index].ManualTransform = processing.RotationAround(cx, cy, rad)
+					ws.state.inputs[index].HasManualTransform = true
+				} else {
+					ws.state.inputs[index].ManualTransform = processing.IdentityTransform()
+					ws.state.inputs[index].HasManualTransform = false
+				}
+				if index < len(ws.state.statuses) && ws.state.statuses[index].Status == "loaded" {
+					ws.state.statuses[index].Status = "manual offset set"
+				}
+				ws.resetPreview()
+				ws.updateStatus()
+			}
+		}(idx, xEntry, yEntry, rotEntry))
+
+		flashBtn := widget.NewButton("Flash", func(index int) func() {
+			return func() {
+				if ws.state.result == nil || ws.activePicker != nil || ws.activeMeasure != nil {
+					return
+				}
+				inputPath := mosaic.InputKey(ws.state.inputs[index])
+				var fps [][4][2]float64
+				for fi, fp := range ws.state.result.InputFootprints {
+					if fi < len(ws.state.result.InputFootprintPaths) && ws.state.result.InputFootprintPaths[fi] == inputPath {
+						fps = append(fps, fp)
+					}
+				}
+				if len(fps) == 0 {
+					return
+				}
+				black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
+				go func() {
+					baseImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode)
+					flashImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode)
+					salmon := color.RGBA{R: 250, G: 128, B: 114, A: 255}
+					pairs := [4][2]int{{0, 1}, {1, 3}, {3, 2}, {2, 0}}
+					for _, fp := range fps {
+						for _, p := range pairs {
+							drawThickLine(flashImg, fp[p[0]], fp[p[1]], 5, salmon)
+						}
+					}
+					for i := 0; i < 3; i++ {
+						fyne.DoAndWait(func() {
+							ws.preview.Image = flashImg
+							ws.preview.Refresh()
+						})
+						time.Sleep(500 * time.Millisecond)
+						fyne.DoAndWait(func() {
+							ws.preview.Image = baseImg
+							ws.preview.Refresh()
+						})
+						if i < 2 {
+							time.Sleep(500 * time.Millisecond)
+						}
+					}
+				}()
+			}
+		}(idx))
+
+		if idx == 0 {
+			xEntry.Disable()
+			yEntry.Disable()
+			rotEntry.Disable()
+			applyBtn.Disable()
+			lockCheck.Disable()
+		}
+
+		upBtn := widget.NewButton("↑", func(index int) func() {
+			return func() {
+				if index == 0 {
+					return
+				}
+				ws.state.inputs[index-1], ws.state.inputs[index] = ws.state.inputs[index], ws.state.inputs[index-1]
+				if index < len(ws.state.statuses) && index-1 < len(ws.state.statuses) {
+					ws.state.statuses[index-1], ws.state.statuses[index] = ws.state.statuses[index], ws.state.statuses[index-1]
+				}
+				ws.resetPreview()
+				ws.rebuildOffsetControls()
+			}
+		}(idx))
+		downBtn := widget.NewButton("↓", func(index int) func() {
+			return func() {
+				if index >= len(ws.state.inputs)-1 {
+					return
+				}
+				ws.state.inputs[index], ws.state.inputs[index+1] = ws.state.inputs[index+1], ws.state.inputs[index]
+				if index < len(ws.state.statuses) && index+1 < len(ws.state.statuses) {
+					ws.state.statuses[index], ws.state.statuses[index+1] = ws.state.statuses[index+1], ws.state.statuses[index]
+				}
+				ws.resetPreview()
+				ws.rebuildOffsetControls()
+			}
+		}(idx))
+		if idx == 0 {
+			upBtn.Disable()
+		}
+		if idx == len(ws.state.inputs)-1 {
+			downBtn.Disable()
+		}
+
+		row := container.NewHBox(
+			upBtn, downBtn,
+			nameCell(widget.NewLabel(name)),
+			xEntry, yEntry, rotEntry,
+			dateLabel, expLabel,
+			flashBtn, applyBtn,
+			container.New(&minWidthLayout{w: lockColW}, container.NewCenter(lockCheck)),
+			container.New(&minWidthLayout{w: inclColW}, container.NewCenter(includeCheck)),
+		)
+		rows.Add(row)
+	}
+	scroll := container.NewVScroll(rows)
+	scroll.SetMinSize(fyne.NewSize(900, 360))
+	table := container.NewBorder(header, nil, nil, nil, scroll)
+	content := container.NewVBox(desc, widget.NewSeparator(), table)
+
+	d := dialog.NewCustom("Input Frames", "Close", content, ws.win)
+	d.Resize(fyne.NewSize(960, 520))
+	d.Show()
+}
+
 func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 	// Filter out paths already loaded.
 	existingPaths := make(map[string]bool, len(ws.state.inputs))
@@ -296,7 +523,7 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 			messages = append(messages, "Some loaded files are not standard _flc/_flt inputs. They were kept, but this workflow is tuned for HST calibrated science files.")
 		}
 		messages = append(messages, offsetMessages...)
-		fyne.DoAndWait(func() {
+		fyne.Do(func() {
 			progressDialog.Hide()
 			ws.state.inputs = append(ws.state.inputs, newInputs...)
 			ws.state.statuses = append(ws.state.statuses, newStatuses...)
@@ -307,6 +534,7 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 			ws.resetPreview()
 			ws.rebuildOffsetControls()
 			ws.updateStatus()
+			ws.updateActionButtons()
 			if len(messages) > 0 {
 				dialog.ShowInformation("Mosaic Load", strings.Join(messages, "\n"), ws.win)
 			}
