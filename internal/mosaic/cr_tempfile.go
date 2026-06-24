@@ -40,6 +40,7 @@ func buildCRMasksDrizzle(
 	planned []plannedInput,
 	dataPlanned []int,
 	skyOffsets []float64,
+	skyPlanes []skyPlane,
 	opts Options,
 	width, height int,
 	minX, minY, scale float64,
@@ -75,7 +76,7 @@ func buildCRMasksDrizzle(
 		go func(slot, pi int) {
 			defer sepWG.Done()
 			defer func() { <-sepSem }()
-			pixels, _, perr := prepareFramePixels(planned[pi], opts, skyOffsets[pi])
+			pixels, _, perr := prepareFramePixels(planned[pi], opts, skyOffsets[pi], skyPlanes[pi])
 			if perr != nil {
 				sepErr.Store(fmt.Errorf("load frame %s: %w", InputKey(planned[pi].input), perr))
 				return
@@ -135,7 +136,7 @@ func buildCRMasksDrizzle(
 		go func(slot, pi int) {
 			defer maskWG.Done()
 			defer func() { <-maskSem }()
-			pixels, _, perr := prepareFramePixels(planned[pi], opts, skyOffsets[pi])
+			pixels, _, perr := prepareFramePixels(planned[pi], opts, skyOffsets[pi], skyPlanes[pi])
 			if perr != nil {
 				maskErr.Store(fmt.Errorf("reload frame %s: %w", InputKey(planned[pi].input), perr))
 				return

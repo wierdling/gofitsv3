@@ -22,6 +22,7 @@ type viewerInteractionLayer struct {
 	onPointerOut  func()
 	onTapped      func(fyne.Position)
 	pickerActive  bool
+	lastDragPos   fyne.Position
 	start         *fyne.Position
 	end           *fyne.Position
 }
@@ -51,6 +52,14 @@ func (d *viewerInteractionLayer) setMeasurement(start *fyne.Position, end *fyne.
 }
 
 func (d *viewerInteractionLayer) Dragged(e *fyne.DragEvent) {
+	// While picking levels we don't pan. Fyne classifies any movement of
+	// 2px or more as a drag and then suppresses the Tapped event, so a normal
+	// click would otherwise neither pan nor pick. Remember where the pointer
+	// ended so DragEnd can complete the pick.
+	if d.pickerActive {
+		d.lastDragPos = e.Position
+		return
+	}
 	if d.scroll == nil {
 		return
 	}
@@ -76,7 +85,13 @@ func (d *viewerInteractionLayer) Dragged(e *fyne.DragEvent) {
 	d.scroll.Refresh()
 }
 
-func (d *viewerInteractionLayer) DragEnd() {}
+func (d *viewerInteractionLayer) DragEnd() {
+	// A drag that started while picking is treated as a tap at the release
+	// position, so small pointer jitter during a click still registers a pick.
+	if d.pickerActive && d.onTapped != nil {
+		d.onTapped(d.lastDragPos)
+	}
+}
 
 func (d *viewerInteractionLayer) Tapped(e *fyne.PointEvent) {
 	if d.onTapped != nil {

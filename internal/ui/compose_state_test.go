@@ -196,6 +196,8 @@ func TestDefaultRGBLevelsAndModeLabelRoundTrip(t *testing.T) {
 		{mode: stretch.Asinh, label: "Asinh"},
 		{mode: stretch.Sqrt, label: "Sqrt"},
 		{mode: stretch.HistEq, label: "HistEq"},
+		{mode: stretch.MTF, label: "MTF"},
+		{mode: stretch.GHS, label: "GHS"},
 	}
 	for _, tt := range tests {
 		if got := modeToLabel(tt.mode); got != tt.label {
@@ -407,6 +409,34 @@ func TestComposePixelValueAtReturnsRawChannelValue(t *testing.T) {
 	}
 	if _, ok := composePixelValueAt(img, imagePoint{X: 3, Y: 0}); ok {
 		t.Fatal("composePixelValueAt out-of-bounds ok = true, want false")
+	}
+}
+
+func TestComposeRegionMedianAtIgnoresSinglePixelOutlier(t *testing.T) {
+	// 5x5 uniform background with one hot pixel at the click point. A single-pixel
+	// read returns the outlier; the region median must reject it so the picked
+	// level is stable regardless of exactly which pixel is clicked.
+	pixels := make([]float32, 25)
+	for i := range pixels {
+		pixels[i] = 10
+	}
+	pixels[2*5+2] = 1000 // hot pixel at (2,2)
+	img := makeLoadedImageForUITest(5, 5, pixels)
+
+	if got, ok := composePixelValueAt(img, imagePoint{X: 2, Y: 2}); !ok || got != 1000 {
+		t.Fatalf("composePixelValueAt hot pixel = (%v,%v), want (1000,true)", got, ok)
+	}
+	got, ok := composeRegionMedianAt(img, imagePoint{X: 2, Y: 2}, composePickRadius)
+	if !ok || got != 10 {
+		t.Fatalf("composeRegionMedianAt = (%v,%v), want (10,true)", got, ok)
+	}
+
+	// Clamping at a corner still returns the median of the in-bounds region.
+	if got, ok := composeRegionMedianAt(img, imagePoint{X: 0, Y: 0}, composePickRadius); !ok || got != 10 {
+		t.Fatalf("composeRegionMedianAt corner = (%v,%v), want (10,true)", got, ok)
+	}
+	if _, ok := composeRegionMedianAt(img, imagePoint{X: 5, Y: 0}, composePickRadius); ok {
+		t.Fatal("composeRegionMedianAt out-of-bounds ok = true, want false")
 	}
 }
 

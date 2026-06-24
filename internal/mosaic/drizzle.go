@@ -502,7 +502,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	logMemStats("after planning")
 	options.reportProgress("Sky subtraction", 0, 0)
 	debuglog.Log("Build: calling planSkysub")
-	skyOffset, skyApplied, skyValues, err := planSkysub(planned, options)
+	skyOffset, skyPlanes, skyApplied, skyValues, err := planSkysub(planned, options)
 	if err != nil {
 		return nil, err
 	}
@@ -531,7 +531,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	if effectiveCR == CRMethodDrizzle && len(dataPlanned) > 1 {
 		logMemStats("CR start")
 		debuglog.Log(fmt.Sprintf("Build: starting streamed CR drizzle, %d frames", len(dataPlanned)))
-		crMasks, err = buildCRMasksDrizzle(planned, dataPlanned, skyOffset, options, width, height, minX, minY, options.Scale)
+		crMasks, err = buildCRMasksDrizzle(planned, dataPlanned, skyOffset, skyPlanes, options, width, height, minX, minY, options.Scale)
 		if err != nil {
 			return nil, err
 		}
@@ -563,7 +563,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		options.reportProgress("Drizzling", finalSlot, len(dataPlanned))
 		finalSlot++
 		debuglog.Log(fmt.Sprintf("Build: final drizzle frame %d (%s)", finalSlot, InputKey(planned[i].input)))
-		pixels, errPix, perr := prepareFramePixels(planned[i], options, skyOffset[i])
+		pixels, errPix, perr := prepareFramePixels(planned[i], options, skyOffset[i], skyPlanes[i])
 		if perr != nil {
 			return nil, fmt.Errorf("load frame %s: %w", InputKey(planned[i].input), perr)
 		}
@@ -1520,8 +1520,20 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 		var mapper *processing.WCSMapper
 		if idx == 0 {
 			statuses[idx].Status = "reference"
-			// mapper stays nil; reference pixels map through the identity
-			// affine (sourceToRef) so no WCS round-trip is needed.
+			// The reference must be drizzled through its own distortion model
+			// (SIP + D2IM) onto the linear output plane, exactly like every
+			// other input. Leaving it on the identity affine would place the
+			// reference chip in distorted pixel space while all other chips
+			// land undistorted, so a single multi-chip exposure's chips no
+			// longer line up (non-uniform chip gap, mismatched outer edges).
+			var mapperErr error
+			mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
+			if mapperErr != nil {
+				statuses[idx].Status = "failed"
+				statuses[idx].Error = mapperErr.Error()
+				debuglog.Log(fmt.Sprintf("planInputs: FAILED reference %s - WCSMapper: %v", InputKey(input), mapperErr))
+				return nil, statuses, 0, 0, 0, 0, fmt.Errorf("reference WCS mapper: %w", mapperErr)
+			}
 		} else {
 			// Build the per-pixel WCS mapper for all non-reference inputs,
 			// regardless of whether they share a file with the reference.

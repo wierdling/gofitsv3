@@ -39,6 +39,42 @@ func AutoScaleLikeFitsLiberator(img *models.LoadedImage) {
 	}
 }
 
+// AutoMTFMidtone selects an MTF midtone for the image using a PixInsight-style
+// auto-STF heuristic: it maps the level ~2.8 noise-sigma above the black point
+// to a 0.25 target background. It respects the current Background/Peak levels
+// (running Auto scaling first only if they look unset) and sets Mode to MTF.
+func AutoMTFMidtone(img *models.LoadedImage) {
+	if img == nil || len(img.HDU.Data.Pixels) == 0 {
+		return
+	}
+	if img.Peak <= img.Background {
+		AutoScaleLikeFitsLiberator(img)
+	}
+	_, sigma := EstimateBackground(img.HDU.Data.Pixels)
+	denom := img.Peak - img.Background
+	if denom <= 0 {
+		denom = 1
+	}
+	// Normalised position of the 2.8-sigma reference level above the black point.
+	xRef := 2.8 * sigma / denom
+	if xRef < 1e-5 {
+		xRef = 1e-5
+	}
+	if xRef > 1 {
+		xRef = 1
+	}
+	// m solving Mtf(m, xRef) == 0.25 (the auto-STF target background).
+	m := 3 * xRef / (2*xRef + 1)
+	if m < 0.001 {
+		m = 0.001
+	}
+	if m > 0.5 {
+		m = 0.5
+	}
+	img.MTFMidtone = m
+	img.Mode = stretch.MTF
+}
+
 func ApplyStretchParallel(img *models.LoadedImage) (fitsio.ImageData, []byte) {
 	data := img.HDU.Data
 	numPixels := len(data.Pixels)
@@ -71,9 +107,32 @@ func ApplyStretchParallel(img *models.LoadedImage) (fitsio.ImageData, []byte) {
 	stretchMul := scaledPeak / denom
 
 	invLogPeak := 1.0 / math.Log1p(scaledPeak)
-	invAsinhPeak := 1.0 / math.Asinh(scaledPeak)
 	invSqrtPeak := 1.0 / math.Sqrt(scaledPeak)
 	invLinearPeak := 1.0 / scaledPeak
+
+	// Resolve stretch-specific parameters, substituting defaults for unset
+	// (zero) values so older projects and freshly loaded images stay sensible.
+	asinhScale := img.AsinhScale
+	if asinhScale <= 0 {
+		asinhScale = stretch.DefaultAsinhScale
+	}
+	// Tunable Asinh: result = asinh(val/beta) / asinh(scaledPeak/beta).
+	invAsinhPeak := 1.0 / math.Asinh(scaledPeak/asinhScale)
+
+	mtfMidtone := img.MTFMidtone
+	if mtfMidtone <= 0 || mtfMidtone >= 1 {
+		mtfMidtone = stretch.DefaultMTFMidtone
+	}
+
+	ghsD := img.GHSStretch
+	if ghsD <= 0 {
+		ghsD = stretch.DefaultGHSStretch
+	}
+	ghsSP := img.GHSSymmetry
+	if ghsSP <= 0 || ghsSP >= 1 {
+		ghsSP = stretch.DefaultGHSSymmetry
+	}
+	ghs := stretch.NewGHS(ghsD, img.GHSLocal, ghsSP, 0, 1)
 
 	mode := img.Mode
 	black := img.Black
@@ -140,10 +199,16 @@ func ApplyStretchParallel(img *models.LoadedImage) (fitsio.ImageData, []byte) {
 					result = math.Log1p(val) * invLogPeak
 
 				case stretch.Asinh:
-					result = math.Asinh(val) * invAsinhPeak
+					result = math.Asinh(val/asinhScale) * invAsinhPeak
 
 				case stretch.Sqrt:
 					result = math.Sqrt(val) * invSqrtPeak
+
+				case stretch.MTF:
+					result = stretch.Mtf(mtfMidtone, val*invLinearPeak)
+
+				case stretch.GHS:
+					result = ghs.Eval(val * invLinearPeak)
 
 				default:
 					result = val * invLinearPeak

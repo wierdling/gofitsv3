@@ -84,9 +84,9 @@ func applyScaleInPlace(pixels []float32, scale float32) {
 // surface-brightness normalization (when enabled) and the supplied sky offset.
 // When the underlying pixels are borrowed in-memory arrays they are copied
 // before any mutation, so the caller's originals are never altered. Pass
-// skyOffset == 0 (or NaN) to skip sky subtraction (e.g. during sky planning,
-// where only the surface-brightness step is wanted).
-func prepareFramePixels(p plannedInput, opts Options, skyOffset float64) (sci, errPix []float32, err error) {
+// skyOffset == 0 (or NaN) and an invalid skyPlane skip sky subtraction (e.g.
+// during sky planning, where only the surface-brightness step is wanted).
+func prepareFramePixels(p plannedInput, opts Options, skyOffset float64, plane skyPlane) (sci, errPix []float32, err error) {
 	sci, errPix, owned, err := resolveFramePixels(p.input, opts)
 	if err != nil {
 		return nil, nil, err
@@ -111,8 +111,9 @@ func prepareFramePixels(p plannedInput, opts Options, skyOffset float64) (sci, e
 		}
 	}
 	needSky := skyOffset != 0 && isFinite64(skyOffset)
+	needPlane := plane.Valid
 
-	if (needSB || needExp || needSky) && !owned {
+	if (needSB || needExp || needSky || needPlane) && !owned {
 		sci = append([]float32(nil), sci...)
 		if errPix != nil {
 			errPix = append([]float32(nil), errPix...)
@@ -130,6 +131,9 @@ func prepareFramePixels(p plannedInput, opts Options, skyOffset float64) (sci, e
 	}
 	if needSky {
 		applySkySubInPlace(sci, skyOffset)
+	}
+	if needPlane {
+		applySkyPlaneInPlace(p, sci, plane)
 	}
 	return sci, errPix, nil
 }

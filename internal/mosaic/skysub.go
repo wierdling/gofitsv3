@@ -56,6 +56,18 @@ type sampleAccum struct {
 	count int
 }
 
+type skyPlane struct {
+	A, B, C float64
+	Valid   bool
+}
+
+func (p skyPlane) value(x, y float64) float64 {
+	if !p.Valid {
+		return 0
+	}
+	return p.A*x + p.B*y + p.C
+}
+
 func normalizeSkysubOptions(options SkysubOptions) SkysubOptions {
 	if options.Width <= 0 {
 		options.Width = 0.1
@@ -91,16 +103,17 @@ func normalizeSkysubOptions(options SkysubOptions) SkysubOptions {
 // overlap sample map), then releases the pixels. The returned skyOffset[i] is
 // applied per frame at drizzle time via prepareFramePixels; only scalars (and
 // the tiny overlap maps) are held during planning.
-func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, applied []bool, skyValues []float64, err error) {
+func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyPlanes []skyPlane, applied []bool, skyValues []float64, err error) {
 	n := len(planned)
 	skyOffset = make([]float64, n)
+	skyPlanes = make([]skyPlane, n)
 	applied = make([]bool, n)
 	skyValues = make([]float64, n)
 	for i := range skyValues {
 		skyValues[i] = math.NaN()
 	}
 	if !opts.Skysub.Enabled {
-		return skyOffset, applied, skyValues, nil
+		return skyOffset, skyPlanes, applied, skyValues, nil
 	}
 
 	options := normalizeSkysubOptions(opts.Skysub)
@@ -129,7 +142,7 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, appl
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			pixels, _, perr := prepareFramePixels(planned[i], opts, 0)
+			pixels, _, perr := prepareFramePixels(planned[i], opts, 0, skyPlane{})
 			if perr != nil {
 				skyErrMu.Lock()
 				if skyErr == nil {
@@ -155,10 +168,11 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, appl
 	}
 	wg.Wait()
 	if skyErr != nil {
-		return nil, nil, nil, skyErr
+		return nil, nil, nil, nil, skyErr
 	}
 
 	subtractSky := make([]float64, n)
+	var matched []bool
 	switch options.Method {
 	case SkyMethodGlobalMin:
 		globalMin := math.Inf(1)
@@ -176,7 +190,8 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, appl
 			}
 		}
 	case SkyMethodMatch, SkyMethodGlobalMinMatch:
-		rel, matched := computeMatchedSkyOffsets(planned, maps, options)
+		var rel []float64
+		rel, matched = computeMatchedSkyOffsets(planned, maps, options)
 		if options.Method == SkyMethodMatch {
 			for i := range planned {
 				if planned[i].input.ReferenceOnly {
@@ -245,6 +260,10 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, appl
 		}
 	}
 
+	if needMaps {
+		skyPlanes = computeOverlapAnchoredSkyPlanes(planned, maps, subtractSky, matched, options)
+	}
+
 	logSkysubPlan(planned, rawSky, subtractSky, maps)
 
 	for i := range planned {
@@ -255,7 +274,7 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, appl
 		applied[i] = true
 		skyValues[i] = subtractSky[i]
 	}
-	return skyOffset, applied, skyValues, nil
+	return skyOffset, skyPlanes, applied, skyValues, nil
 }
 
 // skyConcurrency bounds how many frames are sky-estimated at once. Each worker
@@ -282,6 +301,29 @@ func applySkySubInPlace(pixels []float32, sky float64) {
 			continue
 		}
 		pixels[i] = v - delta
+	}
+}
+
+func applySkyPlaneInPlace(p plannedInput, pixels []float32, plane skyPlane) {
+	if !plane.Valid {
+		return
+	}
+	width := p.input.HDU.Data.Width
+	height := p.input.HDU.Data.Height
+	for y := 0; y < height; y++ {
+		row := y * width
+		for x := 0; x < width; x++ {
+			idx := row + x
+			if idx >= len(pixels) || !isFinite32(pixels[idx]) {
+				continue
+			}
+			rx, ry := p.mapPixel(float64(x), float64(y))
+			correction := plane.value(rx, ry)
+			if !isFiniteSky64(correction) {
+				continue
+			}
+			pixels[idx] -= float32(correction)
+		}
 	}
 }
 
@@ -562,23 +604,194 @@ func overlapDiffsForEdge(mapI, mapJ map[int64]float64) []float64 {
 	return diffs
 }
 
+type skyPlaneSample struct {
+	x, y, z float64
+}
+
+func computeOverlapAnchoredSkyPlanes(planned []plannedInput, maps []map[int64]float64, subtractSky []float64, matched []bool, options SkysubOptions) []skyPlane {
+	planes := make([]skyPlane, len(planned))
+	for i := range planned {
+		if planned[i].input.ReferenceOnly || i >= len(maps) || len(maps[i]) == 0 || i >= len(matched) || !matched[i] {
+			continue
+		}
+		overlapKeys := overlapKeysForInput(i, planned, maps)
+		if len(overlapKeys) < skyMinPlaneAnchorCells {
+			continue
+		}
+		anchorVals := make([]float64, 0, len(overlapKeys))
+		for key := range overlapKeys {
+			if v, ok := maps[i][key]; ok {
+				anchorVals = append(anchorVals, v-subtractSky[i])
+			}
+		}
+		if len(anchorVals) < skyMinPlaneAnchorCells {
+			continue
+		}
+		sort.Float64s(anchorVals)
+		anchor := medianFloat64(anchorVals)
+
+		samples := make([]skyPlaneSample, 0, len(maps[i]))
+		for key, value := range maps[i] {
+			x, y := overlapCellCenter(key)
+			samples = append(samples, skyPlaneSample{x: x, y: y, z: value - subtractSky[i] - anchor})
+		}
+		plane, ok := fitSkyPlane(samples, options)
+		if !ok {
+			continue
+		}
+
+		anchorCorrections := make([]float64, 0, len(overlapKeys))
+		for key := range overlapKeys {
+			x, y := overlapCellCenter(key)
+			anchorCorrections = append(anchorCorrections, plane.value(x, y))
+		}
+		sort.Float64s(anchorCorrections)
+		plane.C -= medianFloat64(anchorCorrections)
+		plane.Valid = true
+		planes[i] = plane
+	}
+	return planes
+}
+
+func overlapKeysForInput(i int, planned []plannedInput, maps []map[int64]float64) map[int64]struct{} {
+	keys := make(map[int64]struct{})
+	for j := range planned {
+		if i == j || planned[j].input.ReferenceOnly || j >= len(maps) || len(maps[j]) == 0 {
+			continue
+		}
+		if len(maps[i]) <= len(maps[j]) {
+			for key := range maps[i] {
+				if _, ok := maps[j][key]; ok {
+					keys[key] = struct{}{}
+				}
+			}
+		} else {
+			for key := range maps[j] {
+				if _, ok := maps[i][key]; ok {
+					keys[key] = struct{}{}
+				}
+			}
+		}
+	}
+	return keys
+}
+
+func fitSkyPlane(samples []skyPlaneSample, options SkysubOptions) (skyPlane, bool) {
+	if len(samples) < skyMinPlaneFitCells {
+		return skyPlane{}, false
+	}
+	work := append([]skyPlaneSample(nil), samples...)
+	clip := options.Clip
+	if clip < 1 {
+		clip = 1
+	}
+	var plane skyPlane
+	for iter := 0; iter <= clip; iter++ {
+		var ok bool
+		plane, ok = solveSkyPlane(work)
+		if !ok {
+			return skyPlane{}, false
+		}
+		if iter == clip {
+			break
+		}
+		residuals := make([]float64, len(work))
+		for i, sample := range work {
+			residuals[i] = sample.z - plane.value(sample.x, sample.y)
+		}
+		mean, sigma := meanAndSigma(residuals)
+		if sigma <= 0 {
+			break
+		}
+		lo := mean - options.LSigma*sigma
+		hi := mean + options.USigma*sigma
+		clipped := work[:0]
+		for i, sample := range work {
+			if residuals[i] >= lo && residuals[i] <= hi {
+				clipped = append(clipped, sample)
+			}
+		}
+		if len(clipped) == len(work) || len(clipped) < skyMinPlaneFitCells {
+			break
+		}
+		work = clipped
+	}
+	plane.Valid = true
+	return plane, true
+}
+
+func solveSkyPlane(samples []skyPlaneSample) (skyPlane, bool) {
+	if len(samples) < 3 {
+		return skyPlane{}, false
+	}
+	var meanX, meanY float64
+	for _, sample := range samples {
+		meanX += sample.x
+		meanY += sample.y
+	}
+	meanX /= float64(len(samples))
+	meanY /= float64(len(samples))
+
+	ata := make([][]float64, 3)
+	for i := range ata {
+		ata[i] = make([]float64, 3)
+	}
+	atb := make([]float64, 3)
+	for _, sample := range samples {
+		x := sample.x - meanX
+		y := sample.y - meanY
+		terms := [3]float64{x, y, 1}
+		for r := 0; r < 3; r++ {
+			atb[r] += terms[r] * sample.z
+			for c := 0; c < 3; c++ {
+				ata[r][c] += terms[r] * terms[c]
+			}
+		}
+	}
+	sol := solveLinearSystem(ata, atb)
+	if len(sol) != 3 {
+		return skyPlane{}, false
+	}
+	return skyPlane{
+		A: sol[0],
+		B: sol[1],
+		C: sol[2] - sol[0]*meanX - sol[1]*meanY,
+	}, true
+}
+
 const (
 	// skyOverlapMaxSamples limits how many samples from one chip/frame are used
-	// to build the coarse overlap map.
+	// to build the coarse overlap map when the map cells would still be well
+	// populated. Very large mosaics may exceed this target so each overlap cell
+	// keeps enough samples for stable sky matching.
 	skyOverlapMaxSamples = 20_000
 
 	// skyOverlapCellSize is in output mosaic pixels. Coarse cells make overlap
 	// matching robust against dithers, distortion, and non-identical sampling.
 	skyOverlapCellSize = 32.0
 
+	// skyOverlapSamplesPerCellSide keeps each coarse cell from being represented
+	// by only one or two source pixels on large ACS-sized frames.
+	skyOverlapSamplesPerCellSide = 8
+
+	// skyOverlapMinCellSamples rejects partial/noisy cells that do not have
+	// enough support to represent the local overlap background.
+	skyOverlapMinCellSamples = 8
+
 	// skyMinOverlapCells avoids solving a sky edge from one or two accidental
 	// matching cells.
 	skyMinOverlapCells = 8
+
+	// skyMinPlaneAnchorCells requires enough overlap anchors before extrapolating
+	// a per-chip correction plane into non-overlap regions.
+	skyMinPlaneAnchorCells = 8
+
+	// skyMinPlaneFitCells requires enough coarse background samples across the
+	// chip to fit a stable clipped plane.
+	skyMinPlaneFitCells = 12
 )
 
-func buildOverlapSampleMap(p plannedInput, pixels []float32, options SkysubOptions) map[int64]float64 {
-	width := p.input.HDU.Data.Width
-	height := p.input.HDU.Data.Height
+func overlapSampleStride(width, height int) int {
 	stride := 1
 	if total := width * height; total > skyOverlapMaxSamples {
 		stride = int(math.Ceil(math.Sqrt(float64(total) / float64(skyOverlapMaxSamples))))
@@ -586,10 +799,27 @@ func buildOverlapSampleMap(p plannedInput, pixels []float32, options SkysubOptio
 			stride = 1
 		}
 	}
+	maxStride := int(math.Floor(skyOverlapCellSize / skyOverlapSamplesPerCellSide))
+	if maxStride < 1 {
+		maxStride = 1
+	}
+	if stride > maxStride {
+		stride = maxStride
+	}
+	return stride
+}
+
+func buildOverlapSampleMap(p plannedInput, pixels []float32, options SkysubOptions) map[int64]float64 {
+	width := p.input.HDU.Data.Width
+	height := p.input.HDU.Data.Height
+	stride := overlapSampleStride(width, height)
 	accum := make(map[int64]sampleAccum)
 	for y := 0; y < height; y += stride {
 		for x := 0; x < width; x += stride {
 			idx := y*width + x
+			if idx >= len(pixels) {
+				continue
+			}
 			v := pixels[idx]
 			if !isFinite32(v) {
 				continue
@@ -611,7 +841,7 @@ func buildOverlapSampleMap(p plannedInput, pixels []float32, options SkysubOptio
 	}
 	out := make(map[int64]float64, len(accum))
 	for key, cur := range accum {
-		if cur.count == 0 {
+		if cur.count < skyOverlapMinCellSamples {
 			continue
 		}
 		out[key] = cur.sum / float64(cur.count)
@@ -623,6 +853,12 @@ func overlapCellKey(x, y float64) int64 {
 	ix := int32(math.Floor(x / skyOverlapCellSize))
 	iy := int32(math.Floor(y / skyOverlapCellSize))
 	return (int64(ix) << 32) | int64(uint32(iy))
+}
+
+func overlapCellCenter(key int64) (float64, float64) {
+	ix := int32(key >> 32)
+	iy := int32(uint32(key))
+	return (float64(ix) + 0.5) * skyOverlapCellSize, (float64(iy) + 0.5) * skyOverlapCellSize
 }
 
 func connectedSkyComponents(n int, edges []skyEdge) [][]int {

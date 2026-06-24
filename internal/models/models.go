@@ -31,6 +31,13 @@ type LoadedImage struct {
 	Peak       float64
 	ScaledPeak float64
 	ShowClip   bool
+	// Stretch-specific tuning parameters. Zero values are treated as "unset"
+	// and replaced with sensible defaults at render time.
+	AsinhScale  float64 // Asinh softening beta
+	MTFMidtone  float64 // MTF midtone m in (0,1)
+	GHSStretch  float64 // GHS strength D
+	GHSLocal    float64 // GHS local intensity b
+	GHSSymmetry float64 // GHS symmetry point SP in [0,1]
 }
 
 type ChannelState struct {
@@ -45,6 +52,12 @@ type ChannelState struct {
 	OffsetX    float64 `json:"offsetX,omitempty"`
 	OffsetY    float64 `json:"offsetY,omitempty"`
 	OffsetRot  float64 `json:"offsetRot,omitempty"`
+
+	AsinhScale  float64 `json:"asinhScale,omitempty"`
+	MTFMidtone  float64 `json:"mtfMidtone,omitempty"`
+	GHSStretch  float64 `json:"ghsStretch,omitempty"`
+	GHSLocal    float64 `json:"ghsLocal,omitempty"`
+	GHSSymmetry float64 `json:"ghsSymmetry,omitempty"`
 }
 
 type ComposeProject struct {
@@ -178,15 +191,20 @@ type MosaicProject struct {
 }
 
 type ChannelControl struct {
-	Content         fyne.CanvasObject
-	ModeSelect      *widget.Select
-	BackgroundEntry NumberField
-	PeakEntry       NumberField
-	ScaledPeakEntry NumberField
-	XOffsetEntry    NumberField
-	YOffsetEntry    NumberField
-	RotOffsetEntry  NumberField
-	ShowClip        CheckField
+	Content          fyne.CanvasObject
+	ModeSelect       *widget.Select
+	BackgroundEntry  NumberField
+	PeakEntry        NumberField
+	ScaledPeakEntry  NumberField
+	AsinhScaleEntry  NumberField
+	MTFMidtoneEntry  NumberField
+	GHSStretchEntry  NumberField
+	GHSLocalEntry    NumberField
+	GHSSymmetryEntry NumberField
+	XOffsetEntry     NumberField
+	YOffsetEntry     NumberField
+	RotOffsetEntry   NumberField
+	ShowClip         CheckField
 }
 
 type RgbLevels struct {

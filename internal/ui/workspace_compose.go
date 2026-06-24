@@ -209,7 +209,19 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		viewports[channel].SetPickerValueText(fmt.Sprintf("Pick %s: --", target))
 	}
 	updatePickerValue := func(channel int, point imagePoint) {
-		value, ok := composePixelValueAt(imgs[channel], point)
+		// While picking a level, report the median of a small region so the
+		// readout matches the value that will be committed (see onTapped) and is
+		// stable against single noisy pixels. A plain hover stays a single-pixel
+		// probe.
+		var (
+			value float64
+			ok    bool
+		)
+		if activePicker.channel == channel {
+			value, ok = composeRegionMedianAt(imgs[channel], point, composePickRadius)
+		} else {
+			value, ok = composePixelValueAt(imgs[channel], point)
+		}
 		if !ok {
 			if activePicker.channel == channel {
 				viewports[channel].SetPickerValueText(fmt.Sprintf("Pick %s: --", activePicker.target))
@@ -257,7 +269,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			if !ok {
 				return
 			}
-			value, ok := composePixelValueAt(imgs[idx], point)
+			value, ok := composeRegionMedianAt(imgs[idx], point, composePickRadius)
 			if !ok {
 				return
 			}
@@ -912,11 +924,17 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				dst.Peak = src.Peak
 				dst.ScaledPeak = src.ScaledPeak
 				dst.ShowClip = src.ShowClip
+				dst.AsinhScale = src.AsinhScale
+				dst.MTFMidtone = src.MTFMidtone
+				dst.GHSStretch = src.GHSStretch
+				dst.GHSLocal = src.GHSLocal
+				dst.GHSSymmetry = src.GHSSymmetry
 
 				controlSets[idx].ModeSelect.SetSelected(modeToLabel(src.Mode))
 				controlSets[idx].BackgroundEntry.SetValue(src.Background)
 				controlSets[idx].PeakEntry.SetValue(src.Peak)
 				controlSets[idx].ScaledPeakEntry.SetValue(src.ScaledPeak)
+				setStretchParamEntries(controlSets[idx], src)
 				controlSets[idx].ShowClip.SetChecked(src.ShowClip)
 				viewports[idx].blackBox.SetValue(src.Black)
 				viewports[idx].whiteBox.SetValue(src.White)
@@ -1061,6 +1079,12 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				OffsetX:    dx,
 				OffsetY:    dy,
 				OffsetRot:  rot,
+
+				AsinhScale:  imgs[i].AsinhScale,
+				MTFMidtone:  imgs[i].MTFMidtone,
+				GHSStretch:  imgs[i].GHSStretch,
+				GHSLocal:    imgs[i].GHSLocal,
+				GHSSymmetry: imgs[i].GHSSymmetry,
 			}
 		}
 		if orangeWin != nil {
@@ -2047,6 +2071,12 @@ func channelStateFromImage(img *models.LoadedImage) models.ChannelState {
 		Peak:       img.Peak,
 		ScaledPeak: img.ScaledPeak,
 		ShowClip:   img.ShowClip,
+
+		AsinhScale:  img.AsinhScale,
+		MTFMidtone:  img.MTFMidtone,
+		GHSStretch:  img.GHSStretch,
+		GHSLocal:    img.GHSLocal,
+		GHSSymmetry: img.GHSSymmetry,
 	}
 }
 
@@ -2062,11 +2092,17 @@ func applyChannelState(idx int, state models.ChannelState, imgs []*models.Loaded
 	img.Peak = state.Peak
 	img.ScaledPeak = state.ScaledPeak
 	img.ShowClip = state.ShowClip
+	img.AsinhScale = state.AsinhScale
+	img.MTFMidtone = state.MTFMidtone
+	img.GHSStretch = state.GHSStretch
+	img.GHSLocal = state.GHSLocal
+	img.GHSSymmetry = state.GHSSymmetry
 
 	controls[idx].ModeSelect.SetSelected(modeToLabel(img.Mode))
 	controls[idx].BackgroundEntry.SetValue(img.Background)
 	controls[idx].PeakEntry.SetValue(img.Peak)
 	controls[idx].ScaledPeakEntry.SetValue(img.ScaledPeak)
+	setStretchParamEntries(controls[idx], img)
 	controls[idx].ShowClip.SetChecked(img.ShowClip)
 
 	// Manual Offset fields are the source of truth for placement. Restore them from
@@ -2087,22 +2123,54 @@ func applyChannelState(idx int, state models.ChannelState, imgs []*models.Loaded
 }
 
 func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func()) *models.ChannelControl {
-	selectBox := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
+	// Stretch-specific parameter rows. Only the row(s) relevant to the selected
+	// mode are shown; the rest stay hidden to avoid clutter.
+	asinhScaleEntry := NewNumberEntry(0.1, 3)
+	mtfMidtoneEntry := NewNumberEntry(0.01, 3)
+	ghsStretchEntry := NewNumberEntry(0.1, 2)
+	ghsLocalEntry := NewNumberEntry(0.1, 2)
+	ghsSymmetryEntry := NewNumberEntry(0.05, 3)
+
+	asinhScaleEntry.SetValue(stretch.DefaultAsinhScale)
+	mtfMidtoneEntry.SetValue(stretch.DefaultMTFMidtone)
+	ghsStretchEntry.SetValue(stretch.DefaultGHSStretch)
+	ghsLocalEntry.SetValue(stretch.DefaultGHSLocal)
+	ghsSymmetryEntry.SetValue(stretch.DefaultGHSSymmetry)
+
+	paramRow := func(label string, entry models.NumberField) *fyne.Container {
+		return container.NewBorder(nil, nil, widget.NewLabel(label), nil, entry)
+	}
+	asinhRow := paramRow("Asinh softening", asinhScaleEntry)
+	mtfRow := paramRow("MTF midtone", mtfMidtoneEntry)
+	ghsDRow := paramRow("GHS strength D", ghsStretchEntry)
+	ghsBRow := paramRow("GHS local b", ghsLocalEntry)
+	ghsSPRow := paramRow("GHS symmetry SP", ghsSymmetryEntry)
+
+	updateStretchParams := func(mode stretch.Mode) {
+		asinhRow.Hide()
+		mtfRow.Hide()
+		ghsDRow.Hide()
+		ghsBRow.Hide()
+		ghsSPRow.Hide()
+		switch mode {
+		case stretch.Asinh:
+			asinhRow.Show()
+		case stretch.MTF:
+			mtfRow.Show()
+		case stretch.GHS:
+			ghsDRow.Show()
+			ghsBRow.Show()
+			ghsSPRow.Show()
+		}
+	}
+
+	selectBox := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq", "MTF", "GHS"}, func(value string) {
 		if imgs[idx] == nil {
+			updateStretchParams(labelToMode(value))
 			return
 		}
-		switch value {
-		case "Linear":
-			imgs[idx].Mode = stretch.Linear
-		case "Log":
-			imgs[idx].Mode = stretch.Log
-		case "Asinh":
-			imgs[idx].Mode = stretch.Asinh
-		case "Sqrt":
-			imgs[idx].Mode = stretch.Sqrt
-		case "HistEq":
-			imgs[idx].Mode = stretch.HistEq
-		}
+		imgs[idx].Mode = labelToMode(value)
+		updateStretchParams(imgs[idx].Mode)
 		refresh()
 	})
 	selectBox.SetSelected("Linear")
@@ -2132,6 +2200,11 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		imgs[idx].Background = backgroundEntry.Value()
 		imgs[idx].Peak = peakEntry.Value()
 		imgs[idx].ScaledPeak = scaledPeakEntry.Value()
+		imgs[idx].AsinhScale = asinhScaleEntry.Value()
+		imgs[idx].MTFMidtone = mtfMidtoneEntry.Value()
+		imgs[idx].GHSStretch = ghsStretchEntry.Value()
+		imgs[idx].GHSLocal = ghsLocalEntry.Value()
+		imgs[idx].GHSSymmetry = ghsSymmetryEntry.Value()
 		imgs[idx].Black = views[idx].blackBox.Value()
 		imgs[idx].White = views[idx].whiteBox.Value()
 		apply.SetText("Working…")
@@ -2145,6 +2218,7 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 			})
 		}()
 	})
+	apply.Importance = widget.HighImportance
 
 	auto := widget.NewButton("Auto scaling", func() {
 		if imgs[idx] == nil {
@@ -2157,6 +2231,18 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		peakEntry.SetValue(imgs[idx].Peak)
 		scaledPeakEntry.SetValue(imgs[idx].ScaledPeak)
 		refresh()
+	})
+
+	autoMTF := widget.NewButton("Auto MTF", func() {
+		if imgs[idx] == nil {
+			return
+		}
+		processing.AutoMTFMidtone(imgs[idx])
+		backgroundEntry.SetValue(imgs[idx].Background)
+		peakEntry.SetValue(imgs[idx].Peak)
+		scaledPeakEntry.SetValue(imgs[idx].ScaledPeak)
+		mtfMidtoneEntry.SetValue(imgs[idx].MTFMidtone)
+		selectBox.SetSelected("MTF") // also reveals the MTF row and triggers refresh
 	})
 
 	xOffsetEntry := NewNumberEntry(1, 2)
@@ -2186,8 +2272,13 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 				widget.NewFormItem("Peak level", peakEntry),
 				widget.NewFormItem("Scaled peak level", scaledPeakEntry),
 			),
+			asinhRow,
+			mtfRow,
+			ghsDRow,
+			ghsBRow,
+			ghsSPRow,
 			container.NewHBox(showClip, widget.NewLabel("Show clipped pixels")),
-			container.NewHBox(auto, apply),
+			container.NewHBox(auto, autoMTF, apply),
 			widget.NewLabel("Manual Offset"),
 			offsetRow("X", xOffsetEntry),
 			offsetRow("Y", yOffsetEntry),
@@ -2195,14 +2286,19 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 			applyOffset,
 			widget.NewSeparator(),
 		),
-		ModeSelect:      selectBox,
-		BackgroundEntry: backgroundEntry,
-		PeakEntry:       peakEntry,
-		ScaledPeakEntry: scaledPeakEntry,
-		XOffsetEntry:    xOffsetEntry,
-		YOffsetEntry:    yOffsetEntry,
-		RotOffsetEntry:  rotOffsetEntry,
-		ShowClip:        showClip,
+		ModeSelect:       selectBox,
+		BackgroundEntry:  backgroundEntry,
+		PeakEntry:        peakEntry,
+		ScaledPeakEntry:  scaledPeakEntry,
+		AsinhScaleEntry:  asinhScaleEntry,
+		MTFMidtoneEntry:  mtfMidtoneEntry,
+		GHSStretchEntry:  ghsStretchEntry,
+		GHSLocalEntry:    ghsLocalEntry,
+		GHSSymmetryEntry: ghsSymmetryEntry,
+		XOffsetEntry:     xOffsetEntry,
+		YOffsetEntry:     yOffsetEntry,
+		RotOffsetEntry:   rotOffsetEntry,
+		ShowClip:         showClip,
 	}
 }
 
@@ -2392,6 +2488,60 @@ func composePixelValueAt(img *models.LoadedImage, point imagePoint) (float64, bo
 		return 0, false
 	}
 	return float64(data.Pixels[idx]), true
+}
+
+// composePickRadius is the half-width (in pixels) of the box sampled when
+// picking a black/white level. A 5x5 region keeps the picked value stable
+// against single noisy pixels without averaging over real structure.
+const composePickRadius = 2
+
+// composeRegionMedianAt returns the median of the finite pixels in the square
+// region of half-width radius centered on point. Using a median (rather than a
+// single pixel) makes level picking robust to noise and hot/cold pixels, so the
+// committed level no longer depends on exactly which pixel was clicked.
+func composeRegionMedianAt(img *models.LoadedImage, point imagePoint, radius int) (float64, bool) {
+	if img == nil {
+		return 0, false
+	}
+	data := img.HDU.Data
+	if data.Width <= 0 || data.Height <= 0 || point.X < 0 || point.Y < 0 || point.X >= data.Width || point.Y >= data.Height {
+		return 0, false
+	}
+	if radius < 0 {
+		radius = 0
+	}
+	vals := make([]float64, 0, (2*radius+1)*(2*radius+1))
+	for dy := -radius; dy <= radius; dy++ {
+		y := point.Y + dy
+		if y < 0 || y >= data.Height {
+			continue
+		}
+		row := y * data.Width
+		for dx := -radius; dx <= radius; dx++ {
+			x := point.X + dx
+			if x < 0 || x >= data.Width {
+				continue
+			}
+			idx := row + x
+			if idx < 0 || idx >= len(data.Pixels) {
+				continue
+			}
+			v := float64(data.Pixels[idx])
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				continue
+			}
+			vals = append(vals, v)
+		}
+	}
+	if len(vals) == 0 {
+		return 0, false
+	}
+	sort.Float64s(vals)
+	n := len(vals)
+	if n%2 == 1 {
+		return vals[n/2], true
+	}
+	return (vals[n/2-1] + vals[n/2]) / 2, true
 }
 
 func buildSharedScaleChannelHistograms(channelPixels [3][]float32, channelStats [3]histogram.Stats) ([3][256]int, int, bool) {
@@ -2910,6 +3060,46 @@ func isFinite64(v float64) bool {
 	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
+// setStretchParamEntries populates a channel's stretch-parameter entry widgets
+// from a LoadedImage, substituting defaults for unset (zero) values so the
+// fields always show a meaningful number.
+func setStretchParamEntries(control *models.ChannelControl, img *models.LoadedImage) {
+	if control == nil || img == nil {
+		return
+	}
+	asinh := img.AsinhScale
+	if asinh <= 0 {
+		asinh = stretch.DefaultAsinhScale
+	}
+	mtf := img.MTFMidtone
+	if mtf <= 0 || mtf >= 1 {
+		mtf = stretch.DefaultMTFMidtone
+	}
+	d := img.GHSStretch
+	if d <= 0 {
+		d = stretch.DefaultGHSStretch
+	}
+	sp := img.GHSSymmetry
+	if sp <= 0 || sp >= 1 {
+		sp = stretch.DefaultGHSSymmetry
+	}
+	if control.AsinhScaleEntry != nil {
+		control.AsinhScaleEntry.SetValue(asinh)
+	}
+	if control.MTFMidtoneEntry != nil {
+		control.MTFMidtoneEntry.SetValue(mtf)
+	}
+	if control.GHSStretchEntry != nil {
+		control.GHSStretchEntry.SetValue(d)
+	}
+	if control.GHSLocalEntry != nil {
+		control.GHSLocalEntry.SetValue(img.GHSLocal)
+	}
+	if control.GHSSymmetryEntry != nil {
+		control.GHSSymmetryEntry.SetValue(sp)
+	}
+}
+
 func modeToLabel(m stretch.Mode) string {
 	switch m {
 	case stretch.Linear:
@@ -2922,6 +3112,10 @@ func modeToLabel(m stretch.Mode) string {
 		return "Sqrt"
 	case stretch.HistEq:
 		return "HistEq"
+	case stretch.MTF:
+		return "MTF"
+	case stretch.GHS:
+		return "GHS"
 	default:
 		return "Linear"
 	}
@@ -2937,6 +3131,10 @@ func labelToMode(label string) stretch.Mode {
 		return stretch.Sqrt
 	case "histeq":
 		return stretch.HistEq
+	case "mtf":
+		return stretch.MTF
+	case "ghs":
+		return stretch.GHS
 	default:
 		return stretch.Linear
 	}
