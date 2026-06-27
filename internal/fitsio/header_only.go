@@ -39,23 +39,28 @@ func HeaderString(header Header, keys ...string) string {
 	return ""
 }
 
-// FilterString resolves the best filter name from FILTER, FILTER1, FILTER2,
-// skipping any value that is empty or contains "CLEAR" (case-insensitive).
-// This handles instruments like Hubble ACS where one wheel may be CLEAR.
+// FilterString resolves the best filter name from common HST filter keywords,
+// skipping empty, CLEAR, and numeric wheel-position values.
+// This handles ACS/WFC3 FILTER keys and WFPC2 FILTNAM keys.
 func FilterString(header Header) string {
-	for _, key := range []string{"FILTER", "FILTER1", "FILTER2"} {
-		raw, ok := header.Cards[key]
-		if !ok {
-			continue
-		}
-		val := raw
-		if idx := strings.Index(val, "/"); idx >= 0 {
-			val = val[:idx]
-		}
-		val = strings.TrimSpace(strings.Trim(strings.TrimSpace(val), "'"))
-		if val != "" && !strings.Contains(strings.ToUpper(val), "CLEAR") {
+	for _, key := range []string{"FILTER", "FILTNAM1", "FILTNAM2", "FILTER1", "FILTER2"} {
+		val := HeaderString(header, key)
+		if val != "" && !isBlankFilterValue(val) {
 			return val
 		}
 	}
 	return ""
+}
+
+func isBlankFilterValue(val string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(val))
+	if upper == "" || strings.Contains(upper, "CLEAR") {
+		return true
+	}
+	for _, r := range upper {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

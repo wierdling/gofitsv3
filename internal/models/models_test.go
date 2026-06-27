@@ -10,6 +10,7 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 	project := ComposeProject{
 		Flip:                 true,
 		SharedHistogramScale: true,
+		DisableComposite:     true,
 		MeasureComposite:     true,
 		BlinkFilters:         true,
 		BlinkExcludedFilter:  2,
@@ -23,7 +24,27 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 				Peak:       8.8,
 				ScaledPeak: 7.7,
 				ShowClip:   true,
+				OffsetX:    -12.5,
+				OffsetY:    33.25,
+				OffsetRot:  -1.5,
 			},
+		},
+		OrangeLayer: OrangeLayerState{
+			Open: true,
+			Channel: ChannelState{
+				Path:       "ha.fits",
+				Mode:       "Asinh",
+				Black:      0.1,
+				White:      2.5,
+				Background: 0.2,
+				Peak:       1.8,
+				ScaledPeak: 9,
+				ShowClip:   true,
+			},
+			ColorR:  159,
+			ColorG:  140,
+			ColorB:  80,
+			Opacity: 0.65,
 		},
 		StarlessSettings: StarlessComposeSettings{
 			Enabled:                 true,
@@ -95,11 +116,20 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 	if decoded.Channels[0].Path != "blue.fits" || !decoded.Channels[0].ShowClip {
 		t.Fatalf("Channels[0] = %+v, want preserved compose channel state", decoded.Channels[0])
 	}
+	if decoded.Channels[0].OffsetX != -12.5 || decoded.Channels[0].OffsetY != 33.25 || decoded.Channels[0].OffsetRot != -1.5 {
+		t.Fatalf("Channels[0] offsets = (%v,%v,%v), want (-12.5,33.25,-1.5)", decoded.Channels[0].OffsetX, decoded.Channels[0].OffsetY, decoded.Channels[0].OffsetRot)
+	}
 	if !decoded.SharedHistogramScale || !decoded.MeasureComposite {
 		t.Fatalf("compose UI settings = shared:%v measure:%v, want both true", decoded.SharedHistogramScale, decoded.MeasureComposite)
 	}
+	if !decoded.DisableComposite {
+		t.Fatal("DisableComposite = false, want true")
+	}
 	if !decoded.BlinkFilters || decoded.BlinkExcludedFilter != 2 {
 		t.Fatalf("blink settings = enabled:%v excluded:%d, want enabled true excluded 2", decoded.BlinkFilters, decoded.BlinkExcludedFilter)
+	}
+	if !decoded.OrangeLayer.Open || decoded.OrangeLayer.Channel.Path != "ha.fits" || decoded.OrangeLayer.ColorR != 159 || decoded.OrangeLayer.Opacity != 0.65 {
+		t.Fatalf("orange layer = %+v, want preserved optional layer state", decoded.OrangeLayer)
 	}
 }
 
@@ -124,16 +154,17 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 		ReferencePath:   "ref_flc.fits",
 		ReferenceSCIExt: 2,
 		DrizzleSettings: DrizzleSettings{
-			FinalScale:      0.04,
-			Scale:           1.5,
-			PixFrac:         0.8,
-			CRMethod:        2,
-			SepKernel:       3,
-			FinalKernel:     4,
-			WeightingMode:   1,
-			UseERRWeighting: true,
-			CRSeedSNR:       4.2,
-			CRDerivScale:    1.6,
+			FinalScale:            0.04,
+			Scale:                 1.5,
+			PixFrac:               0.8,
+			CRMethod:              2,
+			SepKernel:             3,
+			FinalKernel:           4,
+			WeightingMode:         1,
+			UseERRWeighting:       true,
+			SurfaceBrightnessNorm: true,
+			CRSeedSNR:             4.2,
+			CRDerivScale:          1.6,
 		},
 		DrizzleSettingsSet: true,
 		AlignmentSettings: AlignmentSettings{
@@ -186,6 +217,9 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 	}
 	if decoded.ReferencePath != "ref_flc.fits" || decoded.ActiveFilter != "F502N" {
 		t.Fatalf("reference/filter = (%q,%q), want preserved values", decoded.ReferencePath, decoded.ActiveFilter)
+	}
+	if !decoded.DrizzleSettings.SurfaceBrightnessNorm {
+		t.Fatal("SurfaceBrightnessNorm = false, want true")
 	}
 }
 

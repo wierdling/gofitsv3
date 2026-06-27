@@ -31,6 +31,21 @@ type LoadedImage struct {
 	Peak       float64
 	ScaledPeak float64
 	ShowClip   bool
+	// Stretch-specific tuning parameters. Zero values are treated as "unset"
+	// and replaced with sensible defaults at render time.
+	AsinhScale  float64 // Asinh softening beta
+	MTFMidtone  float64 // MTF midtone m in (0,1)
+	GHSStretch  float64 // GHS strength D
+	GHSLocal    float64 // GHS local intensity b
+	GHSSymmetry float64 // GHS symmetry point SP in [0,1]
+
+	// AlignTransform is the backward (output→source) sampling affine produced by
+	// Compose "Align to Channel 2". When HasAlignTransform is set it is applied at
+	// render time underneath the Manual Offset, preserving the full fitted affine
+	// (scale and skew included) instead of reducing it to translation+rotation.
+	// Stored as plain coefficients to avoid a models→processing import.
+	HasAlignTransform                              bool
+	AlignA, AlignB, AlignC, AlignD, AlignE, AlignF float64
 }
 
 type ChannelState struct {
@@ -42,16 +57,46 @@ type ChannelState struct {
 	Peak       float64 `json:"peak"`
 	ScaledPeak float64 `json:"scaledPeak"`
 	ShowClip   bool    `json:"showClip"`
+	OffsetX    float64 `json:"offsetX,omitempty"`
+	OffsetY    float64 `json:"offsetY,omitempty"`
+	OffsetRot  float64 `json:"offsetRot,omitempty"`
+
+	// Full star-alignment affine (backward sampling) from "Align to Channel 2",
+	// applied underneath the Manual Offset at render time. See LoadedImage.
+	HasAlign bool    `json:"hasAlign,omitempty"`
+	AlignA   float64 `json:"alignA,omitempty"`
+	AlignB   float64 `json:"alignB,omitempty"`
+	AlignC   float64 `json:"alignC,omitempty"`
+	AlignD   float64 `json:"alignD,omitempty"`
+	AlignE   float64 `json:"alignE,omitempty"`
+	AlignF   float64 `json:"alignF,omitempty"`
+
+	AsinhScale  float64 `json:"asinhScale,omitempty"`
+	MTFMidtone  float64 `json:"mtfMidtone,omitempty"`
+	GHSStretch  float64 `json:"ghsStretch,omitempty"`
+	GHSLocal    float64 `json:"ghsLocal,omitempty"`
+	GHSSymmetry float64 `json:"ghsSymmetry,omitempty"`
 }
 
 type ComposeProject struct {
 	Channels             [3]ChannelState         `json:"channels"`
+	OrangeLayer          OrangeLayerState        `json:"orangeLayer,omitempty"`
 	Flip                 bool                    `json:"flip"`
 	SharedHistogramScale bool                    `json:"sharedHistogramScale,omitempty"`
+	DisableComposite     bool                    `json:"disableComposite,omitempty"`
 	MeasureComposite     bool                    `json:"measureComposite,omitempty"`
 	BlinkFilters         bool                    `json:"blinkFilters,omitempty"`
 	BlinkExcludedFilter  int                     `json:"blinkExcludedFilter,omitempty"`
 	StarlessSettings     StarlessComposeSettings `json:"starlessSettings"`
+}
+
+type OrangeLayerState struct {
+	Open    bool         `json:"open,omitempty"`
+	Channel ChannelState `json:"channel"`
+	ColorR  uint8        `json:"colorR"`
+	ColorG  uint8        `json:"colorG"`
+	ColorB  uint8        `json:"colorB"`
+	Opacity float64      `json:"opacity"`
 }
 
 type StarlessComposeSettings struct {
@@ -93,11 +138,17 @@ type DrizzleSettings struct {
 	FinalKernel     int     `json:"finalKernel"`
 	WeightingMode   int     `json:"weightingMode"`
 	UseERRWeighting bool    `json:"useERRWeighting,omitempty"`
+	// SurfaceBrightnessNorm normalizes mixed-scale chips by their mapped pixel
+	// area before drizzle. Useful for WFPC2 PC+WF mosaics.
+	SurfaceBrightnessNorm bool `json:"surfaceBrightnessNorm,omitempty"`
 	// CRSeedSNR and CRDerivScale control the drizzle-style CR detection thresholds.
 	// CRSeedSNR is the signal-to-noise ratio threshold for seeding a CR candidate.
 	// CRDerivScale scales the derivative (sharpness) term in the rejection test.
 	CRSeedSNR    float64 `json:"crSeedSNR"`
 	CRDerivScale float64 `json:"crDerivScale"`
+	// DebugOutputDir, when set, is the directory where the drizzle process
+	// writes individual output-scale chip images for blinking.
+	DebugOutputDir string `json:"debugOutputDir,omitempty"`
 }
 
 // AlignmentSettings holds the star-alignment controls configured through the
@@ -158,12 +209,20 @@ type MosaicProject struct {
 }
 
 type ChannelControl struct {
-	Content         fyne.CanvasObject
-	ModeSelect      *widget.Select
-	BackgroundEntry NumberField
-	PeakEntry       NumberField
-	ScaledPeakEntry NumberField
-	ShowClip        CheckField
+	Content          fyne.CanvasObject
+	ModeSelect       *widget.Select
+	BackgroundEntry  NumberField
+	PeakEntry        NumberField
+	ScaledPeakEntry  NumberField
+	AsinhScaleEntry  NumberField
+	MTFMidtoneEntry  NumberField
+	GHSStretchEntry  NumberField
+	GHSLocalEntry    NumberField
+	GHSSymmetryEntry NumberField
+	XOffsetEntry     NumberField
+	YOffsetEntry     NumberField
+	RotOffsetEntry   NumberField
+	ShowClip         CheckField
 }
 
 type RgbLevels struct {

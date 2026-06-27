@@ -3,8 +3,10 @@ package processing
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
@@ -113,6 +115,25 @@ func NewWCSMapper(srcHeader fitsio.Header, srcD2IX, srcD2IY *D2ITable, refHeader
 	ref.d2iY = refD2IY
 
 	return &WCSMapper{sourceWCS: src, refWCS: ref}, nil
+}
+
+// NewWCSMapperToLinearRef constructs a mapper for drizzle output. Source pixels
+// are corrected through their own distortion model, then projected onto the
+// reference image's linear tangent plane without applying the reference chip's
+// inverse detector distortion. This avoids extrapolating a reference chip SIP
+// solution across other chips in multi-detector instruments such as WFPC2.
+func NewWCSMapperToLinearRef(srcHeader fitsio.Header, srcD2IX, srcD2IY *D2ITable, refHeader fitsio.Header) (*WCSMapper, error) {
+	mapper, err := NewWCSMapper(srcHeader, srcD2IX, srcD2IY, refHeader, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	mapper.refWCS.a = sipPoly{}
+	mapper.refWCS.b = sipPoly{}
+	mapper.refWCS.ap = sipPoly{}
+	mapper.refWCS.bp = sipPoly{}
+	mapper.refWCS.d2iX = nil
+	mapper.refWCS.d2iY = nil
+	return mapper, nil
 }
 
 // MapPixel maps a 0-indexed source pixel (x, y) to a 0-indexed reference
@@ -225,6 +246,78 @@ func AlignChannelUsingWCS(targetPixels []float32, targetWidth, targetHeight int,
 		return nil, AffineTransform{}, fmt.Errorf("unexpected aligned pixel count: got %d want %d", len(alignedPixels), refWidth*refHeight)
 	}
 	return alignedPixels, transform, nil
+}
+
+// WarpImageThroughWCS resamples srcPixels onto an outWidth×outHeight grid using
+// a full nonlinear WCS map, applying SIP (and D2I, if the mapper carries it) per
+// output pixel rather than collapsing the geometry into a single affine. This is
+// the same distortion-aware resampling the mosaic builder performs, and unlike
+// WarpImageToSize it keeps field-dependent distortion (tens of pixels on HST
+// frames) correctly registered.
+//
+// reverseMapper must map output (reference) pixel coordinates to source pixel
+// coordinates — build it with NewWCSMapper(refHeader, refD2IX, refD2IY,
+// srcHeader, srcD2IX, srcD2IY). residualInv is applied to each output pixel
+// before the WCS map to fold in a star-based residual correction; pass
+// IdentityTransform() when there is none.
+func WarpImageThroughWCS(srcPixels []float32, srcWidth, srcHeight, outWidth, outHeight int, reverseMapper *WCSMapper, residualInv AffineTransform) []float32 {
+	out := make([]float32, outWidth*outHeight)
+	if srcWidth <= 0 || srcHeight <= 0 || outWidth <= 0 || outHeight <= 0 || len(srcPixels) == 0 || reverseMapper == nil {
+		return out
+	}
+	maxHeight := len(srcPixels) / srcWidth
+	if srcHeight > maxHeight {
+		srcHeight = maxHeight
+	}
+
+	workers := runtime.NumCPU()
+	if workers < 1 {
+		workers = 1
+	}
+	rows := make(chan int, outHeight)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for y := range rows {
+				for x := 0; x < outWidth; x++ {
+					rx, ry := ApplyAffineTransform(residualInv, float64(x), float64(y))
+					sx, sy := reverseMapper.MapPixel(rx, ry)
+					out[y*outWidth+x] = bilinearSampleImage(srcPixels, srcWidth, srcHeight, sx, sy)
+				}
+			}
+		}()
+	}
+	for y := 0; y < outHeight; y++ {
+		rows <- y
+	}
+	close(rows)
+	wg.Wait()
+	return out
+}
+
+// bilinearSampleImage samples image data at fractional (sx, sy), returning 0
+// outside the source bounds and NaN when any contributing pixel is NaN. It
+// mirrors the sampling used by WarpImageToSize.
+func bilinearSampleImage(pix []float32, w, h int, sx, sy float64) float32 {
+	x0 := int(math.Floor(sx))
+	y0 := int(math.Floor(sy))
+	x1 := x0 + 1
+	y1 := y0 + 1
+	if x0 < 0 || x1 >= w || y0 < 0 || y1 >= h {
+		return 0
+	}
+	wx := sx - float64(x0)
+	wy := sy - float64(y0)
+	p00 := float64(pix[y0*w+x0])
+	p10 := float64(pix[y0*w+x1])
+	p01 := float64(pix[y1*w+x0])
+	p11 := float64(pix[y1*w+x1])
+	if math.IsNaN(p00) || math.IsNaN(p10) || math.IsNaN(p01) || math.IsNaN(p11) {
+		return float32(math.NaN())
+	}
+	return float32(p00*(1-wx)*(1-wy) + p10*wx*(1-wy) + p01*(1-wx)*wy + p11*wx*wy)
 }
 
 func ComputeWCSTransform(targetHeader fitsio.Header, refHeader fitsio.Header) (AffineTransform, error) {
@@ -486,7 +579,7 @@ func applyInverseSIP(w linearWCS, u, v float64) (float64, float64) {
 		guessU += u - fwdU
 		guessV += v - fwdV
 	}
-	if isFinite64(guessU) && isFinite64(guessV) {
+	if isFinite64(guessU) && isFinite64(guessV) && math.Abs(guessU-u) < 1000 && math.Abs(guessV-v) < 1000 {
 		return guessU, guessV
 	}
 	return u, v

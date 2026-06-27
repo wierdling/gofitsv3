@@ -1,8 +1,11 @@
 package mosaic
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -15,10 +18,6 @@ import (
 	"gofitsv3/internal/processing"
 )
 
-// edgeTrim is the number of pixels to exclude from each edge of every input
-// image before drizzling, to avoid border artifacts.
-const edgeTrim = 20
-
 // weightEpsilon is used when normalizing signed-kernel accumulators such as Lanczos.
 // Very small denominators are treated as uncovered to avoid edge blow-ups.
 const weightEpsilon float32 = 1e-12
@@ -29,6 +28,7 @@ type Input struct {
 	PrimaryHeader      fitsio.Header
 	HDU                fitsio.HDU
 	ExposureTime       float64
+	DateObs            string
 	OffsetX            float64
 	OffsetY            float64
 	ManualTransform    processing.AffineTransform
@@ -52,6 +52,19 @@ type Input struct {
 	// alignment and coordinate-system setup but its pixels are not drizzled into
 	// the output. Use this to align a new filter to a previously drizzled baseline.
 	ReferenceOnly bool
+	// BUnit is the BUNIT header value (e.g. "ELECTRONS", "ELECTRONS/S"), used to
+	// decide automatically whether the pixels are total counts that must be
+	// divided by exposure time. Empty when the header has no BUNIT.
+	BUnit string
+	// NormalizeExposure, when true, causes prepareFramePixels to convert this
+	// frame's SCI (and ERR) pixels to a rate (per-second) by multiplying by
+	// ExposureScale before any drizzle weighting. This is independent of
+	// Options.WeightingMode. Off by default to preserve existing behavior.
+	NormalizeExposure bool
+	// ExposureScale is the per-frame normalization factor (1/EXPTIME) applied when
+	// NormalizeExposure is set. Zero or non-finite disables normalization for the
+	// frame even when NormalizeExposure is true.
+	ExposureScale float64
 }
 
 func InputKey(input Input) string {
@@ -145,6 +158,10 @@ func isFinite32(v float32) bool {
 	return math.Float32bits(v)&0x7f800000 != 0x7f800000
 }
 
+func isFinite64(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
 // DrizzleKernel selects how each input pixel's flux is distributed onto the
 // output grid during the drizzle step.
 type DrizzleKernel int
@@ -228,6 +245,10 @@ type Options struct {
 	FinalKernel DrizzleKernel
 	// WeightingMode selects how each valid input pixel is weighted.
 	WeightingMode WeightingMode
+	// SurfaceBrightnessNorm converts each input from source-pixel count rate to
+	// reference-grid pixel-area count rate before sky subtraction and drizzle.
+	// This is useful for mixed-scale instruments such as WFPC2 PC+WF.
+	SurfaceBrightnessNorm bool
 	// KeepWeights retains the final output weight/coverage image in Result.Weights.
 	// Leave false for lower memory use. The final drizzle pass still allocates
 	// weights while normalizing the image, but setting this to false releases that
@@ -241,6 +262,64 @@ type Options struct {
 	// Skysub controls optional AstroDrizzle-style sky subtraction applied to
 	// non-reference inputs before CR rejection and final drizzle.
 	Skysub SkysubOptions
+	// Progress, when non-nil, is invoked at each major phase of Build with a
+	// human-readable stage name and progress counters. total is 0 when a phase
+	// has no meaningful unit count (the UI should show indeterminate progress).
+	// It may be called from the Build goroutine; the callback must be safe to
+	// invoke off the UI thread.
+	Progress func(stage string, done, total int)
+	// Ctx, when non-nil, allows Build to be cancelled. Build checks Ctx.Err()
+	// between frames and returns ErrCancelled if the context is done.
+	Ctx context.Context
+	// DebugOutputDir, when not empty, causes the drizzle process to output an individual
+	// FITS file for each input chip, exactly matching the footprint of the final combined mosaic.
+	DebugOutputDir string
+	// FrameLoader, when non-nil, supplies a frame's SCI (and optional ERR) pixels
+	// on demand instead of reading them from disk. Build uses it only for inputs
+	// whose in-memory pixels are nil, so callers can stream large mosaics without
+	// holding every input array at once. When nil, such inputs are reloaded from
+	// their FITS file via LoadInputsFromPath. Inputs that already carry pixels are
+	// used directly regardless of this field.
+	FrameLoader func(in Input) (sci []float32, errPix []float32, err error)
+}
+
+// ErrCancelled is returned by Build (or AlignInputsByStarsWithMode) when its
+// context is cancelled.
+var ErrCancelled = errors.New("operation cancelled")
+
+// AlignProgress carries optional progress reporting and cancellation for the
+// star-alignment routines. The zero value disables both.
+type AlignProgress struct {
+	// Progress, when non-nil, is invoked as each input finishes aligning.
+	Progress func(done, total int)
+	// Ctx, when non-nil, allows the alignment to be cancelled. Goroutines that
+	// have not yet started are skipped and ErrCancelled is returned.
+	Ctx context.Context
+}
+
+func (p AlignProgress) report(done, total int) {
+	if p.Progress != nil {
+		p.Progress(done, total)
+	}
+}
+
+func (p AlignProgress) cancelled() bool {
+	return p.Ctx != nil && p.Ctx.Err() != nil
+}
+
+// reportProgress invokes the Progress callback if one is set.
+func (o Options) reportProgress(stage string, done, total int) {
+	if o.Progress != nil {
+		o.Progress(stage, done, total)
+	}
+}
+
+// cancelled returns ErrCancelled if the context is set and done, else nil.
+func (o Options) cancelled() error {
+	if o.Ctx != nil && o.Ctx.Err() != nil {
+		return ErrCancelled
+	}
+	return nil
 }
 
 // WeightingMode selects the drizzle weighting scheme.
@@ -307,10 +386,11 @@ type StarAlignmentResult struct {
 }
 
 type plannedInput struct {
-	input       Input
-	sourceToRef processing.AffineTransform // affine approximation, used for CR detection
-	mapper      *processing.WCSMapper      // per-pixel WCS projection, used for drizzle
-	statusIndex int
+	input            Input
+	sourceToRef      processing.AffineTransform // affine approximation, used for CR detection
+	mapper           *processing.WCSMapper      // per-pixel WCS projection, used for drizzle
+	sourcePixelScale float64                    // source pixel size in reference-pixel units
+	statusIndex      int
 }
 
 // mapPixel projects a 0-indexed source pixel through the full WCS pipeline
@@ -354,6 +434,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
 	}
+	logMemStats("before planning")
 
 	// Resolve FinalScale (arcsec/pixel) → internal Scale multiplier.
 	// Use the same WCS anchor that will be used for the output header, so a
@@ -375,6 +456,10 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		options.PixFrac = 1
 	}
 
+	if err := options.cancelled(); err != nil {
+		return nil, err
+	}
+	options.reportProgress("Planning inputs", 0, 0)
 	debuglog.Log("Build: calling planInputs")
 	planned, statuses, minX, minY, maxX, maxY, err := planInputs(inputs, options.Scale)
 	if err != nil {
@@ -391,7 +476,6 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		height = 1
 	}
 
-	dropSize := options.Scale * options.PixFrac
 	includedCount := 0
 
 	effectiveCR := options.CRMethod
@@ -409,13 +493,20 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	if len(dataPlanned) == 0 {
 		return nil, fmt.Errorf("no data-bearing FITS inputs selected")
 	}
+	// Surface-brightness normalization is now applied per frame inside
+	// prepareFramePixels (streamed), so no whole-slice copy is made here.
 
-	debuglog.Log("Build: calling prepareSkysubWorkingPixels")
-	workingPixels, skyApplied, skyValues, err := prepareSkysubWorkingPixels(planned, options.Skysub)
+	if err := options.cancelled(); err != nil {
+		return nil, err
+	}
+	logMemStats("after planning")
+	options.reportProgress("Sky subtraction", 0, 0)
+	debuglog.Log("Build: calling planSkysub")
+	skyOffset, skyPlanes, skyApplied, skyValues, err := planSkysub(planned, options)
 	if err != nil {
 		return nil, err
 	}
-	debuglog.Log("Build: prepareSkysubWorkingPixels done")
+	debuglog.Log("Build: planSkysub done")
 	for i := range planned {
 		if planned[i].input.ReferenceOnly || !skyApplied[i] {
 			continue
@@ -433,73 +524,18 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		crMaskIndex[pi] = slot
 	}
 
-	// Build per-frame FrameInfo for any multi-frame CR method.
-	var frameInfos []processing.FrameInfo
-	if effectiveCR != CRMethodNone && len(dataPlanned) > 1 {
-		frameInfos = make([]processing.FrameInfo, len(dataPlanned))
-		for slot, pi := range dataPlanned {
-			refToSource, err := processing.InvertAffineTransform(planned[pi].sourceToRef)
-			if err != nil {
-				refToSource = processing.IdentityTransform()
-			}
-			crPixels := normalizedPixelsForWeighting(planned[pi].input, workingPixels[pi], options.WeightingMode)
-			_, sigma := processing.EstimateBackground(crPixels)
-			frameInfos[slot] = processing.FrameInfo{
-				Pixels:      crPixels,
-				Width:       planned[pi].input.HDU.Data.Width,
-				Height:      planned[pi].input.HDU.Data.Height,
-				SourceToRef: planned[pi].sourceToRef,
-				RefToSource: refToSource,
-				OffsetX:     0,
-				OffsetY:     0,
-				Sigma:       sigma,
-			}
-		}
-	}
-
+	// Cosmic-ray rejection (streamed, temp-file backed): the separate-drizzle
+	// products are written to disk and median-combined band-by-band so we never
+	// hold one output-size image per frame in memory at once.
 	var crMasks []BitMask
-	switch {
-	case effectiveCR == CRMethodDrizzle && len(dataPlanned) > 1:
-		// Separate pass: drizzle each frame individually with SepKernel to build
-		// per-frame images, then median-combine into a clean model. This gives the
-		// model better fidelity than inverse-blot when the sep kernel is non-trivial.
-		debuglog.Log(fmt.Sprintf("Build: starting CR sep-drizzle pass, %d frames", len(dataPlanned)))
-		sepFrames := make([]SepFrame, len(dataPlanned))
-		for slot, pi := range dataPlanned {
-			debuglog.Log(fmt.Sprintf("Build: sep frame %d/%d (%s)", slot+1, len(dataPlanned), InputKey(planned[pi].input)))
-			sepFrames[slot] = drizzleSepFrame(planned[pi], workingPixels[pi], width, height, minX, minY, options.Scale, dropSize, options.SepKernel, options.WeightingMode)
+	if effectiveCR == CRMethodDrizzle && len(dataPlanned) > 1 {
+		logMemStats("CR start")
+		debuglog.Log(fmt.Sprintf("Build: starting streamed CR drizzle, %d frames", len(dataPlanned)))
+		crMasks, err = buildCRMasksDrizzle(planned, dataPlanned, skyOffset, skyPlanes, options, width, height, minX, minY, options.Scale)
+		if err != nil {
+			return nil, err
 		}
-		debuglog.Log("Build: sep-drizzle pass done, building median model")
-		model := buildMedianModel(sepFrames, width, height, len(dataPlanned))
-		debuglog.Log("Build: median model done")
-		sepFrames = nil // allow GC before final drizzle pass
-		// Wire full WCS mappers into each FrameInfo so BuildCRMasksFromModel
-		// blots using the same per-pixel mapping as drizzleSepFrame did.
-		// Without this, the affine SourceToRef approximation can be off by
-		// several pixels when SIP distortion is present, causing stars to be
-		// falsely flagged (blot samples background instead of the star peak).
-		for slot, pi := range dataPlanned {
-			pi := pi // capture for closure
-			frameInfos[slot].MapFunc = func(x, y float64) (float64, float64) {
-				return planned[pi].mapPixel(x, y)
-			}
-		}
-		crSeedSNR := options.CRSeedSNR
-		if crSeedSNR <= 0 {
-			crSeedSNR = 4.0
-		}
-		crDerivScale := options.CRDerivScale
-		if crDerivScale <= 0 {
-			crDerivScale = 1.2
-		}
-		debuglog.Log(fmt.Sprintf("Build: calling BuildCRMasksFromModel, %d frames", len(frameInfos)))
-		boolMasks := processing.BuildCRMasksFromModel(
-			frameInfos, model, width, height, minX, minY, options.Scale,
-			processing.DrizzleStyleCROptions{SeedSNR: crSeedSNR, DerivScale: crDerivScale},
-		)
-		debuglog.Log("Build: BuildCRMasksFromModel done, compressing masks")
-		crMasks = compressCRMasks(boolMasks)
-		boolMasks = nil
+		logMemStats("CR done")
 	}
 
 	// Final drizzle pass: accumulate all frames into the output using FinalKernel.
@@ -509,13 +545,30 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	finalKernel := options.FinalKernel
 	finalSlot := 0
 
+	var debugBaseHeader fitsio.Header
+	if options.DebugOutputDir != "" {
+		if err := os.MkdirAll(options.DebugOutputDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create debug output directory: %w", err)
+		}
+		debugBaseHeader = buildOutputHeader(wcsReferenceInput(inputs), width, height, minX, minY, options.Scale, 1)
+	}
+
 	for i := range planned {
 		if planned[i].input.ReferenceOnly {
 			continue
 		}
+		if err := options.cancelled(); err != nil {
+			return nil, err
+		}
+		options.reportProgress("Drizzling", finalSlot, len(dataPlanned))
 		finalSlot++
 		debuglog.Log(fmt.Sprintf("Build: final drizzle frame %d (%s)", finalSlot, InputKey(planned[i].input)))
-		pixels := workingPixels[i]
+		pixels, errPix, perr := prepareFramePixels(planned[i], options, skyOffset[i], skyPlanes[i])
+		if perr != nil {
+			return nil, fmt.Errorf("load frame %s: %w", InputKey(planned[i].input), perr)
+		}
+		// drizzlePlannedInput reads ERR weights from planned[i].input.ERRPixels.
+		planned[i].input.ERRPixels = errPix
 		var crMask BitMask
 		cleaned := false
 
@@ -540,17 +593,48 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 		includedCount++
 
-		trimX := effectiveEdgeTrim(planned[i].input.HDU.Data.Width, options.Scale)
-		trimY := effectiveEdgeTrim(planned[i].input.HDU.Data.Height, options.Scale)
+		trimX := effectiveEdgeTrimForInput(planned[i], planned[i].input.HDU.Data.Width, options.Scale)
+		trimY := effectiveEdgeTrimForInput(planned[i], planned[i].input.HDU.Data.Height, options.Scale)
 		debuglog.Log(fmt.Sprintf("Build: frame %d input %dx%d kernel=%d trimX=%d trimY=%d", finalSlot,
 			planned[i].input.HDU.Data.Width, planned[i].input.HDU.Data.Height, int(finalKernel), trimX, trimY))
+		dropSize := inputDropSize(planned[i], options.Scale, options.PixFrac)
 		drizzlePlannedInput(planned[i], sums, weights, width, height, minX, minY,
 			options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY)
 		debuglog.Log(fmt.Sprintf("Build: frame %d done", finalSlot))
+
+		if options.DebugOutputDir != "" {
+			dbgSums := make([]float32, width*height)
+			dbgWeights := make([]float32, width*height)
+			drizzlePlannedInput(planned[i], dbgSums, dbgWeights, width, height, minX, minY,
+				options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY)
+			normalizeAccumulatedImage(dbgSums, dbgWeights)
+
+			safeName := strings.ReplaceAll(InputLabel(planned[i].input), "[", "_")
+			safeName = strings.ReplaceAll(safeName, "]", "_")
+			safeName = strings.ReplaceAll(safeName, ",", "_")
+			debugPath := filepath.Join(options.DebugOutputDir, fmt.Sprintf("debug_%s.fits", safeName))
+
+			err := fitsio.WriteFloat32Image(debugPath, debugBaseHeader, fitsio.ImageData{Pixels: dbgSums, Width: width, Height: height})
+			if err != nil {
+				debuglog.Log(fmt.Sprintf("Build: failed to write debug image %s: %v", debugPath, err))
+			} else {
+				debuglog.Log(fmt.Sprintf("Build: wrote debug image %s", debugPath))
+			}
+		}
+
+		// Release this frame's pixels before loading the next one so peak memory
+		// stays at roughly one input frame plus the output accumulators.
+		pixels = nil
+		planned[i].input.ERRPixels = nil
+		if finalSlot%8 == 0 {
+			logMemStats(fmt.Sprintf("drizzled %d/%d frames", finalSlot, len(dataPlanned)))
+		}
 	}
 
+	options.reportProgress("Finalizing", len(dataPlanned), len(dataPlanned))
 	debuglog.Log("Build: normalizing accumulated image")
 	normalizeAccumulatedImage(sums, weights)
+	logMemStats("finalized")
 	debuglog.Log("Build: normalization done, computing footprints")
 
 	// Compute output-space footprints for preview border drawing.
@@ -564,8 +648,8 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 		chipCorners := p.input.ChipFootprints
 		if len(chipCorners) == 0 {
-			trimX := float64(effectiveEdgeTrim(p.input.HDU.Data.Width, options.Scale))
-			trimY := float64(effectiveEdgeTrim(p.input.HDU.Data.Height, options.Scale))
+			trimX := float64(effectiveEdgeTrimForInput(p, p.input.HDU.Data.Width, options.Scale))
+			trimY := float64(effectiveEdgeTrimForInput(p, p.input.HDU.Data.Height, options.Scale))
 			w := float64(p.input.HDU.Data.Width)
 			h := float64(p.input.HDU.Data.Height)
 			chipCorners = [][4][2]float64{{
@@ -742,9 +826,69 @@ func sortedByDistFromRef(inputs []Input) []int {
 	return out
 }
 
-func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode, searchRadiusArcsec float64) ([]StarAlignmentResult, error) {
+// propagateSameExposureAlignment gives any still-unaligned chip the alignment
+// solution of an aligned sibling chip from the same exposure (same file Path,
+// different SCIExt). The chips of one exposure are rigid on the focal plane and
+// share a single pointing residual, but adjacent chips barely overlap each other
+// so they cannot be star-matched directly — without this, a chip that doesn't
+// overlap the reference is either left unrefined or, worse, pushed by a false
+// cross-chip match. It returns the number of chips filled in.
+func propagateSameExposureAlignment(inputs []Input, results []StarAlignmentResult, aligned []bool) int {
+	filled := 0
+	for i := range inputs {
+		if aligned[i] || inputs[i].Excluded {
+			continue
+		}
+		for j := range inputs {
+			if j == i || !aligned[j] || inputs[j].Excluded {
+				continue
+			}
+			if inputs[j].Path != inputs[i].Path {
+				continue
+			}
+			results[i] = StarAlignmentResult{
+				OffsetX:            results[j].OffsetX,
+				OffsetY:            results[j].OffsetY,
+				ManualTransform:    results[j].ManualTransform,
+				HasManualTransform: results[j].HasManualTransform,
+				Applied:            true,
+				MatchedStars:       results[j].MatchedStars,
+				RMS:                results[j].RMS,
+				MaxError:           results[j].MaxError,
+			}
+			aligned[i] = true
+			filled++
+			break
+		}
+	}
+	return filled
+}
+
+// framesMayOverlap reports whether two inputs' footprints could share any
+// pixels, using a cheap WCS center-distance test (bounding-circle criterion, no
+// image warp). It is deliberately conservative — it never rules out a genuine
+// overlap, only skips pairs clearly too far apart — so it is safe to gate the
+// expensive warp+star-match chain fallback on it.
+func framesMayOverlap(a, b Input) bool {
+	dist, err := processing.CenterDistInRefPixels(
+		a.HDU.Header, a.HDU.Data.Width, a.HDU.Data.Height,
+		b.HDU.Header, b.HDU.Data.Width, b.HDU.Data.Height,
+	)
+	if err != nil {
+		return true // can't determine geometry → don't skip
+	}
+	diagA := math.Hypot(float64(a.HDU.Data.Width), float64(a.HDU.Data.Height))
+	diagB := math.Hypot(float64(b.HDU.Data.Width), float64(b.HDU.Data.Height))
+	return dist <= (diagA+diagB)/2
+}
+
+func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode, searchRadiusArcsec float64, progress ...AlignProgress) ([]StarAlignmentResult, error) {
 	debuglog.Log("AlignInputsByStarsWithMode: starting")
 	defer debuglog.Log("AlignInputsByStarsWithMode: finished")
+	var prog AlignProgress
+	if len(progress) > 0 {
+		prog = progress[0]
+	}
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
 	}
@@ -858,6 +1002,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	type alignOneResult struct {
 		i          int
 		refinement processing.AffineTransform
+		stats      processing.AlignStats
 		errMsg     string
 		ok         bool
 	}
@@ -870,6 +1015,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			}
 			var (
 				refinement processing.AffineTransform
+				stats      processing.AlignStats
 				err        error
 			)
 			switch mode {
@@ -882,7 +1028,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 					err = fmt.Errorf("WCSMapper: %v", mapErr)
 					break
 				}
-				refinement, err = processing.EstimateTweakRegAlignmentWithRefStars(
+				refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
 					inputs[i].HDU.Data.Pixels,
 					inputs[i].HDU.Data.Width,
 					inputs[i].HDU.Data.Height,
@@ -916,13 +1062,36 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				refinement = processing.ComposeAffineTransforms(rc.wRto0,
 					processing.ComposeAffineTransforms(refinement, rc.w0toR))
 			}
-			return alignOneResult{i: i, refinement: refinement, ok: true}
+			return alignOneResult{i: i, refinement: refinement, stats: stats, ok: true}
 		}
 		return alignOneResult{i: i, errMsg: lastErr[i]}
 	}
 
+	// triedChain records (intermediate, image) pairs already attempted in the
+	// chain fallback so a genuinely-unalignable image is not re-matched against
+	// every aligned intermediate — the O(aligned × unaligned) blow-up that made
+	// auto-alignment hang on large, partially-overlapping mosaics.
+	triedChain := make(map[[2]int]bool)
+
+	// starCatalog caches each input's extracted star catalog so the chain
+	// fallback matches against pre-extracted catalogs (cheap, no image warp and
+	// no repeated extraction) instead of re-warping + re-extracting per pair.
+	starCatalog := make(map[int][]processing.Star)
+	getStars := func(idx int) []processing.Star {
+		if s, ok := starCatalog[idx]; ok {
+			return s
+		}
+		s := processing.ExtractAndLimitStars(
+			inputs[idx].HDU.Data.Pixels, inputs[idx].HDU.Data.Width, inputs[idx].HDU.Data.Height, 4.0, 3, 200)
+		starCatalog[idx] = s
+		return s
+	}
+
 	primaryPassDone := false
 	for len(queue) > 0 {
+		if prog.cancelled() {
+			return nil, ErrCancelled
+		}
 		refIdx := queue[0]
 		queue = queue[1:]
 
@@ -944,10 +1113,14 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				continue
 			}
 
+			prog.report(0, len(toAlign))
 			ch := make(chan alignOneResult, len(toAlign))
 			sem := make(chan struct{}, runtime.NumCPU())
 			var wg sync.WaitGroup
 			for _, i := range toAlign {
+				if prog.cancelled() {
+					break
+				}
 				wg.Add(1)
 				sem <- struct{}{}
 				go func(i int) {
@@ -959,7 +1132,14 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			wg.Wait()
 			close(ch)
 
+			if prog.cancelled() {
+				return nil, ErrCancelled
+			}
+
+			done := 0
 			for r := range ch {
+				done++
+				prog.report(done, len(toAlign))
 				if r.ok {
 					results[r.i] = StarAlignmentResult{
 						OffsetX:            inputs[r.i].OffsetX,
@@ -967,6 +1147,9 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 						ManualTransform:    r.refinement,
 						HasManualTransform: true,
 						Applied:            true,
+						MatchedStars:       r.stats.MatchedStars,
+						RMS:                r.stats.RMS,
+						MaxError:           r.stats.MaxError,
 					}
 					aligned[r.i] = true
 					queue = append(queue, r.i)
@@ -981,10 +1164,33 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				if aligned[i] || inputs[i].Excluded {
 					continue
 				}
-				dx, dy, err := processing.EstimateTranslationAfterWCS(
-					inputs[i].HDU.Data.Pixels, inputs[i].HDU.Data.Width, inputs[i].HDU.Data.Height, inputs[i].HDU.Header,
-					inputs[refIdx].HDU.Data.Pixels, inputs[refIdx].HDU.Data.Width, inputs[refIdx].HDU.Data.Height, inputs[refIdx].HDU.Header,
-					0, 0,
+				if prog.cancelled() {
+					return nil, ErrCancelled
+				}
+				// Skip pairs already attempted, and pairs whose WCS footprints
+				// cannot overlap (cheap center-distance test, no image warp). For
+				// a mosaic most intermediate/image pairs are far apart, so this
+				// avoids the expensive warp+star-match on pairs that can never align.
+				if triedChain[[2]int{refIdx, i}] {
+					continue
+				}
+				triedChain[[2]int{refIdx, i}] = true
+				// Chips of the same exposure (same file, different SCIExt) are rigid
+				// and barely overlap each other; never star-match them across chips —
+				// propagateSameExposureAlignment gives the sibling its solution later.
+				if inputs[i].Path == inputs[refIdx].Path {
+					continue
+				}
+				if !framesMayOverlap(inputs[i], inputs[refIdx]) {
+					continue
+				}
+				// Catalog-based residual translation against the already-aligned
+				// intermediate: projects cached star catalogs through the WCS, no
+				// full-image warp or re-extraction (which previously made this
+				// path hang on large mosaics).
+				dx, dy, _, err := processing.EstimateTranslationFromCatalogs(
+					getStars(i), inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
+					getStars(refIdx), inputs[refIdx].HDU.Header, inputs[refIdx].D2IX, inputs[refIdx].D2IY,
 				)
 				if err != nil {
 					lastErr[i] = err.Error()
@@ -1006,6 +1212,13 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				queue = append(queue, i)
 			}
 		}
+	}
+
+	// Chips of a multi-chip exposure are rigid and share one residual; let an
+	// unaligned chip inherit an aligned sibling's solution rather than be left
+	// unrefined (or, before the chain-fallback gate, mis-shoved by a false match).
+	if filled := propagateSameExposureAlignment(inputs, results, aligned); filled > 0 {
+		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: propagated alignment to %d same-exposure sibling chip(s)", filled))
 	}
 
 	for i := 1; i < len(inputs); i++ {
@@ -1147,6 +1360,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 
 			var (
 				refinement processing.AffineTransform
+				stats      processing.AlignStats
 				err        error
 			)
 			switch mode {
@@ -1159,7 +1373,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 					err = fmt.Errorf("WCSMapper: %v", mapErr)
 					break
 				}
-				refinement, err = processing.EstimateTweakRegAlignmentWithRefStars(
+				refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
 					inputs[i].HDU.Data.Pixels,
 					inputs[i].HDU.Data.Width,
 					inputs[i].HDU.Data.Height,
@@ -1218,6 +1432,9 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 				ManualTransform:    manualT,
 				HasManualTransform: true,
 				Applied:            true,
+				MatchedStars:       stats.MatchedStars,
+				RMS:                stats.RMS,
+				MaxError:           stats.MaxError,
 			}
 			aligned = true
 		}
@@ -1303,18 +1520,27 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 		var mapper *processing.WCSMapper
 		if idx == 0 {
 			statuses[idx].Status = "reference"
-			// mapper stays nil; reference pixels map through the identity
-			// affine (sourceToRef) so no WCS round-trip is needed.
+			// The reference must be drizzled through its own distortion model
+			// (SIP + D2IM) onto the linear output plane, exactly like every
+			// other input. Leaving it on the identity affine would place the
+			// reference chip in distorted pixel space while all other chips
+			// land undistorted, so a single multi-chip exposure's chips no
+			// longer line up (non-uniform chip gap, mismatched outer edges).
+			var mapperErr error
+			mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
+			if mapperErr != nil {
+				statuses[idx].Status = "failed"
+				statuses[idx].Error = mapperErr.Error()
+				debuglog.Log(fmt.Sprintf("planInputs: FAILED reference %s - WCSMapper: %v", InputKey(input), mapperErr))
+				return nil, statuses, 0, 0, 0, 0, fmt.Errorf("reference WCS mapper: %w", mapperErr)
+			}
 		} else {
 			// Build the per-pixel WCS mapper for all non-reference inputs,
 			// regardless of whether they share a file with the reference.
 			// This replaces the old chipPlacementTransform hack which stripped
 			// inter-chip rotation and produced a rotational offset in SCI[2].
 			var mapperErr error
-			mapper, mapperErr = processing.NewWCSMapper(
-				input.HDU.Header, input.D2IX, input.D2IY,
-				ref.HDU.Header, ref.D2IX, ref.D2IY,
-			)
+			mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
 			if mapperErr != nil {
 				statuses[idx].Status = "failed"
 				statuses[idx].Error = mapperErr.Error()
@@ -1345,6 +1571,10 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 
 		statuses[idx].Included = true
 		p := plannedInput{input: input, sourceToRef: transform, mapper: mapper, statusIndex: idx}
+		p.sourcePixelScale = mappedSourcePixelScale(p)
+		if !isFinite64(p.sourcePixelScale) || p.sourcePixelScale <= 0 {
+			p.sourcePixelScale = 1
+		}
 		planned = append(planned, p)
 
 		// Reference-only inputs anchor the coordinate system but don't contribute
@@ -1419,7 +1649,12 @@ func buildOutputHeader(ref Input, width, height int, originX, originY, scale flo
 		if strings.HasPrefix(key, "NAXIS") && key != "NAXIS1" && key != "NAXIS2" {
 			delete(cards, key)
 		}
+		if isDistortionHeaderCard(key) {
+			delete(cards, key)
+		}
 	}
+	cards["CTYPE1"] = stripSIPSuffix(cards["CTYPE1"])
+	cards["CTYPE2"] = stripSIPSuffix(cards["CTYPE2"])
 
 	cards["OBJECT"] = firstNonEmpty(cards["OBJECT"], quotedString(filepath.Base(ref.Path)))
 	cards["IMAGETYP"] = quotedString("DRIZZLE")
@@ -1461,6 +1696,23 @@ func buildOutputHeader(ref Input, width, height int, originX, originY, scale flo
 	return fitsio.Header{Cards: cards}
 }
 
+func isDistortionHeaderCard(key string) bool {
+	return key == "A_ORDER" || key == "B_ORDER" || key == "AP_ORDER" || key == "BP_ORDER" ||
+		strings.HasPrefix(key, "A_") || strings.HasPrefix(key, "B_") ||
+		strings.HasPrefix(key, "AP_") || strings.HasPrefix(key, "BP_") ||
+		strings.HasPrefix(key, "D2IM")
+}
+
+func stripSIPSuffix(value string) string {
+	if value == "" {
+		return value
+	}
+	if strings.Contains(value, "TAN-SIP") {
+		return strings.Replace(value, "TAN-SIP", "TAN", 1)
+	}
+	return value
+}
+
 func mergeHeaders(headers ...fitsio.Header) fitsio.Header {
 	merged := fitsio.Header{Cards: map[string]string{}}
 	for _, header := range headers {
@@ -1477,36 +1729,24 @@ func imageCorners(width, height int) [4][2]float64 {
 	return [4][2]float64{{0, 0}, {maxX, 0}, {0, maxY}, {maxX, maxY}}
 }
 
-// effectiveEdgeTrim returns the number of input pixels to exclude from each
-// edge so that the trim covers edgeTrim output pixels regardless of scale.
-// It is capped at 10 % of the image dimension to avoid over-trimming at very
-// small scale values.
-func effectiveEdgeTrim(size int, scale float64) int {
-	if scale <= 0 {
-		scale = 1
-	}
-	t := int(math.Ceil(float64(edgeTrim) / scale))
-	if max := size / 10; t > max {
-		t = max
-	}
-	if size <= t*2 {
-		return 0
-	}
-	return t
+// effectiveEdgeTrimForInput reports how many pixels to exclude from each edge of
+// an input before drizzling. Edge trimming is disabled: every input contributes
+// all of its data, so this always returns 0. Kept as the single chokepoint so a
+// trim can be reinstated here without touching the drizzle loops or footprints.
+func effectiveEdgeTrimForInput(p plannedInput, size int, scale float64) int {
+	return 0
 }
 
-// SepFrame holds a singly drizzled frame and a compact coverage mask used by
-// the drizzle-style CR median model. A bitset keeps the median model from
-// treating uncovered pixels as real samples without retaining a second full
-// weight image per input.
+// SepFrame holds a single drizzled frame in output space, normalized to flux
+// units. Uncovered pixels are marked NaN so the median-model builder can ignore
+// them without a separate coverage map.
 type SepFrame struct {
-	Image   []float32
-	Covered BitMask
+	Image []float32
 }
 
 // drizzleSepFrame drizzles a single planned input into its own output-size
-// accumulator and returns the normalized image plus a compact coverage mask.
-// Used to build per-frame images for the AstroDrizzle-style separate pass.
+// accumulator and returns the normalized image (NaN where uncovered). Used to
+// build per-frame images for the AstroDrizzle-style separate CR pass.
 func drizzleSepFrame(p plannedInput, pixels []float32, outW, outH int, minX, minY, scale, dropSize float64, kernel DrizzleKernel, weightingMode WeightingMode) SepFrame {
 	// Use out as the flux accumulator directly; weights tracks coverage.
 	// This avoids allocating a separate sums array.
@@ -1516,63 +1756,14 @@ func drizzleSepFrame(p plannedInput, pixels []float32, outW, outH int, minX, min
 	trimX, trimY := 0, 0
 	drizzlePlannedInput(p, out, weights, outW, outH, minX, minY, scale, dropSize, kernel, weightingMode, nil, pixels, trimX, trimY)
 
-	covered := NewBitMask(len(out))
 	for i := range out {
 		if abs32(weights[i]) <= weightEpsilon {
 			out[i] = float32(math.NaN())
 			continue
 		}
-		covered.Set(i)
 		out[i] /= weights[i]
 	}
-	return SepFrame{Image: out, Covered: covered}
-}
-
-// buildMedianModel combines n per-frame drizzled images into a single clean
-// model using minmed (n ≤ 3) or a true median (n > 3) at each pixel. The
-// per-frame coverage mask prevents uncovered sep-frame pixels from biasing the
-// model, while avoiding full retained weight maps for every input.
-func buildMedianModel(frames []SepFrame, outW, outH, n int) []float32 {
-	model := make([]float32, outW*outH)
-	vals := make([]float32, 0, n)
-	for i := range model {
-		vals = vals[:0]
-		for _, frame := range frames {
-			if len(frame.Image) <= i || !frame.Covered.Get(i) {
-				continue
-			}
-			v := frame.Image[i]
-			if isFinite32(v) {
-				vals = append(vals, v)
-			}
-		}
-		if len(vals) == 0 {
-			model[i] = float32(math.NaN())
-			continue
-		}
-		// sort in-place using a simple insertion sort (n is small)
-		for j := 1; j < len(vals); j++ {
-			for k := j; k > 0 && vals[k] < vals[k-1]; k-- {
-				vals[k], vals[k-1] = vals[k-1], vals[k]
-			}
-		}
-		median := medianSorted(vals)
-		if n <= 3 {
-			var sum float32
-			for _, v := range vals {
-				sum += v
-			}
-			mean := sum / float32(len(vals))
-			if mean < median {
-				model[i] = mean
-			} else {
-				model[i] = median
-			}
-		} else {
-			model[i] = median
-		}
-	}
-	return model
+	return SepFrame{Image: out}
 }
 
 func medianSorted(vals []float32) float32 {
@@ -1623,6 +1814,42 @@ func drizzlePlannedInput(p plannedInput, sums, weights []float32, width, height 
 	}
 }
 
+func inputDropSize(p plannedInput, outputScale, pixFrac float64) float64 {
+	if pixFrac <= 0 {
+		pixFrac = 1
+	}
+	sourceScale := p.sourcePixelScale
+	if !isFinite64(sourceScale) || sourceScale <= 0 {
+		sourceScale = 1
+	}
+	return sourceScale * outputScale * pixFrac
+}
+
+func mappedSourcePixelScale(p plannedInput) float64 {
+	data := p.input.HDU.Data
+	x := float64(data.Width-1) / 2
+	y := float64(data.Height-1) / 2
+	if data.Width < 2 || data.Height < 2 {
+		return 1
+	}
+
+	x0, y0 := p.mapPixel(x, y)
+	x1, y1 := p.mapPixel(x+1, y)
+	x2, y2 := p.mapPixel(x, y+1)
+	dx := math.Hypot(x1-x0, y1-y0)
+	dy := math.Hypot(x2-x0, y2-y0)
+	switch {
+	case isFinite64(dx) && dx > 0 && isFinite64(dy) && dy > 0:
+		return 0.5 * (dx + dy)
+	case isFinite64(dx) && dx > 0:
+		return dx
+	case isFinite64(dy) && dy > 0:
+		return dy
+	default:
+		return 1
+	}
+}
+
 func inputExposureTime(input Input) float64 {
 	if input.ExposureTime > 0 && !math.IsNaN(input.ExposureTime) && !math.IsInf(input.ExposureTime, 0) {
 		return input.ExposureTime
@@ -1630,7 +1857,21 @@ func inputExposureTime(input Input) float64 {
 	return 0
 }
 
+// frameExposureNormalized reports whether prepareFramePixels already converted
+// this frame's SCI (and ERR) pixels to a per-second rate. When true, the drizzle
+// weighting must NOT divide by EXPTIME a second time, otherwise exposure
+// normalization combined with Exposure/ERR weighting double-divides and (for ERR)
+// skews the inter-frame weighting. Mirrors the gate prepareFramePixels applies.
+func frameExposureNormalized(input Input) bool {
+	return input.NormalizeExposure && !input.ReferenceOnly &&
+		isFinite64(input.ExposureScale) && input.ExposureScale > 0
+}
+
 func normalizedPixelsForWeighting(input Input, pixels []float32, weightingMode WeightingMode) []float32 {
+	if frameExposureNormalized(input) {
+		// Pixels are already a rate; no further per-exptime scaling.
+		return pixels
+	}
 	switch weightingMode {
 	case WeightExposure, WeightERR:
 		if exptime := inputExposureTime(input); exptime > 0 {
@@ -1659,7 +1900,9 @@ func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) fl
 	case WeightERR:
 		if errPix := p.input.ERRPixels; errPix != nil && idx < len(errPix) {
 			if e := errPix[idx]; e > 0 && isFinite32(e) {
-				if exptime > 0 {
+				// When the frame is already exposure-normalized, ERR is in rate
+				// units too, so use it directly. Otherwise convert to a rate sigma.
+				if !frameExposureNormalized(p.input) && exptime > 0 {
 					rateErr := e / float32(exptime)
 					if rateErr > 0 && isFinite32(rateErr) {
 						return 1.0 / (rateErr * rateErr)
@@ -1673,6 +1916,11 @@ func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) fl
 }
 
 func drizzlePixelValue(p plannedInput, idx int, value float32, weightingMode WeightingMode) float32 {
+	if frameExposureNormalized(p.input) {
+		// Pixels were already converted to a rate by prepareFramePixels; do not
+		// divide by EXPTIME again.
+		return value
+	}
 	switch weightingMode {
 	case WeightExposure, WeightERR:
 		if exptime := inputExposureTime(p.input); exptime > 0 {
@@ -2121,7 +2369,8 @@ func drizzleBuildStatus(skysubApplied, cleaned bool) string {
 }
 
 func LooksLikeFLC(path string) bool {
-	return strings.Contains(strings.ToLower(filepath.Base(path)), "_flc")
+	base := strings.ToLower(filepath.Base(path))
+	return strings.Contains(base, "_flc") || strings.Contains(base, "_flt")
 }
 
 func formatFloat(v float64) string {

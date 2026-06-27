@@ -67,6 +67,99 @@ func EstimateTranslationAfterWCS(targetPixels []float32, targetWidth, targetHeig
 	return medianFloat64(dxs), medianFloat64(dys), nil
 }
 
+// EstimateTranslationFromCatalogs estimates the residual (dx, dy) translation,
+// in the intermediate image's pixel frame, that aligns src onto intermediate.
+//
+// Unlike EstimateTranslationAfterWCS it works purely from pre-extracted star
+// catalogs plus the WCS — no full-image warp and no re-extraction — so it is
+// cheap enough to call for every overlapping pair in the chain-alignment
+// fallback (the warp + double extraction in the warp-based version made
+// auto-alignment of large mosaics appear to hang). srcStars / intermediateStars
+// are in their own native pixel spaces. Returns the matched-star count.
+//
+// The returned dx,dy has the same meaning as EstimateTranslationAfterWCS: it is
+// the offset to add to src's WCS placement so it lands on intermediate, so the
+// two are interchangeable at the call site.
+func EstimateTranslationFromCatalogs(
+	srcStars []Star, srcHeader fitsio.Header, srcD2IX, srcD2IY *D2ITable,
+	intermediateStars []Star, intermediateHeader fitsio.Header, intermediateD2IX, intermediateD2IY *D2ITable,
+) (float64, float64, int, error) {
+	if len(srcStars) < 3 || len(intermediateStars) < 3 {
+		return 0, 0, 0, fmt.Errorf("insufficient stars (src %d, intermediate %d)", len(srcStars), len(intermediateStars))
+	}
+	mapper, err := NewWCSMapper(srcHeader, srcD2IX, srcD2IY, intermediateHeader, intermediateD2IX, intermediateD2IY)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	projected := make([]Star, len(srcStars))
+	for i, s := range srcStars {
+		rx, ry := mapper.MapPixel(s.X, s.Y)
+		projected[i] = Star{X: rx, Y: ry, Flux: s.Flux}
+	}
+	// Match via the 2D offset histogram (robust to crowding and to which stars are
+	// detected), falling back to triangle matching when no clear peak forms (e.g.
+	// a residual rotation/scale spreads the offsets). The histogram gives the
+	// correspondences; the precise translation is the median pair displacement,
+	// so accuracy is sub-pixel rather than bin-quantised.
+	pairs := matchStarsByOffsetHistogram(projected, intermediateStars, histWindowPx, histBinPx, histMatchRadiusPx)
+	if len(pairs) < 3 {
+		pairs = MatchStars(projected, intermediateStars, triangleMatchHardCap, 0.01)
+	}
+	if len(pairs) < 3 {
+		return 0, 0, 0, fmt.Errorf("insufficient star matches (found %d)", len(pairs))
+	}
+	dxs := make([]float64, len(pairs))
+	dys := make([]float64, len(pairs))
+	for i, p := range pairs {
+		// pairs: RefX/RefY = projected src (in intermediate frame),
+		//        TargetX/TargetY = intermediate star. Residual to add to src's
+		//        placement is intermediate - projected_src.
+		dxs[i] = p.TargetX - p.RefX
+		dys[i] = p.TargetY - p.RefY
+	}
+	dxMed := medianFloat64(dxs)
+	dyMed := medianFloat64(dys)
+
+	// Verify globally: count how many projected source stars land on an
+	// intermediate star after the candidate translation. Frames that barely
+	// overlap (e.g. an ACS chip vs a different chip ~2048 px away) produce a
+	// handful of false triangle matches whose median is a garbage offset; those
+	// align almost no stars and must be rejected, leaving the frame at its WCS
+	// placement rather than shoving it by a bogus ~thousand-pixel translation.
+	inliers := 0
+	tolSq := tweakRegGlobalTolPx * tweakRegGlobalTolPx
+	for _, s := range projected {
+		px := s.X + dxMed
+		py := s.Y + dyMed
+		best := math.Inf(1)
+		for _, r := range intermediateStars {
+			d := (px-r.X)*(px-r.X) + (py-r.Y)*(py-r.Y)
+			if d < best {
+				best = d
+			}
+		}
+		if best <= tolSq {
+			inliers++
+		}
+	}
+	// Reject a large residual (the WCS already places overlapping frames to within
+	// tens of pixels, so a real neighbour residual is small) and require a few
+	// corroborating stars. Together these reject the false cross-chip / no-overlap
+	// matches that produced ~2000 px offsets, without penalising star-poor fields.
+	if shift := math.Hypot(dxMed, dyMed); shift > maxResidualShiftPx {
+		return 0, 0, inliers, fmt.Errorf("chain translation too large (%.0f px > %.0f): likely false matches", shift, maxResidualShiftPx)
+	}
+	if inliers < chainMinSupport {
+		return 0, 0, inliers, fmt.Errorf("chain translation corroborated by too few stars (%d, need %d)", inliers, chainMinSupport)
+	}
+	return dxMed, dyMed, inliers, nil
+}
+
+// chainMinSupport is the low corroboration floor for the chain fallback — small
+// enough that sparse neighbour overlaps still align, with the residual-shift
+// bound (maxResidualShiftPx) doing the real false-match rejection.
+const chainMinSupport = 3
+
 // EstimateTranslationFromRefStars is like EstimateTranslationAfterWCS but uses
 // manually provided reference star positions instead of auto-detecting them.
 // refStars are positions in the reference image's pixel space.
@@ -379,6 +472,107 @@ type candidateMatch struct {
 	refIdx    int
 	targetIdx int
 	distSq    float64
+}
+
+// Offset-histogram matching parameters (TweakReg xyxymatch / 2dhist style).
+const (
+	// histWindowPx is the half-width of the offset search window. Offsets beyond
+	// this are ignored; it is sized to the residual we are willing to accept
+	// (maxResidualShiftPx) since anything larger would be rejected downstream.
+	histWindowPx = maxResidualShiftPx
+	// histBinPx is the offset histogram bin size. Small enough to localise the
+	// peak, large enough that centroid noise doesn't split a real cluster.
+	histBinPx = 3.0
+	// histMinClusterVotes is the minimum 3x3-neighbourhood vote count for the
+	// peak to be trusted as the bulk offset. Low, because everything downstream
+	// (proximity re-match, fit, shift gate) re-validates the result.
+	histMinClusterVotes = 4
+	// histMatchRadiusPx is the proximity radius used to re-pair stars after the
+	// bulk offset is removed. Generous enough to absorb the small per-star spread
+	// from any residual field rotation; the subsequent fit captures the rotation.
+	histMatchRadiusPx = 8.0
+)
+
+// dominantOffset finds the most common pairwise offset (refStar - projected)
+// between two catalogs via a 2D histogram vote — the TweakReg xyxymatch idea.
+// Truly-corresponding star pairs all share (nearly) the same offset and pile up
+// at one histogram cell, while false pairings scatter, so the peak is the bulk
+// translation even in crowded or star-poor fields and even when the residual
+// exceeds a nearest-neighbour search radius. Returns the (sub-bin centroided)
+// offset and whether a confident peak was found.
+func dominantOffset(projected, refStars []Star, windowPx, binPx float64) (float64, float64, bool) {
+	if len(projected) == 0 || len(refStars) == 0 {
+		return 0, 0, false
+	}
+	if binPx <= 0 {
+		binPx = 3
+	}
+	type cell struct{ x, y int }
+	hist := make(map[cell]int)
+	peak := cell{}
+	peakCount := 0
+	for _, p := range projected {
+		for _, r := range refStars {
+			ox := r.X - p.X
+			oy := r.Y - p.Y
+			if ox < -windowPx || ox > windowPx || oy < -windowPx || oy > windowPx {
+				continue
+			}
+			c := cell{int(math.Floor((ox + windowPx) / binPx)), int(math.Floor((oy + windowPx) / binPx))}
+			hist[c]++
+			if hist[c] > peakCount {
+				peakCount = hist[c]
+				peak = c
+			}
+		}
+	}
+	if peakCount == 0 {
+		return 0, 0, false
+	}
+	// Sum and centroid the 3x3 neighbourhood of the peak so a cluster split
+	// across a bin boundary is still recognised and localised to sub-bin accuracy.
+	var sum, sumX, sumY float64
+	for dx := -1; dx <= 1; dx++ {
+		for dy := -1; dy <= 1; dy++ {
+			c := cell{peak.x + dx, peak.y + dy}
+			cnt := hist[c]
+			if cnt == 0 {
+				continue
+			}
+			cx := (float64(c.x)+0.5)*binPx - windowPx
+			cy := (float64(c.y)+0.5)*binPx - windowPx
+			sum += float64(cnt)
+			sumX += float64(cnt) * cx
+			sumY += float64(cnt) * cy
+		}
+	}
+	if int(sum) < histMinClusterVotes {
+		return 0, 0, false
+	}
+	return sumX / sum, sumY / sum, true
+}
+
+// matchStarsByOffsetHistogram pairs stars by first finding the bulk translation
+// with dominantOffset, then re-matching by proximity after removing it. The
+// returned pairs use the original projected coordinates as Ref (so a subsequent
+// fit solves the full residual transform, including the bulk shift). Returns nil
+// if no confident bulk offset is found.
+func matchStarsByOffsetHistogram(projected, refStars []Star, windowPx, binPx, matchRadiusPx float64) []MatchedPair {
+	dx, dy, ok := dominantOffset(projected, refStars, windowPx, binPx)
+	if !ok {
+		return nil
+	}
+	shifted := make([]Star, len(projected))
+	for i, s := range projected {
+		shifted[i] = Star{X: s.X + dx, Y: s.Y + dy, Flux: s.Flux}
+	}
+	pairs := matchStarsByMutualProximity(shifted, refStars, 0, matchRadiusPx, 0.85)
+	// Undo the bulk shift so Ref is the original projected position again.
+	for k := range pairs {
+		pairs[k].RefX -= dx
+		pairs[k].RefY -= dy
+	}
+	return pairs
 }
 
 // matchStarsByMutualProximity matches stars already brought into roughly the

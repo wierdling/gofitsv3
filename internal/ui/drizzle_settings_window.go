@@ -16,15 +16,17 @@ import (
 
 func defaultDrizzleSettings() models.DrizzleSettings {
 	return models.DrizzleSettings{
-		FinalScale:    0,
-		Scale:         1.0,
-		PixFrac:       1.0,
-		CRMethod:      int(mosaic.CRMethodNone),
-		SepKernel:     int(mosaic.KernelTurbo),
-		FinalKernel:   int(mosaic.KernelSquare),
-		WeightingMode: int(mosaic.WeightUniform),
-		CRSeedSNR:     4.0,
-		CRDerivScale:  1.2,
+		FinalScale:            0,
+		Scale:                 1.0,
+		PixFrac:               1.0,
+		CRMethod:              int(mosaic.CRMethodNone),
+		SepKernel:             int(mosaic.KernelTurbo),
+		FinalKernel:           int(mosaic.KernelSquare),
+		WeightingMode:         int(mosaic.WeightUniform),
+		SurfaceBrightnessNorm: false,
+		CRSeedSNR:             4.0,
+		CRDerivScale:          1.2,
+		DebugOutputDir:        "",
 	}
 }
 
@@ -114,6 +116,9 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 	}
 
+	sbNormCheck := widget.NewCheck("Normalize mixed-scale chips by surface brightness", nil)
+	sbNormCheck.SetChecked(current.SurfaceBrightnessNorm)
+
 	crSeedSNREntry := widget.NewEntry()
 	crSeedSNR := current.CRSeedSNR
 	if crSeedSNR <= 0 {
@@ -128,6 +133,10 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 	}
 	crDerivScaleEntry.SetText(fmt.Sprintf("%.2f", crDerivScale))
 
+	debugDirEntry := widget.NewEntry()
+	debugDirEntry.SetText(current.DebugOutputDir)
+	debugDirEntry.SetPlaceHolder("Optional: path to save debug chip FITS")
+
 	notes := widget.NewLabel(
 		"Output Scale: desired plate scale in arcsec/pixel (AstroDrizzle final_scale).\n" +
 			"  Smaller value = finer sampling = larger output image.\n" +
@@ -139,6 +148,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 			"Sep Kernel: used during the per-frame drizzle pass.\n" +
 			"Final Kernel: used during the final combination pass.\n" +
 			"Weighting: Uniform ignores EXPTIME; Exposure Time matches classic drizzle EXP weighting; ERR uses the ERR plane.\n" +
+			"Surface brightness normalization: for mixed-scale chips such as WFPC2 PC+WF, scales chip pixels by mapped pixel area before drizzle.\n" +
 			"Lanczos kernels: only appropriate when PixFrac = 1.0.\n" +
 			"CR Seed SNR: signal-to-noise threshold for seeding a CR candidate (default 4.0).\n" +
 			"CR Deriv Scale: sharpness term weight in the CR rejection test (default 1.2).\n" +
@@ -155,8 +165,10 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		widget.NewFormItem("Sep Kernel", sepSelect),
 		widget.NewFormItem("Final Kernel", finalSelect),
 		widget.NewFormItem("Weighting", weightSelect),
+		widget.NewFormItem("Surface Brightness", sbNormCheck),
 		widget.NewFormItem("CR Seed SNR", crSeedSNREntry),
 		widget.NewFormItem("CR Deriv Scale", crDerivScaleEntry),
+		widget.NewFormItem("Debug Output Dir", debugDirEntry),
 	)
 
 	content := container.NewVBox(form, notes)
@@ -202,15 +214,17 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 
 		onSave(models.DrizzleSettings{
-			FinalScale:    finalScale,
-			Scale:         scale,
-			PixFrac:       pixFrac,
-			CRMethod:      crMethod,
-			SepKernel:     sepKernel,
-			FinalKernel:   finalKernel,
-			WeightingMode: weightingMode,
-			CRSeedSNR:     crSNRVal,
-			CRDerivScale:  crDSVal,
+			FinalScale:            finalScale,
+			Scale:                 scale,
+			PixFrac:               pixFrac,
+			CRMethod:              crMethod,
+			SepKernel:             sepKernel,
+			FinalKernel:           finalKernel,
+			WeightingMode:         weightingMode,
+			SurfaceBrightnessNorm: sbNormCheck.Checked,
+			CRSeedSNR:             crSNRVal,
+			CRDerivScale:          crDSVal,
+			DebugOutputDir:        strings.TrimSpace(debugDirEntry.Text),
 		})
 	}, win)
 	d.Show()

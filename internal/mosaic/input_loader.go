@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"strings"
 
 	"gofitsv3/internal/badpix"
 	"gofitsv3/internal/fitsio"
@@ -28,7 +29,14 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 	sci := file.SelectSCI()
 	if len(sci) == 0 {
 		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst.BadDQBits)
-		return []Input{{Path: path, PrimaryHeader: primary, HDU: hdu}}, nil
+		return []Input{{
+			Path:          path,
+			PrimaryHeader: primary,
+			HDU:           hdu,
+			ExposureTime:  loadExposureTime(primary, hdu.Header),
+			DateObs:       loadDateObs(primary, hdu.Header),
+			BUnit:         loadBUnit(hdu.Header, primary),
+		}}, nil
 	}
 
 	inputs := make([]Input, 0, len(sci))
@@ -42,6 +50,8 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 			PrimaryHeader: primary,
 			HDU:           hdu,
 			ExposureTime:  loadExposureTime(primary, hdu.Header),
+			DateObs:       loadDateObs(primary, hdu.Header),
+			BUnit:         loadBUnit(hdu.Header, primary),
 			D2IX:          d2iX,
 			D2IY:          d2iY,
 			ERRPixels:     loadERRPixels(file, extver),
@@ -116,6 +126,31 @@ func loadExposureTime(headers ...fitsio.Header) float64 {
 		}
 	}
 	return 0
+}
+
+// loadBUnit returns the BUNIT header value (data unit) from the first header
+// that has one, normally the SCI extension header. Returns "" when absent.
+func loadBUnit(headers ...fitsio.Header) string {
+	for _, header := range headers {
+		if v := fitsio.HeaderString(header, "BUNIT"); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func loadDateObs(headers ...fitsio.Header) string {
+	for _, header := range headers {
+		raw := fitsio.HeaderString(header, "DATE-OBS", "DATEOBS")
+		if raw == "" {
+			continue
+		}
+		if len(raw) >= 10 {
+			return raw[:10]
+		}
+		return strings.TrimSpace(raw)
+	}
+	return ""
 }
 
 func loadERRPixels(file *fitsio.File, sciExtver int) []float32 {
@@ -196,7 +231,11 @@ func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *
 	// so a small value here is fine.  The value is taken from the instrument
 	// metadata so that detectors with wider inter-chip gaps (e.g. ACS/WFC)
 	// get a larger trim.
-	chipInnerTrim := inst.ChipInnerTrim
+	// Temporarily disabled to test whether the geometric chip-edge erosion is
+	// still needed now that DQ masking handles bad pixels. Restore by reverting
+	// to the commented assignment if boundary ringing reappears.
+	// chipInnerTrim := inst.ChipInnerTrim
+	chipInnerTrim := 0
 
 	sums := make([]float32, width*height)
 	weights := make([]float32, width*height)
@@ -290,8 +329,70 @@ func cleanSCIWithMatchingDQ(hdu fitsio.HDU, file *fitsio.File, badBits uint32) f
 	if err != nil {
 		return hdu
 	}
+	edgeMask := dqEdgeNoDataMask(mask, hdu.Data.Width, hdu.Data.Height, 0.75)
+	if edgeMask != nil {
+		data := hdu.Data
+		pixels := make([]float32, len(data.Pixels))
+		copy(pixels, data.Pixels)
+		for i, edge := range edgeMask {
+			if edge {
+				pixels[i] = float32(math.NaN())
+				mask[i] = false
+			}
+		}
+		hdu.Data = fitsio.ImageData{Width: data.Width, Height: data.Height, Pixels: pixels}
+	}
 	hdu.Data = badpix.RepairMaskedPixels(hdu.Data, mask)
 	return hdu
+}
+
+func dqEdgeNoDataMask(mask []bool, width, height int, flaggedFraction float64) []bool {
+	if width <= 0 || height <= 0 || len(mask) < width*height {
+		return nil
+	}
+	if flaggedFraction <= 0 || flaggedFraction > 1 {
+		flaggedFraction = 0.75
+	}
+	edge := make([]bool, width*height)
+	any := false
+	markRow := func(y int) {
+		for x := 0; x < width; x++ {
+			edge[y*width+x] = true
+		}
+		any = true
+	}
+	markCol := func(x int) {
+		for y := 0; y < height; y++ {
+			edge[y*width+x] = true
+		}
+		any = true
+	}
+	for y := 0; y < height; y++ {
+		count := 0
+		for x := 0; x < width; x++ {
+			if mask[y*width+x] {
+				count++
+			}
+		}
+		if float64(count)/float64(width) >= flaggedFraction {
+			markRow(y)
+		}
+	}
+	for x := 0; x < width; x++ {
+		count := 0
+		for y := 0; y < height; y++ {
+			if mask[y*width+x] {
+				count++
+			}
+		}
+		if float64(count)/float64(height) >= flaggedFraction {
+			markCol(x)
+		}
+	}
+	if !any {
+		return nil
+	}
+	return edge
 }
 
 func matchingDQHDU(file *fitsio.File, sci fitsio.HDU) *fitsio.HDU {

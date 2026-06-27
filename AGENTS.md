@@ -41,6 +41,7 @@ Prefer narrow, deliberate changes over broad exploration.
 - Do not restyle unrelated areas.
 - Keep state changes localized.
 - Avoid large framework-level changes unless explicitly requested.
+- Do not run expensive image processing on the main UI thread; use a background goroutine with a progress dialog and apply UI updates via the UI thread.
 
 ## Testing and validation
 - Follow `docs/unit-test-standards.md` as the repository definition of a good unit test and when deciding which code needs unit coverage.

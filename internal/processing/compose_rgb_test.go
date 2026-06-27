@@ -31,6 +31,27 @@ func TestComposeRGBUsesGreenReferenceGrid(t *testing.T) {
 	}
 }
 
+func TestComposeRGBWithOrangeScreensTintedLayerWithOpacity(t *testing.T) {
+	header := fitsio.Header{Cards: map[string]string{"DRIZSCAL": "1", "ORIGOFFX": "0", "ORIGOFFY": "0"}}
+	blue := makeLoadedImageForCompose(1, 1, 0, header)
+	green := makeLoadedImageForCompose(1, 1, 0, header)
+	red := makeLoadedImageForCompose(1, 1, 0, header)
+	orange := makeLoadedImageForCompose(1, 1, 10, header)
+
+	buf, w, h, _ := ComposeRGBWithOrange([]*models.LoadedImage{blue, green, red}, orange, models.OrangeLayerState{
+		ColorR:  255,
+		ColorG:  128,
+		ColorB:  0,
+		Opacity: 0.5,
+	})
+	if w != 1 || h != 1 {
+		t.Fatalf("ComposeRGBWithOrange size = %dx%d, want 1x1", w, h)
+	}
+	if got, want := []byte{buf[0], buf[1], buf[2], buf[3]}, []byte{128, 64, 0, 255}; got[0] != want[0] || got[1] != want[1] || got[2] != want[2] || got[3] != want[3] {
+		t.Fatalf("pixel = %v, want %v", got, want)
+	}
+}
+
 func TestStretchForReferenceGridSkipsRewarpForSharedDrizzleGrid(t *testing.T) {
 	header := func(crpix1 string) fitsio.Header {
 		return fitsio.Header{Cards: map[string]string{

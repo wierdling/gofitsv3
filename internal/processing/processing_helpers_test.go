@@ -10,15 +10,21 @@ import (
 
 func TestAutoScaleLikeFitsLiberatorSetsFieldsAndRepairsPeak(t *testing.T) {
 	img := &models.LoadedImage{
-		HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{5, 5, 5, 5}}},
+		HDU:   fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{5, 5, 5, 5}}},
 		Black: 3,
-		White: 3,
+		White: 9,
 	}
 
 	AutoScaleLikeFitsLiberator(img)
 
-	if img.Background != img.Black {
-		t.Fatalf("Background = %v, want %v", img.Background, img.Black)
+	if img.Black != 3 || img.White != 9 {
+		t.Fatalf("levels = (%v,%v), want preserved black/white (3,9)", img.Black, img.White)
+	}
+	if img.Background != 3 {
+		t.Fatalf("Background = %v, want copied black level 3", img.Background)
+	}
+	if img.Peak != 9 {
+		t.Fatalf("Peak = %v, want copied white level 9", img.Peak)
 	}
 	if img.Peak <= img.Background {
 		t.Fatalf("Peak = %v, want > Background %v", img.Peak, img.Background)

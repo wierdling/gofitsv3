@@ -201,117 +201,19 @@ type FrameInfo struct {
 	OffsetX     float64
 	OffsetY     float64
 	Sigma       float64
+	// Noise, if non-nil and the same length as Pixels, is the per-pixel 1-sigma
+	// uncertainty in the same units as Pixels (e.g. the calibration ERR plane).
+	// It is used in place of the scalar Sigma so that the seed/grow thresholds
+	// scale with the local signal (bright regions are noisier), which prevents a
+	// flat global sigma from over-flagging real structure in bright areas. Where
+	// a Noise sample is missing or non-positive, Sigma is used for that pixel.
+	Noise []float32
 	// MapFunc, if non-nil, maps a source pixel (x,y) to reference space.
 	// BuildCRMasksFromModel uses it instead of SourceToRef for blotting,
 	// allowing a full WCS mapper to be passed in for per-pixel accuracy.
 	// The returned coordinates must already include any offset adjustment
 	// (i.e. they are the same reference-space coords used during drizzle).
 	MapFunc func(x, y float64) (float64, float64)
-}
-
-// BuildCosmicRayMasks detects cosmic rays by comparing each pixel across
-// multiple aligned frames. A pixel that is significantly brighter than the
-// corresponding position in other frames is flagged as a seed, then grown
-// into adjacent above-threshold pixels. Returns one boolean mask per frame
-// (true = cosmic ray, skip during drizzle).
-func BuildCosmicRayMasks(frames []FrameInfo, seedMultiplier, growMultiplier float64) [][]bool {
-	debuglog.Log("BuildCosmicRayMasks: starting")
-	defer debuglog.Log("BuildCosmicRayMasks: finished")
-	n := len(frames)
-	masks := make([][]bool, n)
-
-	for i := range frames {
-		f := &frames[i]
-		npix := f.Width * f.Height
-
-		if f.Sigma <= 0 {
-			masks[i] = make([]bool, npix)
-			continue
-		}
-
-		excess := make([]float64, npix)
-		compared := make([]bool, npix)
-		samples := make([]float64, 0, n-1)
-
-		for y := 0; y < f.Height; y++ {
-			for x := 0; x < f.Width; x++ {
-				idx := y*f.Width + x
-				val := float64(f.Pixels[idx])
-				if math.IsNaN(val) || val <= 0 {
-					continue
-				}
-
-				// Transform to reference space
-				refX, refY := ApplyAffineTransform(f.SourceToRef, float64(x), float64(y))
-				refX += f.OffsetX
-				refY += f.OffsetY
-
-				// Sample corresponding position in other frames
-				samples = samples[:0]
-				for j := 0; j < n; j++ {
-					if j == i {
-						continue
-					}
-					g := &frames[j]
-					sx, sy := ApplyAffineTransform(g.RefToSource, refX-g.OffsetX, refY-g.OffsetY)
-					s := bilinearSample(g.Pixels, g.Width, g.Height, sx, sy)
-					if !math.IsNaN(s) && s >= 0 {
-						samples = append(samples, s)
-					}
-				}
-
-				if len(samples) == 0 {
-					continue
-				}
-
-				sort.Float64s(samples)
-				median := samples[len(samples)/2]
-				excess[idx] = val - median
-				compared[idx] = true
-			}
-		}
-
-		// Identify seeds: pixels far brighter than corresponding pixels in other frames.
-		seedThreshold := seedMultiplier * f.Sigma
-		growThreshold := growMultiplier * f.Sigma
-		mask := make([]bool, npix)
-		q := make([]int, 0, 256)
-
-		for idx := 0; idx < npix; idx++ {
-			if compared[idx] && excess[idx] > seedThreshold {
-				mask[idx] = true
-				q = append(q, idx)
-			}
-		}
-
-		// Flood-fill from seeds into neighbors that also show excess.
-		dirs := [][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
-		for len(q) > 0 {
-			currIdx := q[0]
-			q = q[1:]
-			cx := currIdx % f.Width
-			cy := currIdx / f.Width
-
-			for _, d := range dirs {
-				nx, ny := cx+d[0], cy+d[1]
-				if nx < 0 || nx >= f.Width || ny < 0 || ny >= f.Height {
-					continue
-				}
-				nIdx := ny*f.Width + nx
-				if mask[nIdx] {
-					continue
-				}
-				if compared[nIdx] && excess[nIdx] > growThreshold {
-					mask[nIdx] = true
-					q = append(q, nIdx)
-				}
-			}
-		}
-
-		masks[i] = mask
-	}
-
-	return masks
 }
 
 // DrizzleStyleCROptions controls the AstroDrizzle-like multi-frame CR detector.
@@ -324,83 +226,6 @@ type DrizzleStyleCROptions struct {
 	DerivScale float64
 }
 
-// BuildDrizzleStyleCRMasks implements an AstroDrizzle-like cosmic-ray detector
-// that operates across multiple aligned exposures:
-//
-//  1. Builds a clean model image in the output (drizzle) space using minmed
-//     (min of mean and median) for small stacks (n <= 3) or median for larger
-//     stacks. Each output pixel is sampled from every frame via inverse blot.
-//  2. Blots the model back to each input frame's pixel space.
-//  3. Computes a 4-neighbor max-absolute derivative at each frame pixel.
-//  4. Seeds pixels whose excess over the blotted model exceeds
-//     SeedSNR*sigma + DerivScale*derivative.
-//  5. Grows flags to 4-connected neighbors that also show positive excess.
-//
-// The returned per-frame masks are intended to be used during the final drizzle
-// combine so that flagged pixels are skipped rather than replaced in-place.
-//
-// outW/outH are the drizzle output canvas dimensions.
-// minX/minY are the output origin in reference pixel space.
-// scale is the drizzle scale factor (output pixels per reference pixel).
-func BuildDrizzleStyleCRMasks(frames []FrameInfo, outW, outH int, minX, minY, scale float64, opts DrizzleStyleCROptions) [][]bool {
-	debuglog.Log("BuildDrizzleStyleCRMasks: starting")
-	defer debuglog.Log("BuildDrizzleStyleCRMasks: finished")
-	if len(frames) == 0 {
-		return nil
-	}
-	model := buildInverseBlotModel(frames, outW, outH, minX, minY, scale)
-	return BuildCRMasksFromModel(frames, model, outW, outH, minX, minY, scale, opts)
-}
-
-// buildInverseBlotModel builds a clean model image in output space by sampling
-// each input frame at the corresponding source position (inverse blot) and
-// computing a median or minmed across all frames at each output pixel.
-func buildInverseBlotModel(frames []FrameInfo, outW, outH int, minX, minY, scale float64) []float32 {
-	n := len(frames)
-	model := make([]float32, outW*outH)
-	// Reuse a single scratch buffer across all output pixels instead of
-	// allocating one []float64 per pixel (which would be O(outW*outH) allocs).
-	vals := make([]float64, 0, n)
-
-	for oy := 0; oy < outH; oy++ {
-		refY := float64(oy)/scale + minY
-		for ox := 0; ox < outW; ox++ {
-			refX := float64(ox)/scale + minX
-			vals = vals[:0]
-			for i := range frames {
-				f := &frames[i]
-				sx, sy := ApplyAffineTransform(f.RefToSource, refX-f.OffsetX, refY-f.OffsetY)
-				v := bilinearSample(f.Pixels, f.Width, f.Height, sx, sy)
-				if !math.IsNaN(v) && v >= 0 {
-					vals = append(vals, v)
-				}
-			}
-			outIdx := oy*outW + ox
-			if len(vals) == 0 {
-				model[outIdx] = float32(math.NaN())
-				continue
-			}
-			sort.Float64s(vals)
-			median := vals[(len(vals)-1)/2]
-			if n <= 3 {
-				var sum float64
-				for _, v := range vals {
-					sum += v
-				}
-				mean := sum / float64(len(vals))
-				if mean < median {
-					model[outIdx] = float32(mean)
-				} else {
-					model[outIdx] = float32(median)
-				}
-			} else {
-				model[outIdx] = float32(median)
-			}
-		}
-	}
-	return model
-}
-
 // BuildCRMasksFromModel flags cosmic rays by blotting a pre-built output-space
 // model back to each input frame and comparing. This is steps 2-5 of the
 // AstroDrizzle pipeline. Use this when the model has been built externally
@@ -410,7 +235,6 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 	defer debuglog.Log("BuildCRMasksFromModel: finished")
 	n := len(frames)
 	dirs4 := [4][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
-	dirs8 := [8][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
 	masks := make([][]bool, n)
 
 	for fi := range frames {
@@ -423,7 +247,18 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 
 		npix := f.Width * f.Height
 		mask := make([]bool, npix)
-		excesses := make([]float64, npix)
+
+		// noiseAt returns the per-pixel 1-sigma used for thresholding. It prefers
+		// the supplied Noise (ERR) plane so thresholds scale with local signal,
+		// and falls back to the scalar Sigma where Noise is missing/invalid.
+		noiseAt := func(idx int) float64 {
+			if f.Noise != nil && idx < len(f.Noise) {
+				if e := float64(f.Noise[idx]); e > 0 && !math.IsNaN(e) && !math.IsInf(e, 0) {
+					return e
+				}
+			}
+			return f.Sigma
+		}
 
 		// Blot the model back to input frame pixel space.
 		// Use MapFunc when available (full WCS accuracy); fall back to the
@@ -453,25 +288,35 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 			}
 		}
 
-		noiseFloor := opts.SeedSNR * f.Sigma
+		// Excess (data - blotted model) for every comparable pixel; NaN marks
+		// pixels with no valid data or no model coverage. Computed over the full
+		// frame so the growth stages can also consider border pixels.
+		excesses := make([]float64, npix)
+		for idx := range excesses {
+			excesses[idx] = math.NaN()
+		}
+		for idx := 0; idx < npix; idx++ {
+			val := float64(f.Pixels[idx])
+			if math.IsNaN(val) || val <= 0 {
+				continue
+			}
+			bv := float64(blotted[idx])
+			if math.IsNaN(bv) {
+				continue
+			}
+			excesses[idx] = val - bv
+		}
 
-		// Seed pass: flag pixels above derivative-scaled noise threshold.
+		// Seed pass: flag pixels whose excess clears the per-pixel noise floor
+		// plus a derivative-scaled allowance for steep model gradients.
 		for y := 1; y < f.Height-1; y++ {
 			for x := 1; x < f.Width-1; x++ {
 				idx := y*f.Width + x
-				val := float64(f.Pixels[idx])
-				if math.IsNaN(val) || val <= 0 {
+				excess := excesses[idx]
+				if math.IsNaN(excess) || excess <= 0 {
 					continue
 				}
 				bv := float64(blotted[idx])
-				if math.IsNaN(bv) {
-					continue
-				}
-				excess := val - bv
-				excesses[idx] = excess
-				if excess <= 0 {
-					continue
-				}
 				// 4-neighbor max-absolute derivative of the blotted model.
 				var maxDeriv float64
 				for _, d := range dirs4 {
@@ -483,50 +328,13 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 						maxDeriv = diff
 					}
 				}
-				if excess > noiseFloor+opts.DerivScale*maxDeriv {
+				if excess > opts.SeedSNR*noiseAt(idx)+opts.DerivScale*maxDeriv {
 					mask[idx] = true
 				}
 			}
 		}
 
-		// Growth pass: expand flags to 8-connected neighbors with positive excess.
-		growFloor := noiseFloor * 0.5
-		q := make([]int, 0, 256)
-		for idx, flagged := range mask {
-			if flagged {
-				q = append(q, idx)
-			}
-		}
-		for len(q) > 0 {
-			currIdx := q[0]
-			q = q[1:]
-			cx := currIdx % f.Width
-			cy := currIdx / f.Width
-			for _, d := range dirs8 {
-				nx, ny := cx+d[0], cy+d[1]
-				if nx < 0 || nx >= f.Width || ny < 0 || ny >= f.Height {
-					continue
-				}
-				nIdx := ny*f.Width + nx
-				if mask[nIdx] {
-					continue
-				}
-				nv := float64(f.Pixels[nIdx])
-				if math.IsNaN(nv) {
-					continue
-				}
-				nbv := float64(blotted[nIdx])
-				if math.IsNaN(nbv) {
-					continue
-				}
-				if nv-nbv > growFloor {
-					mask[nIdx] = true
-					q = append(q, nIdx)
-				}
-			}
-		}
-
-		recoverCosmicRayHalo(mask, excesses, f.Width, f.Height, f.Sigma)
+		growCRMask(mask, excesses, f.Width, f.Height, noiseAt, opts.SeedSNR)
 
 		masks[fi] = mask
 	}
@@ -534,16 +342,53 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 	return masks
 }
 
-func recoverCosmicRayHalo(mask []bool, excesses []float64, width, height int, sigma float64) {
-	if len(mask) == 0 || sigma <= 0 {
-		return
+// growCRMask expands a seeded cosmic-ray mask in two complementary stages, both
+// using the same per-pixel noise basis (noiseAt) so thresholds track the local
+// signal level:
+//
+//  1. Connected propagation: flood-fill into 8-connected neighbors whose excess
+//     clears half the seed floor. This walks out along the bright body of a CR.
+//  2. Halo fill: a few gentle iterations that bridge weaker fringe pixels which
+//     are surrounded by enough already-flagged neighbors, recovering the diffuse
+//     wings a strict propagation threshold would leave behind.
+//
+// excesses holds data-minus-model per pixel (NaN where not comparable).
+func growCRMask(mask []bool, excesses []float64, width, height int, noiseAt func(idx int) float64, seedSNR float64) {
+	dirs8 := [8][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
+
+	// Stage 1: connected propagation from the seeds.
+	q := make([]int, 0, 256)
+	for idx, flagged := range mask {
+		if flagged {
+			q = append(q, idx)
+		}
+	}
+	for len(q) > 0 {
+		currIdx := q[0]
+		q = q[1:]
+		cx := currIdx % width
+		cy := currIdx / width
+		for _, d := range dirs8 {
+			nx, ny := cx+d[0], cy+d[1]
+			if nx < 0 || nx >= width || ny < 0 || ny >= height {
+				continue
+			}
+			nIdx := ny*width + nx
+			if mask[nIdx] {
+				continue
+			}
+			ex := excesses[nIdx]
+			if math.IsNaN(ex) {
+				continue
+			}
+			if ex > 0.5*seedSNR*noiseAt(nIdx) {
+				mask[nIdx] = true
+				q = append(q, nIdx)
+			}
+		}
 	}
 
-	haloFloor := sigma * 0.5
-	if haloFloor <= 0 {
-		return
-	}
-
+	// Stage 2: halo fill for weaker fringe pixels with enough flagged support.
 	for iter := 0; iter < 2; iter++ {
 		added := make([]int, 0, 64)
 		for idx, flagged := range mask {
@@ -558,11 +403,16 @@ func recoverCosmicRayHalo(mask []bool, excesses []float64, width, height int, si
 					if nIdx == idx || mask[nIdx] {
 						continue
 					}
-					if excesses[nIdx] <= haloFloor {
+					ex := excesses[nIdx]
+					if math.IsNaN(ex) {
+						continue
+					}
+					nse := noiseAt(nIdx)
+					if ex <= 0.5*nse {
 						continue
 					}
 					neighbors := countMaskedNeighbors(mask, width, height, nx, ny)
-					if neighbors >= 2 || (neighbors >= 1 && excesses[nIdx] > sigma) {
+					if neighbors >= 2 || (neighbors >= 1 && ex > nse) {
 						added = append(added, nIdx)
 					}
 				}
@@ -599,8 +449,12 @@ func maxInt(a, b int) int {
 	return b
 }
 
-// bilinearSample returns the bilinear-interpolated value at (x, y).
-// Returns NaN if the position is out of bounds or touches a NaN pixel.
+// bilinearSample returns the bilinear-interpolated value at (x, y). It returns
+// NaN only when the sample falls outside the grid or all four surrounding pixels
+// are NaN. When some (but not all) corners are NaN — as happens one pixel inside
+// a coverage edge — the weights are renormalized over the finite corners so the
+// sample degrades gracefully instead of leaving a NaN ring along the boundary
+// (which would silently exclude cosmic rays near frame/coverage edges).
 func bilinearSample(pixels []float32, width, height int, x, y float64) float64 {
 	x0 := int(math.Floor(x))
 	y0 := int(math.Floor(y))
@@ -611,12 +465,25 @@ func bilinearSample(pixels []float32, width, height int, x, y float64) float64 {
 	}
 	wx := x - float64(x0)
 	wy := y - float64(y0)
-	p00 := float64(pixels[y0*width+x0])
-	p10 := float64(pixels[y0*width+x1])
-	p01 := float64(pixels[y1*width+x0])
-	p11 := float64(pixels[y1*width+x1])
-	if math.IsNaN(p00) || math.IsNaN(p10) || math.IsNaN(p01) || math.IsNaN(p11) {
+	corners := [4]struct {
+		v float64
+		w float64
+	}{
+		{float64(pixels[y0*width+x0]), (1 - wx) * (1 - wy)},
+		{float64(pixels[y0*width+x1]), wx * (1 - wy)},
+		{float64(pixels[y1*width+x0]), (1 - wx) * wy},
+		{float64(pixels[y1*width+x1]), wx * wy},
+	}
+	var sum, wsum float64
+	for _, c := range corners {
+		if math.IsNaN(c.v) {
+			continue
+		}
+		sum += c.v * c.w
+		wsum += c.w
+	}
+	if wsum <= 0 {
 		return math.NaN()
 	}
-	return p00*(1-wx)*(1-wy) + p10*wx*(1-wy) + p01*(1-wx)*wy + p11*wx*wy
+	return sum / wsum
 }

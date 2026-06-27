@@ -224,8 +224,62 @@ func TestLooksLikeFLC(t *testing.T) {
 	if !LooksLikeFLC(filepath.Join("TestImages", "HST", "ick909c1q_flc.fits")) {
 		t.Fatalf("expected _flc path to be recognized")
 	}
+	if !LooksLikeFLC(filepath.Join("TestImages", "WFPC2", "u6l60101m_flt.fits")) {
+		t.Fatalf("expected _flt path to be recognized")
+	}
 	if LooksLikeFLC(filepath.Join("TestImages", "HST", "ick909030_drz.fits")) {
-		t.Fatalf("did not expect _drz path to be recognized as flc")
+		t.Fatalf("did not expect _drz path to be recognized as calibrated input")
+	}
+}
+
+func TestEffectiveEdgeTrimForInputIsDisabled(t *testing.T) {
+	// Edge trimming is disabled: no input loses border data during drizzle,
+	// regardless of detector or scale.
+	p := plannedInput{input: Input{
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{
+			"INSTRUME": "'WFPC2'",
+			"DETECTOR": "'PC'",
+		}},
+		HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 800, Height: 800}},
+	}}
+	if got := effectiveEdgeTrimForInput(p, 800, 1); got != 0 {
+		t.Fatalf("effectiveEdgeTrimForInput(WFPC2) = %d, want 0", got)
+	}
+
+	p.input.PrimaryHeader = fitsio.Header{Cards: map[string]string{
+		"INSTRUME": "'WFC3'",
+		"DETECTOR": "'UVIS'",
+	}}
+	if got := effectiveEdgeTrimForInput(p, 800, 2); got != 0 {
+		t.Fatalf("effectiveEdgeTrimForInput(WFC3/UVIS) = %d, want 0", got)
+	}
+}
+
+func TestNormalizeSurfaceBrightnessInputsScalesSCIAndERRByMappedArea(t *testing.T) {
+	planned := []plannedInput{
+		{
+			sourcePixelScale: 2,
+			input: Input{
+				HDU:       fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 1, Pixels: []float32{8, float32(math.NaN())}}},
+				ERRPixels: []float32{4, 8},
+			},
+		},
+	}
+	sci, errPix, err := prepareFramePixels(planned[0], Options{SurfaceBrightnessNorm: true}, 0, skyPlane{})
+	if err != nil {
+		t.Fatalf("prepareFramePixels returned error: %v", err)
+	}
+	if got := sci[0]; got != 2 {
+		t.Fatalf("normalized SCI pixel = %v, want 2", got)
+	}
+	if !math.IsNaN(float64(sci[1])) {
+		t.Fatalf("normalized SCI NaN changed to %v", sci[1])
+	}
+	if got := errPix[0]; got != 1 {
+		t.Fatalf("normalized ERR pixel = %v, want 1", got)
+	}
+	if planned[0].input.HDU.Data.Pixels[0] != 8 || planned[0].input.ERRPixels[0] != 4 {
+		t.Fatal("prepareFramePixels mutated original input")
 	}
 }
 
@@ -252,6 +306,58 @@ func headerWithCRPIX(crpix1, crpix2 float64) fitsio.Header {
 		"CD2_1":  "0",
 		"CD2_2":  "1",
 	}}
+}
+
+func TestPropagateSameExposureAlignment(t *testing.T) {
+	inputs := []Input{
+		{Path: "a_flc.fits", SCIExt: 1},
+		{Path: "a_flc.fits", SCIExt: 2}, // same exposure, unaligned sibling
+		{Path: "b_flc.fits", SCIExt: 1},
+	}
+	results := make([]StarAlignmentResult, 3)
+	results[0] = StarAlignmentResult{OffsetX: 5, OffsetY: -3, ManualTransform: processing.IdentityTransform(), HasManualTransform: true, Applied: true}
+	results[2] = StarAlignmentResult{OffsetX: 99, OffsetY: 99, Applied: true}
+	aligned := []bool{true, false, true}
+
+	filled := propagateSameExposureAlignment(inputs, results, aligned)
+	if filled != 1 {
+		t.Fatalf("filled = %d, want 1", filled)
+	}
+	if !aligned[1] {
+		t.Fatal("sci,2 sibling should be marked aligned after propagation")
+	}
+	if results[1].OffsetX != 5 || results[1].OffsetY != -3 || !results[1].Applied || !results[1].HasManualTransform {
+		t.Fatalf("sci,2 did not inherit sibling alignment: %+v", results[1])
+	}
+	// Must not pull from a different exposure.
+	if results[1].OffsetX == 99 {
+		t.Fatal("sci,2 incorrectly inherited from a different file")
+	}
+}
+
+func TestFramesMayOverlap(t *testing.T) {
+	hdr := func(crval1 string) fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "5", "CRPIX2": "5",
+			"CRVAL1": crval1, "CRVAL2": "22",
+			"CD1_1": "1", "CD1_2": "0", "CD2_1": "0", "CD2_2": "1",
+		}}
+	}
+	a := makeInput("a.fits", 10, 10, nil, hdr("100"))
+	b := makeInput("b.fits", 10, 10, nil, hdr("100")) // same pointing → overlaps
+	c := makeInput("c.fits", 10, 10, nil, hdr("160")) // 60° away → cannot overlap
+
+	if !framesMayOverlap(a, b) {
+		t.Fatal("co-pointed frames should be reported as possibly overlapping")
+	}
+	if framesMayOverlap(a, c) {
+		t.Fatal("frames 60° apart should be reported as non-overlapping")
+	}
+	// Missing WCS must be treated as "may overlap" (never skip when unsure).
+	noWCS := makeInput("d.fits", 10, 10, nil, fitsio.Header{Cards: map[string]string{}})
+	if !framesMayOverlap(a, noWCS) {
+		t.Fatal("frames with unparseable WCS must not be skipped")
+	}
 }
 
 func filledPixels(width, height int, value float32) []float32 {
@@ -394,9 +500,12 @@ func TestPlanInputsSameFileSCIChipsGetMapper(t *testing.T) {
 	if got.B == 0 && got.D == 0 {
 		t.Fatalf("expected full WCS affine for chip2, got translation-only %+v", got)
 	}
-	// Sanity: reference has no mapper (it is at identity by definition).
-	if planned[0].mapper != nil {
-		t.Fatal("expected nil mapper for reference chip, got non-nil")
+	// The reference chip must also carry a mapper so its own distortion
+	// (SIP + D2IM) is removed onto the linear output plane, matching the
+	// other chips. Otherwise a single multi-chip exposure's chips would be
+	// drizzled in mismatched (distorted vs. undistorted) pixel space.
+	if planned[0].mapper == nil {
+		t.Fatal("expected mapper for reference chip, got nil")
 	}
 	_ = processing.IdentityTransform() // keep import used
 }
@@ -469,14 +578,14 @@ func TestBuildSkysubLocalMinSubtractsPerInput(t *testing.T) {
 	}
 }
 
-func TestPrepareSkysubWorkingPixelsLeavesReferenceOnlyUntouched(t *testing.T) {
+func TestPlanSkysubLeavesReferenceOnlyUntouched(t *testing.T) {
 	planned := []plannedInput{
 		{input: Input{ReferenceOnly: true, HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: filledPixels(2, 2, 20)}}}},
 		{input: Input{Path: "data_flc.fits", HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: filledPixels(2, 2, 10)}}}},
 	}
-	working, applied, skyValues, err := prepareSkysubWorkingPixels(planned, SkysubOptions{Enabled: true, Method: SkyMethodLocalMin, Stat: SkyStatMedian, Width: 0.1, Clip: 5, LSigma: 4, USigma: 4})
+	skyOffset, _, applied, skyValues, err := planSkysub(planned, Options{Skysub: SkysubOptions{Enabled: true, Method: SkyMethodLocalMin, Stat: SkyStatMedian, Width: 0.1, Clip: 5, LSigma: 4, USigma: 4}})
 	if err != nil {
-		t.Fatalf("prepareSkysubWorkingPixels returned error: %v", err)
+		t.Fatalf("planSkysub returned error: %v", err)
 	}
 	if applied[0] {
 		t.Fatal("reference-only input should not be sky-subtracted")
@@ -484,10 +593,67 @@ func TestPrepareSkysubWorkingPixelsLeavesReferenceOnlyUntouched(t *testing.T) {
 	if !applied[1] {
 		t.Fatal("data input should be sky-subtracted")
 	}
-	if &working[0][0] != &planned[0].input.HDU.Data.Pixels[0] {
-		t.Fatal("reference-only pixels should reuse original slice")
+	if skyOffset[0] != 0 {
+		t.Fatalf("reference-only sky offset = %v, want 0", skyOffset[0])
 	}
-	if skyValues[0] == skyValues[0] {
+	if !math.IsNaN(skyValues[0]) {
 		t.Fatal("reference-only sky value should remain NaN")
+	}
+	// The data frame's pixels must not have been mutated in place (sky is applied
+	// later, per frame, in prepareFramePixels).
+	if planned[1].input.HDU.Data.Pixels[0] != 10 {
+		t.Fatalf("planSkysub mutated source pixels: %v", planned[1].input.HDU.Data.Pixels[0])
+	}
+}
+
+func TestOverlapSampleStrideKeepsLargeACSCellsWellSampled(t *testing.T) {
+	got := overlapSampleStride(4096, 4096)
+	if got > 4 {
+		t.Fatalf("overlapSampleStride(4096, 4096) = %d, want at most 4", got)
+	}
+}
+
+func TestComputeMatchedSkyOffsetsChainsAcrossMosaic(t *testing.T) {
+	planned := []plannedInput{
+		{input: Input{Path: "left_flc.fits"}},
+		{input: Input{Path: "middle_flc.fits"}},
+		{input: Input{Path: "right_flc.fits"}},
+	}
+	maps := []map[int64]float64{
+		{},
+		{},
+		{},
+	}
+	for cell := 0; cell < skyMinOverlapCells; cell++ {
+		key := int64(cell)
+		maps[0][key] = 10
+		maps[1][key] = 13
+	}
+	for cell := 0; cell < skyMinOverlapCells; cell++ {
+		key := int64(100 + cell)
+		maps[1][key] = 13
+		maps[2][key] = 11
+	}
+
+	offsets, matched := computeMatchedSkyOffsets(planned, maps, SkysubOptions{
+		Enabled: true,
+		Method:  SkyMethodGlobalMinMatch,
+		Stat:    SkyStatMedian,
+		Width:   0.1,
+		Clip:    5,
+		LSigma:  4,
+		USigma:  2.5,
+	})
+
+	for i, ok := range matched {
+		if !ok {
+			t.Fatalf("matched[%d] = false, want true", i)
+		}
+	}
+	want := []float64{0, 3, 1}
+	for i := range want {
+		if math.Abs(offsets[i]-want[i]) > 1e-6 {
+			t.Fatalf("offsets[%d] = %v, want %v (all offsets: %v)", i, offsets[i], want[i], offsets)
+		}
 	}
 }

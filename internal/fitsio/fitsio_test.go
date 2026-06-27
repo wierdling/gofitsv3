@@ -139,6 +139,42 @@ func TestLoadFileParsesSyntheticFileAndSelectors(t *testing.T) {
 	}
 }
 
+func TestLoadFileNormalizesExtNameWithComment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "commented_extname.fits")
+	data := buildFITSFile(
+		headerBlock(
+			cardLine("SIMPLE", "T"),
+			cardLine("BITPIX", "8"),
+			cardLine("NAXIS", "0"),
+		),
+		headerBlock(
+			cardLine("XTENSION", "'IMAGE'"),
+			cardLine("BITPIX", "16"),
+			cardLine("NAXIS", "2"),
+			cardLine("NAXIS1", "1"),
+			cardLine("NAXIS2", "1"),
+			cardLine("EXTNAME", "'DQ      '           / Extension name"),
+			cardLine("EXTVER", "1                   / Extension version"),
+		),
+		mustEncodeBigEndian(t, []int16{1}),
+		make([]byte, padding(2)),
+	)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	file, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile error = %v", err)
+	}
+	if got := file.HDUs[1].ExtName; got != "DQ" {
+		t.Fatalf("ExtName = %q, want DQ", got)
+	}
+	if file.GetHDUByExtVer("DQ", "1") == nil {
+		t.Fatal("GetHDUByExtVer(DQ,1) = nil, want normalized DQ extension")
+	}
+}
+
 func TestLoadFileRejectsEmptyFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty.fits")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
@@ -208,6 +244,29 @@ func TestCloneHeaderAndHeaderFloat(t *testing.T) {
 	}
 	if _, ok := HeaderFloat(header, "MISSING"); ok {
 		t.Fatal("HeaderFloat(MISSING) should fail")
+	}
+}
+
+func TestFilterStringUsesWFPC2FilterNamesBeforeNumericWheelPositions(t *testing.T) {
+	header := Header{Cards: map[string]string{
+		"FILTNAM1": "'F555W   '           / first filter name",
+		"FILTNAM2": "'        '           / second filter name",
+		"FILTER1":  "25                  / first filter number",
+		"FILTER2":  "0                   / second filter number",
+	}}
+	if got := FilterString(header); got != "F555W" {
+		t.Fatalf("FilterString = %q, want F555W", got)
+	}
+}
+
+func TestFilterStringSkipsClearAndNumericValues(t *testing.T) {
+	header := Header{Cards: map[string]string{
+		"FILTER":  "'CLEAR1L'",
+		"FILTER1": "25",
+		"FILTER2": "'F814W'",
+	}}
+	if got := FilterString(header); got != "F814W" {
+		t.Fatalf("FilterString = %q, want F814W", got)
 	}
 }
 
