@@ -19,7 +19,7 @@ func defaultDrizzleSettings() models.DrizzleSettings {
 		FinalScale:            0,
 		Scale:                 1.0,
 		PixFrac:               1.0,
-		CRMethod:              int(mosaic.CRMethodNone),
+		CRMethod:              int(mosaic.CRMethodDrizzle),
 		SepKernel:             int(mosaic.KernelTurbo),
 		FinalKernel:           int(mosaic.KernelSquare),
 		WeightingMode:         int(mosaic.WeightUniform),

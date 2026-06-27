@@ -307,6 +307,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			if numRefs < 1 {
 				numRefs = 1
 			}
+			// A set reference baseline is the sole alignment reference: it occupies
+			// index 0, so force numRefs=1 regardless of the NumRefs setting.
+			if state.referenceInput != nil {
+				numRefs = 1
+			}
 			results, err := mosaic.AlignInputsBySelectedStarsWithMode(alignInputs, refStars, numRefs, mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec)
 
 			type alignRow struct {
@@ -715,7 +720,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		ws.enterMeasureMode()
 	})
 
-	starAlignBtn := widget.NewButton("Align By Stars", func() {
+	starAlignBtn := widget.NewButton("Align / Register Frames", func() {
 		if len(state.inputs) < 2 {
 			dialog.ShowInformation("Missing Inputs", "Load at least two FITS files before star alignment.", win)
 			return
@@ -733,6 +738,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			alignInputs := ws.inputsWithRef()
 			numRefs := state.alignmentSettings.NumRefs
 			if numRefs < 1 {
+				numRefs = 1
+			}
+			// A set reference baseline is the sole alignment reference: it occupies
+			// index 0, so force numRefs=1 regardless of the NumRefs setting.
+			if state.referenceInput != nil {
 				numRefs = 1
 			}
 			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, numRefs, mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec, mosaic.AlignProgress{
