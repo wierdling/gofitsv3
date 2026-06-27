@@ -1,6 +1,6 @@
 # GoFitsV3
 
-GoFitsV3 is a Go-based desktop application for turning astronomical FITS data into visually compelling images. The project is primarily focused on processing Hubble-style FITS/FLC data, aligning exposures, combining frames, stretching image data, and exporting finished images for presentation.
+GoFitsV3 is a Go-based desktop application for turning astronomical FITS data into visually compelling images. The project is primarily focused on processing Hubble-style FITS data (FLT and FLC files), aligning exposures, combining frames, stretching image data, and exporting finished images for presentation.
 
 The goal of this project is practical image processing for astronomy enthusiasts: preserve enough of the scientific structure of the data to make good decisions, while providing tools that make it easier to create finished “pretty picture” images.
 
@@ -11,18 +11,21 @@ The goal of this project is practical image processing for astronomy enthusiasts
 ## Features
 
 * Load and inspect FITS image data
-* Work with Hubble-style calibrated exposures, including FLC files
-* Combine image chips/extensions where applicable
-* Align images using WCS and star-based refinement workflows
-* Support multiple alignment models, including shift, rotation/scale, and affine-style transforms
-* Drizzle/mosaic image stacks into a combined output
-* Configure drizzle options such as scale, pixfrac, kernels, and cosmic-ray handling
-* Apply image stretches including linear, logarithmic, square-root, histogram equalization, and asinh-style stretches
-* Use auto-scaling / smart-level style tools to create usable starting points for display
-* Process separate filter images into color composites
-* Adjust filter balance for aesthetic RGB output
-* Detect and reduce small hot pixels / localized defects where possible
-* Export finished images, including WebP-oriented workflows
+* Work with Hubble-style calibrated exposures, including FLT and FLC files
+* Recognize common HST detectors (WFC3/IR, WFC3/UVIS, ACS/WFC, ACS/HRC, ACS/SBC, WFPC2) with per-detector pixel scales, SIP distortion, and data-quality bad-pixel masks
+* Combine multi-chip / multi-extension science data where applicable
+* Align images using WCS positioning and star-based refinement, with RANSAC matching to reject bad correspondences
+* Support multiple alignment models: translation-only, rotation/scale, and full affine transforms
+* Drizzle/mosaic image stacks into a combined output, with memory-bounded streaming for large stacks
+* Configure drizzle options such as scale, pixfrac, and kernel (square, point, turbo, Gaussian, tophat, Lanczos-2, Lanczos-3)
+* Reject cosmic rays across multiple exposures with an AstroDrizzle-style detector that uses the ERR (error) plane as a per-pixel noise model
+* Apply image stretches: linear, logarithmic, square-root, asinh, MTF (midtones transfer function), and GHS (Generalised Hyperbolic Stretch)
+* Use auto-scaling / smart-level tools to create usable starting points for display
+* Process separate filter images into RGB color composites
+* Adjust per-channel balance and apply cross-channel cleaning for aesthetic RGB output
+* Detect and reduce hot pixels / localized defects via data-quality flags and badpix handling
+* Save and load Compose projects and mosaic alignment offsets
+* Export finished images as PNG (8- or 16-bit), JPEG, TIFF, or lossless WebP
 * Desktop UI built with Go and Fyne
 
 ---
@@ -55,7 +58,7 @@ Use professional astronomy tools when the output must be scientifically calibrat
 
 Exact requirements may vary by platform and build target, but the project is generally expected to require:
 
-* Go 1.22 or newer
+* Go 1.26 or newer
 * A supported desktop operating system:
 
   * Windows
@@ -72,8 +75,8 @@ For Fyne setup details, see the official Fyne documentation for your operating s
 Clone the repository:
 
 ```bash
-git clone https://github.com/<your-user-or-org>/GoFitsV3.git
-cd GoFitsV3
+git clone https://github.com/wierdling/gofitsv3.git
+cd gofitsv3
 ```
 
 Download dependencies:
@@ -88,16 +91,10 @@ Build the application:
 go build ./...
 ```
 
-Run the application:
+Run the application (the runnable package lives under `cmd`):
 
 ```bash
-go run .
-```
-
-Depending on the final repository layout, the runnable package may be under a command directory such as `cmd/gofitsv3`:
-
-```bash
-go run ./cmd/gofitsv3
+go run ./cmd
 ```
 
 ---
@@ -118,51 +115,39 @@ go test -v ./...
 
 ---
 
-## Basic Workflow
+## Workspaces
 
-A typical workflow looks like this:
+The application is organized into four tabs, each covering one stage of the workflow:
 
-1. **Load FITS/FLC files**
-   Open calibrated astronomy files and inspect the available image extensions.
+* **Mosaic** — Add FITS inputs, set a baseline reference frame, star-align the inputs (with RANSAC matching), measure alignment quality, and drizzle/combine the aligned exposures into a mosaic ("Create Mosaic"). Includes a blink viewer for inspecting frames and tools to save/load alignment offsets. The combined result can be sent directly to the Examine tab.
 
-2. **Prepare channels or exposures**
-   Select the image data to use, combine chips/extensions if needed, and group files by filter or exposure set.
+* **Examine** — Inspect a single FITS image or a drizzle result, including histogram and basic statistics. The Mosaic tab can hand its output here for review.
 
-3. **Align images**
-   Use WCS information where available, then refine alignment with star matching or manual inspection.
+* **Compose** — Assign filter images to R/G/B channels, stretch each channel independently, and merge them into an RGB composite. Includes "Align to Channel 2" (pixel-space star alignment with a full affine fit), cross-channel cleaning, RGB levels, scale normalization, and Compose project save/load. The composite can be sent to the Edit tab.
 
-4. **Drizzle / combine**
-   Combine aligned exposures into a mosaic or stacked image using drizzle settings appropriate for the dataset.
-
-5. **Stretch the data**
-   Apply linear, logarithmic, asinh, square-root, or other stretch modes to bring out faint structure.
-
-6. **Balance filters**
-   Assign filters to RGB channels and adjust channel strength to avoid color dominance, clipped stars, or unnatural balance.
-
-7. **Clean defects**
-   Use available masking, hot-pixel handling, or local smoothing tools to reduce small artifacts.
-
-8. **Export**
-   Save the finished image in a presentation-friendly format.
+* **Edit** — Final touch-up of the composited image before export.
 
 ---
 
 ## FITS and Hubble Data Notes
 
-Many Hubble FITS/FLC files contain multiple science extensions. In these cases, the correct extensions usually correspond to separate detector chips or image sections that must be interpreted together.
+Many Hubble FITS files (FLT/FLC) contain multiple science extensions. In these cases, the correct extensions usually correspond to separate detector chips or image sections that must be interpreted together. GoFitsV3 recognizes the common HST instrument/detector combinations and applies the appropriate pixel scale, chip count, SIP distortion handling, and data-quality bad-pixel bitmask:
 
-GoFitsV3 is being developed with these kinds of files in mind, but users should still inspect the file metadata and verify that the correct image extensions are being used.
+* WFC3/IR, WFC3/UVIS
+* ACS/WFC, ACS/HRC, ACS/SBC
+* WFPC2 (PC and WF chips)
+
+Users should still inspect the file metadata and verify that the correct image extensions are being used.
 
 Important FITS metadata may include:
 
 * `SCI` extensions
-* WCS headers
+* WCS headers (including SIP distortion coefficients)
 * filter names
 * exposure time
 * detector/chip identifiers
-* data quality information
-* error arrays, where available
+* data quality (`DQ`) arrays
+* error (`ERR`) arrays, where available
 
 ---
 
@@ -170,16 +155,19 @@ Important FITS metadata may include:
 
 Image alignment is one of the most important parts of producing clean astronomy composites. GoFitsV3 includes alignment workflows intended to handle common astronomy image-processing cases.
 
-Supported or planned alignment concepts include:
+Alignment concepts in use include:
 
-* WCS-based initial positioning
-* Star centroid refinement
+* WCS-based initial positioning (mosaic drizzle)
+* Star centroid detection and refinement
 * Translation-only alignment
 * Rotation/scale alignment
-* Full affine-style transforms where needed
+* Full affine transforms, including scale and skew
 * RANSAC-style matching for rejecting bad star correspondences
+* Spatially distributed star catalogs and a global affine refinement pass, so the fit is well constrained across the whole frame rather than anchored by a bright cluster
 
-For single-visit Hubble data, rotation/scale alignment may often be sufficient. For wider mosaics, edge overlaps, or images with stronger distortion differences, a more flexible model may be required.
+The Mosaic tab uses WCS for initial placement and refines with star matching. The Compose tab's "Align to Channel 2" works directly in pixel space (independent of channel WCS headers, which can disagree with the true pixel registration), fitting and applying a full affine transform with a manual nudge available on top.
+
+For single-visit Hubble data, rotation/scale alignment may often be sufficient. For wider mosaics, edge overlaps, or images with stronger distortion differences, a full affine model may be required.
 
 Always inspect stars at high zoom after alignment. Color fringing, offset red/green/blue pixels, or repeated star cores usually indicate imperfect alignment, filter-specific PSF differences, or both.
 
@@ -187,15 +175,16 @@ Always inspect stars at high zoom after alignment. Color fringing, offset red/gr
 
 ## Drizzle Notes
 
-The drizzle workflow is used to combine aligned images into a final output grid. Useful settings may include:
+The drizzle workflow is used to combine aligned images into a final output grid. Useful settings include:
 
-* **Final scale**: controls the output pixel scale
-* **Scale**: controls the input-to-output scale relationship
+* **Scale**: controls the output pixel scale relative to the input
 * **Pixfrac**: controls the size of the drizzle “drop”
-* **Kernel**: controls how pixels are distributed into the output image
-* **Cosmic-ray settings**: help reject transient artifacts when multiple exposures are available
+* **Kernel**: controls how each input pixel's flux is distributed into the output image — available kernels are square, point, turbo, Gaussian, tophat, Lanczos-2, and Lanczos-3
+* **Cosmic-ray settings**: reject transient artifacts when multiple comparable exposures are available
 
 Smaller pixfrac values can produce sharper output but may create holes or uneven coverage if there are too few exposures. Larger pixfrac values are more forgiving but can soften detail.
+
+Cosmic-ray rejection uses an AstroDrizzle-style multi-frame approach: a clean model image is built across the aligned exposures, blotted back to each input frame, and pixels that exceed a per-pixel noise floor are flagged and grown. When an ERR (error) plane is available it is used as the per-pixel noise model, so detection thresholds scale with local signal. For large stacks, frames and cosmic-ray masks are streamed via temporary files to keep memory use bounded.
 
 ---
 
@@ -203,15 +192,16 @@ Smaller pixfrac values can produce sharper output but may create holes or uneven
 
 Astronomical image data usually has a much wider dynamic range than a normal display image. GoFitsV3 includes stretch functions to map FITS data into a visible range.
 
-Common stretch types include:
+Available stretch modes:
 
 * **Linear**: simple and predictable, but often poor for faint nebulae or galaxies
 * **Log**: compresses bright areas and reveals faint structure
-* **Asinh**: useful for astronomy images because it can preserve color while compressing highlights
 * **Square root**: moderate compression with a natural-looking transition
-* **Histogram equalization**: can reveal structure, but may produce unnatural contrast
+* **Asinh**: useful for astronomy images because it can preserve color while compressing highlights
+* **MTF** (midtones transfer function): a PixInsight STF-style stretch driven by a midtone parameter
+* **GHS** (Generalised Hyperbolic Stretch): a flexible stretch (Payne "normal" form, ported from Siril's `STRETCH_PAYNE_NORMAL`) driven by strength, local intensity, and symmetry parameters
 
-For color composites, asinh-style stretching is often a good starting point because it can reduce blown-out stars while preserving faint details.
+For color composites, asinh, MTF, or GHS stretching is often a good starting point because each can reduce blown-out stars while preserving faint detail.
 
 ---
 
@@ -234,16 +224,27 @@ For example, when using filters such as `F502N`, `F656N`, and `F658N`, the red c
 
 ## Repository Structure
 
-The exact repository layout may change, but the project may include packages similar to:
-
 ```text
 GoFitsV3/
-├── cmd/                    # Application entry points, if used
+├── cmd/                    # Application entry point (main.go)
 ├── internal/
+│   ├── badpix/             # Bad-pixel / hot-pixel handling
+│   ├── config/             # Configuration
+│   ├── debuglog/           # Debug logging
+│   ├── debugtime/          # Timing instrumentation
+│   ├── export/             # Image export (PNG/JPEG/TIFF/WebP)
+│   ├── fitsio/             # FITS reading/writing
+│   ├── histogram/          # Histogram and image statistics
+│   ├── instrument/         # HST detector definitions (scale, chips, DQ, SIP)
 │   ├── models/             # Shared data structures and settings
-│   ├── mosaic/             # Drizzle and mosaic logic
-│   ├── processing/         # Alignment, stretch, filtering, and image processing
-│   └── ui/                 # Fyne UI components
+│   ├── mosaic/             # Drizzle, mosaic, and cosmic-ray logic
+│   ├── processing/         # Alignment, stretch, filtering, image processing
+│   ├── render/             # Rendering helpers
+│   ├── stretch/            # Stretch functions (linear/log/sqrt/asinh/MTF/GHS)
+│   ├── ui/                 # Fyne UI workspaces (Mosaic/Examine/Compose/Edit)
+│   ├── utils/              # Shared utilities
+│   └── version/            # Version information
+├── webpwriter/             # WebP encoding helper
 ├── go.mod
 ├── go.sum
 └── README.md
@@ -258,7 +259,7 @@ This project emphasizes:
 * Clear, maintainable Go code
 * Deterministic image-processing behavior where practical
 * Parallel processing for large images where useful
-* Conservative memory use for large FITS datasets
+* Conservative, bounded memory use for large FITS datasets
 * UI workflows that make visual inspection practical
 * Processing steps that are understandable and adjustable
 
@@ -273,14 +274,14 @@ Astronomy images can be very large, especially when processing multi-extension F
 Performance-sensitive areas include:
 
 * FITS loading
-* WCS transforms
+* WCS and SIP transforms
 * star detection and matching
 * drizzle accumulation
 * interpolation/resampling
 * stretch preview generation
-* WebP or other compressed image export
+* image export (including WebP)
 
-Where practical, GoFitsV3 uses parallel processing to improve throughput on multi-core systems.
+Where practical, GoFitsV3 uses parallel processing and disk-backed streaming to improve throughput and bound memory on multi-core systems.
 
 ---
 
@@ -288,13 +289,13 @@ Where practical, GoFitsV3 uses parallel processing to improve throughput on mult
 
 Current or expected limitations may include:
 
-* Some workflows may assume Hubble-like FITS structure
+* Some workflows assume Hubble-like FITS structure
 * Scientific calibration is not the primary goal
 * Alignment quality depends heavily on WCS quality and star matching
 * Drizzle quality depends on overlap, exposure count, and input sampling
 * Cosmic-ray rejection works best with multiple comparable exposures
 * Some visual defects may require manual adjustment or masking
-* Large datasets may require significant memory
+* Large datasets may still require significant memory
 
 ---
 
@@ -305,13 +306,10 @@ Possible future improvements:
 * More robust FITS extension selection
 * Better automatic WCS/chip handling
 * Improved star matching for small-overlap images
-* Additional drizzle kernels
-* Better cosmic-ray and hot-pixel detection
 * Improved smart-level / auto-stretch behavior
 * Separate luminance and chrominance workflows
 * Batch processing
-* More export formats
-* Project/session files
+* Additional export formats
 * Better preview caching for large images
 
 ---
@@ -349,7 +347,7 @@ MIT License
 
 ## Acknowledgments
 
-GoFitsV3 is inspired by astronomy image-processing workflows used with FITS data, Hubble observations, drizzle-based image combination, and the broader astrophotography community.
+GoFitsV3 is inspired by astronomy image-processing workflows used with FITS data, Hubble observations, drizzle-based image combination, and the broader astrophotography community. The GHS stretch is ported from Siril's Generalised Hyperbolic Stretch implementation.
 
 This project is not affiliated with NASA, ESA, STScI, or the Hubble Space Telescope program unless explicitly stated elsewhere.
 
