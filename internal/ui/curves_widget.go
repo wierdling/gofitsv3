@@ -41,6 +41,20 @@ var curveChannelColors = [4]color.NRGBA{
 	{R: 80, G: 130, B: 255, A: 255},  // Blue
 }
 
+// dimColor darkens a channel colour so inactive (read-only) curves read as
+// background context behind the active, editable curve.
+func dimColor(c color.NRGBA) color.NRGBA {
+	return color.NRGBA{R: c.R / 2, G: c.G / 2, B: c.B / 2, A: c.A}
+}
+
+// isIdentityCurve reports whether a curve is still the default identity mapping
+// (the two unmoved endpoints), i.e. the user has not set it.
+func isIdentityCurve(pts []curvePoint) bool {
+	return len(pts) == 2 &&
+		pts[0] == curvePoint{0, 0} &&
+		pts[1] == curvePoint{1, 1}
+}
+
 func newCurvesWidget(onChange func()) *curvesWidget {
 	cw := &curvesWidget{dragIdx: -1, onChange: onChange}
 	for i := range cw.points {
@@ -285,11 +299,12 @@ func (cw *curvesWidget) draw(w, h int) image.Image {
 		setPixel(x, y, 70, 70, 70)
 	}
 
-	// Curve – evaluate spline directly for smooth rendering
-	pts := cw.points[cw.active]
-	n := len(pts)
-	col := curveChannelColors[cw.active]
-	if n >= 2 {
+	// Curve – evaluate spline directly for smooth rendering.
+	drawCurve := func(pts []curvePoint, col color.NRGBA) {
+		n := len(pts)
+		if n < 2 {
+			return
+		}
 		sortedPts := make([]curvePoint, n)
 		copy(sortedPts, pts)
 		sort.Slice(sortedPts, func(i, j int) bool { return sortedPts[i].X < sortedPts[j].X })
@@ -323,7 +338,19 @@ func (cw *curvesWidget) draw(w, h int) image.Image {
 		}
 	}
 
-	// Control points
+	// Draw any edited (non-identity) inactive channels dimmed underneath, so the
+	// user can see all curves they have set, then the active curve on top.
+	for ch := 0; ch < 4; ch++ {
+		if ch == cw.active || isIdentityCurve(cw.points[ch]) {
+			continue
+		}
+		drawCurve(cw.points[ch], dimColor(curveChannelColors[ch]))
+	}
+	pts := cw.points[cw.active]
+	col := curveChannelColors[cw.active]
+	drawCurve(pts, col)
+
+	// Control points – only the active channel is editable, so only it gets handles.
 	for i, p := range pts {
 		px := int(p.X * float32(w-1))
 		py := h - 1 - int(p.Y*float32(h-1))

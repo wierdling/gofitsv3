@@ -46,7 +46,7 @@ type mosaicState struct {
 	exposureNormMode mosaic.NormalizationMode
 }
 
-func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu) {
+func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu, *fyne.MenuItem, *fyne.MenuItem) {
 	state := &mosaicState{drizzleSettings: defaultDrizzleSettings(), alignmentSettings: defaultAlignmentSettings(), skysubSettings: defaultSkysubSettings()}
 	ws := &mosaicWorkspace{app: app, win: win, state: state, zoomLevel: 1.0, stretchMode: stretch.Asinh}
 	// ws.activeFilter is set when a filter batch is loaded; used for default save names.
@@ -1135,7 +1135,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	ws.previewSwap = container.NewStack(ws.previewScroll)
 
 	// Zoom controls for the preview pane header.
-	zoomPresets := []string{"fit in preview", "6%", "12%", "25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%"}
+	zoomPresets := []string{"fit", "6%", "12%", "25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%"}
 	zoomSelect := NewSafeSelect(zoomPresets, nil)
 	zoomCustomEntry := widget.NewEntry()
 	zoomCustomEntry.SetPlaceHolder("custom %")
@@ -1152,7 +1152,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		if ws.zoomSelectSyncing {
 			return
 		}
-		if sel == "fit in preview" {
+		if sel == "fit" {
 			ws.zoomFitMode = true
 			ws.updateZoom()
 			return
@@ -1194,7 +1194,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 	// Default to "fit in preview" on startup.
 	ws.zoomFitMode = true
-	zoomSelect.SetSelected("fit in preview")
+	zoomSelect.SetSelected("fit")
 
 	ws.rebuildOffsetControls()
 	ws.updateStatus()
@@ -1204,10 +1204,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 	// ---- Settings menu -----------------------------------------------
 
+	loadMosaicItem := fyne.NewMenuItem("Load Mosaic Project", ws.loadMosaicProject)
+	saveMosaicItem := fyne.NewMenuItem("Save Mosaic Project", ws.saveMosaicProject)
+
 	settingsMenu := fyne.NewMenu("Mosaic",
-		fyne.NewMenuItem("Load Mosaic Project", ws.loadMosaicProject),
-		fyne.NewMenuItem("Save Mosaic Project", ws.saveMosaicProject),
-		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Drizzle Settings", ws.openDrizzleSettings),
 		fyne.NewMenuItem("Alignment Settings", ws.openAlignmentSettings),
 		fyne.NewMenuItem("Skysub Settings", ws.openSkysubSettings),
@@ -1218,5 +1218,5 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	previewPane := container.NewBorder(previewHeader, container.NewVBox(previewFooter, footerBottomPad), nil, nil, ws.previewSwap)
 	split := container.NewHSplit(container.New(&sidePaddedLayout{20}, ws.leftStack), previewPane)
 	split.SetOffset(0.38)
-	return split, settingsMenu
+	return split, settingsMenu, loadMosaicItem, saveMosaicItem
 }

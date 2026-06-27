@@ -192,7 +192,7 @@ type viewport struct {
 	onPickWhite   func()
 }
 
-var presetZoomOptions = []string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}
+var presetZoomOptions = []string{"fit", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}
 
 func newViewport() *viewport {
 	img := canvas.NewImageFromImage(blankImg())
@@ -210,7 +210,7 @@ func newViewport() *viewport {
 
 	vp.blackBox = NewNumberEntry(0.001, 4)
 	vp.whiteBox = NewNumberEntry(0.001, 4)
-	vp.zoomLabel = NewSafeSelect([]string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}, func(s string) {
+	vp.zoomLabel = NewSafeSelect([]string{"fit", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}, func(s string) {
 		vp.setZoomFromSelect(s)
 	})
 	vp.zoomOut = widget.NewButton("-", func() { vp.stepZoom(0.95) })
@@ -247,7 +247,7 @@ func newViewport() *viewport {
 	footer := container.NewVBox(footerRow, vpad(5))
 	vp.container = container.NewBorder(header, footer, nil, nil, vp.scroll)
 
-	vp.zoomLabel.SetSelected("fit in preview")
+	vp.zoomLabel.SetSelected("fit")
 
 	return vp
 }
@@ -335,7 +335,7 @@ func (vp *viewport) setZoomLabelValue(option string) {
 
 func (vp *viewport) setZoomFromSelect(sel string) {
 	switch sel {
-	case "fit in preview":
+	case "fit":
 		vp.zoom = vp.fitZoom()
 	default:
 		sel = strings.TrimSuffix(sel, "%")
@@ -347,7 +347,7 @@ func (vp *viewport) setZoomFromSelect(sel string) {
 }
 
 func (vp *viewport) stepZoom(factor float64) {
-	if vp.zoomLabel.Selected == "fit in preview" {
+	if vp.zoomLabel.Selected == "fit" {
 		vp.zoom = vp.fitZoom()
 	}
 	vp.zoom *= factor

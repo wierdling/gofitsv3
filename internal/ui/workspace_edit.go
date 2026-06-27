@@ -211,6 +211,10 @@ func (es *editWorkspaceState) refreshHistograms(img *image.RGBA) {
 }
 
 func (es *editWorkspaceState) setImage(img image.Image) {
+	es.setImageOpts(img, false)
+}
+
+func (es *editWorkspaceState) setImageOpts(img image.Image, keepZoomAndScroll bool) {
 	if img == nil {
 		return
 	}
@@ -242,20 +246,23 @@ func (es *editWorkspaceState) setImage(img image.Image) {
 	es.refreshHistograms(rgba)
 	es.canvasImg.Image = rgba
 
-	es.zoom = 1.0
-	if es.imgScroll != nil {
-		sz := es.imgScroll.Size()
-		if sz.Width > 1 && sz.Height > 1 && es.origW > 0 && es.origH > 0 {
-			zw := float64(sz.Width) / float64(es.origW)
-			zh := float64(sz.Height) / float64(es.origH)
-			es.zoom = math.Min(zw, zh)
+	if !keepZoomAndScroll {
+		es.zoom = 1.0
+		if es.imgScroll != nil {
+			sz := es.imgScroll.Size()
+			if sz.Width > 1 && sz.Height > 1 && es.origW > 0 && es.origH > 0 {
+				zw := float64(sz.Width) / float64(es.origW)
+				zh := float64(sz.Height) / float64(es.origH)
+				es.zoom = math.Min(zw, zh)
+			}
 		}
+		es.setZoomSelectLabel("fit")
+		es.applyZoom()
 	}
-	es.setZoomSelectLabel("fit")
-	es.applyZoom()
+
 	es.canvasImg.Refresh()
 	if es.cleanStatusLabel != nil {
-		es.cleanStatusLabel.SetText("Run this after cross-channel clean to remove tiny pure-color specks.")
+		es.cleanStatusLabel.SetText("Run this after cross-channel clean to remove tiny color specks and black dropout dots.")
 	}
 	if es.editTabs != nil && es.cleanTab != nil {
 		es.editTabs.Select(es.cleanTab)
@@ -283,7 +290,44 @@ func (es *editWorkspaceState) runColorSpeckClean() {
 			if cleaned == nil {
 				return
 			}
-			es.setImage(cleaned)
+
+			// Capture current zoom and scroll position before resetting the image.
+			savedZoom := es.zoom
+			var savedZoomSel string
+			if es.zoomSelect != nil {
+				savedZoomSel = es.zoomSelect.Selected
+			}
+			var savedOffset fyne.Position
+			if es.imgScroll != nil {
+				savedOffset = es.imgScroll.Offset
+			}
+
+			es.setImageOpts(cleaned, true)
+
+			// Restore the captured zoom and scroll position. setImageOpts(...,true)
+			// leaves them untouched, but the image swap + SetMinSize queues a layout
+			// pass that runs after this callback and can re-fit the view, so re-assert
+			// the saved values now and again on the next event-loop tick.
+			restoreView := func() {
+				// Set the label without firing OnChanged: setZoomFromSelect would
+				// recompute zoom from the label and snap "fit" back in.
+				if es.zoomSelect != nil && savedZoomSel != "" {
+					prev := es.zoomSelect.OnChanged
+					es.zoomSelect.OnChanged = nil
+					es.setZoomSelectLabel(savedZoomSel)
+					es.zoomSelect.OnChanged = prev
+				}
+				es.zoom = savedZoom
+				es.applyZoom()
+				if es.imgScroll != nil {
+					es.imgScroll.Offset = savedOffset
+					es.imgScroll.Refresh()
+				}
+			}
+			restoreView()
+			// Defeat any deferred re-fit triggered by the relayout above.
+			go fyne.Do(restoreView)
+
 			if repaired == 0 {
 				es.cleanStatusLabel.SetText("No tiny pure-color specks were detected.")
 				return
@@ -651,14 +695,14 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 		es.undoHeal()
 	})
 
-	es.cleanStatusLabel = widget.NewLabel("Run this after cross-channel clean to remove tiny pure-color specks.")
+	es.cleanStatusLabel = widget.NewLabel("Run this after cross-channel clean to remove tiny color specks and black dropout dots.")
 	es.cleanBlobSlider = widget.NewSlider(1, 100)
 	es.cleanBlobSlider.Step = 1
 	es.cleanBlobSlider.SetValue(25)
 	es.cleanIntensitySlider = widget.NewSlider(0, 100)
 	es.cleanIntensitySlider.Step = 1
 	es.cleanIntensitySlider.SetValue(50)
-	cleanBtn := widget.NewButton("Remove Color Specks", func() {
+	cleanBtn := widget.NewButton("Remove Color & Dark Specks", func() {
 		es.runColorSpeckClean()
 	})
 
@@ -710,7 +754,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 		sliderRow("Radius", es.sharpRadiusSlider),
 	))
 	cleanTab := container.NewTabItem("Clean", container.NewVBox(
-		widget.NewLabel("Targets small red, green, or blue cosmic-ray leftovers in the composed RGB image."),
+		widget.NewLabel("Targets small red, green, or blue cosmic-ray leftovers and near-black dropout dots in the composed RGB image."),
 		sliderRow("Max Blob Size", es.cleanBlobSlider),
 		sliderRow("Intensity", es.cleanIntensitySlider),
 		cleanBtn,

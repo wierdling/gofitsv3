@@ -186,7 +186,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		vp.blackBox.SetValue(state.img.Black)
 		vp.whiteBox.SetValue(state.img.White)
 		vp.histogram.Refresh()
-		if vp.zoomLabel.Selected == "fit in preview" {
+		if vp.zoomLabel.Selected == "fit" {
 			vp.zoom = vp.fitZoom()
 		}
 		vp.applyZoom()

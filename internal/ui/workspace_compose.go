@@ -42,6 +42,10 @@ var composeBlinkFilterNames = []string{"Blue", "Green", "Red"}
 // stretch settings already applied.
 var globalSendToChannel func(channelIdx int, img *models.LoadedImage)
 
+// globalSelectComposeTab is registered by app.go and called by loadProject in
+// workspace_compose.go to switch to the Compose tab when loading a Compose project.
+var globalSelectComposeTab func()
+
 func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*fyne.Menu) {
 	imgs := make([]*models.LoadedImage, 4)
 	origPixels := make([][]float32, 4)
@@ -632,7 +636,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			orangeViewport.StatsLabel.SetText(fmt.Sprintf("Sky %.3f  μ %.3f  σ %.3f", sky, stats.Mean, stats.Std))
 		}
 		orangeViewport.histogram.Refresh()
-		if orangeViewport.zoomLabel.Selected == "fit in preview" {
+		if orangeViewport.zoomLabel.Selected == "fit" {
 			orangeViewport.zoom = orangeViewport.fitZoom()
 		}
 		orangeViewport.applyZoom()
@@ -717,7 +721,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		orangeViewport.histColor = [4]uint8{orangeSettings.ColorR, orangeSettings.ColorG, orangeSettings.ColorB, 255}
 		orangeViewport.SetLoadSave("Orange", "O", color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255}, loadOrange, saveOrangeGray)
 		orangeViews := []*viewport{nil, nil, nil, orangeViewport}
-		orangeControl = channelControls("Orange Image", color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255}, 3, imgs, &origPixels, orangeViews, refreshOrangePreview)
+		orangeControl = channelControls("Orange Image", color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255}, 3, imgs, &origPixels, orangeViews, refreshOrangePreview, nil)
 
 		swatch := canvas.NewRectangle(color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255})
 		swatch.SetMinSize(fyne.NewSize(36, 18))
@@ -782,10 +786,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		orangeWin.Show()
 	}
 
+	magicGroup := &magicPresetGroup{}
 	controlSets = []*models.ChannelControl{
-		channelControls("Channel 1 (Blue)", color.RGBA{R: 100, G: 149, B: 237, A: 255}, 0, imgs, &origPixels, viewports, refresh),
-		channelControls("Channel 2 (Green)", color.RGBA{R: 80, G: 200, B: 80, A: 255}, 1, imgs, &origPixels, viewports, refresh),
-		channelControls("Channel 3 (Red)", color.RGBA{R: 237, G: 80, B: 80, A: 255}, 2, imgs, &origPixels, viewports, refresh),
+		channelControls("Channel 1 (Blue)", color.RGBA{R: 100, G: 149, B: 237, A: 255}, 0, imgs, &origPixels, viewports, refresh, magicGroup),
+		channelControls("Channel 2 (Green)", color.RGBA{R: 80, G: 200, B: 80, A: 255}, 1, imgs, &origPixels, viewports, refresh, magicGroup),
+		channelControls("Channel 3 (Red)", color.RGBA{R: 237, G: 80, B: 80, A: 255}, 2, imgs, &origPixels, viewports, refresh, magicGroup),
 	}
 
 	// The Manual Offset (X/Y/Rot) fields are the source of truth for each channel's
@@ -1149,6 +1154,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				return
 			}
 
+			if globalSelectComposeTab != nil {
+				globalSelectComposeTab()
+			}
+
 			progressDialog := dialog.NewCustom("Loading Project", "Reading FITS files and restoring saved stretch settings...", widget.NewProgressBarInfinite(), win)
 			progressDialog.Show()
 
@@ -1291,9 +1300,43 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		fd.Show()
 	}
 
+	type vpState struct {
+		zoom    float64
+		zoomSel string
+		offset  fyne.Position
+	}
+
+	captureViewportStates := func() []vpState {
+		states := make([]vpState, len(viewports))
+		for i, vp := range viewports {
+			if vp != nil {
+				states[i] = vpState{
+					zoom:    vp.zoom,
+					zoomSel: vp.zoomLabel.Selected,
+					offset:  vp.scroll.Offset,
+				}
+			}
+		}
+		return states
+	}
+
+	restoreViewportStates := func(states []vpState) {
+		for i, vp := range viewports {
+			if vp != nil && i < len(states) {
+				vp.zoom = states[i].zoom
+				vp.setZoomLabelValue(states[i].zoomSel)
+				vp.applyZoom()
+				vp.scroll.Offset = states[i].offset
+				vp.scroll.Refresh()
+			}
+		}
+	}
+
 	resetData := func() {
 		loaded := false
 		errors := make([]string, 0, 3)
+
+		savedStates := captureViewportStates()
 
 		withSuspendedRefresh(func() {
 			for i := 0; i < 3; i++ {
@@ -1319,6 +1362,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 
 		refresh()
+		restoreViewportStates(savedStates)
 		if len(errors) > 0 {
 			dialog.ShowError(fmt.Errorf("%s", strings.Join(errors, "\n")), win)
 			return
@@ -1331,6 +1375,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			dialog.ShowInformation("Missing Channels", "Load all three FITS channels before aligning.", win)
 			return
 		}
+
+		savedStates := captureViewportStates()
 
 		// Reference is Channel 2 (green); align Channel 1 (blue) and Channel 3 (red)
 		// to it. imgs always holds the ORIGINAL pixels (offsets are applied only at
@@ -1411,6 +1457,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}
 
 				refresh()
+				restoreViewportStates(savedStates)
 
 				if errBlue != nil && errRed != nil {
 					dialog.ShowError(fmt.Errorf("Blue: %v\nRed: %v", errBlue, errRed), win)
@@ -1429,6 +1476,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			dialog.ShowInformation("Missing Channels", "Load all three channels before cleaning.", win)
 			return
 		}
+
+		savedStates := captureViewportStates()
 
 		sharedWidth := 0
 		sharedHeight := 0
@@ -1522,6 +1571,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				win.Canvas().Refresh(win.Content())
 				progressDialog.Hide()
 				refresh()
+				restoreViewportStates(savedStates)
 				dialog.ShowInformation("Complete", fmt.Sprintf("Star masks generated and cosmic rays eradicated in the shared %dx%d region.", sharedWidth, sharedHeight), win)
 			})
 		}()
@@ -1656,7 +1706,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			dst.StatsLabel.SetText(fmt.Sprintf("Blink: %s", composeBlinkFilterNames[srcIdx]))
 		}
 		dst.histogram.Refresh()
-		if dst.zoomLabel.Selected == "fit in preview" {
+		if dst.zoomLabel.Selected == "fit" {
 			dst.zoom = dst.fitZoom()
 		}
 		dst.applyZoom()
@@ -2155,7 +2205,30 @@ func applyChannelState(idx int, state models.ChannelState, imgs []*models.Loaded
 	views[idx].whiteBox.SetValue(img.White)
 }
 
-func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func()) *models.ChannelControl {
+// magicPresetGroup keeps the per-channel Magic preset selectors in sync: picking
+// a preset on one channel applies it to all registered channels. A re-entrancy
+// guard prevents SetSelected from triggering a broadcast storm.
+type magicPresetGroup struct {
+	selects []*widget.Select
+	syncing bool
+}
+
+func (g *magicPresetGroup) add(s *widget.Select) { g.selects = append(g.selects, s) }
+
+func (g *magicPresetGroup) broadcast(value string) {
+	if g == nil || g.syncing {
+		return
+	}
+	g.syncing = true
+	for _, s := range g.selects {
+		if s.Selected != value {
+			s.SetSelected(value)
+		}
+	}
+	g.syncing = false
+}
+
+func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func(), magicGroup *magicPresetGroup) *models.ChannelControl {
 	// Stretch-specific parameter rows. Only the row(s) relevant to the selected
 	// mode are shown; the rest stay hidden to avoid clutter.
 	asinhScaleEntry := NewNumberEntry(0.1, 3)
@@ -2278,6 +2351,29 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		selectBox.SetSelected("MTF") // also reveals the MTF row and triggers refresh
 	})
 
+	magicPreset := widget.NewSelect([]string{"Balanced", "Nebula", "Galaxy"}, nil)
+	magicPreset.SetSelected("Balanced")
+	if magicGroup != nil {
+		magicGroup.add(magicPreset)
+		magicPreset.OnChanged = func(value string) { magicGroup.broadcast(value) }
+	}
+	magic := widget.NewButton("Magic", func() {
+		if imgs[idx] == nil {
+			return
+		}
+		res := processing.ApplyMagicLevels(imgs[idx], processing.ParseMagicPreset(magicPreset.Selected))
+		backgroundEntry.SetValue(imgs[idx].Background)
+		peakEntry.SetValue(imgs[idx].Peak)
+		views[idx].blackBox.SetValue(imgs[idx].Black)
+		views[idx].whiteBox.SetValue(imgs[idx].White)
+		debuglog.Log(fmt.Sprintf(
+			"Magic[%s] ch%d: black=%.4g white=%.4g sky=%.4g sigma=%.4g clipLow=%.3f%% clipHigh=%.3f%% stars=%v(%.2f%%) whiteSrc=%s whiteN=%d(%.2f%%)",
+			res.Preset, idx, res.Black, res.White, res.Background, res.Sigma,
+			res.ClipLowPercent, res.ClipHighPercent, res.StarsExcluded, res.StarPixelPercent,
+			res.WhiteSampleSource, res.WhiteSampleCount, res.WhiteSamplePercent))
+		refresh()
+	})
+
 	xOffsetEntry := NewNumberEntry(1, 2)
 	yOffsetEntry := NewNumberEntry(1, 2)
 	rotOffsetEntry := NewNumberEntry(0.1, 1)
@@ -2311,7 +2407,8 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 			ghsBRow,
 			ghsSPRow,
 			container.NewHBox(showClip, widget.NewLabel("Show clipped pixels")),
-			container.NewHBox(auto, autoMTF, apply),
+			container.NewHBox(outlinedButton(col, auto), outlinedButton(col, autoMTF), outlinedButton(col, apply)),
+			container.NewHBox(outlinedButton(col, magic), magicPreset),
 			widget.NewLabel("Manual Offset"),
 			offsetRow("X", xOffsetEntry),
 			offsetRow("Y", yOffsetEntry),
@@ -2661,7 +2758,7 @@ func applyComposePreviewData(data composePreviewData, views []*viewport, pushHis
 			views[i].StatsLabel.SetText(item.StatsText)
 		}
 		views[i].histogram.Refresh()
-		if views[i].zoomLabel.Selected == "fit in preview" {
+		if views[i].zoomLabel.Selected == "fit" {
 			views[i].zoom = views[i].fitZoom()
 		}
 		views[i].applyZoom()
@@ -2727,7 +2824,7 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 		views[i].whiteBox.SetValue(imgs[i].White)
 
 		views[i].histogram.Refresh()
-		if views[i].zoomLabel.Selected == "fit in preview" {
+		if views[i].zoomLabel.Selected == "fit" {
 			views[i].zoom = views[i].fitZoom()
 		}
 		views[i].applyZoom()
@@ -2785,7 +2882,7 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 	views[3].whiteBox.SetValue(0)
 	views[3].histogram.Refresh()
 
-	if views[3].zoomLabel.Selected == "fit in preview" {
+	if views[3].zoomLabel.Selected == "fit" {
 		views[3].zoom = views[3].fitZoom()
 	}
 

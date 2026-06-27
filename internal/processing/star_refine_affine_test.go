@@ -33,8 +33,7 @@ func TestComposeAffineTransformsIdentity(t *testing.T) {
 }
 
 // makeWideStarField creates a 400×300 pixel array with bright, well-separated
-// stars. Pairwise distances are all >100 px, so CentroidNear with radius 50
-// never confuses one star for another even after a small shift.
+// stars modeled as 2D Gaussians to pass cosmic ray filtering.
 func makeWideStarField() (pixels []float32, positions [][2]int, w, h int) {
 	w, h = 400, 300
 	positions = [][2]int{
@@ -43,15 +42,16 @@ func makeWideStarField() (pixels []float32, positions [][2]int, w, h int) {
 	}
 	pixels = make([]float32, w*h)
 	for _, c := range positions {
-		for dy := -2; dy <= 2; dy++ {
-			for dx := -2; dx <= 2; dx++ {
+		for dy := -3; dy <= 3; dy++ {
+			for dx := -3; dx <= 3; dx++ {
 				x, y := c[0]+dx, c[1]+dy
 				if x < 0 || x >= w || y < 0 || y >= h {
 					continue
 				}
-				v := float32(30)
-				if dx == 0 && dy == 0 {
-					v = 200
+				d2 := float64(dx*dx + dy*dy)
+				v := float32(200.0 * math.Exp(-d2/(2.0*1.5*1.5)))
+				if v < 1.0 {
+					v = 0
 				}
 				pixels[y*w+x] = v
 			}

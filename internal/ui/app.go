@@ -39,8 +39,24 @@ func Run() error {
 
 	composeContent, composeMenus := newComposeWorkspace(a, win)
 	examine := newExamineWorkspace(a, win)
-	mosaicContent, mosaicMenu := newMosaicWorkspace(a, win)
+	mosaicContent, mosaicMenu, loadMosaicItem, saveMosaicItem := newMosaicWorkspace(a, win)
 	editContent, setEditImage := newEditWorkspace(a, win)
+
+	if len(composeMenus) > 0 && composeMenus[0].Label == "File" {
+		fileMenu := composeMenus[0]
+		if len(fileMenu.Items) >= 3 {
+			origItems := fileMenu.Items
+			fileMenu.Items = []*fyne.MenuItem{
+				loadMosaicItem,
+				saveMosaicItem,
+				fyne.NewMenuItemSeparator(),
+				origItems[0],
+				origItems[1],
+				fyne.NewMenuItemSeparator(),
+			}
+			fileMenu.Items = append(fileMenu.Items, origItems[3:]...)
+		}
+	}
 
 	editTab := container.NewTabItem("Edit", editContent)
 	mosaicTab := container.NewTabItem("Mosaic", mosaicContent)
@@ -57,13 +73,28 @@ func Run() error {
 		tabs.Select(editTab)
 	}
 
+	globalSelectComposeTab = func() {
+		tabs.Select(composeTab)
+	}
+
 	windowMenu := fyne.NewMenu("Window",
 		fyne.NewMenuItem("Debug Log", func() {
 			showDebugWindow(a)
 		}),
 	)
 
-	allMenus := append(composeMenus, mosaicMenu, windowMenu)
+	var allMenus []*fyne.Menu
+	if len(composeMenus) >= 3 {
+		allMenus = []*fyne.Menu{
+			composeMenus[0], // File
+			mosaicMenu,      // Mosaic
+			composeMenus[1], // Compose
+			composeMenus[2], // View
+			windowMenu,      // Window
+		}
+	} else {
+		allMenus = append(composeMenus, mosaicMenu, windowMenu)
+	}
 	win.SetMainMenu(fyne.NewMainMenu(allMenus...))
 
 	win.SetContent(fynetooltip.AddWindowToolTipLayer(tabs, win.Canvas()))
