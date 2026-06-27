@@ -11,6 +11,8 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 
+	ttwidget "github.com/dweymouth/fyne-tooltip/widget"
+
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
@@ -40,7 +42,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	}
 	vp := newViewport()
 	vp.actionRow.Objects = []fyne.CanvasObject{layout.NewSpacer(), vp.StatsLabel, hpad(6)}
-	reloadBtn := widget.NewButton("Reload Current FITS", func() {})
+	reloadBtn := ttwidget.NewButton("Reload Current FITS", func() {})
+	reloadBtn.SetToolTip("Reload the current FITS from disk, keeping the current stretch settings")
 	reloadBtn.Disable()
 
 	pathLabel := widget.NewLabel("No FITS loaded.")
@@ -225,7 +228,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		updateMeasurement()
 	}
 
-	applyBtn := widget.NewButton("Apply values", func() {
+	applyBtn := ttwidget.NewButton("Apply values", func() {
 		if state.img == nil {
 			return
 		}
@@ -236,8 +239,9 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		state.img.White = vp.whiteBox.Value()
 		refresh()
 	})
+	applyBtn.SetToolTip("Apply the Background/Peak and Black/White values to the stretch")
 
-	autoBtn := widget.NewButton("Auto scaling", func() {
+	autoBtn := ttwidget.NewButton("Auto scaling", func() {
 		if state.img == nil {
 			return
 		}
@@ -249,6 +253,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		sPeakEntry.SetValue(state.img.ScaledPeak)
 		refresh()
 	})
+	autoBtn.SetToolTip("Compute Background, Peak and Black/White levels automatically (FITS Liberator style)")
 
 	loadFitsFromPath := func(path string, preserveStretch bool) {
 		progressDialog := dialog.NewCustom("Loading FITS", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
@@ -320,7 +325,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	// Send to Compose channel
 	channelSelect := NewSafeSelect([]string{"Channel 1", "Channel 2", "Channel 3"}, nil)
 	channelSelect.SetSelectedIndex(0)
-	sendToChannelBtn := widget.NewButton("Send to Channel", func() {
+	sendToChannelBtn := ttwidget.NewButton("Send to Channel", func() {
 		if globalSendToChannel == nil || state.img == nil {
 			return
 		}
@@ -337,9 +342,15 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		}
 		globalSendToChannel(idx, &imgCopy)
 	})
+	sendToChannelBtn.SetToolTip("Send this image (with current values) to the selected Compose channel")
+
+	loadFitsBtn := ttwidget.NewButton("Load FITS", loadFits)
+	loadFitsBtn.SetToolTip("Open a FITS file from disk")
+	clearMeasureBtn := ttwidget.NewButton("Clear Measurement", clearMeasurement)
+	clearMeasureBtn.SetToolTip("Clear the current ruler measurement")
 
 	controls := container.NewVBox(
-		container.NewHBox(widget.NewButton("Load FITS", loadFits), reloadBtn),
+		container.NewHBox(loadFitsBtn, reloadBtn),
 		pathLabel,
 		widget.NewSeparator(),
 		widget.NewLabel("Stretch Controls"),
@@ -357,7 +368,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		measureCheck,
 		coordLabel,
 		measureLabel,
-		widget.NewButton("Clear Measurement", clearMeasurement),
+		clearMeasureBtn,
 		widget.NewSeparator(),
 		widget.NewLabel("Send to Compose"),
 		channelSelect,

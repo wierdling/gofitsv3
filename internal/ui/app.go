@@ -10,6 +10,8 @@ import (
 	"fyne.io/fyne/v2/driver"
 	"fyne.io/fyne/v2/theme"
 
+	fynetooltip "github.com/dweymouth/fyne-tooltip"
+
 	"gofitsv3/internal/version"
 )
 
@@ -64,7 +66,7 @@ func Run() error {
 	allMenus := append(composeMenus, mosaicMenu, windowMenu)
 	win.SetMainMenu(fyne.NewMainMenu(allMenus...))
 
-	win.SetContent(tabs)
+	win.SetContent(fynetooltip.AddWindowToolTipLayer(tabs, win.Canvas()))
 	win.Show()
 	maximizeWindow(win)
 
