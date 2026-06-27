@@ -136,13 +136,22 @@ func buildCRMasksDrizzle(
 		go func(slot, pi int) {
 			defer maskWG.Done()
 			defer func() { <-maskSem }()
-			pixels, _, perr := prepareFramePixels(planned[pi], opts, skyOffsets[pi], skyPlanes[pi])
+			pixels, errPix, perr := prepareFramePixels(planned[pi], opts, skyOffsets[pi], skyPlanes[pi])
 			if perr != nil {
 				maskErr.Store(fmt.Errorf("reload frame %s: %w", InputKey(planned[pi].input), perr))
 				return
 			}
 			crPixels := normalizedPixelsForWeighting(planned[pi].input, pixels, opts.WeightingMode)
+			// The ERR plane is the per-pixel 1-sigma in the same units as SCI and
+			// is scaled identically by prepareFramePixels, so the same weighting
+			// normalization keeps it matched to crPixels. Used as the CR noise
+			// model when present.
+			var crNoise []float32
+			if errPix != nil && len(errPix) == len(crPixels) {
+				crNoise = normalizedPixelsForWeighting(planned[pi].input, errPix, opts.WeightingMode)
+			}
 			pixels = nil
+			errPix = nil
 			_, sigma := processing.EstimateBackground(crPixels)
 			refToSource, ierr := processing.InvertAffineTransform(planned[pi].sourceToRef)
 			if ierr != nil {
@@ -151,6 +160,7 @@ func buildCRMasksDrizzle(
 			pcopy := planned[pi]
 			fi := processing.FrameInfo{
 				Pixels:      crPixels,
+				Noise:       crNoise,
 				Width:       planned[pi].input.HDU.Data.Width,
 				Height:      planned[pi].input.HDU.Data.Height,
 				SourceToRef: planned[pi].sourceToRef,

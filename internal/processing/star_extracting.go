@@ -31,6 +31,63 @@ func ExtractAndLimitStars(pixels []float32, width, height int, thresholdSigma fl
 	return stars
 }
 
+// selectSpatiallyDistributedStars picks up to maxStars from stars (assumed
+// sorted brightest-first) while spreading the selection across the frame, so a
+// global transform fit is constrained over the whole image rather than by one
+// bright cluster. Taking simply the brightest N leaves rotation/scale
+// under-determined when the bright sources are concentrated, which makes a fitted
+// alignment drift the farther a pixel is from that cluster. The frame is binned
+// into a roughly sqrt(maxStars) grid and cells are visited round-robin, brightest
+// first within each cell.
+func selectSpatiallyDistributedStars(stars []Star, width, height, maxStars int) []Star {
+	if maxStars <= 0 || len(stars) <= maxStars || width <= 0 || height <= 0 {
+		return stars
+	}
+	cols := int(math.Ceil(math.Sqrt(float64(maxStars))))
+	if cols < 1 {
+		cols = 1
+	}
+	rows := cols
+	cellW := float64(width) / float64(cols)
+	cellH := float64(height) / float64(rows)
+	buckets := make([][]Star, cols*rows)
+	for _, s := range stars { // stars already sorted brightest-first
+		cx := int(s.X / cellW)
+		if cx >= cols {
+			cx = cols - 1
+		}
+		if cx < 0 {
+			cx = 0
+		}
+		cy := int(s.Y / cellH)
+		if cy >= rows {
+			cy = rows - 1
+		}
+		if cy < 0 {
+			cy = 0
+		}
+		b := cy*cols + cx
+		buckets[b] = append(buckets[b], s)
+	}
+	selected := make([]Star, 0, maxStars)
+	for pass := 0; len(selected) < maxStars; pass++ {
+		progressed := false
+		for b := range buckets {
+			if pass < len(buckets[b]) {
+				selected = append(selected, buckets[b][pass])
+				progressed = true
+				if len(selected) >= maxStars {
+					break
+				}
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+	return selected
+}
+
 func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, minArea int) []Star {
 	median, sigma := EstimateBackground(pixels)
 	threshold := median + (thresholdSigma * sigma)

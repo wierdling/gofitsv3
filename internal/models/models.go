@@ -38,6 +38,14 @@ type LoadedImage struct {
 	GHSStretch  float64 // GHS strength D
 	GHSLocal    float64 // GHS local intensity b
 	GHSSymmetry float64 // GHS symmetry point SP in [0,1]
+
+	// AlignTransform is the backward (output→source) sampling affine produced by
+	// Compose "Align to Channel 2". When HasAlignTransform is set it is applied at
+	// render time underneath the Manual Offset, preserving the full fitted affine
+	// (scale and skew included) instead of reducing it to translation+rotation.
+	// Stored as plain coefficients to avoid a models→processing import.
+	HasAlignTransform                              bool
+	AlignA, AlignB, AlignC, AlignD, AlignE, AlignF float64
 }
 
 type ChannelState struct {
@@ -52,6 +60,16 @@ type ChannelState struct {
 	OffsetX    float64 `json:"offsetX,omitempty"`
 	OffsetY    float64 `json:"offsetY,omitempty"`
 	OffsetRot  float64 `json:"offsetRot,omitempty"`
+
+	// Full star-alignment affine (backward sampling) from "Align to Channel 2",
+	// applied underneath the Manual Offset at render time. See LoadedImage.
+	HasAlign bool    `json:"hasAlign,omitempty"`
+	AlignA   float64 `json:"alignA,omitempty"`
+	AlignB   float64 `json:"alignB,omitempty"`
+	AlignC   float64 `json:"alignC,omitempty"`
+	AlignD   float64 `json:"alignD,omitempty"`
+	AlignE   float64 `json:"alignE,omitempty"`
+	AlignF   float64 `json:"alignF,omitempty"`
 
 	AsinhScale  float64 `json:"asinhScale,omitempty"`
 	MTFMidtone  float64 `json:"mtfMidtone,omitempty"`

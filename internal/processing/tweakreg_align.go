@@ -341,9 +341,12 @@ func AlignChannelByStars(targetPixels []float32, targetWidth, targetHeight int, 
 		targetWidth, targetHeight = refWidth, refHeight
 	}
 
+	// Spread the alignment catalog across the frame so the global rotation/scale is
+	// well constrained; the brightest-N alone can cluster and leave the fit drifting
+	// toward the edges (see selectSpatiallyDistributedStars).
 	const maxCatalogStars = 200
-	refStars := ExtractAndLimitStars(refPixels, refWidth, refHeight, 4.0, 3, maxCatalogStars)
-	targetStars := ExtractAndLimitStars(aligned, targetWidth, targetHeight, 4.0, 3, maxCatalogStars)
+	refStars := selectSpatiallyDistributedStars(ExtractStars(refPixels, refWidth, refHeight, 4.0, 3), refWidth, refHeight, maxCatalogStars)
+	targetStars := selectSpatiallyDistributedStars(ExtractStars(aligned, targetWidth, targetHeight, 4.0, 3), targetWidth, targetHeight, maxCatalogStars)
 	if len(refStars) < 3 || len(targetStars) < 3 {
 		return nil, AffineTransform{}, AlignStats{}, fmt.Errorf("insufficient stars for alignment (ref %d, target %d)", len(refStars), len(targetStars))
 	}
@@ -355,6 +358,13 @@ func AlignChannelByStars(targetPixels []float32, targetWidth, targetHeight int, 
 		return nil, AffineTransform{}, stats, err
 	}
 
+	// Globally refine: the initial fit may be anchored by a bright cluster (the
+	// histogram re-match radius drops stars displaced by residual rotation), so
+	// re-pair the full distributed catalog through the current fit and refit a full
+	// affine. This pulls in edge stars and pins down the rotation/scale that causes
+	// "aligned here, drifting there".
+	t, stats = refineGlobalAffine(targetStars, refStars, t, stats, refWidth, refHeight)
+
 	// WarpImageToSize samples the source at warpT(outputPixel); we need ref → target.
 	warpT, err := InvertAffineTransform(t)
 	if err != nil {
@@ -362,6 +372,98 @@ func AlignChannelByStars(targetPixels []float32, targetWidth, targetHeight int, 
 	}
 	warped := WarpImageToSize(aligned, refWidth, refHeight, refWidth, refHeight, warpT)
 	return warped, t, stats, nil
+}
+
+// pairByTransform pairs target stars to ref stars by nearest neighbour within
+// radius, after mapping each target star through t (which maps target → ref). The
+// returned pairs carry the ORIGINAL target coordinates as Ref and the matched ref
+// coordinates as Target, so a subsequent solve fits the target → ref transform
+// (matching residualStats / the rest of this file's convention). A ref star is
+// used at most once.
+func pairByTransform(targetStars, refStars []Star, t AffineTransform, radius float64) []MatchedPair {
+	r2 := radius * radius
+	usedRef := make([]bool, len(refStars))
+	pairs := make([]MatchedPair, 0, len(targetStars))
+	for _, ts := range targetStars {
+		px := t.A*ts.X + t.B*ts.Y + t.C
+		py := t.D*ts.X + t.E*ts.Y + t.F
+		best := -1
+		bestD := r2
+		for j, rs := range refStars {
+			if usedRef[j] {
+				continue
+			}
+			dx := px - rs.X
+			dy := py - rs.Y
+			if d := dx*dx + dy*dy; d < bestD {
+				bestD = d
+				best = j
+			}
+		}
+		if best >= 0 {
+			usedRef[best] = true
+			pairs = append(pairs, MatchedPair{RefX: ts.X, RefY: ts.Y, TargetX: refStars[best].X, TargetY: refStars[best].Y})
+		}
+	}
+	return pairs
+}
+
+// statsForTransform reports how well t (target → ref) registers the full
+// catalogs: global support within tweakRegGlobalTolPx plus the RMS/max of the
+// stars that land within that tolerance.
+func statsForTransform(targetStars, refStars []Star, t AffineTransform) AlignStats {
+	support := transformGlobalSupport(targetStars, refStars, t, tweakRegGlobalTolPx)
+	pairs := pairByTransform(targetStars, refStars, t, tweakRegGlobalTolPx)
+	rms, maxErr := residualStats(pairs, t)
+	return AlignStats{MatchedStars: len(pairs), GlobalInliers: support, RMS: rms, MaxError: maxErr}
+}
+
+// refineGlobalAffine improves an initial target → ref fit by re-pairing the full
+// (spatially distributed) catalogs through the current transform and refitting a
+// full affine. Because the initial fit already registers the bulk of the field,
+// the re-match now pairs stars across the whole frame at a tight radius, which
+// constrains the global rotation/scale/shear and removes edge drift. It iterates a
+// few times and keeps a refined transform only when it stays physical and
+// corroborates with at least as many stars as the current best.
+func refineGlobalAffine(targetStars, refStars []Star, init AffineTransform, initStats AlignStats, refWidth, refHeight int) (AffineTransform, AlignStats) {
+	best := init
+	bestStats := initStats
+	if bestStats.GlobalInliers == 0 {
+		bestStats = statsForTransform(targetStars, refStars, init)
+	}
+	current := init
+	// Start wide: a small rotation/scale error in a centre-anchored initial fit
+	// extrapolates to a large displacement at the corners, so edge stars can sit
+	// well beyond a tight radius. Pull them in first, then tighten over passes to
+	// lock the global solution.
+	radii := []float64{16.0, 8.0, 4.0, 4.0}
+	for _, radius := range radii {
+		pairs := pairByTransform(targetStars, refStars, current, radius)
+		if len(pairs) < 6 {
+			break
+		}
+		cand, err := solveLeastSquares(pairs)
+		if err != nil {
+			break
+		}
+		if clipped := sigmaClipPairs(pairs, cand, 3.0); len(clipped) >= 6 {
+			if c2, err := solveLeastSquares(clipped); err == nil {
+				cand = c2
+			}
+		}
+		if !tweakRegTransformIsPhysical(cand) || maxCornerShift(cand, refWidth, refHeight) > maxResidualShiftPx {
+			break
+		}
+		st := statsForTransform(targetStars, refStars, cand)
+		// Accept only when more (or equal) stars agree globally; the goal is broader
+		// corroboration, and equal support with a fresh fit is still a safe no-op.
+		if st.GlobalInliers < bestStats.GlobalInliers {
+			break
+		}
+		best, bestStats, current = cand, st, cand
+	}
+	debuglog.Log(fmt.Sprintf("refineGlobalAffine: support %d→%d, rms %.2f→%.2f", initStats.GlobalInliers, bestStats.GlobalInliers, initStats.RMS, bestStats.RMS))
+	return best, bestStats
 }
 
 func shouldUpgradeTweakRegFit(pairs []MatchedPair, rscale, general AffineTransform, refWidth, refHeight int) bool {

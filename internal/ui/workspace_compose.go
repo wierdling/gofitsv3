@@ -76,7 +76,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	sharedHistCheck := NewToggle(nil)
 	sharedHistCheck.SetChecked(false)
 	buildCompositeCheck := NewToggle(nil)
-	buildCompositeCheck.SetChecked(true)
+	buildCompositeCheck.SetChecked(false)
 	blinkCheck := NewToggle(nil)
 	blinkCheck.SetChecked(false)
 	blinkExcludedIdx := 0
@@ -819,7 +819,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			return nil
 		}
 		dx, dy, rot, ok := channelOffsetFields(idx)
-		if !ok || (dx == 0 && dy == 0 && rot == 0) {
+		align, hasAlign := channelAlignTransform(imgs[idx])
+		if (!ok || (dx == 0 && dy == 0 && rot == 0)) && !hasAlign {
 			return imgs[idx]
 		}
 		src := imgs[idx].HDU.Data.Pixels
@@ -827,7 +828,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		if idx < len(renderCache) {
 			renderMu.Lock()
 			c := renderCache[idx]
-			if c.pixels != nil && c.dx == dx && c.dy == dy && c.rot == rot && sameFloatSlice(c.src, src) {
+			if c.pixels != nil && c.dx == dx && c.dy == dy && c.rot == rot && c.hasAlign == hasAlign && c.align == align && sameFloatSlice(c.src, src) {
 				warpedPixels = c.pixels
 			}
 			renderMu.Unlock()
@@ -835,11 +836,15 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		if warpedPixels == nil {
 			w := imgs[idx].HDU.Data.Width
 			h := imgs[idx].HDU.Data.Height
+			// Backward sampling: output → manual nudge → star-alignment affine → source.
 			t := composeManualOffsetTransform(w, h, dx, dy, rot)
+			if hasAlign {
+				t = processing.ComposeAffineTransforms(align, t)
+			}
 			warpedPixels = processing.WarpImage(src, w, h, t)
 			if idx < len(renderCache) {
 				renderMu.Lock()
-				renderCache[idx] = composeRenderCache{dx: dx, dy: dy, rot: rot, src: src, pixels: warpedPixels}
+				renderCache[idx] = composeRenderCache{dx: dx, dy: dy, rot: rot, hasAlign: hasAlign, align: align, src: src, pixels: warpedPixels}
 				renderMu.Unlock()
 			}
 		}
@@ -1079,6 +1084,14 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				OffsetX:    dx,
 				OffsetY:    dy,
 				OffsetRot:  rot,
+
+				HasAlign: imgs[i].HasAlignTransform,
+				AlignA:   imgs[i].AlignA,
+				AlignB:   imgs[i].AlignB,
+				AlignC:   imgs[i].AlignC,
+				AlignD:   imgs[i].AlignD,
+				AlignE:   imgs[i].AlignE,
+				AlignF:   imgs[i].AlignF,
 
 				AsinhScale:  imgs[i].AsinhScale,
 				MTFMidtone:  imgs[i].MTFMidtone,
@@ -1340,7 +1353,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			// the mosaic builder uses (WCS-independent: channel WCS headers can
 			// disagree with the real pixel registration by ~100 px).
 			alignOne := func(base []float32, w, h int) (processing.AffineTransform, string, error) {
-				_, t, stats, err := processing.AlignChannelByStars(base, w, h, refBase, width, height, 30.0, "rscale")
+				_, t, stats, err := processing.AlignChannelByStars(base, w, h, refBase, width, height, 30.0, "general")
 				if err != nil {
 					return processing.AffineTransform{}, "", err
 				}
@@ -1362,16 +1375,21 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				setAndApply := func(idx int, back processing.AffineTransform) (dx, dy, rot float64) {
 					w := imgs[idx].HDU.Data.Width
 					h := imgs[idx].HDU.Data.Height
+					// Store the full fitted affine (scale/skew included); the Manual
+					// Offset becomes a zeroed user nudge applied on top of it. The
+					// returned dx/dy/rot are the equivalent translation/rotation for
+					// the summary line only.
 					dx, dy, rot = extractManualOffset(back, w, h)
+					setChannelAlignTransform(imgs[idx], back)
 					if idx < len(controlSets) && controlSets[idx] != nil {
 						if controlSets[idx].XOffsetEntry != nil {
-							controlSets[idx].XOffsetEntry.SetValue(dx)
+							controlSets[idx].XOffsetEntry.SetValue(0)
 						}
 						if controlSets[idx].YOffsetEntry != nil {
-							controlSets[idx].YOffsetEntry.SetValue(dy)
+							controlSets[idx].YOffsetEntry.SetValue(0)
 						}
 						if controlSets[idx].RotOffsetEntry != nil {
-							controlSets[idx].RotOffsetEntry.SetValue(rot)
+							controlSets[idx].RotOffsetEntry.SetValue(0)
 						}
 					}
 					return dx, dy, rot
@@ -1740,12 +1758,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	saveProjectItem := fyne.NewMenuItem("Save Compose Project", saveProject)
 	loadProjectItem := fyne.NewMenuItem("Load Compose Project", loadProject)
 	exportRGBItem := fyne.NewMenuItem("Export Compose RGB", exportRGB)
-	fileMenu := fyne.NewMenu("File",
-		loadProjectItem,
-		saveProjectItem,
-		fyne.NewMenuItemSeparator(),
-		exportRGBItem,
-	)
 
 	viewHeaderItems := []*fyne.MenuItem{
 		fyne.NewMenuItem("View FITS Header 1", func() { showHeader(0) }),
@@ -1796,37 +1808,12 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	addOrangeItem := fyne.NewMenuItem("Add Orange Image...", openOrangeWindow)
 	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
 	sendToEditItem := fyne.NewMenuItem("Send Composite to Edit", sendToEdit)
-	channelsMenu := fyne.NewMenu("Channels",
-		viewHeaderItems[0],
-		viewHeaderItems[1],
-		viewHeaderItems[2],
-		fyne.NewMenuItemSeparator(),
-		saveHeaderItems[0],
-		saveHeaderItems[1],
-		saveHeaderItems[2],
-		fyne.NewMenuItemSeparator(),
-		copySettingsItem,
-		matchStretchItem,
-		addOrangeItem,
-		normalizeScaleItem,
-		fyne.NewMenuItemSeparator(),
-		sendToEditItem,
-	)
-
 	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
 	cleanChannelsItem := fyne.NewMenuItem("Cross-Channel Clean", crossChannelClean)
-	// Starless Settings is intentionally omitted from the Process menu.
+	resetDataItem := fyne.NewMenuItem("Reset Data (Undo Align & Clean)", resetData)
+	// Starless Settings is intentionally omitted from the Compose menu.
 	// The experimental starless/white-star code remains in the repository for
 	// future investigation, but it should not be reachable from the UI for now.
-	postRGBCleanItem := fyne.NewMenuItem("Post-RGB Clean in Edit", sendToEdit)
-	resetDataItem := fyne.NewMenuItem("Reset Data (Undo Align & Clean)", resetData)
-	processMenu := fyne.NewMenu("Process",
-		alignChannelsItem,
-		cleanChannelsItem,
-		postRGBCleanItem,
-		fyne.NewMenuItemSeparator(),
-		resetDataItem,
-	)
 
 	openLevels := func() {
 		if levelsWin == nil {
@@ -1837,7 +1824,40 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		levelsWin.win.Show()
 		levelsWin.win.RequestFocus()
 	}
-	viewMenu := fyne.NewMenu("View", fyne.NewMenuItem("RGB Levels...", openLevels))
+
+	// File: project I/O and handing the result off to other tabs / disk.
+	fileMenu := fyne.NewMenu("File",
+		loadProjectItem,
+		saveProjectItem,
+		fyne.NewMenuItemSeparator(),
+		exportRGBItem,
+		sendToEditItem,
+	)
+	// Compose: everything that acts on the channels themselves (merge of the
+	// former Channels and Process menus).
+	composeMenu := fyne.NewMenu("Compose",
+		alignChannelsItem,
+		cleanChannelsItem,
+		resetDataItem,
+		fyne.NewMenuItemSeparator(),
+		copySettingsItem,
+		matchStretchItem,
+		normalizeScaleItem,
+		fyne.NewMenuItemSeparator(),
+		addOrangeItem,
+	)
+	// View: display tuning plus the per-channel FITS header viewers/savers.
+	viewMenu := fyne.NewMenu("View",
+		fyne.NewMenuItem("RGB Levels...", openLevels),
+		fyne.NewMenuItemSeparator(),
+		viewHeaderItems[0],
+		viewHeaderItems[1],
+		viewHeaderItems[2],
+		fyne.NewMenuItemSeparator(),
+		saveHeaderItems[0],
+		saveHeaderItems[1],
+		saveHeaderItems[2],
+	)
 
 	updateMenus = func() {
 		for i := range viewHeaderItems {
@@ -1853,7 +1873,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		normalizeScaleItem.Disabled = !allLoaded
 		alignChannelsItem.Disabled = !allLoaded
 		cleanChannelsItem.Disabled = !allLoaded
-		postRGBCleanItem.Disabled = !allLoaded
 		resetDataItem.Disabled = !allLoaded
 		exportRGBItem.Disabled = !allLoaded
 		sendToEditItem.Disabled = !allLoaded
@@ -2003,7 +2022,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	split = container.NewHSplit(controlsScroll, grid)
 	split.SetOffset(0.32)
-	return split, []*fyne.Menu{fileMenu, channelsMenu, processMenu, viewMenu}
+	return split, []*fyne.Menu{fileMenu, composeMenu, viewMenu}
 }
 
 // loadImagesFromPath loads all SCI extensions from a FITS file as separate LoadedImage values.
@@ -2072,6 +2091,14 @@ func channelStateFromImage(img *models.LoadedImage) models.ChannelState {
 		ScaledPeak: img.ScaledPeak,
 		ShowClip:   img.ShowClip,
 
+		HasAlign: img.HasAlignTransform,
+		AlignA:   img.AlignA,
+		AlignB:   img.AlignB,
+		AlignC:   img.AlignC,
+		AlignD:   img.AlignD,
+		AlignE:   img.AlignE,
+		AlignF:   img.AlignF,
+
 		AsinhScale:  img.AsinhScale,
 		MTFMidtone:  img.MTFMidtone,
 		GHSStretch:  img.GHSStretch,
@@ -2092,6 +2119,12 @@ func applyChannelState(idx int, state models.ChannelState, imgs []*models.Loaded
 	img.Peak = state.Peak
 	img.ScaledPeak = state.ScaledPeak
 	img.ShowClip = state.ShowClip
+
+	// Restore the full star-alignment affine (applied underneath the Manual Offset
+	// at render time). A freshly loaded/reset channel carries HasAlign=false.
+	img.HasAlignTransform = state.HasAlign
+	img.AlignA, img.AlignB, img.AlignC = state.AlignA, state.AlignB, state.AlignC
+	img.AlignD, img.AlignE, img.AlignF = state.AlignD, state.AlignE, state.AlignF
 	img.AsinhScale = state.AsinhScale
 	img.MTFMidtone = state.MTFMidtone
 	img.GHSStretch = state.GHSStretch
@@ -2809,6 +2842,8 @@ func offsetRow(name string, entry *NumberEntry) fyne.CanvasObject {
 // the warp was based on; if the channel is reloaded (new slice) the cache misses.
 type composeRenderCache struct {
 	dx, dy, rot float64
+	hasAlign    bool
+	align       processing.AffineTransform
 	src         []float32
 	pixels      []float32
 }
@@ -2860,6 +2895,30 @@ func extractManualOffset(t processing.AffineTransform, w, h int) (dx, dy, rot fl
 	u := -cosA*(t.C-cx) + sinA*(t.F-cy)
 	v := -sinA*(t.C-cx) - cosA*(t.F-cy)
 	return u - cx, v - cy, rad * 180 / math.Pi
+}
+
+// channelAlignTransform returns the channel's stored star-alignment affine
+// (backward sampling) and whether one is present.
+func channelAlignTransform(img *models.LoadedImage) (processing.AffineTransform, bool) {
+	if img == nil || !img.HasAlignTransform {
+		return processing.AffineTransform{}, false
+	}
+	return processing.AffineTransform{
+		A: img.AlignA, B: img.AlignB, C: img.AlignC,
+		D: img.AlignD, E: img.AlignE, F: img.AlignF,
+	}, true
+}
+
+// setChannelAlignTransform stores the full fitted alignment affine on the image.
+// Unlike the Manual Offset fields (translation+rotation only), this preserves the
+// scale and skew of the fit, which are applied at render time.
+func setChannelAlignTransform(img *models.LoadedImage, t processing.AffineTransform) {
+	if img == nil {
+		return
+	}
+	img.HasAlignTransform = true
+	img.AlignA, img.AlignB, img.AlignC = t.A, t.B, t.C
+	img.AlignD, img.AlignE, img.AlignF = t.D, t.E, t.F
 }
 
 func matchComposeChannelStretch(ref, target *models.LoadedImage, matchStarCores bool) error {

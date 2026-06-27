@@ -848,7 +848,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		ws.enterStarMode()
 	})
 
-	buildBtn := widget.NewButton("Build Drizzle Preview", func() {
+	buildBtn := widget.NewButton("Create Mosaic", func() {
 		if len(state.inputs) == 0 {
 			dialog.ShowInformation("Missing Inputs", "Add one or more FITS files first.", win)
 			return
@@ -1090,12 +1090,12 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		widget.NewLabel("Baseline Reference"),
 		refLabel,
 		container.New(&fixedVSpacingLayout{15},
-		container.NewGridWithColumns(2, setRefBtn, clearRefBtn),
-		container.NewGridWithColumns(2, starAlignBtn, selectStarsBtn),
-		container.NewGridWithColumns(2, measureBtn, buildBtn),
-		container.NewGridWithColumns(2, openBlinkerBtn, saveOffsetsBtn),
-		container.NewGridWithColumns(2, loadOffsetsBtn, clearOffsetsBtn),
-		container.NewGridWithColumns(2, clearBtn, layout.NewSpacer()),
+			container.NewGridWithColumns(2, setRefBtn, clearRefBtn),
+			container.NewGridWithColumns(2, starAlignBtn, selectStarsBtn),
+			container.NewGridWithColumns(2, measureBtn, buildBtn),
+			container.NewGridWithColumns(2, openBlinkerBtn, saveOffsetsBtn),
+			container.NewGridWithColumns(2, loadOffsetsBtn, clearOffsetsBtn),
+			container.NewGridWithColumns(2, clearBtn, layout.NewSpacer()),
 		),
 		widget.NewSeparator(),
 		inputFramesBtn,
