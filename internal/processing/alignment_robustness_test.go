@@ -98,6 +98,26 @@ func TestFitCatalogResidualRecoversRScale(t *testing.T) {
 	}
 }
 
+// TestRefineCentroidSubPixel verifies the iterative centroid refinement recovers
+// a sub-pixel star centre from an integer-rounded starting guess.
+func TestRefineCentroidSubPixel(t *testing.T) {
+	const w, h = 41, 41
+	const trueX, trueY = 20.37, 19.62
+	const sigma = 1.6
+	pix := make([]float32, w*h)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dx := float64(x) - trueX
+			dy := float64(y) - trueY
+			pix[y*w+x] = float32(1000 * math.Exp(-(dx*dx+dy*dy)/(2*sigma*sigma)))
+		}
+	}
+	gx, gy := refineCentroid(pix, w, h, 20, 20, 0, 6.0)
+	if d := math.Hypot(gx-trueX, gy-trueY); d > 0.05 {
+		t.Fatalf("refined centroid (%.3f,%.3f) is %.3f px off true (%.3f,%.3f)", gx, gy, d, trueX, trueY)
+	}
+}
+
 func TestTransformGlobalSupport(t *testing.T) {
 	stars := []Star{
 		{X: 10, Y: 12}, {X: 120, Y: 30}, {X: 200, Y: 80}, {X: 60, Y: 150},
