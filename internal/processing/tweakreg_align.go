@@ -193,6 +193,18 @@ func EstimateTweakRegAlignmentWithRefStars(
 	return result, stats, nil
 }
 
+// FitCatalogResidual fits the residual transform mapping the projected source
+// catalog onto the target catalog when both are already expressed in the same
+// (reference) pixel space, applying the full robustness cascade and gates used
+// by the primary TweakReg path. It is the catalog-only entry point used by the
+// mosaic chain fallback to align a frame to an already-aligned intermediate with
+// a complete rscale/affine correction — not merely a translation. fitgeom is
+// "rscale" or "general".
+func FitCatalogResidual(projected, target []Star, refWidth, refHeight int, searchRadiusPx float64, fitgeom string) (AffineTransform, AlignStats, error) {
+	t, stats, _, err := fitCatalogTransform(projected, target, refWidth, refHeight, searchRadiusPx, fitgeom)
+	return t, stats, err
+}
+
 // fitCatalogTransform matches a projected source catalog against a reference
 // catalog (both already in reference-pixel space) and fits the transform that
 // maps projected positions onto the reference positions, applying the same

@@ -961,12 +961,6 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			aligned[r] = true
 		}
 	}
-	queue := make([]int, 0, numRefs)
-	for r := 0; r < numRefs; r++ {
-		if !inputs[r].Excluded {
-			queue = append(queue, r)
-		}
-	}
 	lastErr := make([]string, len(inputs))
 	ordered := sortedByDistFromRef(inputs)
 
@@ -1084,15 +1078,9 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		return alignOneResult{i: i, errMsg: lastErr[i]}
 	}
 
-	// triedChain records (intermediate, image) pairs already attempted in the
-	// chain fallback so a genuinely-unalignable image is not re-matched against
-	// every aligned intermediate — the O(aligned × unaligned) blow-up that made
-	// auto-alignment hang on large, partially-overlapping mosaics.
-	triedChain := make(map[[2]int]bool)
-
-	// starCatalog caches each input's extracted star catalog so the chain
-	// fallback matches against pre-extracted catalogs (cheap, no image warp and
-	// no repeated extraction) instead of re-warping + re-extracting per pair.
+	// starCatalog caches each input's extracted star catalog so the chain fallback
+	// matches against pre-extracted catalogs (cheap, no image warp and no repeated
+	// extraction) instead of re-warping + re-extracting per pair.
 	starCatalog := make(map[int][]processing.Star)
 	getStars := func(idx int) []processing.Star {
 		if s, ok := starCatalog[idx]; ok {
@@ -1104,138 +1092,204 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		return s
 	}
 
-	primaryPassDone := false
-	for len(queue) > 0 {
+	// mapperCache caches each input's WCS mapper into inputs[0] pixel space.
+	type mapperEntry struct {
+		m  *processing.WCSMapper
+		ok bool
+	}
+	mapperCache := make(map[int]mapperEntry)
+	getMapper := func(idx int) (*processing.WCSMapper, bool) {
+		if e, seen := mapperCache[idx]; seen {
+			return e.m, e.ok
+		}
+		m, err := processing.NewWCSMapper(
+			inputs[idx].HDU.Header, inputs[idx].D2IX, inputs[idx].D2IY,
+			inputs[0].HDU.Header, inputs[0].D2IX, inputs[0].D2IY,
+		)
+		e := mapperEntry{m: m, ok: err == nil}
+		mapperCache[idx] = e
+		return e.m, e.ok
+	}
+	// projectRaw maps a frame's catalog into inputs[0] pixel space using only its
+	// WCS placement (mapper + base offset), i.e. before any residual correction —
+	// the "projected source" role for a residual fit.
+	projectRaw := func(idx int) ([]processing.Star, bool) {
+		m, ok := getMapper(idx)
+		if !ok {
+			return nil, false
+		}
+		src := getStars(idx)
+		out := make([]processing.Star, len(src))
+		for k, s := range src {
+			rx, ry := m.MapPixel(s.X, s.Y)
+			out[k] = processing.Star{X: rx + inputs[idx].OffsetX, Y: ry + inputs[idx].OffsetY, Flux: s.Flux}
+		}
+		return out, true
+	}
+	// projectCorrected maps an already-aligned frame's catalog into inputs[0] pixel
+	// space using its FULL solution (mapper + offset + ManualTransform), exactly as
+	// plannedInput.mapPixel does at render. Chaining off this (not the raw WCS
+	// placement) propagates the intermediate's own residual into the new frame.
+	projectCorrected := func(idx int) ([]processing.Star, bool) {
+		m, ok := getMapper(idx)
+		if !ok {
+			return nil, false
+		}
+		src := getStars(idx)
+		r := results[idx]
+		out := make([]processing.Star, len(src))
+		for k, s := range src {
+			rx, ry := m.MapPixel(s.X, s.Y)
+			rx += r.OffsetX
+			ry += r.OffsetY
+			if r.HasManualTransform {
+				rx, ry = processing.ApplyAffineTransform(r.ManualTransform, rx, ry)
+			}
+			out[k] = processing.Star{X: rx, Y: ry, Flux: s.Flux}
+		}
+		return out, true
+	}
+
+	refW := inputs[0].HDU.Data.Width
+	refH := inputs[0].HDU.Data.Height
+	chainSearchRadiusPx := 30.0
+	if ps, ok := nativePlateScaleArcsec(inputs[0].HDU.Header); ok && ps > 0 {
+		chainSearchRadiusPx = searchRadiusArcsec / ps
+	}
+
+	// --- Primary pass: align every non-reference frame directly to a designated
+	// reference, concurrently. alignOneToRef tries all references internally, and
+	// results are stored by index, so goroutine completion order cannot affect the
+	// outcome.
+	var toAlign []int
+	for _, i := range ordered {
+		if !aligned[i] && !inputs[i].Excluded {
+			toAlign = append(toAlign, i)
+		}
+	}
+	if len(toAlign) > 0 {
+		prog.report(0, len(toAlign))
+		ch := make(chan alignOneResult, len(toAlign))
+		sem := make(chan struct{}, runtime.NumCPU())
+		var wg sync.WaitGroup
+		for _, i := range toAlign {
+			if prog.cancelled() {
+				break
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				ch <- alignOneToRef(i)
+			}(i)
+		}
+		wg.Wait()
+		close(ch)
 		if prog.cancelled() {
 			return nil, ErrCancelled
 		}
-		refIdx := queue[0]
-		queue = queue[1:]
+		done := 0
+		for r := range ch {
+			done++
+			prog.report(done, len(toAlign))
+			if r.ok {
+				results[r.i] = StarAlignmentResult{
+					OffsetX:            inputs[r.i].OffsetX,
+					OffsetY:            inputs[r.i].OffsetY,
+					ManualTransform:    r.refinement,
+					HasManualTransform: true,
+					Applied:            true,
+					MatchedStars:       r.stats.MatchedStars,
+					RMS:                r.stats.RMS,
+					MaxError:           r.stats.MaxError,
+				}
+				aligned[r.i] = true
+			} else {
+				lastErr[r.i] = r.errMsg
+			}
+		}
+	}
 
-		if refIdx < numRefs {
-			// Designated reference: run (or re-use) the full multi-ref TweakReg pass.
-			// Only run once — alignOneToRef already tries every reference internally.
-			if primaryPassDone {
+	// --- Chain fallback: frames that did not align directly to a reference are
+	// aligned to an already-aligned intermediate. Each frame fits a FULL residual
+	// (rscale/general, including rotation/scale — not the old translation-only
+	// correction) against the intermediate's fully-corrected catalog, and chooses
+	// the intermediate that corroborates with the most catalog stars (ties broken
+	// by lower RMS, then lower index — all deterministic). Iterated to a fixed
+	// point so a frame aligned in one pass can be an intermediate in the next.
+	//
+	// evaluated memoizes (frame, intermediate) pairs already fit-attempted: an
+	// intermediate's solution is fixed once set, so a failed pair never succeeds
+	// later, which keeps the total work bounded (≈ unaligned × aligned, pruned by
+	// framesMayOverlap) instead of re-fitting every pass.
+	evaluated := make(map[[2]int]bool)
+	for progressed := true; progressed; {
+		progressed = false
+		for _, i := range ordered {
+			if aligned[i] || inputs[i].Excluded {
 				continue
 			}
-			primaryPassDone = true
-			// Collect unaligned inputs and run them concurrently against the reference.
-			var toAlign []int
-			for _, i := range ordered {
-				if !aligned[i] && !inputs[i].Excluded {
-					toAlign = append(toAlign, i)
-				}
-			}
-			if len(toAlign) == 0 {
-				continue
-			}
-
-			prog.report(0, len(toAlign))
-			ch := make(chan alignOneResult, len(toAlign))
-			sem := make(chan struct{}, runtime.NumCPU())
-			var wg sync.WaitGroup
-			for _, i := range toAlign {
-				if prog.cancelled() {
-					break
-				}
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(i int) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					ch <- alignOneToRef(i)
-				}(i)
-			}
-			wg.Wait()
-			close(ch)
-
 			if prog.cancelled() {
 				return nil, ErrCancelled
 			}
-
-			done := 0
-			// Collect newly-aligned indices and enqueue them in a deterministic
-			// (ascending) order. Draining the channel follows goroutine-completion
-			// order, which is nondeterministic; if that order leaked into queue, the
-			// chain fallback below would match a frame against whichever overlapping
-			// intermediate happened to finish first, producing a different solution
-			// (and a different mosaic) on each run.
-			var newlyAligned []int
-			for r := range ch {
-				done++
-				prog.report(done, len(toAlign))
-				if r.ok {
-					results[r.i] = StarAlignmentResult{
-						OffsetX:            inputs[r.i].OffsetX,
-						OffsetY:            inputs[r.i].OffsetY,
-						ManualTransform:    r.refinement,
-						HasManualTransform: true,
-						Applied:            true,
-						MatchedStars:       r.stats.MatchedStars,
-						RMS:                r.stats.RMS,
-						MaxError:           r.stats.MaxError,
-					}
-					aligned[r.i] = true
-					newlyAligned = append(newlyAligned, r.i)
-				} else {
-					lastErr[r.i] = r.errMsg
+			srcProj, ok := projectRaw(i)
+			if !ok {
+				continue
+			}
+			bestJ := -1
+			bestSupport := -1
+			bestRMS := math.Inf(1)
+			var bestT processing.AffineTransform
+			var bestStats processing.AlignStats
+			for _, j := range ordered {
+				if j == i || !aligned[j] || !results[j].Applied || inputs[j].Excluded {
+					continue
+				}
+				// Chips of the same exposure are rigid and barely overlap; never
+				// star-match them — propagateSameExposureAlignment handles siblings.
+				if inputs[i].Path == inputs[j].Path {
+					continue
+				}
+				if evaluated[[2]int{i, j}] {
+					continue
+				}
+				evaluated[[2]int{i, j}] = true
+				if !framesMayOverlap(inputs[i], inputs[j]) {
+					continue
+				}
+				intProj, ok := projectCorrected(j)
+				if !ok {
+					continue
+				}
+				t, stats, err := processing.FitCatalogResidual(srcProj, intProj, refW, refH, chainSearchRadiusPx, fitgeom)
+				if err != nil {
+					lastErr[i] = err.Error()
+					continue
+				}
+				if stats.GlobalInliers > bestSupport ||
+					(stats.GlobalInliers == bestSupport && stats.RMS < bestRMS) {
+					bestJ = j
+					bestSupport = stats.GlobalInliers
+					bestRMS = stats.RMS
+					bestT = t
+					bestStats = stats
 				}
 			}
-			sort.Ints(newlyAligned)
-			queue = append(queue, newlyAligned...)
-		} else {
-			// Chain fallback: translate unaligned images against an already-aligned intermediate.
-			// (refIdx here is always a non-reference intermediate, never a designated reference.)
-			for _, i := range ordered {
-				if aligned[i] || inputs[i].Excluded {
-					continue
-				}
-				if prog.cancelled() {
-					return nil, ErrCancelled
-				}
-				// Skip pairs already attempted, and pairs whose WCS footprints
-				// cannot overlap (cheap center-distance test, no image warp). For
-				// a mosaic most intermediate/image pairs are far apart, so this
-				// avoids the expensive warp+star-match on pairs that can never align.
-				if triedChain[[2]int{refIdx, i}] {
-					continue
-				}
-				triedChain[[2]int{refIdx, i}] = true
-				// Chips of the same exposure (same file, different SCIExt) are rigid
-				// and barely overlap each other; never star-match them across chips —
-				// propagateSameExposureAlignment gives the sibling its solution later.
-				if inputs[i].Path == inputs[refIdx].Path {
-					continue
-				}
-				if !framesMayOverlap(inputs[i], inputs[refIdx]) {
-					continue
-				}
-				// Catalog-based residual translation against the already-aligned
-				// intermediate: projects cached star catalogs through the WCS, no
-				// full-image warp or re-extraction (which previously made this
-				// path hang on large mosaics).
-				dx, dy, _, err := processing.EstimateTranslationFromCatalogs(
-					getStars(i), inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
-					getStars(refIdx), inputs[refIdx].HDU.Header, inputs[refIdx].D2IX, inputs[refIdx].D2IY,
-				)
-				if err != nil {
-					lastErr[i] = err.Error()
-					continue
-				}
-				bToA, err := processing.ComputeWCSTransform(inputs[refIdx].HDU.Header, inputs[0].HDU.Header)
-				if err != nil {
-					lastErr[i] = err.Error()
-					continue
-				}
+			if bestJ >= 0 {
 				results[i] = StarAlignmentResult{
-					OffsetX:            bToA.A*dx + bToA.B*dy + results[refIdx].OffsetX,
-					OffsetY:            bToA.D*dx + bToA.E*dy + results[refIdx].OffsetY,
-					ManualTransform:    processing.IdentityTransform(),
-					HasManualTransform: false,
+					OffsetX:            inputs[i].OffsetX,
+					OffsetY:            inputs[i].OffsetY,
+					ManualTransform:    bestT,
+					HasManualTransform: true,
 					Applied:            true,
+					MatchedStars:       bestStats.MatchedStars,
+					RMS:                bestStats.RMS,
+					MaxError:           bestStats.MaxError,
 				}
 				aligned[i] = true
-				queue = append(queue, i)
+				progressed = true
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain-aligned input[%d] via intermediate[%d] (support=%d rms=%.2f)", i, bestJ, bestSupport, bestRMS))
 			}
 		}
 	}
