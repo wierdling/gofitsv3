@@ -1136,14 +1136,22 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			return nil, false
 		}
 		src := getStars(idx)
-		r := results[idx]
+		// Use the computed solution once it exists; otherwise fall back to the
+		// frame's accepted placement (the path designated references take, since
+		// their results entry is only filled at the very end).
+		offX, offY := inputs[idx].OffsetX, inputs[idx].OffsetY
+		mt, hasMT := inputs[idx].ManualTransform, inputs[idx].HasManualTransform
+		if results[idx].Applied {
+			offX, offY = results[idx].OffsetX, results[idx].OffsetY
+			mt, hasMT = results[idx].ManualTransform, results[idx].HasManualTransform
+		}
 		out := make([]processing.Star, len(src))
 		for k, s := range src {
 			rx, ry := m.MapPixel(s.X, s.Y)
-			rx += r.OffsetX
-			ry += r.OffsetY
-			if r.HasManualTransform {
-				rx, ry = processing.ApplyAffineTransform(r.ManualTransform, rx, ry)
+			rx += offX
+			ry += offY
+			if hasMT {
+				rx, ry = processing.ApplyAffineTransform(mt, rx, ry)
 			}
 			out[k] = processing.Star{X: rx, Y: ry, Flux: s.Flux}
 		}
@@ -1290,6 +1298,55 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				aligned[i] = true
 				progressed = true
 				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain-aligned input[%d] via intermediate[%d] (support=%d rms=%.2f)", i, bestJ, bestSupport, bestRMS))
+			}
+		}
+	}
+
+	// Global bundle adjustment: every frame so far was fit to the reference (or an
+	// intermediate) independently, so overlapping non-reference frames can disagree
+	// with each other even while each agrees with the reference. This simultaneously
+	// minimizes the cross-frame star residual over all overlaps, holding the
+	// references fixed. It runs before same-exposure propagation so rigid sibling
+	// chips inherit the adjusted solution rather than being adjusted independently.
+	// The adjustment is applied only when it strictly reduces the global residual,
+	// so it can never make an alignment worse.
+	{
+		cats := make([][]processing.Star, len(inputs))
+		fixed := make([]bool, len(inputs))
+		anyAdjustable := false
+		for i := range inputs {
+			if inputs[i].Excluded || !aligned[i] {
+				fixed[i] = true
+				continue
+			}
+			if c, ok := projectCorrected(i); ok {
+				cats[i] = c
+			} else {
+				fixed[i] = true
+				continue
+			}
+			// References and frames without a fitted residual are held fixed; only
+			// star-aligned non-reference frames may move.
+			if i < numRefs || !results[i].Applied || !results[i].HasManualTransform {
+				fixed[i] = true
+			} else {
+				anyAdjustable = true
+			}
+		}
+		if anyAdjustable {
+			mayOverlap := func(a, b int) bool {
+				return inputs[a].Path != inputs[b].Path && framesMayOverlap(inputs[a], inputs[b])
+			}
+			if updates, ok := processing.GlobalBundleAdjust(cats, fixed, mayOverlap, fitgeom, refW, refH, 5); ok {
+				adjusted := 0
+				for i := range updates {
+					if fixed[i] || updates[i] == processing.IdentityTransform() {
+						continue
+					}
+					results[i].ManualTransform = processing.ComposeAffineTransforms(updates[i], results[i].ManualTransform)
+					adjusted++
+				}
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: global bundle adjustment improved %d frame(s)", adjusted))
 			}
 		}
 	}

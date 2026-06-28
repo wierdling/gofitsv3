@@ -118,6 +118,44 @@ func TestRefineCentroidSubPixel(t *testing.T) {
 	}
 }
 
+// TestGlobalBundleAdjustReducesResidual verifies the bundle adjustment pulls an
+// adjustable frame into agreement with the fixed frames it overlaps, and leaves
+// fixed frames untouched.
+func TestGlobalBundleAdjustReducesResidual(t *testing.T) {
+	var grid []Star
+	for gx := 0; gx < 5; gx++ {
+		for gy := 0; gy < 5; gy++ {
+			grid = append(grid, Star{X: 60 + float64(gx)*100, Y: 60 + float64(gy)*100})
+		}
+	}
+	cats := make([][]Star, 3)
+	cats[0] = append([]Star(nil), grid...) // reference, fixed
+	cats[1] = append([]Star(nil), grid...) // another fixed frame
+	// Frame 2 carries a small consistent error (<bundleMatchRadiusPx so the
+	// correspondences still form): 1.5 px in x, -1.0 px in y.
+	bad := AffineTransform{A: 1, C: 1.5, E: 1, F: -1.0}
+	cats[2] = make([]Star, len(grid))
+	for i, s := range grid {
+		x, y := ApplyAffineTransform(bad, s.X, s.Y)
+		cats[2][i] = Star{X: x, Y: y}
+	}
+
+	fixed := []bool{true, true, false}
+	updates, ok := GlobalBundleAdjust(cats, fixed, func(a, b int) bool { return true }, "general", 600, 600, 5)
+	if !ok {
+		t.Fatalf("bundle adjustment did not improve the global residual")
+	}
+	if updates[0] != IdentityTransform() || updates[1] != IdentityTransform() {
+		t.Fatalf("fixed frames must not move: %+v %+v", updates[0], updates[1])
+	}
+	for i, s := range cats[2] {
+		x, y := ApplyAffineTransform(updates[2], s.X, s.Y)
+		if d := math.Hypot(x-grid[i].X, y-grid[i].Y); d > 0.1 {
+			t.Fatalf("frame 2 star %d still %.3f px off after adjustment", i, d)
+		}
+	}
+}
+
 func TestTransformGlobalSupport(t *testing.T) {
 	stars := []Star{
 		{X: 10, Y: 12}, {X: 120, Y: 30}, {X: 200, Y: 80}, {X: 60, Y: 150},
