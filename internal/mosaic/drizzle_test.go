@@ -97,6 +97,31 @@ func TestBuildExposureWeightingNormalizesToRate(t *testing.T) {
 	}
 }
 
+func TestBuildExposureWeightingPreservesCalibratedFlux(t *testing.T) {
+	// JWST-style calibrated frames (MJy/sr) are already absolute flux, not
+	// counts, so Exposure/ERR weighting must NOT divide them by EXPTIME the way
+	// it does for count data (see TestBuildExposureWeightingNormalizesToRate).
+	ref := makeInput("ref_cal.fits", 2, 2, filledPixels(2, 2, 100), headerWithCRPIX(10, 10))
+	ref.ExposureTime = 100
+	ref.PrimaryHeader.Cards["EXPTIME"] = "100"
+	ref.BUnit = "MJy/sr"
+	other := makeInput("other_cal.fits", 2, 2, filledPixels(2, 2, 100), headerWithCRPIX(10, 10))
+	other.ExposureTime = 110
+	other.PrimaryHeader.Cards["EXPTIME"] = "110"
+	other.BUnit = "MJy/sr"
+
+	result, err := Build([]Input{ref, other}, Options{Scale: 1, WeightingMode: WeightExposure})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+
+	for i := range result.Pixels {
+		if math.Abs(float64(result.Pixels[i]-100)) > 1e-4 {
+			t.Fatalf("pixel[%d] = %v, want 100 (calibrated flux must not be divided by EXPTIME)", i, result.Pixels[i])
+		}
+	}
+}
+
 func TestBuildExposureWeightingWithDrizzleCRKeepsValidPixels(t *testing.T) {
 	ref := makeInput("ref_flc.fits", 2, 2, []float32{100, 110, 90, 100}, headerWithCRPIX(10, 10))
 	ref.ExposureTime = 100

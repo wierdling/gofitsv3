@@ -173,6 +173,53 @@ func TestDiscoverFiltersGroupsRealWFPC2FLTFiles(t *testing.T) {
 	}
 }
 
+func TestDiscoverFiltersGroupsJWSTCalFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeMinimalFITS(t, filepath.Join(dir, "jw01_cal.fits"), "F770W")
+	writeMinimalFITS(t, filepath.Join(dir, "jw02_cal.fits"), "F770W")
+	writeMinimalFITS(t, filepath.Join(dir, "jw03_cal.fits"), "F1000W")
+
+	groups, err := DiscoverFilters(dir)
+	if err != nil {
+		t.Fatalf("DiscoverFilters returned error: %v", err)
+	}
+	if got := len(groups["F770W"]); got != 2 {
+		t.Fatalf("len(F770W) = %d, want 2", got)
+	}
+	if got := len(groups["F1000W"]); got != 1 {
+		t.Fatalf("len(F1000W) = %d, want 1", got)
+	}
+}
+
+func TestProductTypeRecognisesCal(t *testing.T) {
+	cases := map[string]string{
+		"ick909c1q_flc.fits": "flc",
+		"u6l60101m_flt.fits": "flt",
+		"jw01234_cal.fits":   "cal",
+		"random.fits":        "",
+	}
+	for path, want := range cases {
+		if got := ProductType(path); got != want {
+			t.Fatalf("ProductType(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestAvailableProductTypesReportsCal(t *testing.T) {
+	dir := t.TempDir()
+	writeMinimalFITS(t, filepath.Join(dir, "rawa_flc.fits"), "F606W")
+	writeMinimalFITS(t, filepath.Join(dir, "jw01_cal.fits"), "F770W")
+
+	filesByFilter, err := DiscoverFilterFiles(dir)
+	if err != nil {
+		t.Fatalf("DiscoverFilterFiles returned error: %v", err)
+	}
+	hasFLC, hasFLT, hasCal := AvailableProductTypes(filesByFilter)
+	if !hasFLC || hasFLT || !hasCal {
+		t.Fatalf("AvailableProductTypes = (flc=%t,flt=%t,cal=%t), want (true,false,true)", hasFLC, hasFLT, hasCal)
+	}
+}
+
 func writeMinimalFITS(t *testing.T, path string, filter string) {
 	t.Helper()
 	content := makeHeaderCard("SIMPLE", "=                    T") +

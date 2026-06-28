@@ -56,6 +56,19 @@ const wfc3BadDQ = dqBadDetector | dqHot | dqUnstable | dqSaturated | dqBadFlat |
 // acsBadDQ is the shared bad-pixel bitmask for ACS detectors.
 const acsBadDQ = dqBadDetector | dqHot | dqUnstable | dqSaturated | dqBadFlat | dqChargeTrap | dqCRRejected
 
+// JWST DQ flags use a completely different bit convention from HST (see
+// jwst.datamodels.dqflags.pixel). DO_NOT_USE is the master "this pixel is not
+// usable" flag the pipeline sets whenever a pixel should be discarded, so it is
+// the correct gate for masking/interpolation. Masking on every non-zero DQ bit
+// (the HST-style default) would wrongly reject the many usable pixels that
+// carry only informational flags.
+const (
+	jwstDoNotUse uint32 = 1
+)
+
+// jwstBadDQ is the bad-pixel bitmask for JWST detectors: only DO_NOT_USE.
+const jwstBadDQ = jwstDoNotUse
+
 var detectors = map[key]Info{
 	{"WFC3", "IR"}:   {PixelScale: 0.128, Chips: 1, ChipInnerTrim: 10, HasSIP: true, BadDQBits: wfc3BadDQ},
 	{"WFC3", "UVIS"}: {PixelScale: 0.0396, Chips: 2, ChipInnerTrim: 10, HasSIP: true, BadDQBits: wfc3BadDQ},
@@ -66,6 +79,23 @@ var detectors = map[key]Info{
 	// native scales, so drizzle should prefer per-chip WCS; this fallback scale is
 	// only used when WCS scale cannot be read.
 	{"WFPC2", "PC"}: {PixelScale: 0.0996, Chips: 4, ChipInnerTrim: 0, HasSIP: false, BadDQBits: 0},
+	// JWST MIRI imager (_cal Stage-2 products). Single SCI extension, no
+	// inter-chip gap; the cal-file SCI header carries an approximate SIP WCS.
+	{"MIRI", "MIRIMAGE"}: {PixelScale: 0.11, Chips: 1, ChipInnerTrim: 0, HasSIP: true, BadDQBits: jwstBadDQ},
+	// JWST NIRCam detectors are registered in init() below (one _cal per
+	// detector). Short-wave modules (NRCA1-4, NRCB1-4) sample at ~0.031"/px and
+	// long-wave (NRCALONG, NRCBLONG) at ~0.063"/px. Native scale is read from the
+	// WCS at drizzle time; these entries mainly carry the JWST DQ mask and SIP.
+}
+
+func init() {
+	sw := Info{PixelScale: 0.031, Chips: 1, ChipInnerTrim: 0, HasSIP: true, BadDQBits: jwstBadDQ}
+	lw := Info{PixelScale: 0.063, Chips: 1, ChipInnerTrim: 0, HasSIP: true, BadDQBits: jwstBadDQ}
+	for _, d := range []string{"NRCA1", "NRCA2", "NRCA3", "NRCA4", "NRCB1", "NRCB2", "NRCB3", "NRCB4"} {
+		detectors[key{"NIRCAM", d}] = sw
+	}
+	detectors[key{"NIRCAM", "NRCALONG"}] = lw
+	detectors[key{"NIRCAM", "NRCBLONG"}] = lw
 }
 
 type key struct {

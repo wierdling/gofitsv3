@@ -391,6 +391,15 @@ type plannedInput struct {
 	mapper           *processing.WCSMapper      // per-pixel WCS projection, used for drizzle
 	sourcePixelScale float64                    // source pixel size in reference-pixel units
 	statusIndex      int
+	// cancel, when non-nil, is polled at row intervals inside the per-frame
+	// drizzle kernels so a single large frame can be interrupted partway through
+	// rather than only between frames. Returns true once the build is cancelled.
+	cancel func() bool
+}
+
+// cancelled reports whether this frame's drizzle should abort early.
+func (p *plannedInput) cancelled() bool {
+	return p.cancel != nil && p.cancel()
 }
 
 // mapPixel projects a 0-indexed source pixel through the full WCS pipeline
@@ -464,6 +473,14 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	planned, statuses, minX, minY, maxX, maxY, err := planInputs(inputs, options.Scale)
 	if err != nil {
 		return nil, err
+	}
+
+	// Let the heavy per-frame drizzle kernels (and the streamed CR median model)
+	// poll for cancellation mid-frame so a single large frame doesn't have to
+	// finish before the build aborts.
+	cancelFn := func() bool { return options.cancelled() != nil }
+	for i := range planned {
+		planned[i].cancel = cancelFn
 	}
 
 	width := int(math.Ceil((maxX - minX + 1) * options.Scale))
@@ -1137,6 +1154,13 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			}
 
 			done := 0
+			// Collect newly-aligned indices and enqueue them in a deterministic
+			// (ascending) order. Draining the channel follows goroutine-completion
+			// order, which is nondeterministic; if that order leaked into queue, the
+			// chain fallback below would match a frame against whichever overlapping
+			// intermediate happened to finish first, producing a different solution
+			// (and a different mosaic) on each run.
+			var newlyAligned []int
 			for r := range ch {
 				done++
 				prog.report(done, len(toAlign))
@@ -1152,11 +1176,13 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 						MaxError:           r.stats.MaxError,
 					}
 					aligned[r.i] = true
-					queue = append(queue, r.i)
+					newlyAligned = append(newlyAligned, r.i)
 				} else {
 					lastErr[r.i] = r.errMsg
 				}
 			}
+			sort.Ints(newlyAligned)
+			queue = append(queue, newlyAligned...)
 		} else {
 			// Chain fallback: translate unaligned images against an already-aligned intermediate.
 			// (refIdx here is always a non-reference intermediate, never a designated reference.)
@@ -1867,8 +1893,28 @@ func frameExposureNormalized(input Input) bool {
 		isFinite64(input.ExposureScale) && input.ExposureScale > 0
 }
 
+// bunitIsAlreadyRate reports whether a BUNIT denotes data that is already in
+// per-time rate or absolutely-calibrated flux/surface-brightness units (e.g.
+// "ELECTRONS/S", JWST "MJy/sr"), as opposed to total detector counts. Such data
+// must never be divided by EXPTIME for Exposure/ERR weighting.
+func bunitIsAlreadyRate(bunit string) bool {
+	if rate, known := bunitIsRate(bunit); known && rate {
+		return true
+	}
+	return bunitIsCalibratedFlux(bunit)
+}
+
+// framePixelsAreRate reports whether this frame's SCI/ERR pixels are already a
+// rate (or calibrated flux) and so must NOT be divided by EXPTIME during
+// Exposure/ERR weighting. True when prepareFramePixels already normalized the
+// frame, or when BUNIT indicates a rate/calibrated-flux unit. This is broader
+// than frameExposureNormalized, which only reports the explicit pre-scale path.
+func framePixelsAreRate(input Input) bool {
+	return frameExposureNormalized(input) || bunitIsAlreadyRate(input.BUnit)
+}
+
 func normalizedPixelsForWeighting(input Input, pixels []float32, weightingMode WeightingMode) []float32 {
-	if frameExposureNormalized(input) {
+	if framePixelsAreRate(input) {
 		// Pixels are already a rate; no further per-exptime scaling.
 		return pixels
 	}
@@ -1900,9 +1946,10 @@ func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) fl
 	case WeightERR:
 		if errPix := p.input.ERRPixels; errPix != nil && idx < len(errPix) {
 			if e := errPix[idx]; e > 0 && isFinite32(e) {
-				// When the frame is already exposure-normalized, ERR is in rate
-				// units too, so use it directly. Otherwise convert to a rate sigma.
-				if !frameExposureNormalized(p.input) && exptime > 0 {
+				// When the frame is already a rate (pre-normalized or calibrated
+				// flux), ERR is in the same units, so use it directly. Otherwise
+				// convert the count-based sigma to a rate sigma.
+				if !framePixelsAreRate(p.input) && exptime > 0 {
 					rateErr := e / float32(exptime)
 					if rateErr > 0 && isFinite32(rateErr) {
 						return 1.0 / (rateErr * rateErr)
@@ -1916,9 +1963,9 @@ func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) fl
 }
 
 func drizzlePixelValue(p plannedInput, idx int, value float32, weightingMode WeightingMode) float32 {
-	if frameExposureNormalized(p.input) {
-		// Pixels were already converted to a rate by prepareFramePixels; do not
-		// divide by EXPTIME again.
+	if framePixelsAreRate(p.input) {
+		// Pixels are already a rate (pre-normalized or calibrated flux units);
+		// do not divide by EXPTIME.
 		return value
 	}
 	switch weightingMode {
@@ -1935,6 +1982,9 @@ func drizzlePlannedInputPoint(p plannedInput, sums, weights []float32, width, he
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle point: row %d/%d (%s)", y, data.Height, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -1963,6 +2013,9 @@ func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, h
 	const maxExtremeLog = 3
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle square: row %d/%d extreme=%d (%s)", y, data.Height, extremeCount, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -2002,6 +2055,9 @@ func drizzlePlannedInputTurbo(p plannedInput, sums, weights []float32, width, he
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle turbo: row %d/%d (%s)", y, data.Height, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -2029,6 +2085,9 @@ func drizzlePlannedInputGaussian(p plannedInput, sums, weights []float32, width,
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle gaussian: row %d/%d (%s)", y, data.Height, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -2056,6 +2115,9 @@ func drizzlePlannedInputTophat(p plannedInput, sums, weights []float32, width, h
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle tophat: row %d/%d (%s)", y, data.Height, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -2081,6 +2143,9 @@ func drizzlePlannedInputLanczos(p plannedInput, sums, weights []float32, width, 
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle lanczos%d: row %d/%d (%s)", n, y, data.Height, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -2371,6 +2436,19 @@ func drizzleBuildStatus(skysubApplied, cleaned bool) string {
 func LooksLikeFLC(path string) bool {
 	base := strings.ToLower(filepath.Base(path))
 	return strings.Contains(base, "_flc") || strings.Contains(base, "_flt")
+}
+
+// LooksLikeCal reports whether path is a JWST Stage-2 calibrated product
+// (_cal.fits), the per-exposure input used to build mosaics.
+func LooksLikeCal(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	return strings.Contains(base, "_cal")
+}
+
+// LooksLikeCalibratedInput reports whether path is a supported calibrated
+// science exposure: HST _flc/_flt or JWST _cal.
+func LooksLikeCalibratedInput(path string) bool {
+	return LooksLikeFLC(path) || LooksLikeCal(path)
 }
 
 func formatFloat(v float64) string {

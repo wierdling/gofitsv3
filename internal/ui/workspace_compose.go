@@ -1853,6 +1853,30 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}, win)
 	}
 
+	resetCompose := func() {
+		dialog.ShowConfirm("Reset Compose", "Clear all images and reset Build color composite?", func(ok bool) {
+			if !ok {
+				return
+			}
+			for i := range imgs {
+				imgs[i] = nil
+				clearComposeOrigPixels(&origPixels, i)
+			}
+			for i := range viewports {
+				viewports[i].image.Image = blankImg()
+			}
+			buildCompositeCheck.SetChecked(false)
+			refresh()
+			if updateMenus != nil {
+				updateMenus()
+			}
+			go func() {
+				runtime.GC()
+				debug.FreeOSMemory()
+			}()
+		}, win)
+	}
+
 	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 Settings to 2 & 3", copySettings)
 	matchStretchItem := fyne.NewMenuItem("Match Channel Stretch...", showMatchStretchDialog)
 	addOrangeItem := fyne.NewMenuItem("Add Orange Image...", openOrangeWindow)
@@ -1966,6 +1990,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	clearBtn := widget.NewButton("Clear Channels", clearChannels)
 	clearBtn.Importance = widget.DangerImportance
 
+	resetBtn := widget.NewButton("Reset", resetCompose)
+	resetBtn.Importance = widget.DangerImportance
+
 	histScaleStatus := widget.NewLabel("")
 	histScaleStatus.Wrapping = fyne.TextWrapWord
 	updateHistScaleLabel = func() {
@@ -1988,6 +2015,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		blinkStatus,
 		container.NewHBox(measureCheck, widget.NewLabel("Measure composite")),
 		clearBtn,
+		resetBtn,
 		widget.NewSeparator(),
 		measureLabel,
 		widget.NewSeparator(),

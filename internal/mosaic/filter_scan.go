@@ -61,7 +61,7 @@ func DiscoverFilterFiles(dir string) (map[string][]FilterFile, error) {
 		}
 
 		path := filepath.Join(dir, entry.Name())
-		if !LooksLikeFLC(path) || IsPipelineProductFLC(path) {
+		if !LooksLikeCalibratedInput(path) || IsPipelineProductFLC(path) {
 			continue
 		}
 
@@ -73,7 +73,7 @@ func DiscoverFilterFiles(dir string) (map[string][]FilterFile, error) {
 		if filter == "" {
 			filter = "Unknown"
 		}
-		proposalID := fitsio.HeaderString(header, "PROPOSID", "PROPOSAL", "PROPOSALID")
+		proposalID := fitsio.HeaderString(header, "PROPOSID", "PROPOSAL", "PROPOSALID", "PROGRAM")
 		if proposalID == "" {
 			proposalID = "Unknown"
 		}
@@ -88,7 +88,7 @@ func DiscoverFilterFiles(dir string) (map[string][]FilterFile, error) {
 		})
 	}
 	if len(groups) == 0 {
-		return nil, fmt.Errorf("no matching calibrated _flc/_flt FITS files with filter headers found in %s", dir)
+		return nil, fmt.Errorf("no matching calibrated _flc/_flt/_cal FITS files with filter headers found in %s", dir)
 	}
 	return groups, nil
 }
@@ -285,8 +285,9 @@ func filterFromOption(option string) string {
 	return option
 }
 
-// ProductType reports the calibrated product type of an input path, "flc" or
-// "flt", or "" when the filename matches neither.
+// ProductType reports the calibrated product type of an input path: "flc"
+// (HST CTE-corrected), "flt" (HST), or "cal" (JWST Stage-2), or "" when the
+// filename matches none.
 func ProductType(path string) string {
 	base := strings.ToLower(filepath.Base(path))
 	switch {
@@ -294,14 +295,16 @@ func ProductType(path string) string {
 		return "flc"
 	case strings.Contains(base, "_flt"):
 		return "flt"
+	case strings.Contains(base, "_cal"):
+		return "cal"
 	default:
 		return ""
 	}
 }
 
-// AvailableProductTypes reports whether any discovered file is an _flc and/or an
-// _flt product, across all filters.
-func AvailableProductTypes(filesByFilter map[string][]FilterFile) (hasFLC, hasFLT bool) {
+// AvailableProductTypes reports which calibrated product types (_flc, _flt,
+// JWST _cal) are present across all discovered files.
+func AvailableProductTypes(filesByFilter map[string][]FilterFile) (hasFLC, hasFLT, hasCal bool) {
 	for _, files := range filesByFilter {
 		for _, file := range files {
 			switch ProductType(file.Path) {
@@ -309,8 +312,10 @@ func AvailableProductTypes(filesByFilter map[string][]FilterFile) (hasFLC, hasFL
 				hasFLC = true
 			case "flt":
 				hasFLT = true
+			case "cal":
+				hasCal = true
 			}
-			if hasFLC && hasFLT {
+			if hasFLC && hasFLT && hasCal {
 				return
 			}
 		}

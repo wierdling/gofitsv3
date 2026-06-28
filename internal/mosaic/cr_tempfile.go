@@ -105,7 +105,7 @@ func buildCRMasksDrizzle(
 	// ---- Phase 2: streamed median model ----
 	logMemStats("CR median-model start")
 	debuglog.Log("buildCRMasksDrizzle: building median model from temp files")
-	model, err := buildMedianModelFromFiles(paths, width, height, n)
+	model, err := buildMedianModelFromFiles(paths, width, height, n, func() bool { return opts.cancelled() != nil })
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +232,7 @@ func maskConcurrency() int {
 // horizontal row bands and minmed/median-combines them into a single model image.
 // Uncovered pixels are written as NaN and ignored. n is the original frame count
 // (used for the minmed-vs-median threshold), matching the in-memory path.
-func buildMedianModelFromFiles(paths []string, width, height, n int) ([]float32, error) {
+func buildMedianModelFromFiles(paths []string, width, height, n int, cancel func() bool) ([]float32, error) {
 	model := make([]float32, width*height)
 
 	files := make([]*os.File, len(paths))
@@ -289,6 +289,9 @@ func buildMedianModelFromFiles(paths []string, width, height, n int) ([]float32,
 	vals := make([]float32, 0, active)
 
 	for startRow := 0; startRow < height; startRow += bandRows {
+		if cancel != nil && cancel() {
+			return nil, ErrCancelled
+		}
 		rows := bandRows
 		if startRow+rows > height {
 			rows = height - startRow

@@ -617,16 +617,24 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						dateMaxSelect.OnChanged = func(string) { updateSelectedFiles() }
 					}
 
-					hasFLC, hasFLT := mosaic.AvailableProductTypes(filesByFilter)
-					typeRadio = widget.NewRadioGroup([]string{".flc", ".flt"}, nil)
-					typeRadio.Horizontal = true
+					hasFLC, hasFLT, hasCal := mosaic.AvailableProductTypes(filesByFilter)
+					var typeOptions []string
 					if hasFLC {
-						typeRadio.SetSelected(".flc")
-					} else {
-						typeRadio.SetSelected(".flt")
+						typeOptions = append(typeOptions, ".flc")
+					}
+					if hasFLT {
+						typeOptions = append(typeOptions, ".flt")
+					}
+					if hasCal {
+						typeOptions = append(typeOptions, ".cal")
+					}
+					typeRadio = widget.NewRadioGroup(typeOptions, nil)
+					typeRadio.Horizontal = true
+					if len(typeOptions) > 0 {
+						typeRadio.SetSelected(typeOptions[0])
 					}
 					// Only one product type present: lock the choice to it.
-					if !(hasFLC && hasFLT) {
+					if len(typeOptions) <= 1 {
 						typeRadio.Disable()
 					}
 					typeRadio.OnChanged = func(string) {

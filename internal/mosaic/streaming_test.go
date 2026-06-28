@@ -192,13 +192,13 @@ func TestBuildMedianModelFromFilesBandingMatches(t *testing.T) {
 	defer func() { crModelMemBudget = saved }()
 
 	crModelMemBudget = 1 << 30 // single band
-	full, err := buildMedianModelFromFiles(paths, width, height, n)
+	full, err := buildMedianModelFromFiles(paths, width, height, n, nil)
 	if err != nil {
 		t.Fatalf("full-band model: %v", err)
 	}
 
 	crModelMemBudget = 1 // forces bandRows == 1
-	banded, err := buildMedianModelFromFiles(paths, width, height, n)
+	banded, err := buildMedianModelFromFiles(paths, width, height, n, nil)
 	if err != nil {
 		t.Fatalf("banded model: %v", err)
 	}
