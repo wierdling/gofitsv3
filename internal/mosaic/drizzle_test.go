@@ -1,6 +1,7 @@
 package mosaic
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -438,6 +439,74 @@ func TestAlignInputsBySelectedStarsAppliesAffineRefinement(t *testing.T) {
 		x, y := processing.ApplyAffineTransform(results[1].ManualTransform, ts.X, ts.Y)
 		if math.Hypot(x-refStars[i].X, y-refStars[i].Y) > 2.0 {
 			t.Fatalf("star %d remapped to (%.2f, %.2f), want near (%.2f, %.2f)", i, x, y, refStars[i].X, refStars[i].Y)
+		}
+	}
+}
+
+// TestAlignInputsByStarsIsDeterministic guards the whole multi-frame aligner
+// (not just the RANSAC solver) against run-to-run variation. The aligner aligns
+// frames concurrently and previously enqueued the results in goroutine-completion
+// order, which let the chain fallback pick a different intermediate per run and
+// produced a different mosaic. Every stage must now be deterministic, so running
+// the identical inputs twice must yield byte-identical results.
+func TestAlignInputsByStarsIsDeterministic(t *testing.T) {
+	refStars := []processing.Star{
+		{X: 60, Y: 60}, {X: 220, Y: 60}, {X: 380, Y: 60},
+		{X: 140, Y: 220}, {X: 300, Y: 220}, {X: 220, Y: 340},
+	}
+	refPixels := makeTestStarField(400, 400, refStars)
+	wcsHdr := func() fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "200", "CRPIX2": "200",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "0.0001", "CD1_2": "0", "CD2_1": "0", "CD2_2": "0.0001",
+		}}
+	}
+
+	// One reference plus several targets at small, distinct rotations+shifts so
+	// the concurrent primary pass runs many goroutines whose completion order is a
+	// race.
+	makeInputs := func() []Input {
+		inputs := []Input{makeInput("ref_flc.fits", 400, 400, refPixels, wcsHdr())}
+		offsets := []struct {
+			angleDeg, dx, dy float64
+		}{
+			{1.5, 2.0, -1.0}, {-2.0, -1.5, 2.5}, {0.8, -3.0, -2.0}, {2.5, 1.0, 1.5},
+		}
+		for k, o := range offsets {
+			ts := transformStarsAroundCenter(refStars, 200, 200, o.angleDeg*math.Pi/180, o.dx, o.dy)
+			px := makeTestStarField(400, 400, ts)
+			inputs = append(inputs, makeInput(fmt.Sprintf("target%d_flc.fits", k), 400, 400, px, wcsHdr()))
+		}
+		return inputs
+	}
+
+	first, err := AlignInputsByStarsWithMode(makeInputs(), 1, AlignmentModeTweakRegRScale, 2.0)
+	if err != nil {
+		t.Fatalf("first align returned error: %v", err)
+	}
+	// Guard against a vacuous pass: the test is only meaningful if alignment
+	// actually ran and produced transforms for the targets.
+	for i := 1; i < len(first); i++ {
+		if !first[i].Applied || !first[i].HasManualTransform {
+			t.Fatalf("target %d did not align (Applied=%v HasManualTransform=%v, err=%q); test would be vacuous",
+				i, first[i].Applied, first[i].HasManualTransform, first[i].Error)
+		}
+	}
+	// Run several more times; any nondeterminism (map iteration, goroutine order,
+	// unstable sort tie) tends to surface only intermittently, so repeat.
+	for run := 0; run < 8; run++ {
+		next, err := AlignInputsByStarsWithMode(makeInputs(), 1, AlignmentModeTweakRegRScale, 2.0)
+		if err != nil {
+			t.Fatalf("run %d align returned error: %v", run, err)
+		}
+		if len(next) != len(first) {
+			t.Fatalf("run %d produced %d results, want %d", run, len(next), len(first))
+		}
+		for i := range first {
+			if next[i] != first[i] {
+				t.Fatalf("run %d result[%d] differs:\n first: %+v\n  this: %+v", run, i, first[i], next[i])
+			}
 		}
 	}
 }

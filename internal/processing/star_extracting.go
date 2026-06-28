@@ -265,7 +265,20 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 	// In nebula fields, extended emission knots have high integrated flux but
 	// low peak brightness. Real stars are compact and bright per pixel, so
 	// peak-sorted lists contain mostly actual stars rather than nebula features.
-	sort.Slice(stars, func(i, j int) bool { return stars[i].Peak > stars[j].Peak })
+	// Sort brightest-first, with position tiebreakers so the ordering is fully
+	// deterministic even when two sources share an identical peak (e.g. saturated
+	// pixels clamped to the same value). A stable order is required upstream: the
+	// matcher uses the brightest-N, so any reordering would change which stars are
+	// matched and make alignment non-reproducible.
+	sort.Slice(stars, func(i, j int) bool {
+		if stars[i].Peak != stars[j].Peak {
+			return stars[i].Peak > stars[j].Peak
+		}
+		if stars[i].X != stars[j].X {
+			return stars[i].X < stars[j].X
+		}
+		return stars[i].Y < stars[j].Y
+	})
 	return stars
 }
 
