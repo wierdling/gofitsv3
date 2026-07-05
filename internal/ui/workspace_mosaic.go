@@ -295,12 +295,18 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			if state.alignmentSettings.DebugAlignment {
 				defer installAlignmentDebugHook(win)()
 			}
-			if err := ws.ensureInputPixelsLoaded(); err != nil {
-				fyne.Do(func() {
-					progressDialog.Hide()
-					dialog.ShowError(err, win)
-				})
-				return
+			// TweakReg modes stream each frame's pixels on demand during
+			// alignment, so only the legacy warp-based modes (and the debug hook,
+			// which needs image backdrops) require every frame resident up front.
+			alignMode := mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode)
+			if !mosaic.AlignmentStreamsPixels(alignMode) || state.alignmentSettings.DebugAlignment {
+				if err := ws.ensureInputPixelsLoaded(); err != nil {
+					fyne.Do(func() {
+						progressDialog.Hide()
+						dialog.ShowError(err, win)
+					})
+					return
+				}
 			}
 			alignInputs := ws.inputsWithRef()
 			numRefs := state.alignmentSettings.NumRefs
@@ -552,22 +558,55 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						return filtered
 					}
 
-					setSelectSelection := func(sel *SafeSelect, options []string, selected string) {
+					var updating bool
+
+					productFilteredFiles := func() []mosaic.FilterFile {
+						product := productType()
+						if product == "" {
+							return files
+						}
+						filtered := make([]mosaic.FilterFile, 0, len(files))
+						for _, f := range files {
+							if mosaic.ProductType(f.Path) == product {
+								filtered = append(filtered, f)
+							}
+						}
+						return filtered
+					}
+
+					setSelectSelection := func(sel *SafeSelect, options []string) {
+						oldFacet := mosaic.FacetValue(sel.Selected)
 						sel.Options = options
 						sel.Refresh()
-						if selected != "" {
-							sel.SetSelected(selected)
-							return
+						if oldFacet != "" {
+							for _, opt := range options {
+								if mosaic.FacetValue(opt) == oldFacet {
+									sel.SetSelected(opt)
+									return
+								}
+							}
 						}
 						if len(options) > 0 {
 							sel.SetSelected(options[0])
+						} else {
+							sel.SetSelected("")
 						}
 					}
 
 					updateDependentOptions := func() {
+						if updating {
+							return
+						}
+						updating = true
+						defer func() { updating = false }()
+
+						// 1. Update filter options based on product type
+						setSelectSelection(filterSelect, mosaic.FilterFacetOptions(productFilteredFiles()))
+
+						// 2. Update dependent selections based on both product type and filter
 						filtered := filteredFiles()
-						setSelectSelection(proposalSelect, mosaic.ProposalFacetOptions(filtered), "Any ("+fmt.Sprintf("%d files", len(filtered))+")")
-						setSelectSelection(exposureSelect, mosaic.ExposureFacetOptions(filtered), "Any ("+fmt.Sprintf("%d files", len(filtered))+")")
+						setSelectSelection(proposalSelect, mosaic.ProposalFacetOptions(filtered))
+						setSelectSelection(exposureSelect, mosaic.ExposureFacetOptions(filtered))
 						if dateMinSelect != nil {
 							dates := mosaic.DateValues(filtered)
 							dateMinSelect.Options = append([]string(nil), dates...)
@@ -585,6 +624,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					}
 
 					updateSelectedFiles := func() {
+						if updating {
+							return
+						}
 						paths := mosaic.MatchFiles(files, criteria())
 						fileChecks = make([]fileCheck, len(paths))
 						checkBoxes = make([]*widget.Check, len(paths))
@@ -738,10 +780,16 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			if state.alignmentSettings.DebugAlignment {
 				defer installAlignmentDebugHook(win)()
 			}
-			if err := ws.ensureInputPixelsLoaded(); err != nil {
-				pt.hide()
-				fyne.Do(func() { dialog.ShowError(err, win) })
-				return
+			// TweakReg modes stream each frame's pixels on demand during
+			// alignment, so only the legacy warp-based modes (and the debug hook,
+			// which needs image backdrops) require every frame resident up front.
+			alignMode := mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode)
+			if !mosaic.AlignmentStreamsPixels(alignMode) || state.alignmentSettings.DebugAlignment {
+				if err := ws.ensureInputPixelsLoaded(); err != nil {
+					pt.hide()
+					fyne.Do(func() { dialog.ShowError(err, win) })
+					return
+				}
 			}
 			alignInputs := ws.inputsWithRef()
 			numRefs := state.alignmentSettings.NumRefs
@@ -753,7 +801,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			if state.referenceInput != nil {
 				numRefs = 1
 			}
-			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, numRefs, mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec, mosaic.AlignProgress{
+			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, numRefs, alignMode, state.alignmentSettings.SearchRadiusArcsec, mosaic.AlignProgress{
 				Progress: func(done, total int) { pt.progress("Aligning", done, total) },
 				Ctx:      pt.ctx,
 			})

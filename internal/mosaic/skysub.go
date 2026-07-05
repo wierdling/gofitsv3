@@ -142,7 +142,7 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyP
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			pixels, _, perr := prepareFramePixels(planned[i], opts, 0, skyPlane{})
+			pixels, _, _, perr := prepareFramePixels(planned[i], opts, 0, skyPlane{})
 			if perr != nil {
 				skyErrMu.Lock()
 				if skyErr == nil {
@@ -422,7 +422,9 @@ func estimateSkyFromValues(values []float64, options SkysubOptions) (float64, er
 	if len(work) == 0 {
 		return 0, fmt.Errorf("all sky pixels rejected by clipping")
 	}
-	sort.Float64s(work)
+	// Only the median needs the values sorted. The mean is order-independent and
+	// the mode bins by value, so sorting (an O(n log n) pass over up to ~2M
+	// samples per frame) is pure waste for those two statistics.
 	switch options.Stat {
 	case SkyStatMean:
 		mean, _ := meanAndSigma(work)
@@ -430,24 +432,120 @@ func estimateSkyFromValues(values []float64, options SkysubOptions) (float64, er
 	case SkyStatMode:
 		return histogramMode(work, options.Width), nil
 	default:
-		return medianFloat64(work), nil
+		return quickSelectMedian(work), nil
 	}
 }
 
-func histogramMode(sorted []float64, widthSigma float64) float64 {
-	if len(sorted) == 0 {
+// quickSelectMedian returns the median of values, reordering the slice in place.
+// It runs in O(n) average time using a three-way partition that stays linear
+// even when the data contains many equal values (common in integer-quantised
+// sky backgrounds), avoiding the O(n log n) cost of a full sort just to read out
+// the middle element(s). The result is the exact median, identical to sorting.
+func quickSelectMedian(values []float64) float64 {
+	n := len(values)
+	if n == 0 {
 		return 0
 	}
-	_, sigma := meanAndSigma(sorted)
+	mid := n / 2
+	kth := selectKth(values, mid)
+	if n%2 == 1 {
+		return kth
+	}
+	// Even count: also need the (mid-1)th order statistic. selectKth left every
+	// element in values[:mid] <= kth, so the (mid-1)th smallest is the maximum of
+	// that left partition.
+	lower := values[0]
+	for _, v := range values[1:mid] {
+		if v > lower {
+			lower = v
+		}
+	}
+	return 0.5 * (lower + kth)
+}
+
+// selectKth reorders a in place so that a[k] holds the k-th smallest element,
+// with every element left of k <= a[k] and every element right of k >= a[k].
+// It uses a three-way (Dutch-flag) partition with a median-of-three pivot, which
+// keeps duplicate-heavy inputs linear and avoids the sorted-input worst case.
+func selectKth(a []float64, k int) float64 {
+	lo, hi := 0, len(a)-1
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		pivot := medianOfThree(a[lo], a[mid], a[hi])
+		lt, i, gt := lo, lo, hi
+		for i <= gt {
+			switch {
+			case a[i] < pivot:
+				a[lt], a[i] = a[i], a[lt]
+				lt++
+				i++
+			case a[i] > pivot:
+				a[i], a[gt] = a[gt], a[i]
+				gt--
+			default:
+				i++
+			}
+		}
+		// a[lo:lt] < pivot, a[lt:gt+1] == pivot, a[gt+1:hi+1] > pivot.
+		switch {
+		case k < lt:
+			hi = lt - 1
+		case k > gt:
+			lo = gt + 1
+		default:
+			return a[k]
+		}
+	}
+	return a[k]
+}
+
+func medianOfThree(a, b, c float64) float64 {
+	if a < b {
+		switch {
+		case b < c:
+			return b
+		case a < c:
+			return c
+		default:
+			return a
+		}
+	}
+	switch {
+	case a < c:
+		return a
+	case b < c:
+		return c
+	default:
+		return b
+	}
+}
+
+// histogramMode finds the modal background from an unsorted slice of values. It
+// derives its own min/max in a single linear pass rather than requiring the
+// caller to pre-sort.
+func histogramMode(values []float64, widthSigma float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	_, sigma := meanAndSigma(values)
+	minV, maxV := values[0], values[0]
+	for _, v := range values {
+		if v < minV {
+			minV = v
+		}
+		if v > maxV {
+			maxV = v
+		}
+	}
 	if sigma <= 0 {
-		return medianFloat64(sorted)
+		// Degenerate (effectively constant) data: every value equals minV, which
+		// is also the median, so this matches the previous behaviour.
+		return minV
 	}
 	binWidth := widthSigma * sigma
 	if binWidth <= 0 {
-		return medianFloat64(sorted)
+		return minV
 	}
-	minV := sorted[0]
-	maxV := sorted[len(sorted)-1]
 	if maxV <= minV {
 		return minV
 	}
@@ -456,7 +554,7 @@ func histogramMode(sorted []float64, widthSigma float64) float64 {
 		bins = 1
 	}
 	counts := make([]int, bins)
-	for _, v := range sorted {
+	for _, v := range values {
 		idx := int(math.Floor((v - minV) / binWidth))
 		if idx < 0 {
 			idx = 0

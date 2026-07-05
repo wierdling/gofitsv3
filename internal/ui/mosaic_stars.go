@@ -47,8 +47,9 @@ func (ws *mosaicWorkspace) enterStarMode() {
 		refResult = ws.state.result
 	} else {
 		// No drizzle result yet: the reference preview comes from input[0]'s
-		// pixels, which may have been freed by a prior build. Reload on demand.
-		if err := ws.ensureInputPixelsLoaded(); err != nil {
+		// pixels, which may be unloaded (metadata-only load) or freed by a prior
+		// build. Reload only that one frame so the whole dataset stays on disk.
+		if err := ws.ensureInputPixelsLoadedAt(0); err != nil {
 			dialog.ShowError(err, ws.win)
 			return
 		}

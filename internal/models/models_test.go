@@ -139,6 +139,7 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 			{
 				Path:         "ref_flc.fits",
 				SCIExt:       2,
+				Combined:     true,
 				OffsetX:      1.25,
 				OffsetY:      -2.5,
 				HasTransform: true,
@@ -200,6 +201,9 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 	if decoded.Inputs[0].SCIExt != 2 || !decoded.Inputs[0].HasTransform || !decoded.Inputs[0].Locked {
 		t.Fatalf("Inputs[0] = %+v, want preserved transform and lock state", decoded.Inputs[0])
 	}
+	if !decoded.Inputs[0].Combined {
+		t.Fatalf("Inputs[0].Combined = false, want true (combined flag must round-trip)")
+	}
 	if decoded.Inputs[0].TransformB != 0.1 || decoded.Inputs[0].TransformF != -3 {
 		t.Fatalf("transform fields = %+v, want preserved affine values", decoded.Inputs[0])
 	}
@@ -241,7 +245,7 @@ func TestMosaicProjectJSONOmitsOptionalZeroFieldsAndDecodesDefaults(t *testing.T
 		t.Fatalf("json.Marshal error = %v", err)
 	}
 	raw := string(data)
-	for _, field := range []string{"referencePath", "referenceSciExt", "sciExt", "locked", "transformA", "useERRWeighting"} {
+	for _, field := range []string{"referencePath", "referenceSciExt", "sciExt", "combined", "locked", "transformA", "useERRWeighting"} {
 		if containsJSONField(raw, field) {
 			t.Fatalf("JSON unexpectedly contained omitted field %q: %s", field, raw)
 		}

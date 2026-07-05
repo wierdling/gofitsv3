@@ -4,7 +4,11 @@ import (
 	"image/color"
 	"fmt"
 	"math"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -14,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 
+	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/mosaic"
 	"gofitsv3/internal/processing"
 )
@@ -461,10 +466,15 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 }
 
 func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
-	// Filter out paths already loaded.
-	existingPaths := make(map[string]bool, len(ws.state.inputs))
+	// Filter out paths already loaded, matching on both the input's own Path and
+	// (for combined inputs) the original SourcePath so re-adding a source file
+	// whose chips were already combined is recognized as a duplicate.
+	existingPaths := make(map[string]bool, len(ws.state.inputs)*2)
 	for _, inp := range ws.state.inputs {
 		existingPaths[inp.Path] = true
+		if inp.SourcePath != "" {
+			existingPaths[inp.SourcePath] = true
+		}
 	}
 	filtered := paths[:0:0]
 	for _, p := range paths {
@@ -479,31 +489,202 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 	skipped := len(paths) - len(filtered)
 	paths = filtered
 
-	progressDialog := dialog.NewCustom(title, "Reading FITS data...", widget.NewProgressBarInfinite(), ws.win)
-	progressDialog.Show()
-
 	go func() {
+		_ = skipped // available for future status reporting
+
+		pt := newProgressTracker(title, "Reading FITS metadata...", ws.win)
+
+		startAll := time.Now()
+		debuglog.Log(fmt.Sprintf("loadPaths: reading metadata for %d file(s) with %d workers", len(paths), loadWorkers(len(paths))))
+
+		// Pass 1 (concurrent): metadata-only load per path. Reads headers,
+		// dimensions, WCS, and distortion tables but NOT the large SCI/ERR pixel
+		// arrays. This detects multi-chip exposures and yields the per-chip
+		// inputs used both for single-chip files and as the combine fallback.
+		type metaResult struct {
+			meta []mosaic.Input
+			err  error
+		}
+		results := make([]metaResult, len(paths))
+		workers := loadWorkers(len(paths))
+		var next int64 = -1
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					i := int(atomic.AddInt64(&next, 1))
+					if i >= len(paths) {
+						return
+					}
+					meta, err := mosaic.LoadInputsMetadataFromPath(paths[i])
+					results[i] = metaResult{meta: meta, err: err}
+				}
+			}()
+		}
+		wg.Wait()
+
+		// Pass 2 (bounded parallel): each multi-chip exposure is drizzled into one
+		// working file, and combines dominate load time while each combine is
+		// essentially single-threaded, so we run them across a worker pool to use
+		// all cores. Concurrency is capped by a memory budget (a combine loads a
+		// full exposure and builds an output canvas + weights) so large datasets
+		// stay bounded. Results are written per-path and flattened in order so the
+		// input/status ordering stays deterministic.
+		multiTotal := 0
+		var maxCombineBytes int64
+		for i := range results {
+			if results[i].err != nil || len(results[i].meta) <= 1 {
+				continue
+			}
+			multiTotal++
+			var b int64
+			for _, in := range results[i].meta {
+				b += int64(in.HDU.Data.Width) * int64(in.HDU.Data.Height) * 4 * 4
+			}
+			if b > maxCombineBytes {
+				maxCombineBytes = b
+			}
+		}
+
+		combineWorkers := runtime.NumCPU()
+		if multiTotal > 0 {
+			const combineMemBudget = int64(4) << 30 // 4 GiB across concurrent combines
+			if maxCombineBytes > 0 {
+				if byBudget := int(combineMemBudget / maxCombineBytes); byBudget < combineWorkers {
+					combineWorkers = byBudget
+				}
+			}
+			if combineWorkers > multiTotal {
+				combineWorkers = multiTotal
+			}
+		}
+		if combineWorkers < 1 {
+			combineWorkers = 1
+		}
+
+		type preparedInputs struct {
+			inputs      []mosaic.Input
+			statuses    []mosaic.InputStatus
+			combineWarn string
+		}
+		prep := make([]preparedInputs, len(paths))
+
+		// buildPerChip returns the per-chip inputs for a single- or fallback-mode
+		// file. It touches no shared state so it is safe to call from any worker.
+		buildPerChip := func(path string, meta []mosaic.Input, status string) preparedInputs {
+			var p preparedInputs
+			for _, input := range meta {
+				st := mosaic.InputStatus{Path: mosaic.InputKey(input), Included: true, Status: status}
+				if !mosaic.LooksLikeCalibratedInput(path) {
+					st.Status = "loaded (warning: not _flc/_flt/_cal)"
+				}
+				p.inputs = append(p.inputs, input)
+				p.statuses = append(p.statuses, st)
+			}
+			return p
+		}
+
+		combineOne := func(path string, meta []mosaic.Input) preparedInputs {
+			workingPath, cached, cerr := mosaic.EnsureCombinedExposure(path, mosaic.CombineOptions{Ctx: pt.ctx})
+			if cerr != nil {
+				if cerr == mosaic.ErrCancelled {
+					return preparedInputs{}
+				}
+				debuglog.Log(fmt.Sprintf("loadPaths: combine %s failed, using per-chip mode: %v", filepath.Base(path), cerr))
+				p := buildPerChip(path, meta, "loaded (combine failed: per-chip mode)")
+				p.combineWarn = fmt.Sprintf("%s: %v", filepath.Base(path), cerr)
+				return p
+			}
+			combinedMeta, lerr := mosaic.LoadInputsMetadataFromPath(workingPath)
+			if lerr != nil {
+				debuglog.Log(fmt.Sprintf("loadPaths: reload combined %s failed, using per-chip mode: %v", filepath.Base(path), lerr))
+				p := buildPerChip(path, meta, "loaded (combine failed: per-chip mode)")
+				p.combineWarn = fmt.Sprintf("%s: %v", filepath.Base(path), lerr)
+				return p
+			}
+			var p preparedInputs
+			for j := range combinedMeta {
+				combinedMeta[j].SourcePath = path
+				st := mosaic.InputStatus{Path: mosaic.InputKey(combinedMeta[j]), Included: true, Status: fmt.Sprintf("combined (%d chips)", len(meta))}
+				if !mosaic.LooksLikeCalibratedInput(path) {
+					st.Status = "combined (warning: not _flc/_flt/_cal)"
+				}
+				p.inputs = append(p.inputs, combinedMeta[j])
+				p.statuses = append(p.statuses, st)
+			}
+			debuglog.Log(fmt.Sprintf("loadPaths: %s combined %d chips (cached=%t)", filepath.Base(path), len(meta), cached))
+			return p
+		}
+
+		debuglog.Log(fmt.Sprintf("loadPaths: combining %d multi-chip exposure(s) with %d worker(s)", multiTotal, combineWorkers))
+		var combinesDone int64
+		var next2 int64 = -1
+		var wg2 sync.WaitGroup
+		for w := 0; w < combineWorkers; w++ {
+			wg2.Add(1)
+			go func() {
+				defer wg2.Done()
+				for {
+					i := int(atomic.AddInt64(&next2, 1))
+					if i >= len(paths) {
+						return
+					}
+					if pt.ctx.Err() != nil {
+						return
+					}
+					path := paths[i]
+					r := results[i]
+					switch {
+					case r.err != nil:
+						debuglog.Log(fmt.Sprintf("loadPaths: %s FAILED: %v", filepath.Base(path), r.err))
+						prep[i] = preparedInputs{statuses: []mosaic.InputStatus{{Path: path, Status: "failed", Error: r.err.Error()}}}
+					case len(r.meta) <= 1:
+						prep[i] = buildPerChip(path, r.meta, "loaded")
+					default:
+						prep[i] = combineOne(path, r.meta)
+						n := atomic.AddInt64(&combinesDone, 1)
+						pt.progress("Combining exposures", int(n), multiTotal)
+					}
+				}
+			}()
+		}
+		wg2.Wait()
+
+		cancelled := pt.ctx.Err() != nil
+
+		// Flatten per-path results in order so ordering is deterministic, and
+		// tally warnings from the status text (as the previous single-threaded
+		// path did).
 		newInputs := make([]mosaic.Input, 0, len(paths))
 		newStatuses := make([]mosaic.InputStatus, 0, len(paths))
 		warnings := 0
-		_ = skipped // available for future status reporting
-
-		for _, path := range paths {
-			loadedInputs, err := mosaic.LoadInputsFromPath(path)
-			if err != nil {
-				newStatuses = append(newStatuses, mosaic.InputStatus{Path: path, Status: "failed", Error: err.Error()})
-				continue
-			}
-			for _, input := range loadedInputs {
-				newInputs = append(newInputs, input)
-				status := mosaic.InputStatus{Path: mosaic.InputKey(input), Included: true, Status: "loaded"}
-				if !mosaic.LooksLikeCalibratedInput(path) {
-					status.Status = "loaded (warning: not _flc/_flt/_cal)"
-					warnings++
+		combineWarnings := make([]string, 0)
+		if !cancelled {
+			for i := range prep {
+				newInputs = append(newInputs, prep[i].inputs...)
+				newStatuses = append(newStatuses, prep[i].statuses...)
+				for _, st := range prep[i].statuses {
+					if strings.Contains(st.Status, "warning") {
+						warnings++
+					}
 				}
-				newStatuses = append(newStatuses, status)
+				if prep[i].combineWarn != "" {
+					combineWarnings = append(combineWarnings, prep[i].combineWarn)
+				}
 			}
 		}
+
+		if cancelled {
+			debuglog.Log("loadPaths: cancelled by user")
+			fyne.Do(func() {
+				pt.hide()
+				dialog.ShowInformation("Mosaic Load", "Loading was cancelled. No files were added.", ws.win)
+			})
+			return
+		}
+		debuglog.Log(fmt.Sprintf("loadPaths: prepared %d input(s) from %d file(s) in %s", len(newInputs), len(paths), time.Since(startAll).Round(time.Millisecond)))
 
 		offsetMessages := ws.applyAutoLoadedOffsets(newInputs)
 		for i := range newInputs {
@@ -518,13 +699,16 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 			mosaic.SortInputsByWCSDistance(newInputs, newStatuses)
 		}
 
-		messages := make([]string, 0, len(offsetMessages)+1)
+		messages := make([]string, 0, len(offsetMessages)+2)
 		if warnings > 0 {
 			messages = append(messages, "Some loaded files are not standard _flc/_flt/_cal inputs. They were kept, but this workflow is tuned for calibrated science exposures.")
 		}
+		if len(combineWarnings) > 0 {
+			messages = append(messages, "Some exposures could not be combined and were loaded per-chip instead:\n  "+strings.Join(combineWarnings, "\n  "))
+		}
 		messages = append(messages, offsetMessages...)
 		fyne.Do(func() {
-			progressDialog.Hide()
+			pt.hide()
 			ws.state.inputs = append(ws.state.inputs, newInputs...)
 			ws.state.statuses = append(ws.state.statuses, newStatuses...)
 			// Re-sort the full inputs list so overall drizzle order is correct.
@@ -540,6 +724,19 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 			}
 		})
 	}()
+}
+
+// loadWorkers picks a concurrency level for reading FITS files: one per CPU,
+// but never more than the number of files to read.
+func loadWorkers(n int) int {
+	w := runtime.NumCPU()
+	if w > n {
+		w = n
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
 }
 
 func (ws *mosaicWorkspace) configureLastDir(fd *dialog.FileDialog) {

@@ -12,6 +12,21 @@ import (
 
 // WriteFloat32Image writes a primary-HDU FITS image using float32 pixels.
 func WriteFloat32Image(path string, header Header, data ImageData) error {
+	return WriteFloat32ImageWithExtensions(path, header, data)
+}
+
+// ImageExtension describes a float32 IMAGE extension appended after the primary
+// HDU. The structural cards (XTENSION, BITPIX, NAXIS*, PCOUNT, GCOUNT, EXTNAME)
+// are derived from ExtName and Data and override anything in Header.
+type ImageExtension struct {
+	ExtName string
+	Header  Header
+	Data    ImageData
+}
+
+// WriteFloat32ImageWithExtensions writes a primary-HDU float32 FITS image
+// followed by zero or more float32 IMAGE extensions (e.g. a WHT weight plane).
+func WriteFloat32ImageWithExtensions(path string, header Header, data ImageData, exts ...ImageExtension) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -24,6 +39,14 @@ func WriteFloat32Image(path string, header Header, data ImageData) error {
 	}
 	if err := writeFloat32Data(bw, data.Pixels); err != nil {
 		return err
+	}
+	for _, ext := range exts {
+		if err := writeExtensionHeader(bw, ext); err != nil {
+			return err
+		}
+		if err := writeFloat32Data(bw, ext.Data.Pixels); err != nil {
+			return err
+		}
 	}
 	return bw.Flush()
 }
@@ -69,7 +92,33 @@ func writeHeader(w *bufio.Writer, header Header, width, height int) error {
 	cards["EXTEND"] = "T"
 	delete(cards, "END")
 
-	ordered := []string{"SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "EXTEND"}
+	return emitHeaderCards(w, cards, []string{"SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "EXTEND"})
+}
+
+func writeExtensionHeader(w *bufio.Writer, ext ImageExtension) error {
+	cards := make(map[string]string, len(ext.Header.Cards)+8)
+	for key, value := range ext.Header.Cards {
+		cards[key] = value
+	}
+	cards["XTENSION"] = formatFitsString("IMAGE")
+	cards["BITPIX"] = "-32"
+	cards["NAXIS"] = "2"
+	cards["NAXIS1"] = strconv.Itoa(ext.Data.Width)
+	cards["NAXIS2"] = strconv.Itoa(ext.Data.Height)
+	cards["PCOUNT"] = "0"
+	cards["GCOUNT"] = "1"
+	cards["EXTNAME"] = formatFitsString(ext.ExtName)
+	delete(cards, "SIMPLE")
+	delete(cards, "EXTEND")
+	delete(cards, "END")
+
+	return emitHeaderCards(w, cards, []string{"XTENSION", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "PCOUNT", "GCOUNT", "EXTNAME"})
+}
+
+// emitHeaderCards writes the required cards (in the given order) followed by any
+// remaining cards sorted alphabetically, then an END card padded to a 2880-byte
+// block boundary.
+func emitHeaderCards(w *bufio.Writer, cards map[string]string, ordered []string) error {
 	seen := make(map[string]bool, len(ordered))
 	for _, key := range ordered {
 		seen[key] = true
@@ -83,10 +132,11 @@ func writeHeader(w *bufio.Writer, header Header, width, height int) error {
 		extra = append(extra, key)
 	}
 	sort.Strings(extra)
-	ordered = append(ordered, extra...)
+
+	keys := append(append([]string{}, ordered...), extra...)
 
 	cardCount := 0
-	for _, key := range ordered {
+	for _, key := range keys {
 		if err := writeCard(w, key, cards[key]); err != nil {
 			return err
 		}
@@ -135,4 +185,13 @@ func formatHeaderCard(key, value string) string {
 
 func formatEndCard() string {
 	return "END" + strings.Repeat(" ", 77)
+}
+
+// formatFitsString renders a FITS string value: single-quoted and padded to at
+// least 8 characters, matching how the reader stores and parses string cards.
+func formatFitsString(s string) string {
+	if len(s) < 8 {
+		s += strings.Repeat(" ", 8-len(s))
+	}
+	return "'" + s + "'"
 }

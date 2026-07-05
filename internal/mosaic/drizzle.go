@@ -48,6 +48,15 @@ type Input struct {
 	// same dimensions as HDU.Data. Nil when the file has no ERR extension.
 	// Used as inverse-variance weights during drizzle: weight *= 1/err².
 	ERRPixels []float32
+	// SourcePath is the original multi-chip file this combined working input was
+	// generated from. Empty for ordinary inputs. Used for the display label,
+	// dedupe, project persistence, and locating the working/ directory.
+	SourcePath string
+	// WeightPixels holds the per-pixel drizzle weight from a combined working
+	// file's WHT extension, same dimensions as HDU.Data. When present it is used
+	// verbatim as the WeightERR pixel weight in place of the ERR-derived inverse
+	// variance. Nil for ordinary inputs.
+	WeightPixels []float32
 	// ReferenceOnly marks this input as a WCS anchor only. It participates in
 	// alignment and coordinate-system setup but its pixels are not drizzled into
 	// the output. Use this to align a new filter to a previously drizzled baseline.
@@ -75,6 +84,13 @@ func InputKey(input Input) string {
 }
 
 func InputLabel(input Input) string {
+	if input.SourcePath != "" {
+		name := filepath.Base(input.SourcePath)
+		if name == "" {
+			name = input.SourcePath
+		}
+		return name + " [comb]"
+	}
 	name := filepath.Base(input.Path)
 	if name == "" {
 		name = input.Path
@@ -218,6 +234,20 @@ func normalizeAlignmentMode(mode AlignmentMode) AlignmentMode {
 		return mode
 	default:
 		return AlignmentModeGeneralAffine
+	}
+}
+
+// AlignmentStreamsPixels reports whether the given alignment mode runs entirely
+// on streamed star catalogs (the TweakReg modes) and therefore does not require
+// every input's pixel arrays to be resident in memory. The legacy warp-based
+// modes (GeneralAffine, RScale) still warp full images and need resident pixels,
+// so callers should preload them before alignment.
+func AlignmentStreamsPixels(mode AlignmentMode) bool {
+	switch normalizeAlignmentMode(mode) {
+	case AlignmentModeTweakRegRScale, AlignmentModeTweakRegGeneral:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -492,6 +522,16 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	if height < 1 {
 		height = 1
 	}
+	// A bad WCS solution or a misaligned frame's manual transform can push
+	// minX/minY/maxX/maxY far outside the real mosaic footprint, producing a
+	// canvas so large the output allocation crashes the process with an OOM
+	// panic instead of a reportable error. Reject implausible canvases here,
+	// at the single chokepoint where width/height are derived from the
+	// per-frame bounds.
+	const maxCanvasPixels = 500_000_000 // ~2GB per float32 buffer
+	if int64(width)*int64(height) > maxCanvasPixels {
+		return nil, fmt.Errorf("output canvas too large (%dx%d = %d pixels); check for a misaligned or badly-WCS'd input frame", width, height, int64(width)*int64(height))
+	}
 
 	includedCount := 0
 
@@ -580,12 +620,14 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		options.reportProgress("Drizzling", finalSlot, len(dataPlanned))
 		finalSlot++
 		debuglog.Log(fmt.Sprintf("Build: final drizzle frame %d (%s)", finalSlot, InputKey(planned[i].input)))
-		pixels, errPix, perr := prepareFramePixels(planned[i], options, skyOffset[i], skyPlanes[i])
+		pixels, errPix, whtPix, perr := prepareFramePixels(planned[i], options, skyOffset[i], skyPlanes[i])
 		if perr != nil {
 			return nil, fmt.Errorf("load frame %s: %w", InputKey(planned[i].input), perr)
 		}
-		// drizzlePlannedInput reads ERR weights from planned[i].input.ERRPixels.
+		// drizzlePlannedInput reads weights from planned[i].input.WeightPixels
+		// (combined working frames) or ERRPixels (ordinary frames).
 		planned[i].input.ERRPixels = errPix
+		planned[i].input.WeightPixels = whtPix
 		var crMask BitMask
 		cleaned := false
 
@@ -643,6 +685,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		// stays at roughly one input frame plus the output accumulators.
 		pixels = nil
 		planned[i].input.ERRPixels = nil
+		planned[i].input.WeightPixels = nil
 		if finalSlot%8 == 0 {
 			logMemStats(fmt.Sprintf("drizzled %d/%d frames", finalSlot, len(dataPlanned)))
 		}
@@ -972,6 +1015,13 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		fitgeom = "general"
 	}
 
+	// Build every input's star catalog up front, streaming pixels from disk so
+	// the whole dataset never needs to be resident at once. All downstream
+	// alignment (primary TweakReg fit, chain fallback, bundle adjustment) runs on
+	// these catalogs; pixels are reloaded on demand only for the legacy warp modes
+	// and the alignment debug hook.
+	catalogs := extractStarCatalogsForAlignment(inputs)
+
 	type refCache struct {
 		input  Input
 		stars  []processing.Star
@@ -982,9 +1032,8 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	refCaches := make([]refCache, numRefs)
 	refCaches[0] = refCache{input: inputs[0], hasWCS: true}
 	if isTweakReg {
-		refCaches[0].stars = processing.ExtractAndLimitStars(
-			inputs[0].HDU.Data.Pixels, inputs[0].HDU.Data.Width, inputs[0].HDU.Data.Height, 4.0, 3, 200)
-		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[0] extracted %d stars", len(refCaches[0].stars)))
+		refCaches[0].stars = catalogs[0]
+		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[0] has %d stars", len(refCaches[0].stars)))
 	}
 	for r := 1; r < numRefs; r++ {
 		if inputs[r].Excluded {
@@ -1000,9 +1049,8 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		}
 		rc := refCache{input: inputs[r], w0toR: w0toR, wRto0: wRto0, hasWCS: true}
 		if isTweakReg {
-			rc.stars = processing.ExtractAndLimitStars(
-				inputs[r].HDU.Data.Pixels, inputs[r].HDU.Data.Width, inputs[r].HDU.Data.Height, 4.0, 3, 200)
-			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[%d] extracted %d stars", r, len(rc.stars)))
+			rc.stars = catalogs[r]
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[%d] has %d stars", r, len(rc.stars)))
 		}
 		refCaches[r] = rc
 	}
@@ -1039,19 +1087,40 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 					err = fmt.Errorf("WCSMapper: %v", mapErr)
 					break
 				}
-				refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
-					inputs[i].HDU.Data.Pixels,
-					inputs[i].HDU.Data.Width,
-					inputs[i].HDU.Data.Height,
-					mapper,
-					rc.input.HDU.Data.Pixels,
-					rc.stars,
-					rc.input.HDU.Data.Width,
-					rc.input.HDU.Data.Height,
-					rc.input.HDU.Header,
-					searchRadiusArcsec,
-					fitgeom,
-				)
+				if processing.AlignmentDebugHook != nil {
+					// Debug visualization needs the actual pixels; reload the pair
+					// on demand so the common (non-debug) path stays pixel-free.
+					srcPix, _, _, _, srcErr := resolveFramePixels(inputs[i], Options{})
+					refPix, _, _, _, refErr := resolveFramePixels(rc.input, Options{})
+					if srcErr != nil || refErr != nil {
+						err = fmt.Errorf("debug pixel reload: %v / %v", srcErr, refErr)
+						break
+					}
+					refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
+						srcPix,
+						inputs[i].HDU.Data.Width,
+						inputs[i].HDU.Data.Height,
+						mapper,
+						refPix,
+						rc.stars,
+						rc.input.HDU.Data.Width,
+						rc.input.HDU.Data.Height,
+						rc.input.HDU.Header,
+						searchRadiusArcsec,
+						fitgeom,
+					)
+				} else {
+					refinement, stats, err = processing.EstimateTweakRegAlignmentFromCatalogs(
+						catalogs[i],
+						mapper,
+						rc.stars,
+						rc.input.HDU.Data.Width,
+						rc.input.HDU.Data.Height,
+						rc.input.HDU.Header,
+						searchRadiusArcsec,
+						fitgeom,
+					)
+				}
 			case AlignmentModeRScale:
 				refinement, err = processing.EstimateRScaleAfterWCS(
 					inputs[i].HDU.Data.Pixels, inputs[i].HDU.Data.Width, inputs[i].HDU.Data.Height, inputs[i].HDU.Header,
@@ -1078,18 +1147,11 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		return alignOneResult{i: i, errMsg: lastErr[i]}
 	}
 
-	// starCatalog caches each input's extracted star catalog so the chain fallback
-	// matches against pre-extracted catalogs (cheap, no image warp and no repeated
-	// extraction) instead of re-warping + re-extracting per pair.
-	starCatalog := make(map[int][]processing.Star)
+	// getStars returns an input's pre-extracted catalog (built once, up front, via
+	// streaming). The chain fallback matches against these catalogs — no image
+	// warp and no repeated extraction.
 	getStars := func(idx int) []processing.Star {
-		if s, ok := starCatalog[idx]; ok {
-			return s
-		}
-		s := processing.ExtractAndLimitStars(
-			inputs[idx].HDU.Data.Pixels, inputs[idx].HDU.Data.Width, inputs[idx].HDU.Data.Height, 4.0, 3, 200)
-		starCatalog[idx] = s
-		return s
+		return catalogs[idx]
 	}
 
 	// mapperCache caches each input's WCS mapper into inputs[0] pixel space.
@@ -1480,6 +1542,12 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 		fitgeom = "general"
 	}
 
+	// Build each target's star catalog up front by streaming pixels, so the whole
+	// dataset is never resident at once. The reference catalogs come from the
+	// user-picked refStars (and their WCS projections), so only the non-reference
+	// targets are extracted here.
+	catalogs := extractStarCatalogsForAlignment(inputs)
+
 	// Align closest images first so results are more stable across runs.
 	for _, i := range sortedByDistFromRef(inputs) {
 		if i < numRefs || inputs[i].Excluded {
@@ -1510,19 +1578,40 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 					err = fmt.Errorf("WCSMapper: %v", mapErr)
 					break
 				}
-				refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
-					inputs[i].HDU.Data.Pixels,
-					inputs[i].HDU.Data.Width,
-					inputs[i].HDU.Data.Height,
-					mapper,
-					ref.input.HDU.Data.Pixels,
-					ref.stars,
-					ref.input.HDU.Data.Width,
-					ref.input.HDU.Data.Height,
-					ref.input.HDU.Header,
-					searchRadiusArcsec,
-					fitgeom,
-				)
+				if processing.AlignmentDebugHook != nil {
+					// Debug visualization needs the actual pixels; reload the pair
+					// on demand so the common (non-debug) path stays pixel-free.
+					srcPix, _, _, _, srcErr := resolveFramePixels(inputs[i], Options{})
+					refPix, _, _, _, refErr := resolveFramePixels(ref.input, Options{})
+					if srcErr != nil || refErr != nil {
+						err = fmt.Errorf("debug pixel reload: %v / %v", srcErr, refErr)
+						break
+					}
+					refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
+						srcPix,
+						inputs[i].HDU.Data.Width,
+						inputs[i].HDU.Data.Height,
+						mapper,
+						refPix,
+						ref.stars,
+						ref.input.HDU.Data.Width,
+						ref.input.HDU.Data.Height,
+						ref.input.HDU.Header,
+						searchRadiusArcsec,
+						fitgeom,
+					)
+				} else {
+					refinement, stats, err = processing.EstimateTweakRegAlignmentFromCatalogs(
+						catalogs[i],
+						mapper,
+						ref.stars,
+						ref.input.HDU.Data.Width,
+						ref.input.HDU.Data.Height,
+						ref.input.HDU.Header,
+						searchRadiusArcsec,
+						fitgeom,
+					)
+				}
 			case AlignmentModeRScale:
 				refinement, err = processing.EstimateRScaleFromRefStars(
 					ref.stars,
@@ -2055,6 +2144,15 @@ func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) fl
 			return float32(exptime)
 		}
 	case WeightERR:
+		// A combined working frame carries its per-pixel drizzle weight (the
+		// rate-space inverse variance accumulated when the chips were combined)
+		// directly in WeightPixels; use it verbatim rather than re-deriving one
+		// from ERR.
+		if wht := p.input.WeightPixels; wht != nil && idx < len(wht) {
+			if w := wht[idx]; w > 0 && isFinite32(w) {
+				return w
+			}
+		}
 		if errPix := p.input.ERRPixels; errPix != nil && idx < len(errPix) {
 			if e := errPix[idx]; e > 0 && isFinite32(e) {
 				// When the frame is already a rate (pre-normalized or calibrated

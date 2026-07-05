@@ -9,53 +9,6 @@ import (
 	"gofitsv3/internal/fitsio"
 )
 
-func TestCombineSCIHDUsPlacesExtensionsOnSharedCanvas(t *testing.T) {
-	primary := fitsio.Header{Cards: map[string]string{"FILTER": "'F502N'"}}
-	ref := fitsio.HDU{
-		Header: fitsio.Header{Cards: map[string]string{
-			"CRPIX1": "10",
-			"CRPIX2": "10",
-			"CRVAL1": "100",
-			"CRVAL2": "22",
-			"CD1_1":  "1",
-			"CD1_2":  "0",
-			"CD2_1":  "0",
-			"CD2_2":  "1",
-			"EXTVER": "1",
-		}},
-		Data:    fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{1, 1, 1, 1}},
-		ExtName: "SCI",
-	}
-	shifted := fitsio.HDU{
-		Header: fitsio.Header{Cards: map[string]string{
-			"CRPIX1": "8",
-			"CRPIX2": "10",
-			"CRVAL1": "100",
-			"CRVAL2": "22",
-			"CD1_1":  "1",
-			"CD1_2":  "0",
-			"CD2_1":  "0",
-			"CD2_2":  "1",
-			"EXTVER": "2",
-		}},
-		Data:    fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{2, 2, 2, 2}},
-		ExtName: "SCI",
-	}
-
-	combined, _, err := combineSCIHDUs("test_flc.fits", primary, []fitsio.HDU{ref, shifted}, &fitsio.File{HDUs: []fitsio.HDU{ref, shifted}})
-	if err != nil {
-		t.Fatalf("combineSCIHDUs returned error: %v", err)
-	}
-	if combined.Data.Width != 4 || combined.Data.Height != 2 {
-		t.Fatalf("combined size = %dx%d, want 4x2", combined.Data.Width, combined.Data.Height)
-	}
-	for i, want := range []float32{1, 1, 2, 2, 1, 1, 2, 2} {
-		if math.Abs(float64(combined.Data.Pixels[i]-want)) > 1e-6 {
-			t.Fatalf("pixel[%d] = %v, want %v", i, combined.Data.Pixels[i], want)
-		}
-	}
-}
-
 func TestLoadInputsFromPathWFPC2FLTRealFiles(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join("..", "..", "TestImages", "WFPC2", "*_flt.fits"))
 	if err != nil {
@@ -93,6 +46,185 @@ func TestLoadInputsFromPathWFPC2FLTRealFiles(t *testing.T) {
 				}
 				if len(input.ERRPixels) != len(input.HDU.Data.Pixels) {
 					t.Fatalf("input[%d] ERR pixel count = %d, want %d", i, len(input.ERRPixels), len(input.HDU.Data.Pixels))
+				}
+			}
+		})
+	}
+}
+
+func TestLoadInputsMetadataMatchesFullLoadButOmitsPixels(t *testing.T) {
+	var paths []string
+	for _, pat := range []string{
+		filepath.Join("..", "..", "TestImages", "*_flt.fits"),
+		filepath.Join("..", "..", "TestImages", "*_cal.fits"),
+		filepath.Join("..", "..", "TestImages", "WFPC2", "*_flt.fits"),
+	} {
+		matches, err := filepath.Glob(pat)
+		if err != nil {
+			t.Fatalf("Glob error = %v", err)
+		}
+		paths = append(paths, matches...)
+	}
+	if len(paths) == 0 {
+		t.Skip("no FLT/CAL test images found")
+	}
+
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			full, err := LoadInputsFromPath(path)
+			if err != nil {
+				t.Fatalf("LoadInputsFromPath error = %v", err)
+			}
+			meta, err := LoadInputsMetadataFromPath(path)
+			if err != nil {
+				t.Fatalf("LoadInputsMetadataFromPath error = %v", err)
+			}
+			if len(meta) != len(full) {
+				t.Fatalf("metadata input count = %d, want %d", len(meta), len(full))
+			}
+			for i := range full {
+				if meta[i].SCIExt != full[i].SCIExt {
+					t.Fatalf("input[%d].SCIExt = %d, want %d", i, meta[i].SCIExt, full[i].SCIExt)
+				}
+				// Dimensions come from the header, so they must match the full load.
+				if meta[i].HDU.Data.Width != full[i].HDU.Data.Width || meta[i].HDU.Data.Height != full[i].HDU.Data.Height {
+					t.Fatalf("input[%d] metadata size = %dx%d, want %dx%d", i,
+						meta[i].HDU.Data.Width, meta[i].HDU.Data.Height, full[i].HDU.Data.Width, full[i].HDU.Data.Height)
+				}
+				// Pixels (the expensive part) must NOT be loaded.
+				if meta[i].HDU.Data.Pixels != nil {
+					t.Fatalf("input[%d] metadata unexpectedly carries %d SCI pixels", i, len(meta[i].HDU.Data.Pixels))
+				}
+				if meta[i].ERRPixels != nil {
+					t.Fatalf("input[%d] metadata unexpectedly carries %d ERR pixels", i, len(meta[i].ERRPixels))
+				}
+				// Header-derived metadata must be identical (proves the header
+				// reader stayed byte-aligned past the skipped data blocks).
+				if meta[i].ExposureTime != full[i].ExposureTime {
+					t.Fatalf("input[%d] ExposureTime = %v, want %v", i, meta[i].ExposureTime, full[i].ExposureTime)
+				}
+				if meta[i].DateObs != full[i].DateObs {
+					t.Fatalf("input[%d] DateObs = %q, want %q", i, meta[i].DateObs, full[i].DateObs)
+				}
+				if fitsio.HeaderString(meta[i].HDU.Header, "EXTVER") != fitsio.HeaderString(full[i].HDU.Header, "EXTVER") {
+					t.Fatalf("input[%d] EXTVER header mismatch", i)
+				}
+				// Distortion tables must be loaded when the full path has them.
+				if (full[i].D2IX == nil) != (meta[i].D2IX == nil) || (full[i].D2IY == nil) != (meta[i].D2IY == nil) {
+					t.Fatalf("input[%d] D2I table presence mismatch (full X=%v Y=%v, meta X=%v Y=%v)",
+						i, full[i].D2IX != nil, full[i].D2IY != nil, meta[i].D2IX != nil, meta[i].D2IY != nil)
+				}
+			}
+		})
+	}
+}
+
+// TestLoadCleanedSCIForExtractionMatchesFullLoad verifies the chip-selective
+// extraction loader returns pixels byte-identical to a full LoadInputsFromPath
+// for every SCI chip — proving the memory optimization does not change the star
+// catalog that alignment is built from.
+func TestLoadCleanedSCIForExtractionMatchesFullLoad(t *testing.T) {
+	var paths []string
+	for _, pat := range []string{
+		filepath.Join("..", "..", "TestImages", "*_flt.fits"),
+		filepath.Join("..", "..", "TestImages", "*_cal.fits"),
+		filepath.Join("..", "..", "TestImages", "NIRCAM_SHORT", "*_cal.fits"),
+	} {
+		m, _ := filepath.Glob(pat)
+		paths = append(paths, m...)
+	}
+	if len(paths) == 0 {
+		t.Skip("no FLT/CAL test images found")
+	}
+
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			full, err := LoadInputsFromPath(path)
+			if err != nil {
+				t.Fatalf("LoadInputsFromPath error = %v", err)
+			}
+			meta, err := LoadInputsMetadataFromPath(path)
+			if err != nil {
+				t.Fatalf("LoadInputsMetadataFromPath error = %v", err)
+			}
+			if len(meta) != len(full) {
+				t.Fatalf("input count: metadata %d, full %d", len(meta), len(full))
+			}
+			for i := range full {
+				got, w, h, err := loadCleanedSCIForExtraction(meta[i])
+				if err != nil {
+					t.Fatalf("input[%d] loadCleanedSCIForExtraction error = %v", i, err)
+				}
+				if w != full[i].HDU.Data.Width || h != full[i].HDU.Data.Height {
+					t.Fatalf("input[%d] dims = %dx%d, want %dx%d", i, w, h, full[i].HDU.Data.Width, full[i].HDU.Data.Height)
+				}
+				want := full[i].HDU.Data.Pixels
+				if len(got) != len(want) {
+					t.Fatalf("input[%d] pixel count = %d, want %d", i, len(got), len(want))
+				}
+				for k := range want {
+					a, b := got[k], want[k]
+					if a != b && !(math.IsNaN(float64(a)) && math.IsNaN(float64(b))) {
+						t.Fatalf("input[%d] cleaned pixel[%d] = %v, want %v", i, k, a, b)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestLoadFrameFromDiskMatchesFullLoad verifies the chip-selective Build reload
+// path returns SCI and ERR pixels byte-identical to a full LoadInputsFromPath for
+// every chip, so streaming a multi-chip mosaic produces the same drizzle input.
+func TestLoadFrameFromDiskMatchesFullLoad(t *testing.T) {
+	var paths []string
+	for _, pat := range []string{
+		filepath.Join("..", "..", "TestImages", "*_flt.fits"),
+		filepath.Join("..", "..", "TestImages", "*_cal.fits"),
+		filepath.Join("..", "..", "TestImages", "NIRCAM_SHORT", "*_cal.fits"),
+	} {
+		m, _ := filepath.Glob(pat)
+		paths = append(paths, m...)
+	}
+	if len(paths) == 0 {
+		t.Skip("no FLT/CAL test images found")
+	}
+
+	eq := func(a, b []float32) (int, bool) {
+		if len(a) != len(b) {
+			return -1, false
+		}
+		for k := range a {
+			if a[k] != b[k] && !(math.IsNaN(float64(a[k])) && math.IsNaN(float64(b[k]))) {
+				return k, false
+			}
+		}
+		return 0, true
+	}
+
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			full, err := LoadInputsFromPath(path)
+			if err != nil {
+				t.Fatalf("LoadInputsFromPath error = %v", err)
+			}
+			meta, err := LoadInputsMetadataFromPath(path)
+			if err != nil {
+				t.Fatalf("LoadInputsMetadataFromPath error = %v", err)
+			}
+			if len(meta) != len(full) {
+				t.Fatalf("input count: metadata %d, full %d", len(meta), len(full))
+			}
+			for i := range full {
+				sci, errPix, _, derr := loadFrameFromDisk(meta[i])
+				if derr != nil {
+					t.Fatalf("input[%d] loadFrameFromDisk error = %v", i, derr)
+				}
+				if k, ok := eq(sci, full[i].HDU.Data.Pixels); !ok {
+					t.Fatalf("input[%d] SCI mismatch at %d", i, k)
+				}
+				if k, ok := eq(errPix, full[i].ERRPixels); !ok {
+					t.Fatalf("input[%d] ERR mismatch at %d (got len %d, want len %d)", i, k, len(errPix), len(full[i].ERRPixels))
 				}
 			}
 		})
@@ -269,76 +401,3 @@ func maxIntForFootprint(a, b int) int {
 	return b
 }
 
-func TestCombineSCIHDUsShiftsCRPIXForExpandedCanvas(t *testing.T) {
-	primary := fitsio.Header{Cards: map[string]string{"FILTER": "'F502N'"}}
-	ref := fitsio.HDU{
-		Header: fitsio.Header{Cards: map[string]string{
-			"CRPIX1": "10",
-			"CRPIX2": "10",
-			"CRVAL1": "100",
-			"CRVAL2": "22",
-			"CD1_1":  "1",
-			"CD1_2":  "0",
-			"CD2_1":  "0",
-			"CD2_2":  "1",
-		}},
-		Data:    fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{1, 1, 1, 1}},
-		ExtName: "SCI",
-	}
-	left := fitsio.HDU{
-		Header: fitsio.Header{Cards: map[string]string{
-			"CRPIX1": "12",
-			"CRPIX2": "10",
-			"CRVAL1": "100",
-			"CRVAL2": "22",
-			"CD1_1":  "1",
-			"CD1_2":  "0",
-			"CD2_1":  "0",
-			"CD2_2":  "1",
-		}},
-		Data:    fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{2, 2, 2, 2}},
-		ExtName: "SCI",
-	}
-
-	combined, _, err := combineSCIHDUs("test_flc.fits", primary, []fitsio.HDU{ref, left}, &fitsio.File{HDUs: []fitsio.HDU{ref, left}})
-	if err != nil {
-		t.Fatalf("combineSCIHDUs returned error: %v", err)
-	}
-	if got := fitsio.HeaderString(combined.Header, "CRPIX1"); got != "12" {
-		t.Fatalf("CRPIX1 = %q, want 12", got)
-	}
-	if got := fitsio.HeaderString(combined.Header, "CRPIX2"); got != "10" {
-		t.Fatalf("CRPIX2 = %q, want 10", got)
-	}
-}
-
-func TestChipPlacementTransformIgnoresRotationTerms(t *testing.T) {
-	refHeader := fitsio.Header{Cards: map[string]string{
-		"CRPIX1": "10",
-		"CRPIX2": "10",
-		"CRVAL1": "100",
-		"CRVAL2": "22",
-		"CD1_1":  "1",
-		"CD1_2":  "0",
-		"CD2_1":  "0",
-		"CD2_2":  "1",
-	}}
-	chipHeader := fitsio.Header{Cards: map[string]string{
-		"CRPIX1": "8",
-		"CRPIX2": "10",
-		"CRVAL1": "100",
-		"CRVAL2": "22",
-		"CD1_1":  "0",
-		"CD1_2":  "-1",
-		"CD2_1":  "1",
-		"CD2_2":  "0",
-	}}
-
-	transform, err := chipPlacementTransform(chipHeader, refHeader)
-	if err != nil {
-		t.Fatalf("chipPlacementTransform returned error: %v", err)
-	}
-	if transform.A != 1 || transform.B != 0 || transform.D != 0 || transform.E != 1 {
-		t.Fatalf("expected translation-only transform, got %+v", transform)
-	}
-}

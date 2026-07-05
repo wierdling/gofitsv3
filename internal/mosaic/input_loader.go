@@ -3,7 +3,6 @@ package mosaic
 import (
 	"fmt"
 	"math"
-	"path/filepath"
 	"strings"
 
 	"gofitsv3/internal/badpix"
@@ -36,6 +35,7 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 			ExposureTime:  loadExposureTime(primary, hdu.Header),
 			DateObs:       loadDateObs(primary, hdu.Header),
 			BUnit:         loadBUnit(hdu.Header, primary),
+			WeightPixels:  loadWHTPixels(file),
 		}}, nil
 	}
 
@@ -60,6 +60,148 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 	return inputs, nil
 }
 
+// LoadInputsMetadataFromPath builds mosaic Inputs from a FITS file's headers and
+// distortion tables only, without decoding the large SCI/ERR pixel arrays. Each
+// returned Input carries its dimensions (HDU.Data.Width/Height), WCS header,
+// exposure/date/BUnit metadata, and D2IMARR distortion tables, but HDU.Data.Pixels
+// and ERRPixels are nil.
+//
+// This is the lazy "load by filter" path: pixels are streamed back on demand at
+// align time (ensureInputPixelsLoaded) and build time (loadFrameFromDisk), both
+// of which re-run LoadInputsFromPath so DQ cleaning/repair is applied identically.
+// D2IMARR tables are loaded here because the build planner reads them from the
+// in-memory Input and does not reload them per frame.
+func LoadInputsMetadataFromPath(path string) ([]Input, error) {
+	file, err := fitsio.LoadFileMetadata(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(file.HDUs) == 0 {
+		return nil, fmt.Errorf("no HDUs found in %s", path)
+	}
+
+	primary := file.HDUs[0].Header
+	sci := file.SelectSCI()
+	if len(sci) == 0 {
+		hdu := file.HDUs[0]
+		return []Input{{
+			Path:          path,
+			PrimaryHeader: primary,
+			HDU:           hdu,
+			ExposureTime:  loadExposureTime(primary, hdu.Header),
+			DateObs:       loadDateObs(primary, hdu.Header),
+			BUnit:         loadBUnit(hdu.Header, primary),
+		}}, nil
+	}
+
+	inputs := make([]Input, 0, len(sci))
+	for i := range sci {
+		hdu := sci[i]
+		extver := sciExtNumber(hdu.Header, i+1)
+		d2iX, d2iY := loadD2ITables(file, extver)
+		inputs = append(inputs, Input{
+			Path:          path,
+			SCIExt:        extver,
+			PrimaryHeader: primary,
+			HDU:           hdu,
+			ExposureTime:  loadExposureTime(primary, hdu.Header),
+			DateObs:       loadDateObs(primary, hdu.Header),
+			BUnit:         loadBUnit(hdu.Header, primary),
+			D2IX:          d2iX,
+			D2IY:          d2iY,
+		})
+	}
+	return inputs, nil
+}
+
+// chipDecodePredicate selects which HDUs to decode when reading a single chip:
+// the SCI extension matching sciExtVer (and any SCI lacking an EXTVER), all DQ
+// extensions (small, and matchingDQHDU may match by size rather than EXTVER, so
+// loading all reproduces the full-load cleaning exactly), the matching ERR (and
+// the WHT plane of a combined working file) when needAux is set, and the primary
+// image of a single-HDU file. Skipped extensions are not decoded, so multi-chip
+// exposures are not re-decoded in full per chip.
+func chipDecodePredicate(sciExtVer int, needAux bool) func(fitsio.Header) bool {
+	want := fmt.Sprintf("%d", sciExtVer)
+	matchesChip := func(hdr fitsio.Header) bool {
+		ev := fitsio.HeaderString(hdr, "EXTVER")
+		return ev == "" || ev == want
+	}
+	return func(hdr fitsio.Header) bool {
+		switch strings.ToUpper(strings.TrimSpace(fitsio.HeaderString(hdr, "EXTNAME"))) {
+		case "DQ":
+			return true
+		case "SCI":
+			return matchesChip(hdr)
+		case "ERR":
+			return needAux && matchesChip(hdr)
+		case "WHT":
+			return needAux
+		case "":
+			// Primary image of a single-HDU file (multi-extension primaries have
+			// NAXIS=0 and are filtered out by the data-size guard in fitsio).
+			return true
+		}
+		return false
+	}
+}
+
+// loadChipFromDisk loads only the one SCI chip matching in.SCIExt (plus the DQ
+// extensions needed to clean it, and — when needAux is set — the matching ERR
+// plus the WHT plane of a combined working file), skipping the other chips. It
+// returns the cleaned SCI pixels (and aux planes when requested) byte-identical
+// to a full LoadInputsFromPath for that chip, using a fraction of the transient
+// memory and I/O and without re-decoding the whole file once per chip for
+// multi-chip exposures.
+func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w, h int, err error) {
+	file, err := fitsio.LoadFileSelective(in.Path, chipDecodePredicate(in.SCIExt, needAux))
+	if err != nil {
+		return nil, nil, nil, 0, 0, err
+	}
+	if len(file.HDUs) == 0 {
+		return nil, nil, nil, 0, 0, fmt.Errorf("no HDUs found in %s", in.Path)
+	}
+
+	inst, _ := instrument.FromHeader(file.HDUs[0].Header)
+	sciHDUs := file.SelectSCI()
+	if len(sciHDUs) == 0 {
+		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst.BadDQBits)
+		if needAux {
+			whtPix = loadWHTPixels(file)
+		}
+		return hdu.Data.Pixels, nil, whtPix, hdu.Data.Width, hdu.Data.Height, nil
+	}
+
+	target := sciHDUs[0]
+	matched := false
+	for i := range sciHDUs {
+		if sciExtNumber(sciHDUs[i].Header, i+1) == in.SCIExt {
+			target = sciHDUs[i]
+			matched = true
+			break
+		}
+	}
+	if !matched && len(sciHDUs) > 1 {
+		return nil, nil, nil, 0, 0, fmt.Errorf("frame loader: no SCI ext %d in %s", in.SCIExt, in.Path)
+	}
+	if target.Data.Pixels == nil {
+		return nil, nil, nil, 0, 0, fmt.Errorf("SCI ext %d not loaded from %s", in.SCIExt, in.Path)
+	}
+	hdu := cleanSCIWithMatchingDQ(target, file, inst.BadDQBits)
+	if needAux {
+		errPix = loadERRPixels(file, in.SCIExt)
+	}
+	return hdu.Data.Pixels, errPix, whtPix, hdu.Data.Width, hdu.Data.Height, nil
+}
+
+// loadCleanedSCIForExtraction loads just the cleaned SCI pixels (no aux planes)
+// for the chip in.SCIExt — the minimal read for building an alignment star
+// catalog.
+func loadCleanedSCIForExtraction(in Input) ([]float32, int, int, error) {
+	sci, _, _, w, h, err := loadChipFromDisk(in, false)
+	return sci, w, h, err
+}
+
 // LoadInputFromPath is retained for callers that expect exactly one input.
 func LoadInputFromPath(path string) (Input, error) {
 	inputs, err := LoadInputsFromPath(path)
@@ -77,21 +219,6 @@ func sciExtNumber(header fitsio.Header, fallback int) int {
 		return int(extver)
 	}
 	return fallback
-}
-
-// chipPlacementTransform is used only by combineSCIHDUs (dead code path).
-// It returns a translation-only affine by discarding inter-chip rotation from the
-// WCS affine approximation.  The active drizzle path uses WCSMapper instead.
-func chipPlacementTransform(chipHeader, refHeader fitsio.Header) (processing.AffineTransform, error) {
-	refToSCI, err := processing.ComputeWCSTransform(chipHeader, refHeader)
-	if err != nil {
-		return processing.AffineTransform{}, err
-	}
-	sciToRef, err := processing.InvertAffineTransform(refToSCI)
-	if err != nil {
-		return processing.AffineTransform{}, err
-	}
-	return processing.AffineTransform{A: 1, B: 0, C: sciToRef.C, D: 0, E: 1, F: sciToRef.F}, nil
 }
 
 // loadD2ITables extracts the D2IMARR lookup-table corrections for a given SCI
@@ -167,157 +294,17 @@ func loadERRPixels(file *fitsio.File, sciExtver int) []float32 {
 	return pixels
 }
 
-func combineSCIHDUs(path string, primary fitsio.Header, sci []fitsio.HDU, file *fitsio.File) (fitsio.HDU, [][4][2]float64, error) {
-	inst, _ := instrument.FromHeader(primary)
-	cleaned := make([]fitsio.HDU, len(sci))
-	for i := range sci {
-		cleaned[i] = cleanSCIWithMatchingDQ(sci[i], file, inst.BadDQBits)
+// loadWHTPixels reads the WHT weight plane of a combined working file. Working
+// files are single-image (one WHT extension, no EXTVER), so a plain lookup by
+// name is sufficient. Returns nil when the file has no WHT extension.
+func loadWHTPixels(file *fitsio.File) []float32 {
+	hdu := file.GetHDU("WHT")
+	if hdu == nil || len(hdu.Data.Pixels) == 0 {
+		return nil
 	}
-
-	ref := cleaned[0]
-	transforms := make([]processing.AffineTransform, len(cleaned))
-	transforms[0] = processing.IdentityTransform()
-
-	minX, minY := 0.0, 0.0
-	maxX := float64(ref.Data.Width - 1)
-	maxY := float64(ref.Data.Height - 1)
-
-	for i := 1; i < len(cleaned); i++ {
-		// Use WCS to compute the translation of chip i relative to chip 0,
-		// but force the rotation/scale to identity. Each chip's CD matrix is a
-		// local linearisation of the geometric distortion and differs by a tiny
-		// amount between chips even though the detector is physically rigid.
-		// Keeping the full affine rotation from ComputeWCSTransform causes the
-		// inter-chip placement to pick up a false relative rotation. The
-		// translation (C, F) is the piece we want when combining the SCI chips
-		// into a single detector image.
-		transform, err := chipPlacementTransform(cleaned[i].Header, ref.Header)
-		if err != nil {
-			return fitsio.HDU{}, nil, fmt.Errorf("combine %s SCI[%d]: %w", filepath.Base(path), i+1, err)
-		}
-		transforms[i] = transform
-
-		for _, corner := range imageCorners(cleaned[i].Data.Width, cleaned[i].Data.Height) {
-			x, y := processing.ApplyAffineTransform(transforms[i], corner[0], corner[1])
-			if x < minX {
-				minX = x
-			}
-			if x > maxX {
-				maxX = x
-			}
-			if y < minY {
-				minY = y
-			}
-			if y > maxY {
-				maxY = y
-			}
-		}
-	}
-
-	width := int(math.Ceil(maxX - minX + 1))
-	height := int(math.Ceil(maxY - minY + 1))
-	if width < 1 {
-		width = 1
-	}
-	if height < 1 {
-		height = 1
-	}
-
-	// chipInnerTrim is how many pixels to exclude from every edge of each
-	// individual SCI chip before merging them onto the shared canvas.
-	// This widens the inter-chip gap and removes the hot/ringing pixels that
-	// appear at chip boundaries in the drizzled output.  The outer edges are
-	// also trimmed, but those are already handled by edgeTrim during drizzle,
-	// so a small value here is fine.  The value is taken from the instrument
-	// metadata so that detectors with wider inter-chip gaps (e.g. ACS/WFC)
-	// get a larger trim.
-	// Temporarily disabled to test whether the geometric chip-edge erosion is
-	// still needed now that DQ masking handles bad pixels. Restore by reverting
-	// to the commented assignment if boundary ringing reappears.
-	// chipInnerTrim := inst.ChipInnerTrim
-	chipInnerTrim := 0
-
-	sums := make([]float32, width*height)
-	weights := make([]float32, width*height)
-	for i := range cleaned {
-		hdu := cleaned[i]
-		for y := chipInnerTrim; y < hdu.Data.Height-chipInnerTrim; y++ {
-			for x := chipInnerTrim; x < hdu.Data.Width-chipInnerTrim; x++ {
-				idx := y*hdu.Data.Width + x
-				val := float64(hdu.Data.Pixels[idx])
-				if math.IsNaN(val) || math.IsInf(val, 0) {
-					continue
-				}
-				refX, refY := processing.ApplyAffineTransform(transforms[i], float64(x), float64(y))
-				drizzlePixelSquare(sums, weights, width, height, refX-minX, refY-minY, 1, float32(val), 1.0)
-			}
-		}
-	}
-
-	pixels := make([]float32, len(sums))
-	for i := range pixels {
-		if weights[i] == 0 {
-			pixels[i] = float32(math.NaN())
-			continue
-		}
-		pixels[i] = sums[i] / weights[i]
-	}
-
-	// Compute chip footprints in combined-canvas coords so the preview can
-	// draw a border around each chip (making the inter-chip gap visible).
-	chipFootprints := make([][4][2]float64, len(cleaned))
-	for i, hdu := range cleaned {
-		t := float64(chipInnerTrim)
-		w := float64(hdu.Data.Width)
-		h := float64(hdu.Data.Height)
-		// corners: TL, TR, BL, BR (matching imageCorners order)
-		srcCorners := [4][2]float64{
-			{t, t},
-			{w - t - 1, t},
-			{t, h - t - 1},
-			{w - t - 1, h - t - 1},
-		}
-		for ci, sc := range srcCorners {
-			rx, ry := processing.ApplyAffineTransform(transforms[i], sc[0], sc[1])
-			chipFootprints[i][ci] = [2]float64{rx - minX, ry - minY}
-		}
-	}
-
-	return fitsio.HDU{
-		Header:  buildCombinedInputHeader(path, primary, ref.Header, width, height, minX, minY, len(cleaned)),
-		Data:    fitsio.ImageData{Width: width, Height: height, Pixels: pixels},
-		ExtName: "SCI",
-	}, chipFootprints, nil
-}
-
-func buildCombinedInputHeader(path string, primary, ref fitsio.Header, width, height int, originX, originY float64, combinedCount int) fitsio.Header {
-	merged := mergeHeaders(primary, ref)
-	cards := fitsio.CloneHeader(merged).Cards
-
-	for _, key := range []string{
-		"END", "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "XTENSION", "PCOUNT", "GCOUNT",
-		"CHECKSUM", "DATASUM", "BSCALE", "BZERO", "LTV1", "LTV2",
-	} {
-		delete(cards, key)
-	}
-	cards["OBJECT"] = firstNonEmpty(cards["OBJECT"], quotedString(filepath.Base(path)))
-	cards["IMAGETYP"] = quotedString("SCI-COMB")
-	cards["NCOMBINE"] = fmt.Sprintf("%d", combinedCount)
-	cards["ORIGOFFX"] = formatFloat(originX)
-	cards["ORIGOFFY"] = formatFloat(originY)
-	cards["EXTNAME"] = quotedString("SCI")
-	cards["EXTEND"] = "T"
-	cards["NAXIS1"] = fmt.Sprintf("%d", width)
-	cards["NAXIS2"] = fmt.Sprintf("%d", height)
-
-	if crpix1, ok := fitsio.HeaderFloat(ref, "CRPIX1"); ok {
-		cards["CRPIX1"] = formatFloat(crpix1 - originX)
-	}
-	if crpix2, ok := fitsio.HeaderFloat(ref, "CRPIX2"); ok {
-		cards["CRPIX2"] = formatFloat(crpix2 - originY)
-	}
-
-	return fitsio.Header{Cards: cards}
+	pixels := make([]float32, len(hdu.Data.Pixels))
+	copy(pixels, hdu.Data.Pixels)
+	return pixels
 }
 
 func cleanSCIWithMatchingDQ(hdu fitsio.HDU, file *fitsio.File, badBits uint32) fitsio.HDU {

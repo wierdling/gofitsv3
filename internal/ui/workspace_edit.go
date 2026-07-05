@@ -132,7 +132,22 @@ func (es *editWorkspaceState) screenToImagePt(pos fyne.Position) (image.Point, b
 	if es.zoom <= 0 || es.origW == 0 || es.origH == 0 {
 		return image.Point{}, false
 	}
-	pt, ok := mapViewportPositionToImage(pos, fyne.NewPos(0, 0), es.zoom, es.origW, es.origH, false)
+	// canvasImg uses ImageFillContain inside a NewMax container, so when the
+	// displayed image (origW*zoom x origH*zoom) is smaller than the overlay in
+	// either axis it is centered with a letterbox margin. Back that offset out
+	// before mapping, otherwise the selection maps above/left of the real pixels.
+	dispW := float32(es.origW) * float32(es.zoom)
+	dispH := float32(es.origH) * float32(es.zoom)
+	sz := es.canvasImg.Size()
+	var offX, offY float32
+	if sz.Width > dispW {
+		offX = (sz.Width - dispW) / 2
+	}
+	if sz.Height > dispH {
+		offY = (sz.Height - dispH) / 2
+	}
+	adj := fyne.NewPos(pos.X-offX, pos.Y-offY)
+	pt, ok := mapViewportPositionToImage(adj, fyne.NewPos(0, 0), es.zoom, es.origW, es.origH, false)
 	return image.Pt(pt.X, pt.Y), ok
 }
 

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -83,6 +84,10 @@ type NumberEntry struct {
 	// least max(content natural min, MinWidth) wide. Set to 1 to get the natural
 	// content minimum with no extra enforcement.
 	MinWidth float32
+	// Min and Max clamp the value entered via the text field or chevrons.
+	// Default to -/+ math.MaxFloat64 (unclamped).
+	Min float64
+	Max float64
 
 	value    float64
 	entry    *selectAllEntry
@@ -97,6 +102,8 @@ func NewNumberEntry(step float64, decimals int) *NumberEntry {
 	n := &NumberEntry{
 		Step:     step,
 		Decimals: decimals,
+		Min:      -math.MaxFloat64,
+		Max:      math.MaxFloat64,
 	}
 	n.ExtendBaseWidget(n)
 
@@ -105,6 +112,11 @@ func NewNumberEntry(step float64, decimals int) *NumberEntry {
 		v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
 		if err != nil {
 			return
+		}
+		if v < n.Min {
+			v = n.Min
+		} else if v > n.Max {
+			v = n.Max
 		}
 		n.value = v
 		if n.OnChanged != nil {
@@ -144,6 +156,11 @@ func (n *NumberEntry) Value() float64 { return n.value }
 
 // SetValue updates the value, refreshes the text, and fires OnChanged.
 func (n *NumberEntry) SetValue(v float64) {
+	if v < n.Min {
+		v = n.Min
+	} else if v > n.Max {
+		v = n.Max
+	}
 	n.value = v
 	n.syncText()
 	if n.OnChanged != nil {

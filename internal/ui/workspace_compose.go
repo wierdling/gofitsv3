@@ -19,6 +19,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -719,6 +720,89 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 		orangeViewport = newViewport()
 		orangeViewport.histColor = [4]uint8{orangeSettings.ColorR, orangeSettings.ColorG, orangeSettings.ColorB, 255}
+
+		orangeActivePicker := ""
+		clearOrangePicker := func() {
+			orangeActivePicker = ""
+			orangeViewport.overlay.pickerActive = false
+			orangeViewport.overlay.Refresh()
+			orangeViewport.SetPickerValueText("Value: --")
+		}
+		setOrangePicker := func(target string) {
+			if orangeActivePicker == target {
+				clearOrangePicker()
+				return
+			}
+			orangeActivePicker = target
+			orangeViewport.overlay.pickerActive = true
+			orangeViewport.overlay.Refresh()
+			orangeViewport.SetPickerValueText(fmt.Sprintf("Pick %s: --", target))
+		}
+		orangeViewport.SetLevelPickers(
+			func() { setOrangePicker("Black") },
+			func() { setOrangePicker("White") },
+		)
+		orangeViewport.overlay.onPointerMove = func(pos fyne.Position) {
+			point, ok := orangeViewport.imagePointAtPosition(pos, false)
+			if !ok {
+				if orangeActivePicker != "" {
+					orangeViewport.SetPickerValueText(fmt.Sprintf("Pick %s: --", orangeActivePicker))
+				} else {
+					orangeViewport.SetPickerValueText("Value: --")
+				}
+				return
+			}
+			var value float64
+			var okv bool
+			if orangeActivePicker != "" {
+				value, okv = composeRegionMedianAt(imgs[3], point, composePickRadius)
+			} else {
+				value, okv = composePixelValueAt(imgs[3], point)
+			}
+			if !okv {
+				if orangeActivePicker != "" {
+					orangeViewport.SetPickerValueText(fmt.Sprintf("Pick %s: --", orangeActivePicker))
+				} else {
+					orangeViewport.SetPickerValueText("Value: --")
+				}
+				return
+			}
+			if orangeActivePicker != "" {
+				orangeViewport.SetPickerValueText(fmt.Sprintf("Pick %s: %.6g", orangeActivePicker, value))
+				return
+			}
+			orangeViewport.SetPickerValueText(fmt.Sprintf("Value: %.6g", value))
+		}
+		orangeViewport.overlay.onPointerOut = func() {
+			if orangeActivePicker != "" {
+				orangeViewport.SetPickerValueText(fmt.Sprintf("Pick %s: --", orangeActivePicker))
+				return
+			}
+			orangeViewport.SetPickerValueText("Value: --")
+		}
+		orangeViewport.overlay.onTapped = func(pos fyne.Position) {
+			if orangeActivePicker == "" {
+				return
+			}
+			point, ok := orangeViewport.imagePointAtPosition(pos, false)
+			if !ok {
+				return
+			}
+			value, ok := composeRegionMedianAt(imgs[3], point, composePickRadius)
+			if !ok {
+				return
+			}
+			if orangeActivePicker == "Black" {
+				imgs[3].Black = value
+				orangeViewport.blackBox.SetValue(value)
+			} else {
+				imgs[3].White = value
+				orangeViewport.whiteBox.SetValue(value)
+			}
+			clearOrangePicker()
+			refreshOrangePreview()
+		}
+
 		orangeViewport.SetLoadSave("Orange", "O", color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255}, loadOrange, saveOrangeGray)
 		orangeViews := []*viewport{nil, nil, nil, orangeViewport}
 		orangeControl = channelControls("Orange Image", color.RGBA{R: orangeSettings.ColorR, G: orangeSettings.ColorG, B: orangeSettings.ColorB, A: 255}, 3, imgs, &origPixels, orangeViews, refreshOrangePreview, nil)
@@ -732,26 +816,57 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			orangeViewport.histColor = [4]uint8{orangeSettings.ColorR, orangeSettings.ColorG, orangeSettings.ColorB, 255}
 			refreshOrangePreview()
 		}
+		colorLabelWidth := float32(0)
+		for _, s := range []string{"Red", "Green", "Blue"} {
+			if w := widget.NewLabel(s).MinSize().Width; w > colorLabelWidth {
+				colorLabelWidth = w
+			}
+		}
+		colorLabel := func(text string) fyne.CanvasObject {
+			l := widget.NewLabel(text)
+			return container.New(layout.NewGridWrapLayout(fyne.NewSize(colorLabelWidth, l.MinSize().Height)), l)
+		}
 		colorSlider := func(label string, value uint8, set func(uint8)) fyne.CanvasObject {
 			slider := widget.NewSlider(0, 255)
 			slider.Step = 1
 			slider.Value = float64(value)
-			valueLabel := widget.NewLabel(fmt.Sprintf("%d", value))
+			valueEntry := NewNumberEntry(1, 0)
+			valueEntry.Min = 0
+			valueEntry.Max = 255
+			valueEntry.MinWidth = 70
+			valueEntry.SetValue(float64(value))
 			slider.OnChanged = func(v float64) {
 				n := uint8(math.Round(v))
 				set(n)
-				valueLabel.SetText(fmt.Sprintf("%d", n))
+				valueEntry.SetValue(float64(n))
 				updateSwatch()
 			}
-			return container.NewBorder(nil, nil, widget.NewLabel(label), valueLabel, slider)
+			valueEntry.OnChanged = func(v float64) {
+				n := uint8(math.Round(v))
+				set(n)
+				slider.Value = float64(n)
+				slider.Refresh()
+				updateSwatch()
+			}
+			return container.NewBorder(nil, nil, colorLabel(label), valueEntry, slider)
 		}
 		opacitySlider := widget.NewSlider(0, 100)
 		opacitySlider.Step = 1
 		opacitySlider.Value = orangeSettings.Opacity * 100
-		opacityValue := widget.NewLabel(fmt.Sprintf("%.0f%%", opacitySlider.Value))
+		opacityValue := NewNumberEntry(1, 0)
+		opacityValue.Min = 0
+		opacityValue.Max = 100
+		opacityValue.MinWidth = 70
+		opacityValue.SetValue(opacitySlider.Value)
 		opacitySlider.OnChanged = func(v float64) {
 			orangeSettings.Opacity = v / 100
-			opacityValue.SetText(fmt.Sprintf("%.0f%%", v))
+			opacityValue.SetValue(v)
+			refresh()
+		}
+		opacityValue.OnChanged = func(v float64) {
+			orangeSettings.Opacity = v / 100
+			opacitySlider.Value = v
+			opacitySlider.Refresh()
 			refresh()
 		}
 
@@ -764,10 +879,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			colorSlider("Red", orangeSettings.ColorR, func(v uint8) { orangeSettings.ColorR = v }),
 			colorSlider("Green", orangeSettings.ColorG, func(v uint8) { orangeSettings.ColorG = v }),
 			colorSlider("Blue", orangeSettings.ColorB, func(v uint8) { orangeSettings.ColorB = v }),
-			container.NewBorder(nil, nil, widget.NewLabel("Opacity"), opacityValue, opacitySlider),
+			container.NewBorder(nil, nil, widget.NewLabel("Opacity"), container.NewHBox(opacityValue, widget.NewLabel("%")), opacitySlider),
 		)
 		controls := container.NewVScroll(container.NewVBox(orangeControl.Content, colorControls))
-		controls.SetMinSize(fyne.NewSize(260, 200))
+		controls.SetMinSize(fyne.NewSize(300, 200))
 		orangeWin = app.NewWindow("Orange Image")
 		orangeWin.SetContent(container.NewBorder(nil, nil, controls, nil, orangeViewport.container))
 		orangeWin.Resize(fyne.NewSize(900, 600))
@@ -2317,6 +2432,70 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 	peakEntry.SetValue(1)
 	scaledPeakEntry.SetValue(1)
 
+	// Lock buttons: when engaged, the "Black" level and "Background level" fields
+	// mirror each other (and likewise "White"/"Peak level"), so editing one input
+	// updates the other. Locking is per-channel and only affects future edits; the
+	// syncing guards prevent the paired SetValue from recursing back.
+	var blackBgLocked, whitePeakLocked bool
+	var syncingBlackBg, syncingWhitePeak bool
+
+	blackBgLockBtn := widget.NewButton("Lock", nil)
+	whitePeakLockBtn := widget.NewButton("Lock", nil)
+	blackBgLockBtn.Importance = widget.LowImportance
+	whitePeakLockBtn.Importance = widget.LowImportance
+
+	setLockAppearance := func(btn *widget.Button, locked bool) {
+		if locked {
+			btn.SetText("Locked")
+			btn.Importance = widget.HighImportance
+		} else {
+			btn.SetText("Lock")
+			btn.Importance = widget.LowImportance
+		}
+		btn.Refresh()
+	}
+	blackBgLockBtn.OnTapped = func() {
+		blackBgLocked = !blackBgLocked
+		setLockAppearance(blackBgLockBtn, blackBgLocked)
+	}
+	whitePeakLockBtn.OnTapped = func() {
+		whitePeakLocked = !whitePeakLocked
+		setLockAppearance(whitePeakLockBtn, whitePeakLocked)
+	}
+
+	backgroundEntry.OnChanged = func(v float64) {
+		if !blackBgLocked || syncingBlackBg {
+			return
+		}
+		syncingBlackBg = true
+		views[idx].blackBox.SetValue(v)
+		syncingBlackBg = false
+	}
+	views[idx].blackBox.OnChanged = func(v float64) {
+		if !blackBgLocked || syncingBlackBg {
+			return
+		}
+		syncingBlackBg = true
+		backgroundEntry.SetValue(v)
+		syncingBlackBg = false
+	}
+	peakEntry.OnChanged = func(v float64) {
+		if !whitePeakLocked || syncingWhitePeak {
+			return
+		}
+		syncingWhitePeak = true
+		views[idx].whiteBox.SetValue(v)
+		syncingWhitePeak = false
+	}
+	views[idx].whiteBox.OnChanged = func(v float64) {
+		if !whitePeakLocked || syncingWhitePeak {
+			return
+		}
+		syncingWhitePeak = true
+		peakEntry.SetValue(v)
+		syncingWhitePeak = false
+	}
+
 	showClip := NewToggle(func(v bool) {
 		if imgs[idx] == nil {
 			return
@@ -2425,8 +2604,8 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 			}(),
 			selectBox,
 			widget.NewForm(
-				widget.NewFormItem("Background level", backgroundEntry),
-				widget.NewFormItem("Peak level", peakEntry),
+				widget.NewFormItem("Background level", container.NewBorder(nil, nil, nil, blackBgLockBtn, backgroundEntry)),
+				widget.NewFormItem("Peak level", container.NewBorder(nil, nil, nil, whitePeakLockBtn, peakEntry)),
 				widget.NewFormItem("Scaled peak level", scaledPeakEntry),
 			),
 			asinhRow,

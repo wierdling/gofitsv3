@@ -181,8 +181,12 @@ type SkysubSettings struct {
 }
 
 type MosaicInputState struct {
-	Path         string  `json:"path"`
-	SCIExt       int     `json:"sciExt,omitempty"`
+	Path   string `json:"path"`
+	SCIExt int    `json:"sciExt,omitempty"`
+	// Combined marks an entry whose Path is the original multi-chip source file
+	// that gets drizzled into a single working image on load. Absent (false) for
+	// ordinary single-chip inputs and for pre-combine legacy projects.
+	Combined     bool    `json:"combined,omitempty"`
 	OffsetX      float64 `json:"offsetX"`
 	OffsetY      float64 `json:"offsetY"`
 	HasTransform bool    `json:"hasTransform"`

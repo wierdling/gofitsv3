@@ -132,24 +132,59 @@ func EstimateTweakRegAlignmentWithRefStars(
 	searchRadiusArcsec float64,
 	fitgeom string,
 ) (AffineTransform, AlignStats, error) {
-	if mapper == nil {
-		return AffineTransform{}, AlignStats{}, fmt.Errorf("WCSMapper is required for TweakReg alignment")
-	}
+	const maxCatalogStars = 200
+	sourceStars := ExtractAndLimitStars(sourcePixels, sourceWidth, sourceHeight, 4.0, 3, maxCatalogStars)
+	result, stats, projected, pairs, err := estimateTweakRegFromCatalogs(
+		sourceStars, mapper, refStars, refWidth, refHeight, refHeader, searchRadiusArcsec, fitgeom)
 
-	// Capture diagnostic data for the debug hook, regardless of success or failure.
-	var dbgRef, dbgSrc []Star
-	var dbgPairs []MatchedPair
+	// Fire the debug hook with the image-backed diagnostic data; it is only set
+	// during debug-alignment sessions.
 	if AlignmentDebugHook != nil {
-		defer func() {
-			AlignmentDebugHook(AlignmentDiag{
-				RefPixels:   refPixels,
-				RefW:        refWidth,
-				RefH:        refHeight,
-				RefStars:    dbgRef,
-				SourceStars: dbgSrc,
-				Pairs:       dbgPairs,
-			})
-		}()
+		AlignmentDebugHook(AlignmentDiag{
+			RefPixels:   refPixels,
+			RefW:        refWidth,
+			RefH:        refHeight,
+			RefStars:    refStars,
+			SourceStars: projected,
+			Pairs:       pairs,
+		})
+	}
+	return result, stats, err
+}
+
+// EstimateTweakRegAlignmentFromCatalogs aligns a pre-extracted source star
+// catalog to a reference star catalog through the WCS mapper, with no image
+// pixels. Given the same source catalog it is exactly equivalent to
+// EstimateTweakRegAlignmentWithRefStars; it exists so the mosaic alignment path
+// can stream pixels — extract each catalog once, then align on catalogs alone —
+// keeping the memory footprint bounded for large mosaics.
+func EstimateTweakRegAlignmentFromCatalogs(
+	sourceStars []Star,
+	mapper *WCSMapper,
+	refStars []Star,
+	refWidth, refHeight int, refHeader fitsio.Header,
+	searchRadiusArcsec float64,
+	fitgeom string,
+) (AffineTransform, AlignStats, error) {
+	result, stats, _, _, err := estimateTweakRegFromCatalogs(
+		sourceStars, mapper, refStars, refWidth, refHeight, refHeader, searchRadiusArcsec, fitgeom)
+	return result, stats, err
+}
+
+// estimateTweakRegFromCatalogs is the catalog-only core shared by the pixel and
+// streaming TweakReg entry points. It projects the source catalog into reference
+// pixel space through the WCS mapper and fits the residual against the reference
+// catalog, returning the projected source stars and matched pairs for diagnostics.
+func estimateTweakRegFromCatalogs(
+	sourceStars []Star,
+	mapper *WCSMapper,
+	refStars []Star,
+	refWidth, refHeight int, refHeader fitsio.Header,
+	searchRadiusArcsec float64,
+	fitgeom string,
+) (AffineTransform, AlignStats, []Star, []MatchedPair, error) {
+	if mapper == nil {
+		return AffineTransform{}, AlignStats{}, nil, nil, fmt.Errorf("WCSMapper is required for TweakReg alignment")
 	}
 
 	plateScale, ok := plateScaleArcsecPerPixel(refHeader)
@@ -158,16 +193,13 @@ func EstimateTweakRegAlignmentWithRefStars(
 	}
 	searchRadiusPx := searchRadiusArcsec / plateScale
 
-	const maxCatalogStars = 200
-	sourceStars := ExtractAndLimitStars(sourcePixels, sourceWidth, sourceHeight, 4.0, 3, maxCatalogStars)
-	debuglog.Log(fmt.Sprintf("EstimateTweakRegAlignmentWithRefStars: %d source stars detected, %d ref stars provided", len(sourceStars), len(refStars)))
+	debuglog.Log(fmt.Sprintf("estimateTweakRegFromCatalogs: %d source stars, %d ref stars provided", len(sourceStars), len(refStars)))
 	if len(sourceStars) < 2 {
-		return AffineTransform{}, AlignStats{}, fmt.Errorf("too few stars in source image (%d)", len(sourceStars))
+		return AffineTransform{}, AlignStats{}, nil, nil, fmt.Errorf("too few stars in source image (%d)", len(sourceStars))
 	}
 	if len(refStars) < 2 {
-		return AffineTransform{}, AlignStats{}, fmt.Errorf("too few stars in reference image (%d)", len(refStars))
+		return AffineTransform{}, AlignStats{}, nil, nil, fmt.Errorf("too few stars in reference image (%d)", len(refStars))
 	}
-	dbgRef = refStars
 
 	// Project source stars to reference pixel space through the full WCS pipeline.
 	projected := make([]Star, 0, len(sourceStars))
@@ -179,18 +211,16 @@ func EstimateTweakRegAlignmentWithRefStars(
 		}
 		projected = append(projected, Star{X: rx, Y: ry, Flux: s.Flux})
 	}
-	dbgSrc = projected
-	debuglog.Log(fmt.Sprintf("EstimateTweakRegAlignmentWithRefStars: %d/%d source stars project into reference frame", len(projected), len(sourceStars)))
+	debuglog.Log(fmt.Sprintf("estimateTweakRegFromCatalogs: %d/%d source stars project into reference frame", len(projected), len(sourceStars)))
 	if len(projected) < 2 {
-		return AffineTransform{}, AlignStats{}, fmt.Errorf("too few source stars project into reference frame (%d)", len(projected))
+		return AffineTransform{}, AlignStats{}, projected, nil, fmt.Errorf("too few source stars project into reference frame (%d)", len(projected))
 	}
 
 	result, stats, pairs, err := fitCatalogTransform(projected, refStars, refWidth, refHeight, searchRadiusPx, fitgeom)
-	dbgPairs = pairs
 	if err != nil {
-		return AffineTransform{}, stats, err
+		return AffineTransform{}, stats, projected, pairs, err
 	}
-	return result, stats, nil
+	return result, stats, projected, pairs, nil
 }
 
 // FitCatalogResidual fits the residual transform mapping the projected source

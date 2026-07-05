@@ -14,7 +14,10 @@ func LoadPrimaryHeader(path string) (Header, error) {
 	}
 	defer f.Close()
 
-	header, _, err := readHeader(bufio.NewReader(f))
+	// FITS primary headers commonly span several 2880-byte blocks (ACS/WFC3
+	// headers run to many KiB), so a larger buffer reads the whole header in
+	// one or two syscalls instead of many small ones.
+	header, _, err := readHeader(bufio.NewReaderSize(f, 32*1024))
 	if err != nil {
 		return Header{}, err
 	}

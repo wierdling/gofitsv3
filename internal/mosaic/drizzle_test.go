@@ -291,7 +291,7 @@ func TestNormalizeSurfaceBrightnessInputsScalesSCIAndERRByMappedArea(t *testing.
 			},
 		},
 	}
-	sci, errPix, err := prepareFramePixels(planned[0], Options{SurfaceBrightnessNorm: true}, 0, skyPlane{})
+	sci, errPix, _, err := prepareFramePixels(planned[0], Options{SurfaceBrightnessNorm: true}, 0, skyPlane{})
 	if err != nil {
 		t.Fatalf("prepareFramePixels returned error: %v", err)
 	}
@@ -306,6 +306,54 @@ func TestNormalizeSurfaceBrightnessInputsScalesSCIAndERRByMappedArea(t *testing.
 	}
 	if planned[0].input.HDU.Data.Pixels[0] != 8 || planned[0].input.ERRPixels[0] != 4 {
 		t.Fatal("prepareFramePixels mutated original input")
+	}
+}
+
+func TestDrizzlePixelWeightPrefersWeightPixels(t *testing.T) {
+	// ExposureTime 0 so the ERR fallback returns 1/(e*e) directly (the rate
+	// conversion branch is gated on exptime > 0).
+	p := plannedInput{input: Input{ERRPixels: []float32{2, 4}}}
+
+	// A present, positive WeightPixels value is used verbatim.
+	p.input.WeightPixels = []float32{5, 0}
+	if got := drizzlePixelWeight(p, 0, WeightERR); got != 5 {
+		t.Fatalf("weight[0] with WeightPixels = %v, want 5", got)
+	}
+	// A zero WeightPixels value falls through to the ERR-derived weight.
+	if got := drizzlePixelWeight(p, 1, WeightERR); got != 1.0/16.0 {
+		t.Fatalf("weight[1] zero-WHT fallback = %v, want %v", got, 1.0/16.0)
+	}
+	// A non-finite WeightPixels value also falls through.
+	p.input.WeightPixels = []float32{float32(math.NaN()), 4}
+	if got := drizzlePixelWeight(p, 0, WeightERR); got != 1.0/4.0 {
+		t.Fatalf("weight[0] NaN-WHT fallback = %v, want %v", got, 1.0/4.0)
+	}
+	// Nil WeightPixels leaves the pure-ERR behavior unchanged.
+	p.input.WeightPixels = nil
+	if got := drizzlePixelWeight(p, 0, WeightERR); got != 1.0/4.0 {
+		t.Fatalf("weight[0] nil WeightPixels = %v, want %v", got, 1.0/4.0)
+	}
+}
+
+func TestPrepareFramePixelsScalesWeightPixels(t *testing.T) {
+	planned := []plannedInput{
+		{
+			sourcePixelScale: 2, // area 4 → sbScale 0.25 → inverse-variance scale 16
+			input: Input{
+				HDU:          fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 1, Pixels: []float32{8, 8}}},
+				WeightPixels: []float32{4, 4},
+			},
+		},
+	}
+	_, _, wht, err := prepareFramePixels(planned[0], Options{SurfaceBrightnessNorm: true}, 0, skyPlane{})
+	if err != nil {
+		t.Fatalf("prepareFramePixels returned error: %v", err)
+	}
+	if got := wht[0]; got != 64 {
+		t.Fatalf("scaled WeightPixels = %v, want 64", got)
+	}
+	if planned[0].input.WeightPixels[0] != 4 {
+		t.Fatal("prepareFramePixels mutated original WeightPixels")
 	}
 }
 
@@ -508,6 +556,107 @@ func TestAlignInputsByStarsIsDeterministic(t *testing.T) {
 				t.Fatalf("run %d result[%d] differs:\n first: %+v\n  this: %+v", run, i, first[i], next[i])
 			}
 		}
+	}
+}
+
+// TestAlignInputsStreamingMatchesResident verifies the streaming alignment path
+// (metadata-only inputs whose pixels are reloaded on demand) produces exactly the
+// same result as the resident path (all pixels held in memory). Synthetic star
+// fields are written to temp FITS files and loaded both ways, so the test
+// exercises the real on-demand reload and the catalog-based TweakReg estimator.
+func TestAlignInputsStreamingMatchesResident(t *testing.T) {
+	refStars := []processing.Star{
+		{X: 60, Y: 60}, {X: 220, Y: 60}, {X: 380, Y: 60},
+		{X: 140, Y: 220}, {X: 300, Y: 220}, {X: 220, Y: 340},
+	}
+	wcsHdr := func() fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "200", "CRPIX2": "200",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "0.0001", "CD1_2": "0", "CD2_1": "0", "CD2_2": "0.0001",
+		}}
+	}
+
+	dir := t.TempDir()
+	// Write one reference plus several rotated/shifted targets to temp FITS files.
+	type frame struct {
+		angleDeg, dx, dy float64
+	}
+	frames := []frame{{0, 0, 0}, {1.5, 2.0, -1.0}, {-2.0, -1.5, 2.5}, {0.8, -3.0, -2.0}}
+	// 600x600 float32 = ~1.4 MiB per frame, above LoadFileMetadata's small-data
+	// decode threshold, so metadata loads leave the pixels on disk and alignment
+	// genuinely streams them back on demand.
+	const dim = 600
+	var paths []string
+	for k, f := range frames {
+		stars := refStars
+		if k > 0 {
+			stars = transformStarsAroundCenter(refStars, 200, 200, f.angleDeg*math.Pi/180, f.dx, f.dy)
+		}
+		px := makeTestStarField(dim, dim, stars)
+		path := filepath.Join(dir, fmt.Sprintf("frame%d_flc.fits", k))
+		if err := fitsio.WriteFloat32Image(path, wcsHdr(), fitsio.ImageData{Width: dim, Height: dim, Pixels: px}); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+		paths = append(paths, path)
+	}
+
+	loadAll := func(loader func(string) ([]Input, error)) []Input {
+		var inputs []Input
+		for _, p := range paths {
+			ins, err := loader(p)
+			if err != nil {
+				t.Fatalf("load %s: %v", p, err)
+			}
+			inputs = append(inputs, ins...)
+		}
+		return inputs
+	}
+
+	resident := loadAll(LoadInputsFromPath)
+	streamed := loadAll(LoadInputsMetadataFromPath)
+
+	// Confirm the streaming inputs really hold no pixels (the memory win) but can
+	// still be reloaded (Path is set).
+	for i := range streamed {
+		if streamed[i].HDU.Data.Pixels != nil {
+			t.Fatalf("streamed input[%d] unexpectedly carries resident pixels", i)
+		}
+		if streamed[i].Path == "" {
+			t.Fatalf("streamed input[%d] has no Path to stream from", i)
+		}
+	}
+
+	mode := AlignmentModeTweakRegRScale
+	resResident, err := AlignInputsByStarsWithMode(resident, 1, mode, 2.0)
+	if err != nil {
+		t.Fatalf("align (resident) error: %v", err)
+	}
+	resStreamed, err := AlignInputsByStarsWithMode(streamed, 1, mode, 2.0)
+	if err != nil {
+		t.Fatalf("align (streamed) error: %v", err)
+	}
+
+	if len(resResident) != len(resStreamed) {
+		t.Fatalf("result count: resident %d, streamed %d", len(resResident), len(resStreamed))
+	}
+	for i := range resResident {
+		if resResident[i] != resStreamed[i] {
+			t.Fatalf("result[%d] differs between resident and streamed paths:\n resident: %+v\n streamed: %+v",
+				i, resResident[i], resStreamed[i])
+		}
+	}
+
+	// Guard against a vacuous pass: at least one target must have actually aligned,
+	// so the equivalence check covered the fitting math, not just failures.
+	aligned := 0
+	for i := 1; i < len(resStreamed); i++ {
+		if resStreamed[i].Applied && resStreamed[i].HasManualTransform {
+			aligned++
+		}
+	}
+	if aligned == 0 {
+		t.Fatal("no target aligned; equivalence held but the fit was not exercised")
 	}
 }
 

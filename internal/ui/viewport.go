@@ -456,7 +456,26 @@ func blankImg() *image.RGBA {
 }
 
 func (vp *viewport) imagePointAtPosition(pos fyne.Position, flipped bool) (imagePoint, bool) {
-	return mapViewportPositionToImage(pos, fyne.NewPos(0, 0), vp.zoom, vp.origW, vp.origH, flipped)
+	adj := pos
+	if vp.overlay != nil && vp.zoom > 0 && vp.origW > 0 && vp.origH > 0 {
+		// img/overlay sit in a NewMax container, which stretches both to fill
+		// the scroll viewport whenever the zoomed image is smaller than it.
+		// ImageFillContain then centers the actual pixels with a letterbox
+		// margin, so that margin must be backed out before mapping (mirrors
+		// screenToImagePt in workspace_edit.go).
+		dispW := float32(vp.origW) * float32(vp.zoom)
+		dispH := float32(vp.origH) * float32(vp.zoom)
+		sz := vp.overlay.Size()
+		var offX, offY float32
+		if sz.Width > dispW {
+			offX = (sz.Width - dispW) / 2
+		}
+		if sz.Height > dispH {
+			offY = (sz.Height - dispH) / 2
+		}
+		adj = fyne.NewPos(pos.X-offX, pos.Y-offY)
+	}
+	return mapViewportPositionToImage(adj, fyne.NewPos(0, 0), vp.zoom, vp.origW, vp.origH, flipped)
 }
 
 func (vp *viewport) setMeasurementOverlay(first *imagePoint, second *imagePoint, flipped bool) {

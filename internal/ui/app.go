@@ -47,11 +47,11 @@ func Run() error {
 		if len(fileMenu.Items) >= 3 {
 			origItems := fileMenu.Items
 			fileMenu.Items = []*fyne.MenuItem{
-				loadMosaicItem,
 				saveMosaicItem,
+				loadMosaicItem,
 				fyne.NewMenuItemSeparator(),
-				origItems[0],
 				origItems[1],
+				origItems[0],
 				fyne.NewMenuItemSeparator(),
 			}
 			fileMenu.Items = append(fileMenu.Items, origItems[3:]...)

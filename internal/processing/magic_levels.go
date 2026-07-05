@@ -85,7 +85,7 @@ const (
 	// up toward white and just begins to clip) rather than at the brightest knots
 	// or residual star-halo pixels, which would leave the nebula under-stretched.
 	nebulaWhitePercentile   = 98.5
-	galaxyWhitePercentile   = 99.95
+	galaxyWhitePercentile   = 99.99
 	balancedWhitePercentile = 99.9
 
 	// minimumWhiteSamplePercent is the minimum size (percent of valid pixels)

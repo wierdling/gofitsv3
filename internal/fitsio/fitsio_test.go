@@ -392,6 +392,71 @@ func TestWriteFloat32ImageRoundTripAndHeaderFormatting(t *testing.T) {
 	}
 }
 
+func TestWriteFloat32ImageWithExtensionsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ext_roundtrip.fits")
+	header := Header{Cards: map[string]string{"OBJECT": "'Nebula'"}}
+	sci := ImageData{Width: 2, Height: 2, Pixels: []float32{1, 2, 3, 4}}
+	wht := ImageData{Width: 2, Height: 2, Pixels: []float32{0.25, 0.5, 0.75, 1}}
+	if err := WriteFloat32ImageWithExtensions(path, header, sci, ImageExtension{ExtName: "WHT", Data: wht}); err != nil {
+		t.Fatalf("WriteFloat32ImageWithExtensions error = %v", err)
+	}
+
+	file, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("round-trip LoadFile error = %v", err)
+	}
+	if len(file.HDUs) != 2 {
+		t.Fatalf("len(HDUs) = %d, want 2", len(file.HDUs))
+	}
+	if file.HDUs[0].Data.Pixels[3] != 4 {
+		t.Fatalf("primary pixels = %v", file.HDUs[0].Data.Pixels)
+	}
+	whtHDU := file.GetHDU("WHT")
+	if whtHDU == nil {
+		t.Fatal("GetHDU(WHT) = nil, want WHT extension")
+	}
+	if whtHDU.ExtName != "WHT" {
+		t.Fatalf("ExtName = %q, want WHT", whtHDU.ExtName)
+	}
+	if whtHDU.Header.Cards["XTENSION"] != "'IMAGE   '" {
+		t.Fatalf("XTENSION = %q", whtHDU.Header.Cards["XTENSION"])
+	}
+	for i, want := range wht.Pixels {
+		if whtHDU.Data.Pixels[i] != want {
+			t.Fatalf("WHT pixel[%d] = %v, want %v", i, whtHDU.Data.Pixels[i], want)
+		}
+	}
+}
+
+func TestWriteFloat32ImageWithExtensionsMetadataSkipsLargeExtension(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ext_metadata.fits")
+	// 513*512*4 bytes > 1 MiB, so LoadFileMetadata skips decoding the extension.
+	const w, h = 513, 512
+	wht := ImageData{Width: w, Height: h, Pixels: make([]float32, w*h)}
+	sci := ImageData{Width: 2, Height: 2, Pixels: []float32{1, 2, 3, 4}}
+	if err := WriteFloat32ImageWithExtensions(path, Header{Cards: map[string]string{}}, sci, ImageExtension{ExtName: "WHT", Data: wht}); err != nil {
+		t.Fatalf("WriteFloat32ImageWithExtensions error = %v", err)
+	}
+
+	file, err := LoadFileMetadata(path)
+	if err != nil {
+		t.Fatalf("LoadFileMetadata error = %v", err)
+	}
+	if len(file.HDUs) != 2 {
+		t.Fatalf("len(HDUs) = %d, want 2", len(file.HDUs))
+	}
+	ext := file.HDUs[1]
+	if ext.ExtName != "WHT" {
+		t.Fatalf("ExtName = %q, want WHT", ext.ExtName)
+	}
+	if ext.Data.Width != w || ext.Data.Height != h {
+		t.Fatalf("dimensions = %dx%d, want %dx%d", ext.Data.Width, ext.Data.Height, w, h)
+	}
+	if ext.Data.Pixels != nil {
+		t.Fatalf("large extension pixels should be nil, got len %d", len(ext.Data.Pixels))
+	}
+}
+
 func TestWriteFloat32ImageCreateError(t *testing.T) {
 	err := WriteFloat32Image(t.TempDir(), Header{}, ImageData{Width: 1, Height: 1, Pixels: []float32{1}})
 	if err == nil {
