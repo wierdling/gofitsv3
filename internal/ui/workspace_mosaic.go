@@ -920,7 +920,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			return
 		}
 		if !state.drizzleSettingsSet {
-			showDrizzleSettingsDialog(win, state.drizzleSettings, func(s models.DrizzleSettings) {
+			showDrizzleSettingsDialog(win, state.drizzleSettings, state.inputs, func(s models.DrizzleSettings) {
 				state.drizzleSettings = s
 				state.drizzleSettingsSet = true
 				go ws.buildDrizzlePreview()

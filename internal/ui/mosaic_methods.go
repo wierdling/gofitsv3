@@ -342,7 +342,7 @@ func (ws *mosaicWorkspace) fitZoom() float64 {
 }
 
 func (ws *mosaicWorkspace) openDrizzleSettings() {
-	showDrizzleSettingsDialog(ws.win, ws.state.drizzleSettings, func(s models.DrizzleSettings) {
+	showDrizzleSettingsDialog(ws.win, ws.state.drizzleSettings, ws.state.inputs, func(s models.DrizzleSettings) {
 		ws.state.drizzleSettings = s
 		ws.state.drizzleSettingsSet = true
 	})

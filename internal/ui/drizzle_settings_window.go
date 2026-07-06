@@ -10,6 +10,7 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
+	"gofitsv3/internal/instrument"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
 )
@@ -44,13 +45,72 @@ func kernelIndex(k int) int {
 	return 0
 }
 
-func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, onSave func(models.DrizzleSettings)) {
+// scalePresetCustom and scalePresetAuto are the two non-instrument entries in
+// the Output Scale preset menu.
+const (
+	scalePresetCustom = "Custom / multiplier"
+	scalePresetAuto   = "Auto — match finest input"
+)
+
+// finestInputScale returns the smallest native plate scale (arcsec/pixel) among
+// the non-excluded inputs. ok is false when no input yields a usable scale.
+func finestInputScale(inputs []mosaic.Input) (float64, bool) {
+	best := 0.0
+	found := false
+	for _, in := range inputs {
+		if in.Excluded {
+			continue
+		}
+		ps, ok := mosaic.NativePlateScaleArcsec(in)
+		if !ok || ps <= 0 {
+			continue
+		}
+		if !found || ps < best {
+			best = ps
+			found = true
+		}
+	}
+	return best, found
+}
+
+func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, inputs []mosaic.Input, onSave func(models.DrizzleSettings)) {
 	// Output scale: arcsec/pixel (preferred) or raw multiplier fallback.
 	finalScaleEntry := widget.NewEntry()
 	if current.FinalScale > 0 {
 		finalScaleEntry.SetText(fmt.Sprintf("%.4f", current.FinalScale))
 	}
 	finalScaleEntry.SetPlaceHolder("e.g. 0.04 (leave blank to use multiplier)")
+
+	// Preset menu that fills the Output Scale field with a known instrument
+	// plate scale (or the finest loaded input). The field stays editable.
+	presetOptions := []string{scalePresetCustom, scalePresetAuto}
+	presetScale := map[string]float64{}
+	for _, p := range instrument.ScalePresets() {
+		label := fmt.Sprintf("%s (%.4g\")", p.Name, p.PixelScale)
+		presetOptions = append(presetOptions, label)
+		presetScale[label] = p.PixelScale
+	}
+	presetSelect := NewSafeSelect(presetOptions, nil)
+	presetSelect.SetSelected(scalePresetCustom)
+	presetSelect.OnChanged = func(s string) {
+		switch s {
+		case scalePresetCustom:
+			return
+		case scalePresetAuto:
+			ps, ok := finestInputScale(inputs)
+			if !ok {
+				dialog.ShowInformation("No Plate Scale",
+					"Could not determine a plate scale from the loaded inputs (missing WCS and unrecognised instrument).", win)
+				presetSelect.SetSelected(scalePresetCustom)
+				return
+			}
+			finalScaleEntry.SetText(fmt.Sprintf("%.4f", ps))
+		default:
+			if v, ok := presetScale[s]; ok {
+				finalScaleEntry.SetText(fmt.Sprintf("%.4f", v))
+			}
+		}
+	}
 
 	scaleEntry := widget.NewEntry()
 	scaleEntry.SetText(fmt.Sprintf("%.4f", current.Scale))
@@ -116,6 +176,9 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 	}
 
+	lockFrameCheck := widget.NewCheck("Lock output to reference baseline (match its size, rotation, scale)", nil)
+	lockFrameCheck.SetChecked(current.LockToReferenceFrame)
+
 	sbNormCheck := widget.NewCheck("Normalize mixed-scale chips by surface brightness", nil)
 	sbNormCheck.SetChecked(current.SurfaceBrightnessNorm)
 
@@ -138,10 +201,15 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 	debugDirEntry.SetPlaceHolder("Optional: path to save debug chip FITS")
 
 	notes := widget.NewLabel(
-		"Output Scale: desired plate scale in arcsec/pixel (AstroDrizzle final_scale).\n" +
+		"Scale Preset: fills Output Scale from a known instrument plate scale, or\n" +
+			"  \"Auto — match finest input\" to use the sharpest loaded frame. Editable after.\n" +
+			"Output Scale: desired plate scale in arcsec/pixel (AstroDrizzle final_scale).\n" +
 			"  Smaller value = finer sampling = larger output image.\n" +
 			"  e.g. native WFC3/UVIS ≈ 0.04; use 0.02 for 2× upsampling.\n" +
 			"  Leave blank to use the Scale Multiplier instead.\n" +
+			"Lock to Reference: pins the output to the Set Reference Baseline frame\n" +
+			"  (exact size, rotation, and plate scale). Use it so each channel drizzles\n" +
+			"  onto the same grid for compositing. Overrides Output Scale / Multiplier.\n" +
 			"Scale Multiplier: raw output/input pixel ratio (1.0 = native).\n" +
 			"  Used only when Output Scale is blank.\n" +
 			"PixFrac: drop size as fraction of pixel (1.0 = full coverage).\n" +
@@ -158,7 +226,9 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 	notes.Wrapping = fyne.TextWrapWord
 
 	form := widget.NewForm(
+		widget.NewFormItem("Scale Preset", presetSelect),
 		widget.NewFormItem("Output Scale (arcsec/px)", finalScaleEntry),
+		widget.NewFormItem("Lock to Reference", lockFrameCheck),
 		widget.NewFormItem("Scale Multiplier", scaleEntry),
 		widget.NewFormItem("PixFrac", pixFracEntry),
 		widget.NewFormItem("CR Method", crSelect),
@@ -215,6 +285,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 
 		onSave(models.DrizzleSettings{
 			FinalScale:            finalScale,
+			LockToReferenceFrame:  lockFrameCheck.Checked,
 			Scale:                 scale,
 			PixFrac:               pixFrac,
 			CRMethod:              crMethod,

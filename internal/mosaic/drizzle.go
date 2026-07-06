@@ -15,6 +15,7 @@ import (
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/instrument"
 	"gofitsv3/internal/processing"
 )
 
@@ -265,8 +266,14 @@ type Options struct {
 	// on a 0.04 arcsec/px camera yields Scale = 2, doubling each dimension).
 	// If WCS plate scale cannot be determined, FinalScale is treated as Scale.
 	FinalScale float64
-	CRMethod   CRMethod
-	PixFrac    float64
+	// LockToReferenceFrame pins the output canvas to a ReferenceOnly baseline at
+	// inputs[0]: the output dimensions, origin, and plate scale become exactly the
+	// baseline's, so every channel drizzled against the same baseline is
+	// pixel-identical (same size, orientation, and scale) for compositing.
+	// When set, Scale is forced to 1 and FinalScale is ignored.
+	LockToReferenceFrame bool
+	CRMethod             CRMethod
+	PixFrac              float64
 	// SepKernel is the kernel used during the per-frame drizzle step.
 	// Defaults to KernelSquare when zero.
 	SepKernel DrizzleKernel
@@ -467,6 +474,37 @@ func nativePlateScaleArcsec(header fitsio.Header) (float64, bool) {
 	return 0, false
 }
 
+// NativePlateScaleArcsec returns an input's native plate scale in arcseconds per
+// pixel. It prefers the WCS in the input's SCI header (CD matrix, then CDELT1)
+// and falls back to the nominal per-detector scale from the instrument table.
+// ok is false only when neither source yields a positive scale. Exported for the
+// UI's "match finest input" scale preset.
+func NativePlateScaleArcsec(in Input) (float64, bool) {
+	if ps, ok := nativePlateScaleArcsec(in.HDU.Header); ok && ps > 0 {
+		return ps, true
+	}
+	if info, ok := instrument.FromHeader(in.HDU.Header); ok && info.PixelScale > 0 {
+		return info.PixelScale, true
+	}
+	return 0, false
+}
+
+// referenceFrameDims returns the pixel dimensions of a baseline frame, preferring
+// the loaded image dimensions and falling back to the NAXIS1/NAXIS2 header cards
+// (which stay valid after the pixel buffer is freed for streaming). Returns
+// (0, 0) when neither source is available.
+func referenceFrameDims(in Input) (int, int) {
+	if in.HDU.Data.Width > 0 && in.HDU.Data.Height > 0 {
+		return in.HDU.Data.Width, in.HDU.Data.Height
+	}
+	w, okW := fitsio.HeaderFloat(in.HDU.Header, "NAXIS1")
+	h, okH := fitsio.HeaderFloat(in.HDU.Header, "NAXIS2")
+	if okW && okH {
+		return int(w), int(h)
+	}
+	return 0, 0
+}
+
 func Build(inputs []Input, options Options) (*Result, error) {
 	debuglog.Log(fmt.Sprintf("Build: starting drizzle, %d inputs", len(inputs)))
 	defer debuglog.Log("Build: finished")
@@ -475,10 +513,23 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	}
 	logMemStats("before planning")
 
-	// Resolve FinalScale (arcsec/pixel) → internal Scale multiplier.
-	// Use the same WCS anchor that will be used for the output header, so a
-	// ReferenceOnly baseline and same-scale filter runs produce matching grids.
-	if options.FinalScale > 0 {
+	// Lock the output grid to a ReferenceOnly baseline at inputs[0]: the baseline
+	// defines the exact output canvas (dimensions, origin, plate scale), so every
+	// channel drizzled against the same baseline is pixel-identical. This forces
+	// Scale = 1 (the baseline already encodes the target plate scale) and pins the
+	// canvas bounds below, overriding FinalScale.
+	lockFrame := options.LockToReferenceFrame && !inputs[0].Excluded && inputs[0].ReferenceOnly
+	var lockW, lockH int
+	if lockFrame {
+		lockW, lockH = referenceFrameDims(inputs[0])
+		if lockW < 1 || lockH < 1 {
+			return nil, fmt.Errorf("lock to reference frame: baseline %s has no readable dimensions", InputKey(inputs[0]))
+		}
+		options.Scale = 1
+	} else if options.FinalScale > 0 {
+		// Resolve FinalScale (arcsec/pixel) → internal Scale multiplier.
+		// Use the same WCS anchor that will be used for the output header, so a
+		// ReferenceOnly baseline and same-scale filter runs produce matching grids.
 		ref := wcsReferenceInput(inputs)
 		if ps, ok := nativePlateScaleArcsec(ref.HDU.Header); ok && ps > 0 {
 			options.Scale = ps / options.FinalScale
@@ -503,6 +554,14 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	planned, statuses, minX, minY, maxX, maxY, err := planInputs(inputs, options.Scale)
 	if err != nil {
 		return nil, err
+	}
+
+	// When locking to the baseline frame, discard the data-derived footprint and
+	// pin the canvas to the baseline's exact pixel grid (origin 0,0 at Scale 1),
+	// so the output header WCS equals the baseline's and dimensions match exactly.
+	if lockFrame {
+		minX, minY = 0, 0
+		maxX, maxY = float64(lockW-1), float64(lockH-1)
 	}
 
 	// Let the heavy per-frame drizzle kernels (and the streamed CR median model)

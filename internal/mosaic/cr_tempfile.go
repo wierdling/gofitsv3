@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -50,7 +51,14 @@ func buildCRMasksDrizzle(
 		return nil, nil
 	}
 
-	tmpDir, err := os.MkdirTemp("", "gofits-crsep-")
+	// Root the scratch files next to the source images (same drive) rather than
+	// the system temp directory, which may live on a small system volume (e.g.
+	// C:) that lacks room for large separate-drizzle products.
+	tmpBase := crTempBaseDir(planned, dataPlanned)
+	if err := os.MkdirAll(tmpBase, 0o755); err != nil {
+		return nil, fmt.Errorf("create CR temp base %s: %w", tmpBase, err)
+	}
+	tmpDir, err := os.MkdirTemp(tmpBase, "gofits-crsep-")
 	if err != nil {
 		return nil, fmt.Errorf("create CR temp dir: %w", err)
 	}
@@ -190,6 +198,29 @@ func buildCRMasksDrizzle(
 	}
 	logMemStats("CR mask done")
 	return masks, nil
+}
+
+// crTempBaseDir picks the directory that holds the CR scratch files. It uses the
+// working/ subdirectory next to the first source image so the scratch lives on
+// the same drive the images were loaded from, never the system temp volume. When
+// no usable source path is available it falls back to the system temp dir.
+func crTempBaseDir(planned []plannedInput, dataPlanned []int) string {
+	for _, pi := range dataPlanned {
+		if pi < 0 || pi >= len(planned) {
+			continue
+		}
+		src := planned[pi].input.SourcePath
+		if src == "" {
+			src = planned[pi].input.Path
+		}
+		if src == "" {
+			continue
+		}
+		if dir := filepath.Dir(src); dir != "" && dir != "." {
+			return filepath.Join(dir, WorkingDirName)
+		}
+	}
+	return os.TempDir()
 }
 
 // sepConcurrency picks how many separate-drizzle frames to process at once. Each

@@ -101,6 +101,7 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 	result, err := mosaic.Build(buildInputs, mosaic.Options{
 		Scale:                 s.Scale,
 		FinalScale:            s.FinalScale,
+		LockToReferenceFrame:  s.LockToReferenceFrame,
 		PixFrac:               s.PixFrac,
 		CRMethod:              mosaic.CRMethod(s.CRMethod),
 		SepKernel:             mosaic.DrizzleKernel(s.SepKernel),

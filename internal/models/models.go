@@ -130,14 +130,19 @@ type DrizzleSettings struct {
 	// final_scale semantics).  When > 0, the internal multiplier is computed from
 	// the reference image WCS.  Scale is used as a raw multiplier fallback when
 	// FinalScale is zero.
-	FinalScale      float64 `json:"finalScale"`
-	Scale           float64 `json:"scale"`
-	PixFrac         float64 `json:"pixFrac"`
-	CRMethod        int     `json:"crMethod"`
-	SepKernel       int     `json:"sepKernel"`
-	FinalKernel     int     `json:"finalKernel"`
-	WeightingMode   int     `json:"weightingMode"`
-	UseERRWeighting bool    `json:"useERRWeighting,omitempty"`
+	FinalScale float64 `json:"finalScale"`
+	// LockToReferenceFrame pins the output canvas (dimensions, origin, and plate
+	// scale) to the reference baseline frame so separately-drizzled channels come
+	// out pixel-identical for compositing. Overrides FinalScale/Scale. Requires a
+	// reference baseline to be set.
+	LockToReferenceFrame bool    `json:"lockToReferenceFrame,omitempty"`
+	Scale                float64 `json:"scale"`
+	PixFrac              float64 `json:"pixFrac"`
+	CRMethod             int     `json:"crMethod"`
+	SepKernel            int     `json:"sepKernel"`
+	FinalKernel          int     `json:"finalKernel"`
+	WeightingMode        int     `json:"weightingMode"`
+	UseERRWeighting      bool    `json:"useERRWeighting,omitempty"`
 	// SurfaceBrightnessNorm normalizes mixed-scale chips by their mapped pixel
 	// area before drizzle. Useful for WFPC2 PC+WF mosaics.
 	SurfaceBrightnessNorm bool `json:"surfaceBrightnessNorm,omitempty"`

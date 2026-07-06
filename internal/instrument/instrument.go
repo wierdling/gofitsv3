@@ -114,6 +114,28 @@ var Default = Info{
 	BadDQBits:     0,
 }
 
+// ScalePreset names a common instrument configuration and its native plate
+// scale, for populating UI menus. PixelScale is in arcseconds per pixel.
+type ScalePreset struct {
+	Name       string
+	PixelScale float64
+}
+
+// ScalePresets returns the common instrument plate-scale presets used by the
+// drizzle Output Scale menu, ordered finest to coarsest. Values are read from
+// the detector table so it stays the single source of truth.
+func ScalePresets() []ScalePreset {
+	return []ScalePreset{
+		{"NIRCam Short", detectors[key{"NIRCAM", "NRCA1"}].PixelScale},
+		{"ACS/HRC", detectors[key{"ACS", "HRC"}].PixelScale},
+		{"WFC3/UVIS", detectors[key{"WFC3", "UVIS"}].PixelScale},
+		{"ACS/WFC", detectors[key{"ACS", "WFC"}].PixelScale},
+		{"NIRCam Long", detectors[key{"NIRCAM", "NRCALONG"}].PixelScale},
+		{"MIRI", detectors[key{"MIRI", "MIRIMAGE"}].PixelScale},
+		{"WFC3/IR", detectors[key{"WFC3", "IR"}].PixelScale},
+	}
+}
+
 // FromHeader reads INSTRUME and DETECTOR from the provided FITS header and
 // returns the matching Info. If the combination is not recognised, Default
 // is returned along with ok=false.
