@@ -1,6 +1,7 @@
 package processing
 
 import (
+	"context"
 	"image"
 	"math"
 	"runtime"
@@ -239,7 +240,7 @@ func ApplyStretchParallel(img *models.LoadedImage) (fitsio.ImageData, []byte) {
 	return fitsio.ImageData{Width: data.Width, Height: data.Height, Pixels: pixels}, mask
 }
 
-func ComposeRGB(imgs []*models.LoadedImage) ([]byte, int, int, [3]histogram.Stats) {
+func ComposeRGB(ctx context.Context, imgs []*models.LoadedImage) ([]byte, int, int, [3]histogram.Stats) {
 	if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
 		return nil, 0, 0, [3]histogram.Stats{}
 	}
@@ -248,23 +249,67 @@ func ComposeRGB(imgs []*models.LoadedImage) ([]byte, int, int, [3]histogram.Stat
 	w := ref.HDU.Data.Width
 	h := ref.HDU.Data.Height
 
-	rData := stretchForReferenceGrid(imgs[2], ref)
-	gData := stretchForReferenceGrid(ref, ref)
-	bData := stretchForReferenceGrid(imgs[0], ref)
+	rData := stretchForReferenceGrid(ctx, imgs[2], ref)
+	if ctx.Err() != nil {
+		return nil, 0, 0, [3]histogram.Stats{}
+	}
+	gData := stretchForReferenceGrid(ctx, ref, ref)
+	if ctx.Err() != nil {
+		return nil, 0, 0, [3]histogram.Stats{}
+	}
+	bData := stretchForReferenceGrid(ctx, imgs[0], ref)
+	if ctx.Err() != nil {
+		return nil, 0, 0, [3]histogram.Stats{}
+	}
 
 	buf := render.ComposeRGB(rData.Pixels, gData.Pixels, bData.Pixels, w, h, imgs[2].Mode, imgs[1].Mode, imgs[0].Mode)
 	return buf, w, h, HistogramRGB(buf)
 }
 
-func ComposeRGBWithOrange(imgs []*models.LoadedImage, orange *models.LoadedImage, settings models.OrangeLayerState) ([]byte, int, int, [3]histogram.Stats) {
+// OverlayLayer is a tinted image (e.g. orange, yellow) screen-blended onto the
+// base RGB composite.
+type OverlayLayer struct {
+	Image    *models.LoadedImage
+	Settings models.OrangeLayerState
+}
+
+func ComposeRGBWithOrange(ctx context.Context, imgs []*models.LoadedImage, orange *models.LoadedImage, settings models.OrangeLayerState) ([]byte, int, int, [3]histogram.Stats) {
+	return ComposeRGBWithOverlays(ctx, imgs, []OverlayLayer{{Image: orange, Settings: settings}})
+}
+
+// ComposeRGBWithOverlays composes the base RGB image, then screen-blends each
+// tinted overlay layer on top, in order.
+func ComposeRGBWithOverlays(ctx context.Context, imgs []*models.LoadedImage, overlays []OverlayLayer) ([]byte, int, int, [3]histogram.Stats) {
 	if len(imgs) < 3 {
 		return nil, 0, 0, [3]histogram.Stats{}
 	}
-	buf, w, h, _ := ComposeRGB(imgs)
-	if buf == nil || orange == nil || imgs[1] == nil {
+	buf, w, h, _ := ComposeRGB(ctx, imgs)
+	if buf == nil || imgs[1] == nil || ctx.Err() != nil {
 		return buf, w, h, HistogramRGB(buf)
 	}
+	ref := imgs[1]
+	for _, ov := range overlays {
+		if ctx.Err() != nil {
+			return nil, 0, 0, [3]histogram.Stats{}
+		}
+		blendOverlayCtx(ctx, buf, ov.Image, ref, ov.Settings)
+	}
+	return buf, w, h, HistogramRGB(buf)
+}
 
+// blendOverlay combines a single tinted overlay image onto buf in place,
+// aligned/stretched to the reference grid, using a highlight-protected additive
+// blend: out = base + layer - k*base*layer, where k = settings.HighlightProtect.
+// k=1 is a screen blend (soft, never clips); k=0 is pure additive (keeps the
+// most overlay detail but can clip in bright regions).
+func blendOverlay(buf []byte, overlay, ref *models.LoadedImage, settings models.OrangeLayerState) {
+	blendOverlayCtx(context.Background(), buf, overlay, ref, settings)
+}
+
+func blendOverlayCtx(ctx context.Context, buf []byte, overlay, ref *models.LoadedImage, settings models.OrangeLayerState) {
+	if overlay == nil || ref == nil {
+		return
+	}
 	opacity := settings.Opacity
 	if opacity < 0 {
 		opacity = 0
@@ -272,32 +317,36 @@ func ComposeRGBWithOrange(imgs []*models.LoadedImage, orange *models.LoadedImage
 		opacity = 1
 	}
 	if opacity == 0 {
-		return buf, w, h, HistogramRGB(buf)
+		return
+	}
+	k := settings.HighlightProtect
+	if k < 0 {
+		k = 0
+	} else if k > 1 {
+		k = 1
 	}
 
-	ref := imgs[1]
-	orangeData := stretchForReferenceGrid(orange, ref)
+	overlayData := stretchForReferenceGrid(ctx, overlay, ref)
 	rTint := float64(settings.ColorR) / 255
 	gTint := float64(settings.ColorG) / 255
 	bTint := float64(settings.ColorB) / 255
 
-	for i, v := range orangeData.Pixels {
+	for i, v := range overlayData.Pixels {
 		idx := i * 4
 		if idx+2 >= len(buf) {
 			break
 		}
 		strength := utils.Clamp01(float64(v)) * opacity
-		screenChannel := func(base byte, tint float64) byte {
+		blendChannel := func(base byte, tint float64) byte {
 			baseF := float64(base) / 255
 			layerF := strength * tint
-			out := 1 - (1-baseF)*(1-layerF)
+			out := baseF + layerF - k*baseF*layerF
 			return byte(utils.Clamp01(out)*255 + 0.5)
 		}
-		buf[idx] = screenChannel(buf[idx], rTint)
-		buf[idx+1] = screenChannel(buf[idx+1], gTint)
-		buf[idx+2] = screenChannel(buf[idx+2], bTint)
+		buf[idx] = blendChannel(buf[idx], rTint)
+		buf[idx+1] = blendChannel(buf[idx+1], gTint)
+		buf[idx+2] = blendChannel(buf[idx+2], bTint)
 	}
-	return buf, w, h, HistogramRGB(buf)
 }
 
 // ComposeRGBFloat32 returns per-channel float32 pixels (values in [0,1]) for
@@ -308,9 +357,9 @@ func ComposeRGBFloat32(imgs []*models.LoadedImage) (r, g, b []float32, width, he
 		return nil, nil, nil, 0, 0
 	}
 	ref := imgs[1]
-	rData := stretchForReferenceGrid(imgs[2], ref)
-	gData := stretchForReferenceGrid(ref, ref)
-	bData := stretchForReferenceGrid(imgs[0], ref)
+	rData := stretchForReferenceGrid(context.Background(), imgs[2], ref)
+	gData := stretchForReferenceGrid(context.Background(), ref, ref)
+	bData := stretchForReferenceGrid(context.Background(), imgs[0], ref)
 	return rData.Pixels, gData.Pixels, bData.Pixels, ref.HDU.Data.Width, ref.HDU.Data.Height
 }
 
@@ -345,6 +394,10 @@ func ApplyRGBLevelsFloat32(r, g, b []float32, levels *models.RgbLevels) ([]float
 }
 
 func ImageDataForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
+	return ImageDataForReferenceGridCtx(context.Background(), img, ref)
+}
+
+func ImageDataForReferenceGridCtx(ctx context.Context, img, ref *models.LoadedImage) fitsio.ImageData {
 	if img == nil || ref == nil {
 		return fitsio.ImageData{}
 	}
@@ -356,7 +409,8 @@ func ImageDataForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 		}
 	}
 
-	alignedPixels, _, err := AlignChannelUsingWCS(
+	alignedPixels, _, err := AlignChannelUsingWCSCtx(
+		ctx,
 		img.HDU.Data.Pixels,
 		img.HDU.Data.Width,
 		img.HDU.Data.Height,
@@ -383,10 +437,10 @@ func ImageDataForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 }
 
 func StretchedImageDataForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
-	return stretchForReferenceGrid(img, ref)
+	return stretchForReferenceGrid(context.Background(), img, ref)
 }
 
-func stretchForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
+func stretchForReferenceGrid(ctx context.Context, img, ref *models.LoadedImage) fitsio.ImageData {
 	if img == nil || ref == nil {
 		return fitsio.ImageData{}
 	}
@@ -394,7 +448,10 @@ func stretchForReferenceGrid(img, ref *models.LoadedImage) fitsio.ImageData {
 		data, _ := ApplyStretchParallel(img)
 		return data
 	}
-	raw := ImageDataForReferenceGrid(img, ref)
+	raw := ImageDataForReferenceGridCtx(ctx, img, ref)
+	if ctx.Err() != nil {
+		return fitsio.ImageData{}
+	}
 	clone := *img
 	clone.HDU = img.HDU
 	clone.HDU.Data = raw

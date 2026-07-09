@@ -1,6 +1,7 @@
 package processing
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"runtime"
@@ -230,6 +231,10 @@ type linearWCS struct {
 }
 
 func AlignChannelUsingWCS(targetPixels []float32, targetWidth, targetHeight int, targetHeader fitsio.Header, refPixels []float32, refWidth, refHeight int, refHeader fitsio.Header) ([]float32, AffineTransform, error) {
+	return AlignChannelUsingWCSCtx(context.Background(), targetPixels, targetWidth, targetHeight, targetHeader, refPixels, refWidth, refHeight, refHeader)
+}
+
+func AlignChannelUsingWCSCtx(ctx context.Context, targetPixels []float32, targetWidth, targetHeight int, targetHeader fitsio.Header, refPixels []float32, refWidth, refHeight int, refHeader fitsio.Header) ([]float32, AffineTransform, error) {
 	debuglog.Log("AlignChannelUsingWCS: starting")
 	defer debuglog.Log("AlignChannelUsingWCS: finished")
 	if targetWidth <= 0 || targetHeight <= 0 || refWidth <= 0 || refHeight <= 0 {
@@ -241,7 +246,10 @@ func AlignChannelUsingWCS(targetPixels []float32, targetWidth, targetHeight int,
 		return nil, AffineTransform{}, err
 	}
 
-	alignedPixels := WarpImageToSize(targetPixels, targetWidth, targetHeight, refWidth, refHeight, transform)
+	alignedPixels := WarpImageToSizeCtx(ctx, targetPixels, targetWidth, targetHeight, refWidth, refHeight, transform)
+	if ctx.Err() != nil {
+		return nil, AffineTransform{}, ctx.Err()
+	}
 	if len(alignedPixels) != refWidth*refHeight {
 		return nil, AffineTransform{}, fmt.Errorf("unexpected aligned pixel count: got %d want %d", len(alignedPixels), refWidth*refHeight)
 	}

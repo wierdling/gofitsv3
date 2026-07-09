@@ -80,7 +80,12 @@ type ChannelState struct {
 
 type ComposeProject struct {
 	Channels             [3]ChannelState         `json:"channels"`
+	// OverlayLayers holds the arbitrary set of colored overlay layers. OrangeLayer
+	// and YellowLayer are legacy fields kept only so projects saved before the
+	// generic layer system still load (migrated into OverlayLayers on read).
+	OverlayLayers        []OrangeLayerState      `json:"overlayLayers,omitempty"`
 	OrangeLayer          OrangeLayerState        `json:"orangeLayer,omitempty"`
+	YellowLayer          OrangeLayerState        `json:"yellowLayer,omitempty"`
 	Flip                 bool                    `json:"flip"`
 	SharedHistogramScale bool                    `json:"sharedHistogramScale,omitempty"`
 	DisableComposite     bool                    `json:"disableComposite,omitempty"`
@@ -97,6 +102,11 @@ type OrangeLayerState struct {
 	ColorG  uint8        `json:"colorG"`
 	ColorB  uint8        `json:"colorB"`
 	Opacity float64      `json:"opacity"`
+	// HighlightProtect (0..1) controls the overlay blend: the tinted layer is
+	// combined additively as out = base + layer - k*base*layer. k=1 reproduces a
+	// screen blend (soft, never clips), k=0 is pure additive (max detail, may
+	// clip). Lower values keep more overlay detail in bright regions.
+	HighlightProtect float64 `json:"highlightProtect,omitempty"`
 }
 
 type StarlessComposeSettings struct {

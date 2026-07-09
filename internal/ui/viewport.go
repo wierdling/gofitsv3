@@ -183,6 +183,7 @@ type viewport struct {
 	customZoom    string
 	histColor     [4]uint8 // bar color; if zero, use default white-bg/gray-bar style
 	StatsLabel    *widget.Label
+	FilterLabel   *widget.Label
 	pickerLabel   *widget.Label
 	pickerBox     fyne.CanvasObject
 	actionRow     *fyne.Container
@@ -219,17 +220,21 @@ func newViewport() *viewport {
 	vp.StatsLabel = widget.NewLabel("Sky --  μ --  σ --")
 	vp.StatsLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.StatsLabel.Alignment = fyne.TextAlignCenter
+	vp.FilterLabel = widget.NewLabel("")
+	vp.FilterLabel.TextStyle = fyne.TextStyle{Italic: true}
 	vp.pickerLabel = widget.NewLabel("Value: --")
 	vp.pickerLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.pickerBox = container.New(layout.NewGridWrapLayout(fyne.NewSize(135, vp.pickerLabel.MinSize().Height)), vp.pickerLabel)
 
 	vp.actionRow = container.NewHBox(layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer())
 
+	histRow := container.NewBorder(nil, nil, container.NewHBox(hpad(6), vp.FilterLabel, hpad(6)), nil, vp.histogram)
+
 	header := container.NewVBox(
 		vpad(4),
 		vp.actionRow,
 		vpad(4),
-		vp.histogram,
+		histRow,
 	)
 	footerRow := container.NewHBox(
 		hpad(6),
@@ -270,6 +275,13 @@ func (vp *viewport) SetPickerValueText(text string) {
 		vp.pickerBox.Refresh()
 		canvas.Refresh(vp.pickerBox)
 	}
+}
+
+func (vp *viewport) SetFilterText(text string) {
+	if vp == nil || vp.FilterLabel == nil {
+		return
+	}
+	vp.FilterLabel.SetText(text)
 }
 
 func (vp *viewport) SetLoadSave(chanLabel, letter string, col color.Color, loadFn, saveFn func()) {

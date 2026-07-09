@@ -98,6 +98,9 @@ func Run() error {
 	win.SetMainMenu(fyne.NewMainMenu(allMenus...))
 
 	win.SetContent(fynetooltip.AddWindowToolTipLayer(tabs, win.Canvas()))
+	win.SetCloseIntercept(func() {
+		a.Quit()
+	})
 	win.Show()
 	maximizeWindow(win)
 

@@ -666,7 +666,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		if err := os.MkdirAll(options.DebugOutputDir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create debug output directory: %w", err)
 		}
-		debugBaseHeader = buildOutputHeader(wcsReferenceInput(inputs), width, height, minX, minY, options.Scale, 1)
+		debugBaseHeader = buildOutputHeader(wcsReferenceInput(inputs), firstDataInput(inputs), width, height, minX, minY, options.Scale, 1)
 	}
 
 	for i := range planned {
@@ -800,7 +800,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		OriginX:             minX,
 		OriginY:             minY,
 		Scale:               options.Scale,
-		OutputHeader:        buildOutputHeader(wcsReferenceInput(inputs), width, height, minX, minY, options.Scale, includedCount),
+		OutputHeader:        buildOutputHeader(wcsReferenceInput(inputs), firstDataInput(inputs), width, height, minX, minY, options.Scale, includedCount),
 		Inputs:              statuses,
 		InputFootprints:     footprints,
 		InputFootprintPaths: footprintPaths,
@@ -1920,9 +1920,25 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 	return planned, statuses, minX, minY, maxX, maxY, nil
 }
 
-func buildOutputHeader(ref Input, width, height int, originX, originY, scale float64, includedCount int) fitsio.Header {
+// buildOutputHeader assembles the drizzled output header. WCS geometry
+// (CTYPE/CRPIX/CD/CDELT) is anchored to ref, which with lock-to-reference
+// drizzle may be a WCS-only frame from a different filter/instrument than what
+// was actually combined. Identity metadata (filter, instrument, detector) is
+// therefore taken from metaSource, the first real science input, instead of
+// ref, so the output header describes what was drizzled rather than the WCS
+// anchor.
+func buildOutputHeader(ref, metaSource Input, width, height int, originX, originY, scale float64, includedCount int) fitsio.Header {
 	merged := mergeHeaders(ref.PrimaryHeader, ref.HDU.Header)
 	cards := fitsio.CloneHeader(merged).Cards
+
+	metaMerged := mergeHeaders(metaSource.PrimaryHeader, metaSource.HDU.Header)
+	for _, key := range []string{"FILTER", "FILTNAM1", "FILTNAM2", "FILTER1", "FILTER2", "PUPIL", "INSTRUME", "DETECTOR"} {
+		if v, ok := metaMerged.Cards[key]; ok {
+			cards[key] = v
+		} else {
+			delete(cards, key)
+		}
+	}
 
 	for _, key := range []string{
 		"END", "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "XTENSION", "PCOUNT", "GCOUNT", "EXTNAME", "EXTVER",

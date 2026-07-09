@@ -679,6 +679,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 			}
 		}
 		fd.SetView(dialog.ListView)
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 

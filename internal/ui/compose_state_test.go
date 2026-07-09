@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"math"
 	"path/filepath"
 	"strings"
@@ -279,7 +280,7 @@ func TestChannelStateRoundTripAndApplyChannelState(t *testing.T) {
 func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing.T) {
 	levels := defaultRGBLevels()
 
-	missing := buildComposePreviewData(make([]*models.LoadedImage, 3), false, false, true, levels, nil)
+	missing := buildComposePreviewData(context.Background(), make([]*models.LoadedImage, 3), false, false, true, levels, nil)
 	for i := 0; i < 4; i++ {
 		if missing.Views[i].Image == nil {
 			t.Fatalf("missing.Views[%d].Image is nil", i)
@@ -295,7 +296,7 @@ func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing
 		makeLoadedImageForUITest(1, 2, []float32{1, 0}),
 	}
 	overrideResult := &processing.StarlessResult{Width: 1, Height: 2}
-	data := buildComposePreviewData(imgs, true, false, true, levels, func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+	data := buildComposePreviewData(context.Background(), imgs, true, false, true, levels, func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
 		return []byte{
 			1, 2, 3, 255,
 			10, 20, 30, 255,
@@ -338,7 +339,7 @@ func TestBuildComposePreviewDataSharedHistogramScaleRebinsChannels(t *testing.T)
 		makeLoadedImageForUITest(1, 3, []float32{0.95, 1, 1}),
 	}
 
-	data := buildComposePreviewData(imgs, false, true, true, levels, nil)
+	data := buildComposePreviewData(context.Background(), imgs, false, true, true, levels, nil)
 
 	for i := 0; i < 3; i++ {
 		if data.Views[i].HistMax != 2 {
@@ -362,7 +363,7 @@ func TestBuildComposePreviewDataSkipsCompositeWhenDisabled(t *testing.T) {
 	}
 	called := false
 
-	data := buildComposePreviewData(imgs, false, false, false, levels, func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+	data := buildComposePreviewData(context.Background(), imgs, false, false, false, levels, func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
 		called = true
 		return nil, 0, 0, [3]histogram.Stats{}, nil, nil
 	})

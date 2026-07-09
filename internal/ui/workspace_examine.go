@@ -311,7 +311,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			}
 		}
 		fd.SetView(dialog.ListView)
-		fd.Resize(fyne.NewSize(1000, 650))
+		sizeFileDialog(fd)
 		fd.Show()
 	}
 

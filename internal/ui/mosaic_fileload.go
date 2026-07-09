@@ -747,3 +747,10 @@ func (ws *mosaicWorkspace) configureLastDir(fd *dialog.FileDialog) {
 		}
 	}
 }
+
+// sizeFileDialog gives file open/save dialogs a tall default so long file
+// lists are visible without heavy scrolling. Fyne clamps this to the parent
+// window if it is smaller.
+func sizeFileDialog(fd *dialog.FileDialog) {
+	fd.Resize(fyne.NewSize(1000, 800))
+}

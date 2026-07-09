@@ -26,6 +26,10 @@ type FilterFile struct {
 	// duplicated here so a flattened file list is self-describing.
 	Filter     string
 	ProposalID string
+	// Instrument is the observing instrument name (INSTRUME header, e.g.
+	// "WFC3", "ACS", "NIRCAM"), or "Unknown" when absent. Used to facet
+	// multi-instrument batches.
+	Instrument string
 	// ExposureTime is the formatted exposure duration (e.g. "1230s") read from
 	// the primary header, or "Unknown" when absent.
 	ExposureTime string
@@ -133,10 +137,15 @@ func scanFilterHeaders(paths []string) []FilterFile {
 				if proposalID == "" {
 					proposalID = "Unknown"
 				}
+				instrument := fitsio.HeaderString(header, "INSTRUME", "INSTRUMENT")
+				if instrument == "" {
+					instrument = "Unknown"
+				}
 				results[i] = FilterFile{
 					Path:         paths[i],
 					Filter:       filter,
 					ProposalID:   proposalID,
+					Instrument:   instrument,
 					ExposureTime: formatExposure(loadExposureTime(header)),
 					DateObs:      parseDateObs(fitsio.HeaderString(header, "DATE-OBS", "DATEOBS")),
 				}
@@ -190,6 +199,7 @@ func AllFilterFiles(groups map[string][]FilterFile) []FilterFile {
 type FileCriteria struct {
 	Filter      string // exact filter name, "" = any
 	ProposalID  string // exact proposal ID, "" = any
+	Instrument  string // exact instrument name, "" = any
 	Exposure    string // exact exposure label (e.g. "1230s"), "" = any
 	DateMin     string // inclusive "YYYY-MM-DD" lower bound, "" = no lower bound
 	DateMax     string // inclusive "YYYY-MM-DD" upper bound, "" = no upper bound
@@ -206,6 +216,9 @@ func MatchFiles(files []FilterFile, c FileCriteria) []string {
 			continue
 		}
 		if c.ProposalID != "" && f.ProposalID != c.ProposalID {
+			continue
+		}
+		if c.Instrument != "" && f.Instrument != c.Instrument {
 			continue
 		}
 		if c.Exposure != "" && f.ExposureTime != c.Exposure {
@@ -237,6 +250,10 @@ func FilterFacetOptions(files []FilterFile) []string {
 
 func ProposalFacetOptions(files []FilterFile) []string {
 	return facetOptions(files, func(f FilterFile) string { return f.ProposalID }, func(a, b string) bool { return a < b })
+}
+
+func InstrumentFacetOptions(files []FilterFile) []string {
+	return facetOptions(files, func(f FilterFile) string { return f.Instrument }, func(a, b string) bool { return a < b })
 }
 
 func ExposureFacetOptions(files []FilterFile) []string {

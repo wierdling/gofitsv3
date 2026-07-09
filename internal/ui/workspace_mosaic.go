@@ -206,6 +206,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				}
 			}
 		}
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 
@@ -249,6 +250,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			}
 		}
 		fd.SetView(dialog.ListView)
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 
@@ -462,6 +464,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
 		ws.configureLastDir(fd)
 		fd.SetView(dialog.ListView)
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 
@@ -491,6 +494,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					filterSelect := NewSafeSelect(mosaic.FilterFacetOptions(files), nil)
 					proposalSelect := NewSafeSelect(mosaic.ProposalFacetOptions(files), nil)
 					exposureSelect := NewSafeSelect(mosaic.ExposureFacetOptions(files), nil)
+					instrumentSelect := NewSafeSelect(mosaic.InstrumentFacetOptions(files), nil)
 
 					// Date range is bounded by the actual observation dates, as a
 					// min/max pair of selects (omitted when no DATE-OBS is present).
@@ -513,6 +517,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						c := mosaic.FileCriteria{
 							Filter:      mosaic.FacetValue(filterSelect.Selected),
 							ProposalID:  mosaic.FacetValue(proposalSelect.Selected),
+							Instrument:  mosaic.FacetValue(instrumentSelect.Selected),
 							Exposure:    mosaic.FacetValue(exposureSelect.Selected),
 							ProductType: productType(),
 						}
@@ -542,7 +547,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					filteredFiles := func() []mosaic.FilterFile {
 						filter := mosaic.FacetValue(filterSelect.Selected)
 						product := productType()
-						if filter == "" && product == "" {
+						instrument := mosaic.FacetValue(instrumentSelect.Selected)
+						if filter == "" && product == "" && instrument == "" {
 							return files
 						}
 						filtered := make([]mosaic.FilterFile, 0, len(files))
@@ -553,6 +559,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 							if product != "" && mosaic.ProductType(f.Path) != product {
 								continue
 							}
+							if instrument != "" && f.Instrument != instrument {
+								continue
+							}
 							filtered = append(filtered, f)
 						}
 						return filtered
@@ -560,16 +569,24 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 					var updating bool
 
-					productFilteredFiles := func() []mosaic.FilterFile {
+					// upstreamFilteredFiles applies the facets that sit above Filter in
+					// the cascade (product type and instrument), so the Filter list and
+					// everything below it narrow to the chosen product/instrument.
+					upstreamFilteredFiles := func() []mosaic.FilterFile {
 						product := productType()
-						if product == "" {
+						instrument := mosaic.FacetValue(instrumentSelect.Selected)
+						if product == "" && instrument == "" {
 							return files
 						}
 						filtered := make([]mosaic.FilterFile, 0, len(files))
 						for _, f := range files {
-							if mosaic.ProductType(f.Path) == product {
-								filtered = append(filtered, f)
+							if product != "" && mosaic.ProductType(f.Path) != product {
+								continue
 							}
+							if instrument != "" && f.Instrument != instrument {
+								continue
+							}
+							filtered = append(filtered, f)
 						}
 						return filtered
 					}
@@ -600,8 +617,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						updating = true
 						defer func() { updating = false }()
 
-						// 1. Update filter options based on product type
-						setSelectSelection(filterSelect, mosaic.FilterFacetOptions(productFilteredFiles()))
+						// 1. Update filter options based on product type and instrument
+						setSelectSelection(filterSelect, mosaic.FilterFacetOptions(upstreamFilteredFiles()))
 
 						// 2. Update dependent selections based on both product type and filter
 						filtered := filteredFiles()
@@ -654,6 +671,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					}
 					proposalSelect.OnChanged = func(string) { updateSelectedFiles() }
 					exposureSelect.OnChanged = func(string) { updateSelectedFiles() }
+					instrumentSelect.OnChanged = func(string) {
+						updateDependentOptions()
+						updateSelectedFiles()
+					}
 					if dateMinSelect != nil {
 						dateMinSelect.OnChanged = func(string) { updateSelectedFiles() }
 						dateMaxSelect.OnChanged = func(string) { updateSelectedFiles() }
@@ -684,6 +705,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						updateSelectedFiles()
 					}
 
+					// Instrument defaults to "Any" so mixed-instrument batches are
+					// discoverable; the user narrows it when combining a single one.
+					instrumentSelect.SetSelected(instrumentSelect.Options[0])
+
 					// Default to a concrete filter (preserving the prior
 					// single-filter workflow) and the full available date range.
 					if len(filterSelect.Options) > 1 {
@@ -706,6 +731,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 					formItems := []*widget.FormItem{
 						widget.NewFormItem("Image Type", typeRadio),
+						widget.NewFormItem("Instrument", instrumentSelect),
 						widget.NewFormItem("Filter", filterSelect),
 						widget.NewFormItem("Proposal ID", proposalSelect),
 						widget.NewFormItem("Exposure Time", exposureSelect),
@@ -758,6 +784,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				fd.SetLocation(l)
 			}
 		}
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 	ws.batchBtn = batchBtn
@@ -1117,6 +1144,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
 		ws.configureLastDir(fd)
 		fd.SetView(dialog.ListView)
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 	ws.setRefBtn = setRefBtn

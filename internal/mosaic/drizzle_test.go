@@ -900,3 +900,30 @@ func TestComputeMatchedSkyOffsetsChainsAcrossMosaic(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildOutputHeaderUsesMetaSourceFilterNotWCSReference(t *testing.T) {
+	ref := Input{
+		Path:          "ref_astrometry.fits",
+		ReferenceOnly: true,
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F814W'", "INSTRUME": "'ACS'"}},
+		HDU:           fitsio.HDU{Header: headerWithCRPIX(3, 3)},
+	}
+	sci := Input{
+		Path:          "sci_f656n.fits",
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F656N'", "INSTRUME": "'WFC3'"}},
+		HDU:           fitsio.HDU{Header: headerWithCRPIX(3, 3)},
+	}
+
+	hdr := buildOutputHeader(ref, sci, 4, 4, 0, 0, 1, 1)
+
+	if got := fitsio.HeaderString(hdr, "FILTER"); got != "F656N" {
+		t.Fatalf("FILTER = %q, want F656N (from science input, not WCS reference)", got)
+	}
+	if got := fitsio.HeaderString(hdr, "INSTRUME"); got != "WFC3" {
+		t.Fatalf("INSTRUME = %q, want WFC3 (from science input, not WCS reference)", got)
+	}
+	// WCS geometry still anchored to ref.
+	if _, ok := hdr.Cards["CRPIX1"]; !ok {
+		t.Fatal("expected CRPIX1 to be carried over from ref")
+	}
+}

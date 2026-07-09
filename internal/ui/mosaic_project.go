@@ -129,6 +129,7 @@ func (ws *mosaicWorkspace) saveMosaicProject() {
 	fd.SetFileName(name)
 	fd.SetFilter(storage.NewExtensionFileFilter([]string{".json"}))
 	ws.configureLastDir(fd)
+	sizeFileDialog(fd)
 	fd.Show()
 }
 
@@ -278,5 +279,6 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 	fd.SetFilter(storage.NewExtensionFileFilter([]string{".json"}))
 	ws.configureLastDir(fd)
 	fd.SetView(dialog.ListView)
+	sizeFileDialog(fd)
 	fd.Show()
 }
