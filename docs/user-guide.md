@@ -141,21 +141,27 @@ Before combining the images, they must be aligned to sub-pixel accuracy.
 * **Blinker Tool**: Click **Blinker** in the upper-right menu. This opens a separate window cycling quickly through the aligned exposures. If aligned correctly, the stars should remain completely stationary. If they jump or drift, adjust your alignment settings or use manual star mode.
 
 #### Sky Subtraction Settings (SkySub)
-Background sky brightness can vary due to light pollution or zodiacal light. Sky subtraction ensures all frames are matched to a common background level before cosmic-ray rejection.
+Background sky brightness can vary due to zodiacal light, scattered light, or small visit-to-visit calibration differences. Sky subtraction ensures all frames are matched to a common background level before cosmic-ray rejection.
 * **AstroDrizzle Sky Subtraction**: Open via **`Mosaic -> Sky Subtraction Settings...`**.
 * **Settings**:
   * **Enabled**: Check this box to turn background subtraction on. **Default: Off** (for simple stacks, but recommended when backgrounds vary).
   * **Sky Method**:
     * `localmin` **(Recommended Default)**: Calculates background levels based on a grid of local minimums. Recommended when images contain large nebulae or galaxy structures to prevent the sky calculation from treating gas as background.
     * `globalmin`: Calculates a single background level across the entire frame. Best for empty star fields.
-    * `match`: Matches the sky level of all frames to a reference frame without fully subtracting the background.
+    * `match`: Matches relative sky offsets between frames using their overlaps. This preserves the reference frame's overall level instead of forcing everything to zero.
     * `globalmin+match`: Combines global minimum subtraction with frame-to-frame matching.
+    * `match+plane`: Like `match`, but also fits a relative gradient plane from overlap differences. This is useful for JWST fields with residual large-scale gradients or extended nebulosity, because it does not estimate the sky from object-filled regions directly.
   * **Sky Stat**:
     * `median` **(Recommended Default)**: Computes the median value of background pixels.
     * `mode` / `mean`: Statistical modes.
   * **Sky Width**: The width of the histogram bins used for mode estimation. **Default: 0.1**.
   * **Sky Clip**: The number of sigma-clipping iterations. **Default: 5**.
   * **Sky LSigma / USigma**: Lower and upper sigma limits for clipping outliers. **Default: 4.0**.
+
+* **JWST Artifact Corrections**: Click **JWST Artifact Corrections...** inside the sky subtraction dialog for detector-level cleanup that runs before sky matching. These options are saved with the mosaic project and default to off for older projects.
+  * **NIRCam Wisp Template**: Optional correction for detector-fixed wisps. It uses only local template FITS files; GoFitsV3 will not download references. Put templates in a folder with names like `nircam_wisp_nrcb4_f200w.fits`, then enter that folder in **Wisp template dir**. Auto-scale is recommended; fixed scale must be non-negative.
+  * **NIRCam Amp Pedestal / Row Banding**: Optional detector-artifact corrections for calibrated NIRCam frames that still show amplifier steps or horizontal 1/f banding. These are separate from sky subtraction. Row banding supports an optional binary FITS mask where nonzero pixels are excluded from row statistics; mask dimensions must exactly match each input.
+  * **MIRI Artifact Mask**: Optional user-provided masks for calibrated MIRI images. A direct mask FITS can be supplied, or a mask folder can contain per-input files named `<input-stem>_miri_mask.fits` such as `jw12345_miri_mask.fits`. Nonzero mask pixels are excluded from sky matching, cosmic-ray modeling, and drizzle. For MIRI shower and snowball artifacts, the preferred fix is to rerun the current STScI JWST pipeline with its jump/shower handling before loading calibrated files into GoFitsV3.
 
 ![Sky Subtraction Settings](images/screenshots/SkysubSettings.png)
 

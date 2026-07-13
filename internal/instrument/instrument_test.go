@@ -17,9 +17,12 @@ func TestFromHeaderRecognizesMIRIImager(t *testing.T) {
 	if info.Chips != 1 {
 		t.Fatalf("Chips = %d, want 1", info.Chips)
 	}
-	// JWST must mask only DO_NOT_USE (bit 0 = 1), not every non-zero DQ bit.
-	if info.BadDQBits != 1 {
-		t.Fatalf("BadDQBits = %d, want 1 (DO_NOT_USE only)", info.BadDQBits)
+	// JWST excludes DO_NOT_USE and NON_SCIENCE, not every non-zero DQ bit.
+	if info.BadDQBits != 513 {
+		t.Fatalf("BadDQBits = %d, want 513 (DO_NOT_USE|NON_SCIENCE)", info.BadDQBits)
+	}
+	if info.DQAction != DQActionExclude {
+		t.Fatalf("DQAction = %v, want DQActionExclude", info.DQAction)
 	}
 }
 
@@ -44,8 +47,11 @@ func TestFromHeaderRecognizesNIRCam(t *testing.T) {
 		if info.PixelScale != c.wantScale {
 			t.Fatalf("%s PixelScale = %v, want %v", c.detector, info.PixelScale, c.wantScale)
 		}
-		if info.BadDQBits != 1 {
-			t.Fatalf("%s BadDQBits = %d, want 1 (JWST DO_NOT_USE)", c.detector, info.BadDQBits)
+		if info.BadDQBits != 513 {
+			t.Fatalf("%s BadDQBits = %d, want 513 (JWST DO_NOT_USE|NON_SCIENCE)", c.detector, info.BadDQBits)
+		}
+		if info.DQAction != DQActionExclude {
+			t.Fatalf("%s DQAction = %v, want DQActionExclude", c.detector, info.DQAction)
 		}
 	}
 }
@@ -66,6 +72,9 @@ func TestFromHeaderRecognizesWFPC2FLT(t *testing.T) {
 	}
 	if info.BadDQBits != 0 {
 		t.Fatalf("BadDQBits = %d, want 0 to treat any non-zero WFPC2 DQ as bad", info.BadDQBits)
+	}
+	if info.DQAction != DQActionRepair {
+		t.Fatalf("DQAction = %v, want DQActionRepair", info.DQAction)
 	}
 	if info.HasSIP {
 		t.Fatal("HasSIP = true, want false for WFPC2")

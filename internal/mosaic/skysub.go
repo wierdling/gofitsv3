@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"runtime"
-	"sort"
 	"sync"
 
 	"gofitsv3/internal/debuglog"
@@ -19,6 +18,13 @@ const (
 	SkyMethodGlobalMin
 	SkyMethodMatch
 	SkyMethodGlobalMinMatch
+	// SkyMethodMatchPlane solves a per-frame correction PLANE (not just a
+	// scalar) from overlap DIFFERENCES between frames, so smooth real
+	// background sampled by both frames in an overlap cancels out instead of
+	// being fit from a single frame's own pixels. See
+	// computeDifferenceSkyPlanes and docs/sky-background-matching-plan.md,
+	// Stage 1.
+	SkyMethodMatchPlane
 )
 
 // SkyStat selects the statistic used to estimate sky from eligible pixels.
@@ -43,17 +49,69 @@ type SkysubOptions struct {
 	Clip     int
 	LSigma   float64
 	USigma   float64
+	// AmpPedestal enables NIRCam per-amplifier pedestal removal (see
+	// amp_pedestal.go). Independent of Enabled/Method: it corrects an
+	// intra-chip readout artifact, not inter-chip sky level, so it applies
+	// even when overlap-based sky matching is off.
+	AmpPedestal bool
+	// RowDestripe enables NIRCam per-amplifier 1/f row-banding removal (see
+	// row_destripe.go). Independent of Enabled/Method for the same reason as
+	// AmpPedestal, and applied after it so row medians see no DC amp steps.
+	RowDestripe bool
+	// RowDestripeMaskPath is an optional binary FITS mask. Non-zero finite pixels
+	// are excluded from row statistics. Dimensions must match each input exactly.
+	RowDestripeMaskPath string
+	// RowDestripeMaskSigma is the positive residual threshold for automatic
+	// source masking. Zero uses the default.
+	RowDestripeMaskSigma float64
+	// RowDestripeTrendWindow is the row smoothing window that preserves the
+	// low-frequency trend. Zero uses the default.
+	RowDestripeTrendWindow int
+	// RowDestripeDirection is reserved for future column support. The current
+	// implementation accepts only "" or "rows".
+	RowDestripeDirection string
+	// NIRCamWisp enables detector-fixed additive wisp template subtraction before
+	// sky estimation. Templates are read from NIRCamWispTemplateDir; no runtime
+	// downloads are attempted.
+	NIRCamWisp bool
+	// NIRCamWispTemplateDir is a local directory containing templates named
+	// nircam_wisp_<detector>_<filter>.fits, for example
+	// nircam_wisp_nrcb4_f200w.fits.
+	NIRCamWispTemplateDir string
+	// NIRCamWispAutoScale fits a non-negative scalar template amplitude. When
+	// false, NIRCamWispScale is used directly.
+	NIRCamWispAutoScale bool
+	// NIRCamWispScale is the fixed non-negative template scale used when
+	// NIRCamWispAutoScale is false.
+	NIRCamWispScale float64
+	// MIRIArtifactMask enables user-provided MIRI artifact masks. This masks
+	// calibrated pixels only; it does not try to reproduce ramp-level shower
+	// detection.
+	MIRIArtifactMask bool
+	// MIRIArtifactMaskPath is an optional binary FITS mask applied to MIRI inputs.
+	MIRIArtifactMaskPath string
+	// MIRIArtifactMaskDir is an optional directory containing per-input masks
+	// named <input-stem>_miri_mask.fits.
+	MIRIArtifactMaskDir string
 }
 
 type skyEdge struct {
 	i, j   int
 	delta  float64
 	weight float64
+	// cells is the number of overlap cells the edge's delta was measured
+	// from, kept for the post-solve debug log.
+	cells int
 }
 
+// sampleAccum holds a bounded set of raw samples for one coarse overlap
+// cell. A plain mean is star-contaminated (a single bright pixel sampled
+// into a cell skews it); keeping the raw values lets buildOverlapSampleMap
+// report a median instead. Capped per cell (skyOverlapCellSampleCap) so a
+// cell's memory stays bounded regardless of how many source pixels stride
+// into it.
 type sampleAccum struct {
-	sum   float64
-	count int
+	values []float64
 }
 
 type skyPlane struct {
@@ -85,7 +143,7 @@ func normalizeSkysubOptions(options SkysubOptions) SkysubOptions {
 		options.USigma = 4.0
 	}
 	switch options.Method {
-	case SkyMethodLocalMin, SkyMethodGlobalMin, SkyMethodMatch, SkyMethodGlobalMinMatch:
+	case SkyMethodLocalMin, SkyMethodGlobalMin, SkyMethodMatch, SkyMethodGlobalMinMatch, SkyMethodMatchPlane:
 	default:
 		options.Method = SkyMethodLocalMin
 	}
@@ -118,7 +176,7 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyP
 
 	options := normalizeSkysubOptions(opts.Skysub)
 	rawSky := make([]float64, n)
-	needMaps := options.Method == SkyMethodMatch || options.Method == SkyMethodGlobalMinMatch
+	needMaps := options.Method == SkyMethodMatch || options.Method == SkyMethodGlobalMinMatch || options.Method == SkyMethodMatchPlane
 	var maps []map[int64]float64
 	if needMaps {
 		maps = make([]map[int64]float64, n)
@@ -187,6 +245,24 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyP
 		for i := range planned {
 			if !planned[i].input.ReferenceOnly {
 				subtractSky[i] = globalMin
+			}
+		}
+	case SkyMethodMatchPlane:
+		planes, planeMatched := computeDifferenceSkyPlanes(planned, maps, options)
+		matched = planeMatched
+		for i := range planned {
+			if planned[i].input.ReferenceOnly {
+				continue
+			}
+			if matched[i] {
+				// The plane's C term already carries the full correction
+				// (including the equivalent of a scalar offset), so no
+				// separate subtractSky is applied on top of it.
+				skyPlanes[i] = planes[i]
+			} else {
+				// Same fallback as SkyMethodMatch: a chip/frame with no
+				// overlap edges falls back to its own measured sky.
+				subtractSky[i] = rawSky[i]
 			}
 		}
 	case SkyMethodMatch, SkyMethodGlobalMinMatch:
@@ -258,10 +334,6 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyP
 			}
 			subtractSky[i] = groupMin[InputKey(planned[i].input)]
 		}
-	}
-
-	if needMaps {
-		skyPlanes = computeOverlapAnchoredSkyPlanes(planned, maps, subtractSky, matched, options)
 	}
 
 	logSkysubPlan(planned, rawSky, subtractSky, maps)
@@ -634,16 +706,7 @@ func computeMatchedSkyOffsets(planned []plannedInput, maps []map[int64]float64, 
 			// through the chain instead of being pinned by a single noisy edge.
 			// sqrt keeps one huge overlap from completely swamping several
 			// medium ones.
-			edges = append(edges, skyEdge{i: i, j: j, delta: delta, weight: math.Sqrt(float64(len(diffs)))})
-			if skyDebugLog {
-				debuglog.Log(fmt.Sprintf(
-					"SKYSUB EDGE i=%s j=%s cells=%d delta=%.6f",
-					InputKey(planned[i].input),
-					InputKey(planned[j].input),
-					len(diffs),
-					delta,
-				))
-			}
+			edges = append(edges, skyEdge{i: i, j: j, delta: delta, weight: math.Sqrt(float64(len(diffs))), cells: len(diffs)})
 		}
 	}
 	if len(edges) == 0 {
@@ -667,14 +730,110 @@ func computeMatchedSkyOffsets(planned []plannedInput, maps []map[int64]float64, 
 			}
 		}
 		compOffsets := solveSkyComponent(component, compEdges)
+		compEdges, compOffsets = dropOutlierSkyEdgesAndResolve(component, compEdges, compOffsets)
 		for _, idx := range component {
 			matched[idx] = true
 		}
 		for idx, val := range compOffsets {
 			offsets[idx] = val
 		}
+		logSkyMatchEdges(planned, compEdges, compOffsets)
 	}
 	return offsets, matched
+}
+
+// dropOutlierSkyEdgesAndResolve computes each edge's residual against the
+// already-solved offsets, and if any edge's residual sits more than
+// skyEdgeResidualSigma sigma from the component's residual distribution,
+// drops it and re-solves once. The drop is only applied if the surviving
+// edges still connect every frame in the component — an outlier edge that is
+// the sole connection for some frame is kept rather than isolating that
+// frame, since a noisy relative offset is still better than none.
+func dropOutlierSkyEdgesAndResolve(component []int, edges []skyEdge, offsets map[int]float64) ([]skyEdge, map[int]float64) {
+	if len(edges) < 2 {
+		return edges, offsets
+	}
+	residuals := make([]float64, len(edges))
+	for k, e := range edges {
+		residuals[k] = e.delta - (offsets[e.j] - offsets[e.i])
+	}
+	// Median/MAD rather than mean/sigma: a mean-based sigma over a handful of
+	// edges is itself dragged around by the one gross outlier it's supposed
+	// to detect (a "masking" effect), whereas the median stays put.
+	center := quickSelectMedian(append([]float64(nil), residuals...))
+	absDev := make([]float64, len(residuals))
+	for k, r := range residuals {
+		absDev[k] = math.Abs(r - center)
+	}
+	sigma := 1.4826 * quickSelectMedian(absDev)
+	if sigma <= 0 {
+		return edges, offsets
+	}
+	lo := center - skyEdgeResidualSigma*sigma
+	hi := center + skyEdgeResidualSigma*sigma
+	kept := make([]skyEdge, 0, len(edges))
+	dropped := false
+	for k, e := range edges {
+		if residuals[k] < lo || residuals[k] > hi {
+			dropped = true
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if !dropped || !sameSkyComponent(component, kept) {
+		return edges, offsets
+	}
+	return kept, solveSkyComponent(component, kept)
+}
+
+// sameSkyComponent reports whether edges alone connect every member of
+// component into one piece, without needing the full frame count that
+// connectedSkyComponents requires.
+func sameSkyComponent(component []int, edges []skyEdge) bool {
+	if len(component) == 0 {
+		return true
+	}
+	adj := make(map[int][]int, len(component))
+	for _, e := range edges {
+		adj[e.i] = append(adj[e.i], e.j)
+		adj[e.j] = append(adj[e.j], e.i)
+	}
+	seen := make(map[int]bool, len(component))
+	queue := []int{component[0]}
+	seen[component[0]] = true
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, next := range adj[cur] {
+			if !seen[next] {
+				seen[next] = true
+				queue = append(queue, next)
+			}
+		}
+	}
+	return len(seen) == len(component)
+}
+
+// logSkyMatchEdges reports each edge's post-solve residual (delta minus what
+// the solved offsets predict), so a bad or inconsistent edge is visible in
+// the same SKYSUB EDGE debuglog lines used for Stage 0-style diagnosis.
+// Logged after solving (and any outlier re-solve) rather than at edge-build
+// time so the residual reflects the final result.
+func logSkyMatchEdges(planned []plannedInput, edges []skyEdge, offsets map[int]float64) {
+	if !skyDebugLog {
+		return
+	}
+	for _, e := range edges {
+		residual := e.delta - (offsets[e.j] - offsets[e.i])
+		debuglog.Log(fmt.Sprintf(
+			"SKYSUB EDGE i=%s j=%s cells=%d delta=%.6f residual=%.6f",
+			InputKey(planned[e.i].input),
+			InputKey(planned[e.j].input),
+			e.cells,
+			e.delta,
+			residual,
+		))
+	}
 }
 
 // overlapDiffsForEdge returns per-cell differences for one edge in the sky
@@ -706,96 +865,338 @@ type skyPlaneSample struct {
 	x, y, z float64
 }
 
-func computeOverlapAnchoredSkyPlanes(planned []plannedInput, maps []map[int64]float64, subtractSky []float64, matched []bool, options SkysubOptions) []skyPlane {
+// positionedOverlapDiffs is overlapDiffsForEdge but keeps each cell's output
+// mosaic position, needed to fit a plane (not just a scalar) from overlap
+// differences. Returned samples are always mapJ - mapI at that cell's center.
+func positionedOverlapDiffs(mapI, mapJ map[int64]float64) []skyPlaneSample {
+	samples := make([]skyPlaneSample, 0, minInt(len(mapI), len(mapJ)))
+	if len(mapI) <= len(mapJ) {
+		for key, vi := range mapI {
+			vj, ok := mapJ[key]
+			if !ok {
+				continue
+			}
+			x, y := overlapCellCenter(key)
+			samples = append(samples, skyPlaneSample{x: x, y: y, z: vj - vi})
+		}
+	} else {
+		for key, vj := range mapJ {
+			vi, ok := mapI[key]
+			if !ok {
+				continue
+			}
+			x, y := overlapCellCenter(key)
+			samples = append(samples, skyPlaneSample{x: x, y: y, z: vj - vi})
+		}
+	}
+	return samples
+}
+
+type skyPlaneEdge struct {
+	i, j    int
+	samples []skyPlaneSample
+	weight  float64
+}
+
+// computeDifferenceSkyPlanes solves per-frame sky correction PLANES directly
+// from overlap DIFFERENCES between frames (Montage mBgModel-style), rather
+// than from a frame's own pixels. This is the nebula-safe replacement for the
+// former own-frame plane fit (see docs/sky-background-matching-plan.md,
+// Stage 1): smooth real background sampled identically by both frames in an
+// overlap cancels out of the difference, so it never gets fit and subtracted.
+//
+// Model: frame i's correction is b_i(x,y) = A_i*x + B_i*y + C_i in output
+// mosaic coordinates. For every shared overlap cell k between frames i and j,
+// the residual to minimize is
+//
+//	r_ijk = (v_jk - v_ik) - (b_j(x_k,y_k) - b_i(x_k,y_k))
+//
+// solved per connected component by weighted least squares. Each component's
+// root frame (lowest index, matching computeMatchedSkyOffsets) is pinned to
+// the zero plane for gauge fixing. matched[i] is true only for frames
+// connected to at least one usable overlap edge; callers should fall back to
+// a plain sky estimate for unmatched inputs, same as the scalar solve.
+func computeDifferenceSkyPlanes(planned []plannedInput, maps []map[int64]float64, options SkysubOptions) ([]skyPlane, []bool) {
 	planes := make([]skyPlane, len(planned))
-	for i := range planned {
-		if planned[i].input.ReferenceOnly || i >= len(maps) || len(maps[i]) == 0 || i >= len(matched) || !matched[i] {
+	matched := make([]bool, len(planned))
+
+	var edges []skyPlaneEdge
+	var connectivity []skyEdge
+	for i := 0; i < len(planned); i++ {
+		if planned[i].input.ReferenceOnly || len(maps[i]) == 0 {
 			continue
 		}
-		overlapKeys := overlapKeysForInput(i, planned, maps)
-		if len(overlapKeys) < skyMinPlaneAnchorCells {
+		for j := i + 1; j < len(planned); j++ {
+			if planned[j].input.ReferenceOnly || len(maps[j]) == 0 {
+				continue
+			}
+			samples := positionedOverlapDiffs(maps[i], maps[j])
+			if len(samples) < skyMinOverlapCells {
+				continue
+			}
+			edges = append(edges, skyPlaneEdge{i: i, j: j, samples: samples, weight: math.Sqrt(float64(len(samples)))})
+			connectivity = append(connectivity, skyEdge{i: i, j: j})
+		}
+	}
+	if len(edges) == 0 {
+		return planes, matched
+	}
+
+	components := connectedSkyComponents(len(planned), connectivity)
+	for _, component := range components {
+		if len(component) <= 1 {
 			continue
 		}
-		anchorVals := make([]float64, 0, len(overlapKeys))
-		for key := range overlapKeys {
-			if v, ok := maps[i][key]; ok {
-				anchorVals = append(anchorVals, v-subtractSky[i])
+		compSet := make(map[int]struct{}, len(component))
+		for _, idx := range component {
+			compSet[idx] = struct{}{}
+		}
+		var compEdges []skyPlaneEdge
+		for _, e := range edges {
+			_, okI := compSet[e.i]
+			_, okJ := compSet[e.j]
+			if okI && okJ {
+				compEdges = append(compEdges, e)
 			}
 		}
-		if len(anchorVals) < skyMinPlaneAnchorCells {
-			continue
+		regScale := componentOutputExtent(planned, component)
+		compPlanes := solveSkyPlaneComponent(component, compEdges, regScale, options)
+		logSkyPlaneEdges(planned, compEdges, compPlanes)
+		for _, idx := range component {
+			matched[idx] = true
+			planes[idx] = compPlanes[idx]
 		}
-		sort.Float64s(anchorVals)
-		anchor := medianFloat64(anchorVals)
-
-		samples := make([]skyPlaneSample, 0, len(maps[i]))
-		for key, value := range maps[i] {
-			x, y := overlapCellCenter(key)
-			samples = append(samples, skyPlaneSample{x: x, y: y, z: value - subtractSky[i] - anchor})
-		}
-		plane, ok := fitSkyPlane(samples, options)
-		if !ok {
-			continue
-		}
-
-		anchorCorrections := make([]float64, 0, len(overlapKeys))
-		for key := range overlapKeys {
-			x, y := overlapCellCenter(key)
-			anchorCorrections = append(anchorCorrections, plane.value(x, y))
-		}
-		sort.Float64s(anchorCorrections)
-		plane.C -= medianFloat64(anchorCorrections)
-		plane.Valid = true
-		planes[i] = plane
 	}
-	return planes
+	return planes, matched
 }
 
-func overlapKeysForInput(i int, planned []plannedInput, maps []map[int64]float64) map[int64]struct{} {
-	keys := make(map[int64]struct{})
-	for j := range planned {
-		if i == j || planned[j].input.ReferenceOnly || j >= len(maps) || len(maps[j]) == 0 {
-			continue
-		}
-		if len(maps[i]) <= len(maps[j]) {
-			for key := range maps[i] {
-				if _, ok := maps[j][key]; ok {
-					keys[key] = struct{}{}
-				}
-			}
-		} else {
-			for key := range maps[j] {
-				if _, ok := maps[i][key]; ok {
-					keys[key] = struct{}{}
-				}
-			}
-		}
+// logSkyPlaneEdges reports each edge's post-fit residual RMS (over all its
+// cells, including any the solver's internal sigma-clip iterations dropped)
+// so a bad or weakly-supported edge is visible the same way SKYSUB EDGE lines
+// are for the scalar solve.
+func logSkyPlaneEdges(planned []plannedInput, edges []skyPlaneEdge, planes map[int]skyPlane) {
+	if !skyDebugLog {
+		return
 	}
-	return keys
+	for _, e := range edges {
+		var sumSq float64
+		for _, sample := range e.samples {
+			pred := planes[e.j].value(sample.x, sample.y) - planes[e.i].value(sample.x, sample.y)
+			r := sample.z - pred
+			sumSq += r * r
+		}
+		rms := 0.0
+		if len(e.samples) > 0 {
+			rms = math.Sqrt(sumSq / float64(len(e.samples)))
+		}
+		debuglog.Log(fmt.Sprintf(
+			"SKYSUB PLANE EDGE i=%s j=%s cells=%d rms=%.6f",
+			InputKey(planned[e.i].input),
+			InputKey(planned[e.j].input),
+			len(e.samples),
+			rms,
+		))
+	}
 }
 
-func fitSkyPlane(samples []skyPlaneSample, options SkysubOptions) (skyPlane, bool) {
-	if len(samples) < skyMinPlaneFitCells {
-		return skyPlane{}, false
+// componentOutputExtent returns the largest output-mosaic-pixel extent (width
+// or height of a frame's own footprint, mapped through its WCS) among a
+// component's members. This bounds how far a fitted plane will be
+// extrapolated beyond the overlap region it was measured in, which is what
+// the slope regularization in solveSkyPlaneComponent needs to guard against —
+// using the overlap sample extent instead would under-regularize exactly the
+// small, poorly-constrained overlaps that need it most.
+func componentOutputExtent(planned []plannedInput, component []int) float64 {
+	extent := 0.0
+	for _, idx := range component {
+		if e := chipOutputExtent(planned[idx]); e > extent {
+			extent = e
+		}
 	}
-	work := append([]skyPlaneSample(nil), samples...)
+	if extent <= 0 {
+		extent = 1
+	}
+	return extent
+}
+
+func chipOutputExtent(p plannedInput) float64 {
+	w := float64(p.input.HDU.Data.Width)
+	h := float64(p.input.HDU.Data.Height)
+	minX, maxX := math.Inf(1), math.Inf(-1)
+	minY, maxY := math.Inf(1), math.Inf(-1)
+	corners := [4][2]float64{{0, 0}, {w, 0}, {0, h}, {w, h}}
+	for _, c := range corners {
+		x, y := p.mapPixel(c[0], c[1])
+		if !isFiniteSky64(x) || !isFiniteSky64(y) {
+			return 0
+		}
+		if x < minX {
+			minX = x
+		}
+		if x > maxX {
+			maxX = x
+		}
+		if y < minY {
+			minY = y
+		}
+		if y > maxY {
+			maxY = y
+		}
+	}
+	dx, dy := maxX-minX, maxY-minY
+	if dx > dy {
+		return dx
+	}
+	return dy
+}
+
+const (
+	// skyPlaneRegLambda scales the slope-regularization term added to the
+	// joint plane solve: λ * regScale² * (A_i² + B_i²) per non-root frame.
+	// This keeps weakly-connected frames (a small or single overlap) from
+	// acquiring large, poorly-constrained gradients that would be
+	// extrapolated across their whole footprint.
+	skyPlaneRegLambda = 0.01
+
+	// skyPlaneClipIters bounds the residual sigma-clip re-solve passes.
+	skyPlaneClipIters = 2
+)
+
+// solveSkyPlaneComponent solves the joint per-frame plane system for one
+// connected component, iterating with sigma-clipping on the residuals (same
+// pattern as estimateSkyFromValues/the retired fitSkyPlane) so a handful of
+// contaminated cells cannot dominate the fit.
+func solveSkyPlaneComponent(component []int, edges []skyPlaneEdge, regScale float64, options SkysubOptions) map[int]skyPlane {
+	result := make(map[int]skyPlane, len(component))
+	root := component[0]
+	for _, idx := range component {
+		if idx < root {
+			root = idx
+		}
+		result[idx] = skyPlane{}
+	}
+	result[root] = skyPlane{Valid: true}
+	if len(component) == 1 || len(edges) == 0 {
+		return result
+	}
+
+	varIndex := make(map[int]int, len(component)-1)
+	order := make([]int, 0, len(component)-1)
+	for _, idx := range component {
+		if idx == root {
+			continue
+		}
+		varIndex[idx] = len(order) * 3
+		order = append(order, idx)
+	}
+	nVars := len(order) * 3
+	if nVars == 0 {
+		return result
+	}
+	regTerm := skyPlaneRegLambda * regScale * regScale
+
+	active := make([][]bool, len(edges))
+	for k, e := range edges {
+		active[k] = make([]bool, len(e.samples))
+		for si := range active[k] {
+			active[k][si] = true
+		}
+	}
+
 	clip := options.Clip
-	if clip < 1 {
-		clip = 1
+	if clip <= 0 {
+		clip = skyPlaneClipIters
 	}
-	var plane skyPlane
+	if clip > skyPlaneClipIters {
+		clip = skyPlaneClipIters
+	}
+	planes := map[int]skyPlane{root: {Valid: true}}
 	for iter := 0; iter <= clip; iter++ {
-		var ok bool
-		plane, ok = solveSkyPlane(work)
-		if !ok {
-			return skyPlane{}, false
+		ata := make([][]float64, nVars)
+		for i := range ata {
+			ata[i] = make([]float64, nVars)
 		}
+		atb := make([]float64, nVars)
+
+		for k, e := range edges {
+			w := e.weight
+			if w <= 0 {
+				w = 1
+			}
+			jBase, jActive := -1, e.j != root
+			if jActive {
+				jBase = varIndex[e.j]
+			}
+			iBase, iActive := -1, e.i != root
+			if iActive {
+				iBase = varIndex[e.i]
+			}
+			for si, sample := range e.samples {
+				if !active[k][si] {
+					continue
+				}
+				var pos [6]int
+				var coeff [6]float64
+				n := 0
+				if jActive {
+					pos[n], coeff[n] = jBase, sample.x
+					n++
+					pos[n], coeff[n] = jBase+1, sample.y
+					n++
+					pos[n], coeff[n] = jBase+2, 1
+					n++
+				}
+				if iActive {
+					pos[n], coeff[n] = iBase, -sample.x
+					n++
+					pos[n], coeff[n] = iBase+1, -sample.y
+					n++
+					pos[n], coeff[n] = iBase+2, -1
+					n++
+				}
+				for a := 0; a < n; a++ {
+					atb[pos[a]] += w * coeff[a] * sample.z
+					for b := 0; b < n; b++ {
+						ata[pos[a]][pos[b]] += w * coeff[a] * coeff[b]
+					}
+				}
+			}
+		}
+		// Slope regularization: penalize A_i, B_i (not C_i) for every
+		// non-root frame so under-constrained frames stay near flat rather
+		// than extrapolating a wild gradient.
+		for _, idx := range order {
+			base := varIndex[idx]
+			ata[base][base] += regTerm
+			ata[base+1][base+1] += regTerm
+		}
+
+		sol := solveLinearSystem(ata, atb)
+		planes = map[int]skyPlane{root: {Valid: true}}
+		for idx, base := range varIndex {
+			planes[idx] = skyPlane{A: sol[base], B: sol[base+1], C: sol[base+2], Valid: true}
+		}
+
 		if iter == clip {
 			break
 		}
-		residuals := make([]float64, len(work))
-		for i, sample := range work {
-			residuals[i] = sample.z - plane.value(sample.x, sample.y)
+
+		// Sigma-clip residuals for the next iteration.
+		var residuals []float64
+		type sampleRef struct{ edge, sample int }
+		var refs []sampleRef
+		for k, e := range edges {
+			for si, sample := range e.samples {
+				if !active[k][si] {
+					continue
+				}
+				pred := planes[e.j].value(sample.x, sample.y) - planes[e.i].value(sample.x, sample.y)
+				residuals = append(residuals, sample.z-pred)
+				refs = append(refs, sampleRef{k, si})
+			}
+		}
+		if len(residuals) == 0 {
+			break
 		}
 		mean, sigma := meanAndSigma(residuals)
 		if sigma <= 0 {
@@ -803,58 +1204,21 @@ func fitSkyPlane(samples []skyPlaneSample, options SkysubOptions) (skyPlane, boo
 		}
 		lo := mean - options.LSigma*sigma
 		hi := mean + options.USigma*sigma
-		clipped := work[:0]
-		for i, sample := range work {
-			if residuals[i] >= lo && residuals[i] <= hi {
-				clipped = append(clipped, sample)
+		changed := false
+		for idx, r := range residuals {
+			if r < lo || r > hi {
+				active[refs[idx].edge][refs[idx].sample] = false
+				changed = true
 			}
 		}
-		if len(clipped) == len(work) || len(clipped) < skyMinPlaneFitCells {
+		if !changed {
 			break
 		}
-		work = clipped
 	}
-	plane.Valid = true
-	return plane, true
-}
-
-func solveSkyPlane(samples []skyPlaneSample) (skyPlane, bool) {
-	if len(samples) < 3 {
-		return skyPlane{}, false
+	for idx, plane := range planes {
+		result[idx] = plane
 	}
-	var meanX, meanY float64
-	for _, sample := range samples {
-		meanX += sample.x
-		meanY += sample.y
-	}
-	meanX /= float64(len(samples))
-	meanY /= float64(len(samples))
-
-	ata := make([][]float64, 3)
-	for i := range ata {
-		ata[i] = make([]float64, 3)
-	}
-	atb := make([]float64, 3)
-	for _, sample := range samples {
-		x := sample.x - meanX
-		y := sample.y - meanY
-		terms := [3]float64{x, y, 1}
-		for r := 0; r < 3; r++ {
-			atb[r] += terms[r] * sample.z
-			for c := 0; c < 3; c++ {
-				ata[r][c] += terms[r] * terms[c]
-			}
-		}
-	}
-	sol := solveLinearSystem(ata, atb)
-	if len(sol) != 3 {
-		return skyPlane{}, false
-	}
-	return skyPlane{
-		A: sol[0],
-		B: sol[1],
-		C: sol[2] - sol[0]*meanX - sol[1]*meanY,
-	}, true
+	return result
 }
 
 const (
@@ -880,13 +1244,16 @@ const (
 	// matching cells.
 	skyMinOverlapCells = 8
 
-	// skyMinPlaneAnchorCells requires enough overlap anchors before extrapolating
-	// a per-chip correction plane into non-overlap regions.
-	skyMinPlaneAnchorCells = 8
+	// skyOverlapCellSampleCap bounds how many raw samples buildOverlapSampleMap
+	// keeps per cell to compute a median. skyOverlapSamplesPerCellSide² is the
+	// design target per cell, so this caps a bit above that rather than at it.
+	skyOverlapCellSampleCap = 96
 
-	// skyMinPlaneFitCells requires enough coarse background samples across the
-	// chip to fit a stable clipped plane.
-	skyMinPlaneFitCells = 12
+	// skyEdgeResidualSigma is the threshold (in residual sigma across a
+	// component's edges) beyond which a sky-match edge is treated as an
+	// outlier: dropped and the component re-solved once, so one bad overlap
+	// cannot skew every frame's offset in its component.
+	skyEdgeResidualSigma = 3.0
 )
 
 func overlapSampleStride(width, height int) int {
@@ -932,17 +1299,22 @@ func buildOverlapSampleMap(p plannedInput, pixels []float32, options SkysubOptio
 			rx, ry := p.mapPixel(float64(x), float64(y))
 			key := overlapCellKey(rx, ry)
 			cur := accum[key]
-			cur.sum += fv
-			cur.count++
+			if len(cur.values) >= skyOverlapCellSampleCap {
+				continue
+			}
+			cur.values = append(cur.values, fv)
 			accum[key] = cur
 		}
 	}
 	out := make(map[int64]float64, len(accum))
 	for key, cur := range accum {
-		if cur.count < skyOverlapMinCellSamples {
+		if len(cur.values) < skyOverlapMinCellSamples {
 			continue
 		}
-		out[key] = cur.sum / float64(cur.count)
+		// Median rather than mean: a single bright star or nebula knot
+		// sampled into a coarse cell should not bias the whole cell's
+		// background estimate.
+		out[key] = quickSelectMedian(cur.values)
 	}
 	return out
 }

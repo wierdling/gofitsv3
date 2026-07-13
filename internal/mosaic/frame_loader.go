@@ -212,8 +212,12 @@ func prepareFramePixels(p plannedInput, opts Options, skyOffset float64, plane s
 	}
 	needSky := skyOffset != 0 && isFinite64(skyOffset)
 	needPlane := plane.Valid
+	needWisp := opts.Skysub.NIRCamWisp && !p.input.ReferenceOnly
+	needAmp := opts.Skysub.AmpPedestal && !p.input.ReferenceOnly
+	needStripe := opts.Skysub.RowDestripe && !p.input.ReferenceOnly
+	needMIRIArtifactMask := opts.Skysub.MIRIArtifactMask && !p.input.ReferenceOnly
 
-	if (needSB || needExp || needSky || needPlane) && !owned {
+	if (needSB || needExp || needSky || needPlane || needWisp || needAmp || needStripe || needMIRIArtifactMask) && !owned {
 		sci = append([]float32(nil), sci...)
 		if errPix != nil {
 			errPix = append([]float32(nil), errPix...)
@@ -222,6 +226,26 @@ func prepareFramePixels(p plannedInput, opts Options, skyOffset float64, plane s
 		// so copy it only when a scale is actually applied below.
 		if whtPix != nil && (needSB || needExp) {
 			whtPix = append([]float32(nil), whtPix...)
+		}
+	}
+	var rowDestripeUserMask []bool
+	if needStripe {
+		rowDestripeUserMask, err = loadRowDestripeUserMask(p.input, opts.Skysub)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("load row destripe mask for %s: %w", InputKey(p.input), err)
+		}
+	}
+	var miriArtifactMask []bool
+	var miriArtifactMaskPath string
+	if needMIRIArtifactMask {
+		miriArtifactMask, miriArtifactMaskPath, err = loadMIRIArtifactMask(p.input, opts.Skysub)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("load MIRI artifact mask for %s: %w", InputKey(p.input), err)
+		}
+	}
+	if needWisp {
+		if err := applyNIRCamWispCorrection(p, sci, opts.Skysub); err != nil {
+			return nil, nil, nil, err
 		}
 	}
 	if needSB {
@@ -237,6 +261,17 @@ func prepareFramePixels(p plannedInput, opts Options, skyOffset float64, plane s
 		applyScaleInPlace(whtPix, inverseVarianceScale(expScale))
 		debuglog.Log(fmt.Sprintf("prepareFramePixels: %s exposure-normalized scale=%.6g errNormalized=%t",
 			InputKey(p.input), expScale, errPix != nil))
+	}
+	if needAmp {
+		applyAmpPedestalCorrection(p, sci)
+	}
+	if needStripe {
+		if err := applyRowDestripe(p, sci, opts.Skysub, rowDestripeUserMask); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	if needMIRIArtifactMask {
+		applyMIRIArtifactMask(p, sci, miriArtifactMask, miriArtifactMaskPath)
 	}
 	if needSky {
 		applySkySubInPlace(sci, skyOffset)

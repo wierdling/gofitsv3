@@ -27,7 +27,7 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 	inst, _ := instrument.FromHeader(primary)
 	sci := file.SelectSCI()
 	if len(sci) == 0 {
-		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst.BadDQBits)
+		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst)
 		return []Input{{
 			Path:          path,
 			PrimaryHeader: primary,
@@ -41,7 +41,7 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 
 	inputs := make([]Input, 0, len(sci))
 	for i := range sci {
-		hdu := cleanSCIWithMatchingDQ(sci[i], file, inst.BadDQBits)
+		hdu := cleanSCIWithMatchingDQ(sci[i], file, inst)
 		extver := sciExtNumber(hdu.Header, i+1)
 		d2iX, d2iY := loadD2ITables(file, extver)
 		inputs = append(inputs, Input{
@@ -165,7 +165,7 @@ func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w,
 	inst, _ := instrument.FromHeader(file.HDUs[0].Header)
 	sciHDUs := file.SelectSCI()
 	if len(sciHDUs) == 0 {
-		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst.BadDQBits)
+		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst)
 		if needAux {
 			whtPix = loadWHTPixels(file)
 		}
@@ -187,7 +187,7 @@ func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w,
 	if target.Data.Pixels == nil {
 		return nil, nil, nil, 0, 0, fmt.Errorf("SCI ext %d not loaded from %s", in.SCIExt, in.Path)
 	}
-	hdu := cleanSCIWithMatchingDQ(target, file, inst.BadDQBits)
+	hdu := cleanSCIWithMatchingDQ(target, file, inst)
 	if needAux {
 		errPix = loadERRPixels(file, in.SCIExt)
 	}
@@ -307,14 +307,17 @@ func loadWHTPixels(file *fitsio.File) []float32 {
 	return pixels
 }
 
-func cleanSCIWithMatchingDQ(hdu fitsio.HDU, file *fitsio.File, badBits uint32) fitsio.HDU {
+func cleanSCIWithMatchingDQ(hdu fitsio.HDU, file *fitsio.File, inst instrument.Info) fitsio.HDU {
 	dq := matchingDQHDU(file, hdu)
 	if dq == nil {
 		return hdu
 	}
-	mask, err := badpix.MaskFromDQ(hdu, *dq, badBits)
+	mask, err := badpix.MaskFromDQ(hdu, *dq, inst.BadDQBits)
 	if err != nil {
 		return hdu
+	}
+	if inst.DQAction == instrument.DQActionExclude {
+		return excludeMaskedPixels(hdu, mask)
 	}
 	edgeMask := dqEdgeNoDataMask(mask, hdu.Data.Width, hdu.Data.Height, 0.75)
 	if edgeMask != nil {
@@ -330,6 +333,22 @@ func cleanSCIWithMatchingDQ(hdu fitsio.HDU, file *fitsio.File, badBits uint32) f
 		hdu.Data = fitsio.ImageData{Width: data.Width, Height: data.Height, Pixels: pixels}
 	}
 	hdu.Data = badpix.RepairMaskedPixels(hdu.Data, mask)
+	return hdu
+}
+
+func excludeMaskedPixels(hdu fitsio.HDU, mask []bool) fitsio.HDU {
+	if len(mask) != len(hdu.Data.Pixels) {
+		return hdu
+	}
+	data := hdu.Data
+	pixels := make([]float32, len(data.Pixels))
+	copy(pixels, data.Pixels)
+	for i, bad := range mask {
+		if bad {
+			pixels[i] = float32(math.NaN())
+		}
+	}
+	hdu.Data = fitsio.ImageData{Width: data.Width, Height: data.Height, Pixels: pixels}
 	return hdu
 }
 

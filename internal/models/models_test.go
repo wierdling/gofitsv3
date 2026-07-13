@@ -176,17 +176,30 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 		},
 		AlignmentSettingsSet: true,
 		SkysubSettings: SkysubSettings{
-			Enabled:     true,
-			SkyMethod:   2,
-			SkyStat:     3,
-			SkyWidth:    0.25,
-			SkyLower:    -0.5,
-			SkyUpper:    4.5,
-			SkyLowerSet: true,
-			SkyUpperSet: true,
-			SkyClip:     5,
-			SkyLSigma:   2.5,
-			SkyUSigma:   3.5,
+			Enabled:                true,
+			SkyMethod:              2,
+			SkyStat:                3,
+			SkyWidth:               0.25,
+			SkyLower:               -0.5,
+			SkyUpper:               4.5,
+			SkyLowerSet:            true,
+			SkyUpperSet:            true,
+			SkyClip:                5,
+			SkyLSigma:              2.5,
+			SkyUSigma:              3.5,
+			AmpPedestal:            true,
+			RowDestripe:            true,
+			RowDestripeMaskPath:    "masks/row_mask.fits",
+			RowDestripeMaskSigma:   2.75,
+			RowDestripeTrendWindow: 97,
+			RowDestripeDirection:   "rows",
+			NIRCamWisp:             true,
+			NIRCamWispTemplateDir:  "refs/wisps",
+			NIRCamWispAutoScale:    true,
+			NIRCamWispScale:        1.75,
+			MIRIArtifactMask:       true,
+			MIRIArtifactMaskPath:   "masks/miri_direct.fits",
+			MIRIArtifactMaskDir:    "masks/miri",
 		},
 		SkysubSettingsSet: true,
 		ActiveFilter:      "F502N",
@@ -218,6 +231,18 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 	}
 	if !decoded.SkysubSettings.Enabled || !decoded.SkysubSettings.SkyLowerSet || decoded.SkysubSettings.SkyUSigma != 3.5 {
 		t.Fatalf("SkysubSettings = %+v, want preserved sky settings", decoded.SkysubSettings)
+	}
+	if !decoded.SkysubSettings.AmpPedestal || !decoded.SkysubSettings.RowDestripe || !decoded.SkysubSettings.NIRCamWisp {
+		t.Fatalf("Skysub detector corrections = %+v, want enabled settings preserved", decoded.SkysubSettings)
+	}
+	if decoded.SkysubSettings.RowDestripeMaskPath != "masks/row_mask.fits" || decoded.SkysubSettings.RowDestripeMaskSigma != 2.75 || decoded.SkysubSettings.RowDestripeTrendWindow != 97 || decoded.SkysubSettings.RowDestripeDirection != "rows" {
+		t.Fatalf("Row destripe settings = %+v, want preserved advanced settings", decoded.SkysubSettings)
+	}
+	if decoded.SkysubSettings.NIRCamWispTemplateDir != "refs/wisps" || !decoded.SkysubSettings.NIRCamWispAutoScale || decoded.SkysubSettings.NIRCamWispScale != 1.75 {
+		t.Fatalf("NIRCam wisp settings = %+v, want preserved template settings", decoded.SkysubSettings)
+	}
+	if !decoded.SkysubSettings.MIRIArtifactMask || decoded.SkysubSettings.MIRIArtifactMaskPath != "masks/miri_direct.fits" || decoded.SkysubSettings.MIRIArtifactMaskDir != "masks/miri" {
+		t.Fatalf("MIRI artifact settings = %+v, want preserved mask settings", decoded.SkysubSettings)
 	}
 	if decoded.ReferencePath != "ref_flc.fits" || decoded.ActiveFilter != "F502N" {
 		t.Fatalf("reference/filter = (%q,%q), want preserved values", decoded.ReferencePath, decoded.ActiveFilter)
@@ -263,6 +288,18 @@ func TestMosaicProjectJSONOmitsOptionalZeroFieldsAndDecodesDefaults(t *testing.T
 	}
 	if decoded.DrizzleSettings.UseERRWeighting {
 		t.Fatalf("UseERRWeighting = %v, want false", decoded.DrizzleSettings.UseERRWeighting)
+	}
+	if decoded.SkysubSettings.AmpPedestal || decoded.SkysubSettings.RowDestripe || decoded.SkysubSettings.NIRCamWisp || decoded.SkysubSettings.MIRIArtifactMask {
+		t.Fatalf("artifact corrections = %+v, want omitted fields to stay disabled", decoded.SkysubSettings)
+	}
+	if decoded.SkysubSettings.RowDestripeMaskPath != "" || decoded.SkysubSettings.RowDestripeMaskSigma != 0 || decoded.SkysubSettings.RowDestripeTrendWindow != 0 || decoded.SkysubSettings.RowDestripeDirection != "" {
+		t.Fatalf("row destripe defaults = %+v, want zero values for old projects", decoded.SkysubSettings)
+	}
+	if decoded.SkysubSettings.NIRCamWispTemplateDir != "" || decoded.SkysubSettings.NIRCamWispAutoScale || decoded.SkysubSettings.NIRCamWispScale != 0 {
+		t.Fatalf("NIRCam wisp defaults = %+v, want zero values for old projects", decoded.SkysubSettings)
+	}
+	if decoded.SkysubSettings.MIRIArtifactMaskPath != "" || decoded.SkysubSettings.MIRIArtifactMaskDir != "" {
+		t.Fatalf("MIRI artifact defaults = %+v, want zero values for old projects", decoded.SkysubSettings)
 	}
 }
 

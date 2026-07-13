@@ -79,7 +79,7 @@ type ChannelState struct {
 }
 
 type ComposeProject struct {
-	Channels             [3]ChannelState         `json:"channels"`
+	Channels [3]ChannelState `json:"channels"`
 	// OverlayLayers holds the arbitrary set of colored overlay layers. OrangeLayer
 	// and YellowLayer are legacy fields kept only so projects saved before the
 	// generic layer system still load (migrated into OverlayLayers on read).
@@ -193,6 +193,40 @@ type SkysubSettings struct {
 	SkyClip     int     `json:"skyClip"`
 	SkyLSigma   float64 `json:"skyLSigma"`
 	SkyUSigma   float64 `json:"skyUSigma"`
+	// AmpPedestal enables NIRCam per-amplifier pedestal removal. Independent
+	// of Enabled/SkyMethod: it fixes an intra-chip readout artifact, not
+	// inter-chip sky level.
+	AmpPedestal bool `json:"ampPedestal"`
+	// RowDestripe enables NIRCam per-amplifier 1/f row-banding removal,
+	// independent of Enabled/SkyMethod for the same reason as AmpPedestal.
+	RowDestripe bool `json:"rowDestripe"`
+	// RowDestripeMaskPath is an optional binary FITS mask. Non-zero finite
+	// pixels are excluded from row statistics.
+	RowDestripeMaskPath string `json:"rowDestripeMaskPath,omitempty"`
+	// RowDestripeMaskSigma is the automatic positive-residual source-mask
+	// threshold. Zero loads the default.
+	RowDestripeMaskSigma float64 `json:"rowDestripeMaskSigma,omitempty"`
+	// RowDestripeTrendWindow is the row smoothing window. Zero loads the default.
+	RowDestripeTrendWindow int `json:"rowDestripeTrendWindow,omitempty"`
+	// RowDestripeDirection is reserved for future column support; current value
+	// is blank or "rows".
+	RowDestripeDirection string `json:"rowDestripeDirection,omitempty"`
+	// NIRCamWisp enables local template subtraction for detector-fixed NIRCam
+	// wisps before sky matching. It is default-off and never downloads templates.
+	NIRCamWisp bool `json:"nircamWisp"`
+	// NIRCamWispTemplateDir is a local directory containing files named like
+	// nircam_wisp_nrcb4_f200w.fits.
+	NIRCamWispTemplateDir string `json:"nircamWispTemplateDir,omitempty"`
+	// NIRCamWispAutoScale fits a non-negative template scale when enabled.
+	NIRCamWispAutoScale bool `json:"nircamWispAutoScale"`
+	// NIRCamWispScale is used only when NIRCamWispAutoScale is false.
+	NIRCamWispScale float64 `json:"nircamWispScale,omitempty"`
+	// MIRIArtifactMask enables user-provided masks for calibrated MIRI artifacts.
+	MIRIArtifactMask bool `json:"miriArtifactMask"`
+	// MIRIArtifactMaskPath is an optional binary FITS mask applied to MIRI inputs.
+	MIRIArtifactMaskPath string `json:"miriArtifactMaskPath,omitempty"`
+	// MIRIArtifactMaskDir contains per-input masks named <input-stem>_miri_mask.fits.
+	MIRIArtifactMaskDir string `json:"miriArtifactMaskDir,omitempty"`
 }
 
 type MosaicInputState struct {

@@ -231,6 +231,111 @@ func TestLoadFrameFromDiskMatchesFullLoad(t *testing.T) {
 	}
 }
 
+func TestJWSTDQPixelsAreExcludedNotRepaired(t *testing.T) {
+	path := writeSyntheticDQMEF(t, "jwst_dq.fits",
+		map[string]string{"INSTRUME": "'NIRCAM'", "DETECTOR": "'NRCA1'"},
+		[]float32{10, 20, 30, 40},
+		[]float32{1, 512, 2, 0},
+	)
+
+	inputs, err := LoadInputsFromPath(path)
+	if err != nil {
+		t.Fatalf("LoadInputsFromPath error = %v", err)
+	}
+	if len(inputs) != 1 {
+		t.Fatalf("len(inputs) = %d, want 1", len(inputs))
+	}
+	pixels := inputs[0].HDU.Data.Pixels
+	for _, idx := range []int{0, 1} {
+		if !math.IsNaN(float64(pixels[idx])) {
+			t.Fatalf("pixel[%d] = %v, want NaN for JWST unusable DQ", idx, pixels[idx])
+		}
+	}
+	if pixels[2] != 30 {
+		t.Fatalf("pixel[2] = %v, want informational DQ bit to remain usable", pixels[2])
+	}
+	if pixels[3] != 40 {
+		t.Fatalf("pixel[3] = %v, want unflagged pixel unchanged", pixels[3])
+	}
+
+	result, err := Build(inputs, Options{Scale: 1, CRMethod: CRMethodNone})
+	if err != nil {
+		t.Fatalf("Build error = %v", err)
+	}
+	for _, idx := range []int{0, 1} {
+		if result.Weights[idx] != 0 {
+			t.Fatalf("result weight[%d] = %v, want 0 for excluded JWST pixel", idx, result.Weights[idx])
+		}
+		if !math.IsNaN(float64(result.Pixels[idx])) {
+			t.Fatalf("result pixel[%d] = %v, want NaN for excluded JWST pixel", idx, result.Pixels[idx])
+		}
+	}
+}
+
+func TestJWSTDQEagerAndLazyMasksMatch(t *testing.T) {
+	path := writeSyntheticDQMEF(t, "jwst_lazy_dq.fits",
+		map[string]string{"INSTRUME": "'MIRI'", "DETECTOR": "'MIRIMAGE'"},
+		[]float32{1, 2, 3, 4},
+		[]float32{0, 1, 512, 4},
+	)
+
+	full, err := LoadInputsFromPath(path)
+	if err != nil {
+		t.Fatalf("LoadInputsFromPath error = %v", err)
+	}
+	meta, err := LoadInputsMetadataFromPath(path)
+	if err != nil {
+		t.Fatalf("LoadInputsMetadataFromPath error = %v", err)
+	}
+	got, _, _, w, h, err := loadChipFromDisk(meta[0], false)
+	if err != nil {
+		t.Fatalf("loadChipFromDisk error = %v", err)
+	}
+	if w != full[0].HDU.Data.Width || h != full[0].HDU.Data.Height {
+		t.Fatalf("dims = %dx%d, want %dx%d", w, h, full[0].HDU.Data.Width, full[0].HDU.Data.Height)
+	}
+	for i, want := range full[0].HDU.Data.Pixels {
+		if got[i] != want && !(math.IsNaN(float64(got[i])) && math.IsNaN(float64(want))) {
+			t.Fatalf("pixel[%d] lazy = %v, eager = %v", i, got[i], want)
+		}
+	}
+	if got[3] != 4 {
+		t.Fatalf("pixel[3] = %v, want MIRI informational DQ bit to remain usable", got[3])
+	}
+}
+
+func TestHSTDQPixelsStillUseRepairPolicy(t *testing.T) {
+	path := writeSyntheticDQMEF(t, "hst_dq.fits",
+		map[string]string{"INSTRUME": "'WFC3'", "DETECTOR": "'IR'"},
+		[]float32{
+			1, 2, 3, 4, 5,
+			6, 7, 8, 9, 10,
+			11, 12, 1000, 14, 15,
+			16, 17, 18, 19, 20,
+			21, 22, 23, 24, 25,
+		},
+		[]float32{
+			0, 0, 0, 0, 0,
+			0, 0, 0, 0, 0,
+			0, 0, 16, 0, 0,
+			0, 0, 0, 0, 0,
+			0, 0, 0, 0, 0,
+		},
+	)
+
+	inputs, err := LoadInputsFromPath(path)
+	if err != nil {
+		t.Fatalf("LoadInputsFromPath error = %v", err)
+	}
+	got := inputs[0].HDU.Data.Pixels[12]
+	if math.IsNaN(float64(got)) {
+		t.Fatal("HST repaired pixel is NaN, want interpolation repair")
+	}
+	if got == 1000 {
+		t.Fatal("HST repaired pixel kept original bad value")
+	}
+}
+
 func TestBuildWFPC2FLTRealFilesKeepsReasonableCanvas(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join("..", "..", "TestImages", "WFPC2", "*_flt.fits"))
 	if err != nil {
@@ -320,6 +425,45 @@ func TestDQEdgeNoDataMaskMarksHeavilyFlaggedRowsAndColumns(t *testing.T) {
 	}
 }
 
+func writeSyntheticDQMEF(t *testing.T, name string, primaryCards map[string]string, sciPixels, dqPixels []float32) string {
+	t.Helper()
+	if len(sciPixels) != len(dqPixels) {
+		t.Fatalf("synthetic SCI/DQ length mismatch: %d vs %d", len(sciPixels), len(dqPixels))
+	}
+	width := 2
+	if len(sciPixels) == 25 {
+		width = 5
+	}
+	height := len(sciPixels) / width
+	header := fitsio.Header{Cards: map[string]string{
+		"FILTER":  "'F200W'",
+		"EXPTIME": "100",
+	}}
+	for k, v := range primaryCards {
+		header.Cards[k] = v
+	}
+	sciHeader := headerWithCRPIX(10, 10)
+	sciHeader.Cards["EXTVER"] = "1"
+	dqHeader := fitsio.Header{Cards: map[string]string{"EXTVER": "1"}}
+	path := filepath.Join(t.TempDir(), name)
+	err := fitsio.WriteFloat32ImageWithExtensions(path, header, fitsio.ImageData{Width: 1, Height: 1, Pixels: []float32{0}},
+		fitsio.ImageExtension{
+			ExtName: "SCI",
+			Header:  sciHeader,
+			Data:    fitsio.ImageData{Width: width, Height: height, Pixels: sciPixels},
+		},
+		fitsio.ImageExtension{
+			ExtName: "DQ",
+			Header:  dqHeader,
+			Data:    fitsio.ImageData{Width: width, Height: height, Pixels: dqPixels},
+		},
+	)
+	if err != nil {
+		t.Fatalf("WriteFloat32ImageWithExtensions error = %v", err)
+	}
+	return path
+}
+
 func footprintEdgeLength(a, b [2]float64) float64 {
 	return math.Hypot(a[0]-b[0], a[1]-b[1])
 }
@@ -400,4 +544,3 @@ func maxIntForFootprint(a, b int) int {
 	}
 	return b
 }
-
