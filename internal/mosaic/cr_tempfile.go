@@ -128,7 +128,11 @@ func buildCRMasksDrizzle(
 	if crDerivScale <= 0 {
 		crDerivScale = 1.2
 	}
-	crOpts := processing.DrizzleStyleCROptions{SeedSNR: crSeedSNR, DerivScale: crDerivScale}
+	crOpts := processing.DrizzleStyleCROptions{
+		SeedSNR:    crSeedSNR,
+		DerivScale: crDerivScale,
+		TwoSided:   n >= 3,
+	}
 
 	masks := make([]BitMask, n)
 	var maskWG sync.WaitGroup

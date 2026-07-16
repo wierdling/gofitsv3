@@ -190,6 +190,7 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 			AmpPedestal:            true,
 			RowDestripe:            true,
 			RowDestripeMaskPath:    "masks/row_mask.fits",
+			RowDestripeMaskDir:     "masks/row",
 			RowDestripeMaskSigma:   2.75,
 			RowDestripeTrendWindow: 97,
 			RowDestripeDirection:   "rows",
@@ -203,6 +204,32 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 		},
 		SkysubSettingsSet: true,
 		ActiveFilter:      "F502N",
+		ArtifactMasks: &ArtifactMaskProject{
+			Version: 1,
+			Documents: []ArtifactMaskDocument{
+				{
+					ID:         "mask-1",
+					Name:       "MIRI shower",
+					Purpose:    ArtifactMaskPurposeMIRIArtifact,
+					SourceMode: ArtifactMaskSourceInput,
+					SourceKey:  "miri_cal.fits#sci1",
+					Width:      3,
+					Height:     2,
+					Targets: []ArtifactMaskTarget{
+						{Key: "miri_cal.fits#sci1", Path: "miri_cal.fits", SCIExt: 1, Selected: true},
+					},
+					Operations: []ArtifactMaskOperation{
+						{
+							Mode:   ArtifactMaskOperationAdd,
+							Kind:   ArtifactMaskRegionRaster,
+							Width:  3,
+							Height: 2,
+							Mask:   []byte{1, 0, 0, 0, 1, 0},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	var decoded MosaicProject
@@ -235,7 +262,7 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 	if !decoded.SkysubSettings.AmpPedestal || !decoded.SkysubSettings.RowDestripe || !decoded.SkysubSettings.NIRCamWisp {
 		t.Fatalf("Skysub detector corrections = %+v, want enabled settings preserved", decoded.SkysubSettings)
 	}
-	if decoded.SkysubSettings.RowDestripeMaskPath != "masks/row_mask.fits" || decoded.SkysubSettings.RowDestripeMaskSigma != 2.75 || decoded.SkysubSettings.RowDestripeTrendWindow != 97 || decoded.SkysubSettings.RowDestripeDirection != "rows" {
+	if decoded.SkysubSettings.RowDestripeMaskPath != "masks/row_mask.fits" || decoded.SkysubSettings.RowDestripeMaskDir != "masks/row" || decoded.SkysubSettings.RowDestripeMaskSigma != 2.75 || decoded.SkysubSettings.RowDestripeTrendWindow != 97 || decoded.SkysubSettings.RowDestripeDirection != "rows" {
 		t.Fatalf("Row destripe settings = %+v, want preserved advanced settings", decoded.SkysubSettings)
 	}
 	if decoded.SkysubSettings.NIRCamWispTemplateDir != "refs/wisps" || !decoded.SkysubSettings.NIRCamWispAutoScale || decoded.SkysubSettings.NIRCamWispScale != 1.75 {
@@ -249,6 +276,16 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 	}
 	if !decoded.DrizzleSettings.SurfaceBrightnessNorm {
 		t.Fatal("SurfaceBrightnessNorm = false, want true")
+	}
+	if decoded.ArtifactMasks == nil || len(decoded.ArtifactMasks.Documents) != 1 {
+		t.Fatalf("ArtifactMasks = %+v, want one persisted mask document", decoded.ArtifactMasks)
+	}
+	doc := decoded.ArtifactMasks.Documents[0]
+	if doc.Purpose != ArtifactMaskPurposeMIRIArtifact || doc.SourceMode != ArtifactMaskSourceInput || doc.Width != 3 || doc.Height != 2 || len(doc.Operations) != 1 {
+		t.Fatalf("artifact mask document = %+v, want preserved editable document", doc)
+	}
+	if len(doc.Targets) != 1 || !doc.Targets[0].Selected || doc.Targets[0].SCIExt != 1 {
+		t.Fatalf("artifact mask targets = %+v, want selected SCI target", doc.Targets)
 	}
 }
 
@@ -275,6 +312,9 @@ func TestMosaicProjectJSONOmitsOptionalZeroFieldsAndDecodesDefaults(t *testing.T
 			t.Fatalf("JSON unexpectedly contained omitted field %q: %s", field, raw)
 		}
 	}
+	if containsJSONField(raw, "artifactMasks") {
+		t.Fatalf("JSON unexpectedly contained empty artifactMasks field: %s", raw)
+	}
 
 	var decoded MosaicProject
 	if err := json.Unmarshal(data, &decoded); err != nil {
@@ -292,7 +332,7 @@ func TestMosaicProjectJSONOmitsOptionalZeroFieldsAndDecodesDefaults(t *testing.T
 	if decoded.SkysubSettings.AmpPedestal || decoded.SkysubSettings.RowDestripe || decoded.SkysubSettings.NIRCamWisp || decoded.SkysubSettings.MIRIArtifactMask {
 		t.Fatalf("artifact corrections = %+v, want omitted fields to stay disabled", decoded.SkysubSettings)
 	}
-	if decoded.SkysubSettings.RowDestripeMaskPath != "" || decoded.SkysubSettings.RowDestripeMaskSigma != 0 || decoded.SkysubSettings.RowDestripeTrendWindow != 0 || decoded.SkysubSettings.RowDestripeDirection != "" {
+	if decoded.SkysubSettings.RowDestripeMaskPath != "" || decoded.SkysubSettings.RowDestripeMaskDir != "" || decoded.SkysubSettings.RowDestripeMaskSigma != 0 || decoded.SkysubSettings.RowDestripeTrendWindow != 0 || decoded.SkysubSettings.RowDestripeDirection != "" {
 		t.Fatalf("row destripe defaults = %+v, want zero values for old projects", decoded.SkysubSettings)
 	}
 	if decoded.SkysubSettings.NIRCamWispTemplateDir != "" || decoded.SkysubSettings.NIRCamWispAutoScale || decoded.SkysubSettings.NIRCamWispScale != 0 {
@@ -300,6 +340,9 @@ func TestMosaicProjectJSONOmitsOptionalZeroFieldsAndDecodesDefaults(t *testing.T
 	}
 	if decoded.SkysubSettings.MIRIArtifactMaskPath != "" || decoded.SkysubSettings.MIRIArtifactMaskDir != "" {
 		t.Fatalf("MIRI artifact defaults = %+v, want zero values for old projects", decoded.SkysubSettings)
+	}
+	if decoded.ArtifactMasks != nil {
+		t.Fatalf("ArtifactMasks = %+v, want nil for old projects", decoded.ArtifactMasks)
 	}
 }
 

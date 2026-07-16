@@ -203,6 +203,10 @@ type SkysubSettings struct {
 	// RowDestripeMaskPath is an optional binary FITS mask. Non-zero finite
 	// pixels are excluded from row statistics.
 	RowDestripeMaskPath string `json:"rowDestripeMaskPath,omitempty"`
+	// RowDestripeMaskDir contains per-input masks named
+	// <input-stem>_rowmask.fits. Non-zero finite pixels are excluded from row
+	// statistics for the matching calibrated NIRCam input only.
+	RowDestripeMaskDir string `json:"rowDestripeMaskDir,omitempty"`
 	// RowDestripeMaskSigma is the automatic positive-residual source-mask
 	// threshold. Zero loads the default.
 	RowDestripeMaskSigma float64 `json:"rowDestripeMaskSigma,omitempty"`
@@ -229,6 +233,79 @@ type SkysubSettings struct {
 	MIRIArtifactMaskDir string `json:"miriArtifactMaskDir,omitempty"`
 }
 
+type ArtifactMaskSourceMode string
+
+const (
+	ArtifactMaskSourceInput  ArtifactMaskSourceMode = "input"
+	ArtifactMaskSourceMosaic ArtifactMaskSourceMode = "mosaic"
+)
+
+type ArtifactMaskPurpose string
+
+const (
+	ArtifactMaskPurposeMIRIArtifact ArtifactMaskPurpose = "miriArtifact"
+	ArtifactMaskPurposeRowDestripe  ArtifactMaskPurpose = "rowDestripe"
+)
+
+type ArtifactMaskOperationMode string
+
+const (
+	ArtifactMaskOperationAdd   ArtifactMaskOperationMode = "add"
+	ArtifactMaskOperationErase ArtifactMaskOperationMode = "erase"
+)
+
+type ArtifactMaskRegionKind string
+
+const (
+	ArtifactMaskRegionRaster     ArtifactMaskRegionKind = "raster"
+	ArtifactMaskRegionBrush      ArtifactMaskRegionKind = "brush"
+	ArtifactMaskRegionRectangle  ArtifactMaskRegionKind = "rectangle"
+	ArtifactMaskRegionPolygon    ArtifactMaskRegionKind = "polygon"
+	ArtifactMaskRegionMorphology ArtifactMaskRegionKind = "morphology"
+)
+
+type ArtifactMaskPoint struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
+type ArtifactMaskTarget struct {
+	Key      string `json:"key"`
+	Path     string `json:"path"`
+	SCIExt   int    `json:"sciExt,omitempty"`
+	Selected bool   `json:"selected"`
+}
+
+type ArtifactMaskOperation struct {
+	Mode   ArtifactMaskOperationMode `json:"mode"`
+	Kind   ArtifactMaskRegionKind    `json:"kind"`
+	X      int                       `json:"x,omitempty"`
+	Y      int                       `json:"y,omitempty"`
+	Width  int                       `json:"width,omitempty"`
+	Height int                       `json:"height,omitempty"`
+	Radius int                       `json:"radius,omitempty"`
+	Points []ArtifactMaskPoint       `json:"points,omitempty"`
+	Mask   []byte                    `json:"mask,omitempty"`
+}
+
+type ArtifactMaskDocument struct {
+	ID         string                  `json:"id,omitempty"`
+	Name       string                  `json:"name,omitempty"`
+	Purpose    ArtifactMaskPurpose     `json:"purpose,omitempty"`
+	SourceMode ArtifactMaskSourceMode  `json:"sourceMode"`
+	SourceKey  string                  `json:"sourceKey,omitempty"`
+	Width      int                     `json:"width"`
+	Height     int                     `json:"height"`
+	Targets    []ArtifactMaskTarget    `json:"targets,omitempty"`
+	Operations []ArtifactMaskOperation `json:"operations,omitempty"`
+	Stale      bool                    `json:"stale,omitempty"`
+}
+
+type ArtifactMaskProject struct {
+	Version   int                    `json:"version,omitempty"`
+	Documents []ArtifactMaskDocument `json:"documents,omitempty"`
+}
+
 type MosaicInputState struct {
 	Path   string `json:"path"`
 	SCIExt int    `json:"sciExt,omitempty"`
@@ -249,16 +326,17 @@ type MosaicInputState struct {
 }
 
 type MosaicProject struct {
-	Inputs               []MosaicInputState `json:"inputs"`
-	ReferencePath        string             `json:"referencePath,omitempty"`
-	ReferenceSCIExt      int                `json:"referenceSciExt,omitempty"`
-	DrizzleSettings      DrizzleSettings    `json:"drizzleSettings"`
-	DrizzleSettingsSet   bool               `json:"drizzleSettingsSet"`
-	AlignmentSettings    AlignmentSettings  `json:"alignmentSettings"`
-	AlignmentSettingsSet bool               `json:"alignmentSettingsSet"`
-	SkysubSettings       SkysubSettings     `json:"skysubSettings"`
-	SkysubSettingsSet    bool               `json:"skysubSettingsSet"`
-	ActiveFilter         string             `json:"activeFilter,omitempty"`
+	Inputs               []MosaicInputState   `json:"inputs"`
+	ReferencePath        string               `json:"referencePath,omitempty"`
+	ReferenceSCIExt      int                  `json:"referenceSciExt,omitempty"`
+	DrizzleSettings      DrizzleSettings      `json:"drizzleSettings"`
+	DrizzleSettingsSet   bool                 `json:"drizzleSettingsSet"`
+	AlignmentSettings    AlignmentSettings    `json:"alignmentSettings"`
+	AlignmentSettingsSet bool                 `json:"alignmentSettingsSet"`
+	SkysubSettings       SkysubSettings       `json:"skysubSettings"`
+	SkysubSettingsSet    bool                 `json:"skysubSettingsSet"`
+	ActiveFilter         string               `json:"activeFilter,omitempty"`
+	ArtifactMasks        *ArtifactMaskProject `json:"artifactMasks,omitempty"`
 }
 
 type ChannelControl struct {

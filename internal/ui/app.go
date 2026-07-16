@@ -2,6 +2,7 @@ package ui
 
 import (
 	"image"
+	"image/color"
 	"syscall"
 
 	"fyne.io/fyne/v2"
@@ -18,6 +19,15 @@ import (
 // appTheme wraps the dark theme and widens the inner padding so button text
 // has more breathing room on the left and right.
 type appTheme struct{ fyne.Theme }
+
+var actionButtonColor = color.NRGBA{R: 76, G: 175, B: 80, A: 255}
+
+func (t appTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	if name == theme.ColorNamePrimary {
+		return actionButtonColor
+	}
+	return t.Theme.Color(name, variant)
+}
 
 func (t appTheme) Size(name fyne.ThemeSizeName) float32 {
 	switch name {

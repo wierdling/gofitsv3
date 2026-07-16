@@ -1,8 +1,8 @@
 package ui
 
 import (
-	"image/color"
 	"fmt"
+	"image/color"
 	"math"
 	"path/filepath"
 	"runtime"
@@ -158,8 +158,8 @@ func (ws *mosaicWorkspace) rebuildOffsetControls() {
 				}
 				black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
 				go func() {
-					baseImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode)
-					flashImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode)
+					baseImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
+					flashImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 					salmon := color.RGBA{R: 250, G: 128, B: 114, A: 255}
 					pairs := [4][2]int{{0, 1}, {1, 3}, {3, 2}, {2, 0}}
 					for _, fp := range fps {
@@ -376,8 +376,8 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 				}
 				black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
 				go func() {
-					baseImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode)
-					flashImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode)
+					baseImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
+					flashImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 					salmon := color.RGBA{R: 250, G: 128, B: 114, A: 255}
 					pairs := [4][2]int{{0, 1}, {1, 3}, {3, 2}, {2, 0}}
 					for _, fp := range fps {

@@ -213,6 +213,27 @@ func TestLoadRowDestripeUserMaskReadsNonzeroPixels(t *testing.T) {
 	}
 }
 
+func TestLoadRowDestripeUserMaskUsesPerInputDirectory(t *testing.T) {
+	width, height := 3, 2
+	dir := t.TempDir()
+	input := destripePlannedInput(width, height, false, nircamPrimaryHeader()).input
+	input.Path = filepath.Join(dir, "jw02731_cal.fits")
+	maskPixels := []float32{0, 1, 0, 0, 0, 2}
+	if _, err := ExportRowDestripeMaskAtomic(input, dir, []bool{false, true, false, false, false, true}, false); err != nil {
+		t.Fatalf("ExportRowDestripeMaskAtomic error = %v", err)
+	}
+
+	mask, err := loadRowDestripeUserMask(input, SkysubOptions{RowDestripeMaskDir: dir})
+	if err != nil {
+		t.Fatalf("loadRowDestripeUserMask dir error = %v", err)
+	}
+	for i, want := range maskPixels {
+		if mask[i] != (want != 0) {
+			t.Fatalf("mask[%d] = %v, want %v", i, mask[i], want != 0)
+		}
+	}
+}
+
 func TestSmoothValidSeriesPreservesLinearTrend(t *testing.T) {
 	vals := make([]float64, 200)
 	for i := range vals {

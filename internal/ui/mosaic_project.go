@@ -64,6 +64,7 @@ func (ws *mosaicWorkspace) saveMosaicProject() {
 		SkysubSettings:       ws.state.skysubSettings,
 		SkysubSettingsSet:    ws.state.skysubSettingsSet,
 		ActiveFilter:         ws.activeFilter,
+		ArtifactMasks:        ws.state.artifactMasks,
 	}
 	for _, inp := range ws.state.inputs {
 		mis := models.MosaicInputState{
@@ -106,6 +107,13 @@ func (ws *mosaicWorkspace) saveMosaicProject() {
 		if filepath.Ext(path) == "" {
 			path += ".json"
 		}
+		absPath, absErr := filepath.Abs(path)
+		if absErr != nil {
+			dialog.ShowError(absErr, ws.win)
+			return
+		}
+		proj.SkysubSettings.RowDestripeMaskDir = encodeProjectRelativePath(absPath, proj.SkysubSettings.RowDestripeMaskDir)
+		proj.SkysubSettings.MIRIArtifactMaskDir = encodeProjectRelativePath(absPath, proj.SkysubSettings.MIRIArtifactMaskDir)
 		data, jsonErr := json.MarshalIndent(proj, "", "  ")
 		if jsonErr != nil {
 			dialog.ShowError(jsonErr, ws.win)
@@ -115,6 +123,9 @@ func (ws *mosaicWorkspace) saveMosaicProject() {
 			dialog.ShowError(writeErr, ws.win)
 			return
 		}
+		ws.currentProjectPath = absPath
+		ws.state.skysubSettings.RowDestripeMaskDir = proj.SkysubSettings.RowDestripeMaskDir
+		ws.state.skysubSettings.MIRIArtifactMaskDir = proj.SkysubSettings.MIRIArtifactMaskDir
 		ws.lastProjectName = filepath.Base(path)
 		ws.app.Preferences().SetString("lastDir", filepath.Dir(path))
 		dialog.ShowInformation("Saved", "Mosaic project saved.", ws.win)
@@ -140,6 +151,12 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 		}
 		path := r.URI().Path()
 		r.Close()
+		absPath, absErr := filepath.Abs(path)
+		if absErr != nil {
+			dialog.ShowError(absErr, ws.win)
+			return
+		}
+		ws.currentProjectPath = absPath
 		ws.lastProjectName = filepath.Base(path)
 		ws.app.Preferences().SetString("lastDir", filepath.Dir(path))
 		data, readErr := os.ReadFile(path)
@@ -159,6 +176,8 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 		ws.state.alignmentSettingsSet = proj.AlignmentSettingsSet
 		ws.state.skysubSettings = proj.SkysubSettings
 		ws.state.skysubSettingsSet = proj.SkysubSettingsSet
+		ws.state.artifactMasks = proj.ArtifactMasks
+		ws.resetMTFMidtone()
 		if proj.ActiveFilter != "" {
 			ws.activeFilter = proj.ActiveFilter
 			ws.loadLevelPrefsAndMode(ws.activeFilter)

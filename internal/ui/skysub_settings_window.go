@@ -239,6 +239,10 @@ func showJWSTArtifactSettingsDialog(win fyne.Window, current models.SkysubSettin
 	rowMaskEntry.SetText(current.RowDestripeMaskPath)
 	rowMaskEntry.SetPlaceHolder("optional binary FITS mask; nonzero = excluded")
 
+	rowMaskDirEntry := widget.NewEntry()
+	rowMaskDirEntry.SetText(current.RowDestripeMaskDir)
+	rowMaskDirEntry.SetPlaceHolder("folder containing <input-stem>_rowmask.fits")
+
 	rowMaskSigmaEntry := widget.NewEntry()
 	rowMaskSigma := current.RowDestripeMaskSigma
 	if rowMaskSigma <= 0 {
@@ -302,6 +306,7 @@ func showJWSTArtifactSettingsDialog(win fyne.Window, current models.SkysubSettin
 		widget.NewFormItem("NIRCam amp pedestal", ampPedestalCheck),
 		widget.NewFormItem("NIRCam row banding", rowDestripeCheck),
 		widget.NewFormItem("Row mask FITS", rowMaskEntry),
+		widget.NewFormItem("Row mask dir", rowMaskDirEntry),
 		widget.NewFormItem("Row mask sigma", rowMaskSigmaEntry),
 		widget.NewFormItem("Row trend window", rowTrendEntry),
 		widget.NewFormItem("NIRCam wisp template", nircamWispCheck),
@@ -344,6 +349,7 @@ func showJWSTArtifactSettingsDialog(win fyne.Window, current models.SkysubSettin
 			AmpPedestal:            ampPedestal,
 			RowDestripe:            rowDestripe,
 			RowDestripeMaskPath:    strings.TrimSpace(rowMaskEntry.Text),
+			RowDestripeMaskDir:     strings.TrimSpace(rowMaskDirEntry.Text),
 			RowDestripeMaskSigma:   rowMaskSigmaVal,
 			RowDestripeTrendWindow: rowTrendVal,
 			RowDestripeDirection:   "rows",
@@ -364,6 +370,7 @@ func copyJWSTArtifactSettings(dst, src models.SkysubSettings) models.SkysubSetti
 	dst.AmpPedestal = src.AmpPedestal
 	dst.RowDestripe = src.RowDestripe
 	dst.RowDestripeMaskPath = src.RowDestripeMaskPath
+	dst.RowDestripeMaskDir = src.RowDestripeMaskDir
 	dst.RowDestripeMaskSigma = src.RowDestripeMaskSigma
 	dst.RowDestripeTrendWindow = src.RowDestripeTrendWindow
 	dst.RowDestripeDirection = src.RowDestripeDirection
@@ -403,6 +410,7 @@ func skysubOptionsFromSettings(s models.SkysubSettings) mosaic.SkysubOptions {
 		AmpPedestal:            s.AmpPedestal,
 		RowDestripe:            s.RowDestripe,
 		RowDestripeMaskPath:    s.RowDestripeMaskPath,
+		RowDestripeMaskDir:     s.RowDestripeMaskDir,
 		RowDestripeMaskSigma:   s.RowDestripeMaskSigma,
 		RowDestripeTrendWindow: s.RowDestripeTrendWindow,
 		RowDestripeDirection:   s.RowDestripeDirection,

@@ -61,6 +61,10 @@ type SkysubOptions struct {
 	// RowDestripeMaskPath is an optional binary FITS mask. Non-zero finite pixels
 	// are excluded from row statistics. Dimensions must match each input exactly.
 	RowDestripeMaskPath string
+	// RowDestripeMaskDir is an optional directory containing per-input masks
+	// named <input-stem>_rowmask.fits. Each mask applies only to the matching
+	// calibrated NIRCam input.
+	RowDestripeMaskDir string
 	// RowDestripeMaskSigma is the positive residual threshold for automatic
 	// source masking. Zero uses the default.
 	RowDestripeMaskSigma float64

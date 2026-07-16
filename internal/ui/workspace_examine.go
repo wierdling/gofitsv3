@@ -17,6 +17,7 @@ import (
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
+	"gofitsv3/internal/stretch"
 	"gofitsv3/internal/utils"
 )
 
@@ -97,7 +98,21 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 
 	var refresh func()
 
-	modeSelect := NewSafeSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(value string) {
+	var modeSelect *SafeSelect
+	var mtfMidtoneRow fyne.CanvasObject
+	updateStretchParams := func() {
+		if mtfMidtoneRow == nil {
+			return
+		}
+		if modeSelect != nil && labelToMode(modeSelect.Selected) == stretch.MTF {
+			mtfMidtoneRow.Show()
+		} else {
+			mtfMidtoneRow.Hide()
+		}
+	}
+
+	modeSelect = NewSafeSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq", "MTF"}, func(value string) {
+		updateStretchParams()
 		if state.img == nil {
 			return
 		}
@@ -109,6 +124,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	bgEntry := NewNumberEntry(0.001, 4)
 	peakEntry := NewNumberEntry(0.001, 4)
 	sPeakEntry := NewNumberEntry(1, 1)
+	mtfMidtoneEntry := NewNumberEntry(0.01, 3)
+	mtfMidtoneEntry.SetValue(stretch.DefaultMTFMidtone)
 
 	showClip := NewToggle(func(v bool) {
 		if state.img == nil {
@@ -140,14 +157,22 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			bgEntry.SetValue(0)
 			peakEntry.SetValue(1)
 			sPeakEntry.SetValue(1)
+			mtfMidtoneEntry.SetValue(stretch.DefaultMTFMidtone)
 			showClip.SetChecked(true)
+			updateStretchParams()
 			return
 		}
 		modeSelect.SetSelected(modeToLabel(state.img.Mode))
 		bgEntry.SetValue(state.img.Background)
 		peakEntry.SetValue(state.img.Peak)
 		sPeakEntry.SetValue(state.img.ScaledPeak)
+		mtf := state.img.MTFMidtone
+		if mtf <= 0 || mtf >= 1 {
+			mtf = stretch.DefaultMTFMidtone
+		}
+		mtfMidtoneEntry.SetValue(mtf)
 		showClip.SetChecked(state.img.ShowClip)
+		updateStretchParams()
 	}
 
 	refresh = func() {
@@ -237,6 +262,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		state.img.ScaledPeak = sPeakEntry.Value()
 		state.img.Black = vp.blackBox.Value()
 		state.img.White = vp.whiteBox.Value()
+		state.img.MTFMidtone = mtfMidtoneEntry.Value()
 		refresh()
 	})
 	applyBtn.SetToolTip("Apply the Background/Peak and Black/White values to the stretch")
@@ -254,6 +280,28 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		refresh()
 	})
 	autoBtn.SetToolTip("Compute Background, Peak and Black/White levels automatically (FITS Liberator style)")
+
+	autoMTFBtn := ttwidget.NewButton("Auto MTF", func() {
+		if state.img == nil {
+			return
+		}
+		processing.AutoMTFMidtone(state.img)
+		syncControlsFromImage()
+		refresh()
+	})
+	autoMTFBtn.SetToolTip("Calculate a PixInsight-style starting MTF midtone and select MTF stretch")
+
+	magicPreset := widget.NewSelect([]string{"Balanced", "Nebula", "Galaxy"}, nil)
+	magicPreset.SetSelected("Balanced")
+	magicBtn := ttwidget.NewButton("Magic", func() {
+		if state.img == nil {
+			return
+		}
+		processing.ApplyMagicLevels(state.img, processing.ParseMagicPreset(magicPreset.Selected))
+		syncControlsFromImage()
+		refresh()
+	})
+	magicBtn.SetToolTip("Estimate stretch levels using the selected Magic target preset")
 
 	loadFitsFromPath := func(path string, preserveStretch bool) {
 		progressDialog := dialog.NewCustom("Loading FITS", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
@@ -281,6 +329,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 					state.img.Background = savedState.Background
 					state.img.Peak = savedState.Peak
 					state.img.ScaledPeak = savedState.ScaledPeak
+					state.img.MTFMidtone = savedState.MTFMidtone
 					state.img.ShowClip = savedState.ShowClip
 				}
 				state.headerLines = utils.FormatHeadersLines(img.Primary, img.HDU.Header)
@@ -337,6 +386,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		imgCopy.Background = bgEntry.Value()
 		imgCopy.Peak = peakEntry.Value()
 		imgCopy.ScaledPeak = sPeakEntry.Value()
+		imgCopy.MTFMidtone = mtfMidtoneEntry.Value()
 		idx := channelSelect.SelectedIndex()
 		if idx < 0 {
 			idx = 0
@@ -350,6 +400,9 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	clearMeasureBtn := ttwidget.NewButton("Clear Measurement", clearMeasurement)
 	clearMeasureBtn.SetToolTip("Clear the current ruler measurement")
 
+	mtfMidtoneRow = widget.NewForm(widget.NewFormItem("MTF midtone", mtfMidtoneEntry))
+	updateStretchParams()
+
 	controls := container.NewVBox(
 		container.NewHBox(loadFitsBtn, reloadBtn),
 		pathLabel,
@@ -361,9 +414,11 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			widget.NewFormItem("Peak", peakEntry),
 			widget.NewFormItem("Scaled Peak", sPeakEntry),
 		),
+		mtfMidtoneRow,
 		container.NewHBox(showClip, widget.NewLabel("Show clipped")),
 		container.NewHBox(flipCheck, widget.NewLabel("Flip image vertically")),
-		container.NewHBox(autoBtn, applyBtn),
+		container.NewHBox(autoBtn, autoMTFBtn, applyBtn),
+		container.NewHBox(magicBtn, magicPreset),
 		widget.NewSeparator(),
 		widget.NewLabel("Examine Tools"),
 		measureCheck,

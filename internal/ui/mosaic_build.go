@@ -78,6 +78,7 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 	// Release previous result before building the new one so the old pixel
 	// arrays can be collected before the new ones are allocated.
 	ws.state.result = nil
+	markMosaicArtifactMaskDocumentsStale(ws.state.artifactMasks)
 
 	pt := newProgressTracker("Processing", "Aligning, cleaning, and drizzling selected inputs...", ws.win)
 
@@ -98,6 +99,7 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 	ws.freeInputPixels()
 	buildInputs := ws.inputsWithRef()
 
+	buildSkysubSettings := resolveSkysubSettingsForProject(ws.state.skysubSettings, ws.currentProjectPath)
 	result, err := mosaic.Build(buildInputs, mosaic.Options{
 		Scale:                 s.Scale,
 		FinalScale:            s.FinalScale,
@@ -111,7 +113,7 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 		CRSeedSNR:             s.CRSeedSNR,
 		CRDerivScale:          s.CRDerivScale,
 		DebugOutputDir:        s.DebugOutputDir,
-		Skysub:                skysubOptionsFromSettings(ws.state.skysubSettings),
+		Skysub:                skysubOptionsFromSettings(buildSkysubSettings),
 		Progress:              pt.progress,
 		Ctx:                   pt.ctx,
 	})
@@ -137,7 +139,7 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 	}
 	debuglog.Log("buildDrizzlePreview: buildMosaicPreviewImageWithLevels (off main thread)")
 	black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
-	previewImg := buildMosaicPreviewImageWithLevels(result, black, white, bg, peak, scaledPeak, ws.stretchMode)
+	previewImg := buildMosaicPreviewImageWithLevels(result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 	debuglog.Log("buildDrizzlePreview: histogram.Compute (off main thread)")
 	stats := histogram.Compute(result.Pixels)
 

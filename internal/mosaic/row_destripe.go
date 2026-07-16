@@ -3,6 +3,8 @@ package mosaic
 import (
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"gofitsv3/internal/debuglog"
@@ -270,9 +272,12 @@ func buildDestripeAutoSourceMask(sci []float32, baseMask []bool, width, height i
 }
 
 func loadRowDestripeUserMask(input Input, options SkysubOptions) ([]bool, error) {
-	path := strings.TrimSpace(options.RowDestripeMaskPath)
-	if path == "" || input.ReferenceOnly || !isNircamFrame(input) {
+	if input.ReferenceOnly || !isNircamFrame(input) {
 		return nil, nil
+	}
+	path, ok, err := rowDestripeMaskPath(input, options)
+	if err != nil || !ok {
+		return nil, err
 	}
 	mask, w, h, err := loadBinaryMaskFITS(path)
 	if err != nil {
@@ -282,6 +287,40 @@ func loadRowDestripeUserMask(input Input, options SkysubOptions) ([]bool, error)
 		return nil, fmt.Errorf("row destripe mask dimension mismatch: mask %dx%d vs input %dx%d", w, h, input.HDU.Data.Width, input.HDU.Data.Height)
 	}
 	return mask, nil
+}
+
+func rowDestripeMaskPath(input Input, options SkysubOptions) (string, bool, error) {
+	if path := strings.TrimSpace(options.RowDestripeMaskPath); path != "" {
+		return path, true, nil
+	}
+	dir := strings.TrimSpace(options.RowDestripeMaskDir)
+	if dir == "" {
+		debuglog.Log(fmt.Sprintf("DESTRIPE input=%s skipped: row mask path/directory is blank", InputKey(input)))
+		return "", false, nil
+	}
+	name := rowDestripeMaskName(input)
+	path := filepath.Join(dir, name)
+	if _, err := os.Stat(path); err == nil {
+		return path, true, nil
+	} else if os.IsNotExist(err) {
+		debuglog.Log(fmt.Sprintf("DESTRIPE input=%s skipped: row mask not found %s", InputKey(input), name))
+		return "", false, nil
+	} else {
+		return path, false, err
+	}
+}
+
+func rowDestripeMaskName(input Input) string {
+	base := filepath.Base(input.Path)
+	if input.SourcePath != "" {
+		base = filepath.Base(input.SourcePath)
+	}
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	if stem == "" {
+		stem = base
+	}
+	return stem + "_rowmask.fits"
 }
 
 // ampRowMedians returns the median of unmasked finite pixels in columns

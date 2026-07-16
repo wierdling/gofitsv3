@@ -454,6 +454,11 @@ func (p *plannedInput) mapPixel(x, y float64) (float64, float64) {
 	return processing.ApplyAffineTransform(p.sourceToRef, x, y)
 }
 
+func (p *plannedInput) mapOutputPixel(x, y, originX, originY, scale float64) (float64, float64) {
+	refX, refY := p.mapPixel(x, y)
+	return (refX - originX) * scale, (refY - originY) * scale
+}
+
 // nativePlateScaleArcsec returns the native plate scale of the image described
 // by header, in arcseconds per pixel.  It tries the CD matrix first, then
 // CDELT1.  The second return value is false when WCS data is absent.
@@ -2281,9 +2286,7 @@ func drizzlePlannedInputPoint(p plannedInput, sums, weights []float32, width, he
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			drizzlePixelPoint(sums, weights, width, height, outX, outY, value, drizzlePixelWeight(p, idx, weightingMode))
 		}
 	}
@@ -2312,9 +2315,7 @@ func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, h
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			if outX < -1e9 || outX > 1e9 || outY < -1e9 || outY > 1e9 || math.IsNaN(outX) || math.IsNaN(outY) {
 				extremeCount++
 				if extremeCount == 1 && p.mapper != nil {
@@ -2354,9 +2355,7 @@ func drizzlePlannedInputTurbo(p plannedInput, sums, weights []float32, width, he
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			drizzlePixelTurboPrepared(sums, weights, width, height, outX, outY, half, value, drizzlePixelWeight(p, idx, weightingMode))
 		}
 	}
@@ -2384,9 +2383,7 @@ func drizzlePlannedInputGaussian(p plannedInput, sums, weights []float32, width,
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			drizzlePixelGaussianPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, weightingMode))
 		}
 	}
@@ -2414,9 +2411,7 @@ func drizzlePlannedInputTophat(p plannedInput, sums, weights []float32, width, h
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			drizzlePixelTophatPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, weightingMode))
 		}
 	}
@@ -2442,9 +2437,7 @@ func drizzlePlannedInputLanczos(p plannedInput, sums, weights []float32, width, 
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			drizzlePixelLanczosPrepared(sums, weights, width, height, outX, outY, value, n, drizzlePixelWeight(p, idx, weightingMode))
 		}
 	}

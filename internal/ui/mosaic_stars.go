@@ -19,7 +19,7 @@ func (ws *mosaicWorkspace) exitStarMode() {
 
 	if ws.state.result != nil {
 		black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
-		img := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode)
+		img := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 		ws.preview.Image = img
 		ws.preview.Refresh()
 		stats := histogram.Compute(ws.state.result.Pixels)
@@ -65,7 +65,7 @@ func (ws *mosaicWorkspace) enterStarMode() {
 		ws.autoLevels(refResult.Pixels)
 	}
 	black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
-	refImg := buildMosaicPreviewImageWithLevels(refResult, black, white, bg, peak, scaledPeak, ws.stretchMode)
+	refImg := buildMosaicPreviewImageWithLevels(refResult, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 
 	ws.activePicker = newStarPickerWidget(refImg, refResult.Width, refResult.Height)
 	ws.activePicker.SetZoom(ws.zoomLevel)

@@ -41,6 +41,7 @@ type mosaicState struct {
 	alignmentSettingsSet bool
 	skysubSettings       models.SkysubSettings
 	skysubSettingsSet    bool
+	artifactMasks        *models.ArtifactMaskProject
 	// exposureNormMode controls per-frame exposure-time normalization applied
 	// before drizzle. Defaults to Off so existing behavior is preserved.
 	exposureNormMode mosaic.NormalizationMode
@@ -48,7 +49,7 @@ type mosaicState struct {
 
 func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu, *fyne.MenuItem, *fyne.MenuItem) {
 	state := &mosaicState{drizzleSettings: defaultDrizzleSettings(), alignmentSettings: defaultAlignmentSettings(), skysubSettings: defaultSkysubSettings()}
-	ws := &mosaicWorkspace{app: app, win: win, state: state, zoomLevel: 1.0, stretchMode: stretch.Asinh}
+	ws := &mosaicWorkspace{app: app, win: win, state: state, zoomLevel: 1.0, stretchMode: stretch.Asinh, mtfMidtone: stretch.DefaultMTFMidtone}
 	// ws.activeFilter is set when a filter batch is loaded; used for default save names.
 	// ws.lastProjectName is updated on save/load so the save dialog pre-populates the same name.
 
@@ -66,6 +67,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	offsetScroll.SetMinSize(fyne.NewSize(260, 180))
 	offsetHeader := container.NewVBox()
 	saveBtn := widget.NewButton("Save Drizzle FITS", func() {})
+	saveBtn.Importance = widget.HighImportance
 	saveBtn.Disable()
 	sendToExamineBtn := widget.NewButton("Send to Examine", func() {
 		if globalSendToExamine == nil || state.result == nil {
@@ -121,12 +123,14 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	bgEntry := NewNumberEntry(0.001, 4)
 	peakEntry := NewNumberEntry(1, 1)
 	scaledPeakEntry := NewNumberEntry(1, 1)
+	mtfMidtoneEntry := NewNumberEntry(0.01, 3)
 
 	blackEntry.SetValue(0)
 	whiteEntry.SetValue(1)
 	bgEntry.SetValue(0)
 	peakEntry.SetValue(1000)
 	scaledPeakEntry.SetValue(1000)
+	mtfMidtoneEntry.SetValue(stretch.DefaultMTFMidtone)
 
 	// Mirror create-once widgets onto ws so methods extracted from this
 	// constructor can read them. The locals remain in use within the
@@ -136,6 +140,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	ws.bgEntry = bgEntry
 	ws.peakEntry = peakEntry
 	ws.scaledPeakEntry = scaledPeakEntry
+	ws.mtfMidtoneEntry = mtfMidtoneEntry
 	ws.statusLabel = statusLabel
 	ws.saveOffsetsBtn = saveOffsetsBtn
 	ws.loadOffsetsBtn = loadOffsetsBtn
@@ -759,6 +764,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						// "Any" filter loads a mixed-filter batch; activeFilter is
 						// left empty so per-filter prefs/save names are skipped.
 						ws.activeFilter = mosaic.FacetValue(filterSelect.Selected)
+						ws.resetMTFMidtone()
 						if ws.activeFilter != "" {
 							ws.loadLevelPrefsAndMode(ws.activeFilter)
 						}
@@ -1070,6 +1076,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		bgEntry.SetValue(0)
 		peakEntry.SetValue(1000)
 		scaledPeakEntry.SetValue(1000)
+		ws.resetMTFMidtone()
 		ws.updateStatus()
 		ws.resetPreview()
 		ws.rebuildOffsetControls()
@@ -1082,7 +1089,18 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	statusScroll.SetMinSize(fyne.NewSize(260, 160))
 
 	// Level controls form.
-	modeSelect := NewSafeSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(s string) {
+	var mtfMidtoneRow fyne.CanvasObject
+	updateStretchParams := func() {
+		if mtfMidtoneRow == nil {
+			return
+		}
+		if ws.stretchMode == stretch.MTF {
+			mtfMidtoneRow.Show()
+		} else {
+			mtfMidtoneRow.Hide()
+		}
+	}
+	modeSelect := NewSafeSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq", "MTF"}, func(s string) {
 		switch s {
 		case "Linear":
 			ws.stretchMode = stretch.Linear
@@ -1092,9 +1110,12 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			ws.stretchMode = stretch.Sqrt
 		case "HistEq":
 			ws.stretchMode = stretch.HistEq
+		case "MTF":
+			ws.stretchMode = stretch.MTF
 		default:
 			ws.stretchMode = stretch.Asinh
 		}
+		updateStretchParams()
 	})
 	modeSelect.SetSelected("Asinh")
 	ws.modeSelect = modeSelect
@@ -1102,11 +1123,17 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		lbl := widget.NewLabel(label)
 		return container.NewBorder(nil, nil, container.New(&minWidthLayout{w: 90}, lbl), nil, w)
 	}
+	mtfMidtoneRow = makeFormRow("MTF midtone", mtfMidtoneEntry)
+	updateStretchParams()
+	magicPreset := widget.NewSelect([]string{"Balanced", "Nebula", "Galaxy"}, nil)
+	magicPreset.SetSelected("Balanced")
 	levelsForm := container.New(&fixedVSpacingLayout{15},
 		makeFormRow("Mode", modeSelect),
 		makeFormRow("Background", bgEntry),
 		makeFormRow("Peak", peakEntry),
 		makeFormRow("Scaled Peak", scaledPeakEntry),
+		mtfMidtoneRow,
+		makeFormRow("Magic preset", magicPreset),
 	)
 	autoLevelsBtn := widget.NewButton("Auto Scaling", func() {
 		if state.result != nil {
@@ -1117,7 +1144,14 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			ws.applyLevelsToPreview()
 		}
 	})
+	autoMTFBtn := widget.NewButton("Auto MTF", func() {
+		ws.autoMTFLevels(ws.currentPreviewResult())
+	})
+	magicBtn := widget.NewButton("Magic", func() {
+		ws.magicLevels(ws.currentPreviewResult(), processing.ParseMagicPreset(magicPreset.Selected))
+	})
 	applyLevelsBtn := widget.NewButton("Apply Values", func() {
+		ws.mtfMidtone = ws.mtfMidtoneEntry.Value()
 		ws.applyLevelsToPreview()
 		ws.saveLevelPrefs()
 	})
@@ -1175,7 +1209,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			r.SetMinSize(fyne.NewSize(1, 20))
 			return r
 		}(),
-		container.NewGridWithColumns(2, autoLevelsBtn, applyLevelsBtn),
+		container.NewGridWithColumns(2, autoLevelsBtn, autoMTFBtn),
+		container.NewGridWithColumns(2, magicBtn, applyLevelsBtn),
 		widget.NewSeparator(),
 		widget.NewLabel("Mosaic / Drizzle"),
 		container.NewGridWithColumns(2, loadBtn, batchBtn),
@@ -1296,6 +1331,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		fyne.NewMenuItem("Alignment Settings", ws.openAlignmentSettings),
 		fyne.NewMenuItem("Skysub Settings", ws.openSkysubSettings),
 		fyne.NewMenuItem("Exposure Normalization", ws.openExposureReview),
+		fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem("Create Artifact Masks...", ws.openArtifactMaskEditor),
 	)
 	footerBottomPad := canvas.NewRectangle(color.Transparent)
 	footerBottomPad.SetMinSize(fyne.NewSize(1, 20))

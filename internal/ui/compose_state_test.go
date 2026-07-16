@@ -229,11 +229,15 @@ func TestChannelStateRoundTripAndApplyChannelState(t *testing.T) {
 		Background: 2.5,
 		Peak:       8.5,
 		ScaledPeak: 7.5,
+		MTFMidtone: 0.37,
 		ShowClip:   true,
 	}
 	state := channelStateFromImage(img)
 	if state.Path != "channel1.fits" || state.Mode != "Log" || !state.ShowClip {
 		t.Fatalf("channelStateFromImage = %+v", state)
+	}
+	if state.MTFMidtone != 0.37 {
+		t.Fatalf("channelStateFromImage MTFMidtone = %v, want 0.37", state.MTFMidtone)
 	}
 
 	target := &models.LoadedImage{}
@@ -262,6 +266,9 @@ func TestChannelStateRoundTripAndApplyChannelState(t *testing.T) {
 	}
 	if target.Background != 2.5 || target.Peak != 8.5 || target.ScaledPeak != 7.5 || !target.ShowClip {
 		t.Fatalf("applied image scalar state = %+v", target)
+	}
+	if target.MTFMidtone != 0.37 {
+		t.Fatalf("applied MTFMidtone = %v, want 0.37", target.MTFMidtone)
 	}
 	if modeSelect.Selected != "Log" {
 		t.Fatalf("ModeSelect.Selected = %q, want Log", modeSelect.Selected)

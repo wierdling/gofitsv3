@@ -237,6 +237,10 @@ type DrizzleStyleCROptions struct {
 	// DerivScale weights the 4-neighbor derivative contribution to the
 	// per-pixel threshold. AstroDrizzle default is about 1.2.
 	DerivScale float64
+	// TwoSided detects both positive and negative deviations from the blotted
+	// model. It should only be enabled when at least three exposures contribute,
+	// because a two-frame stack cannot identify which side is the outlier.
+	TwoSided bool
 }
 
 // BuildCRMasksFromModel flags cosmic rays by blotting a pre-built output-space
@@ -301,9 +305,11 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 			}
 		}
 
-		// Excess (data - blotted model) for every comparable pixel; NaN marks
-		// pixels with no valid data or no model coverage. Computed over the full
-		// frame so the growth stages can also consider border pixels.
+		// Detection residual for every comparable pixel; NaN marks pixels with no
+		// valid data or no model coverage. In two-sided mode this is the absolute
+		// data-minus-model residual; otherwise it remains the positive excess used
+		// by the legacy detector. Compute over the full frame so growth can also
+		// consider border pixels.
 		nan32 := float32(math.NaN())
 		excesses := make([]float32, npix)
 		for idx := range excesses {
@@ -311,14 +317,18 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 		}
 		for idx := 0; idx < npix; idx++ {
 			val := float64(f.Pixels[idx])
-			if math.IsNaN(val) || val <= 0 {
+			if math.IsNaN(val) || math.IsInf(val, 0) || (!opts.TwoSided && val <= 0) {
 				continue
 			}
 			bv := float64(blotted[idx])
-			if math.IsNaN(bv) {
+			if math.IsNaN(bv) || math.IsInf(bv, 0) {
 				continue
 			}
-			excesses[idx] = float32(val - bv)
+			residual := val - bv
+			if opts.TwoSided {
+				residual = math.Abs(residual)
+			}
+			excesses[idx] = float32(residual)
 		}
 
 		// Seed pass: flag pixels whose excess clears the per-pixel noise floor
@@ -366,7 +376,7 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 //     are surrounded by enough already-flagged neighbors, recovering the diffuse
 //     wings a strict propagation threshold would leave behind.
 //
-// excesses holds data-minus-model per pixel (NaN where not comparable).
+// excesses holds the detection residual per pixel (NaN where not comparable).
 func growCRMask(mask []bool, excesses []float32, width, height int, noiseAt func(idx int) float64, seedSNR float64) {
 	dirs8 := [8][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
 
