@@ -312,17 +312,20 @@ type MosaicInputState struct {
 	// Combined marks an entry whose Path is the original multi-chip source file
 	// that gets drizzled into a single working image on load. Absent (false) for
 	// ordinary single-chip inputs and for pre-combine legacy projects.
-	Combined     bool    `json:"combined,omitempty"`
-	OffsetX      float64 `json:"offsetX"`
-	OffsetY      float64 `json:"offsetY"`
-	HasTransform bool    `json:"hasTransform"`
-	Locked       bool    `json:"locked,omitempty"`
-	TransformA   float64 `json:"transformA,omitempty"`
-	TransformB   float64 `json:"transformB,omitempty"`
-	TransformC   float64 `json:"transformC,omitempty"`
-	TransformD   float64 `json:"transformD,omitempty"`
-	TransformE   float64 `json:"transformE,omitempty"`
-	TransformF   float64 `json:"transformF,omitempty"`
+	Combined          bool    `json:"combined,omitempty"`
+	OffsetX           float64 `json:"offsetX"`
+	OffsetY           float64 `json:"offsetY"`
+	HasTransform      bool    `json:"hasTransform"`
+	Locked            bool    `json:"locked,omitempty"`
+	Excluded          bool    `json:"excluded,omitempty"`
+	NormalizeExposure bool    `json:"normalizeExposure,omitempty"`
+	ExposureScale     float64 `json:"exposureScale,omitempty"`
+	TransformA        float64 `json:"transformA,omitempty"`
+	TransformB        float64 `json:"transformB,omitempty"`
+	TransformC        float64 `json:"transformC,omitempty"`
+	TransformD        float64 `json:"transformD,omitempty"`
+	TransformE        float64 `json:"transformE,omitempty"`
+	TransformF        float64 `json:"transformF,omitempty"`
 }
 
 type MosaicProject struct {
@@ -337,6 +340,7 @@ type MosaicProject struct {
 	SkysubSettingsSet    bool                 `json:"skysubSettingsSet"`
 	ActiveFilter         string               `json:"activeFilter,omitempty"`
 	ArtifactMasks        *ArtifactMaskProject `json:"artifactMasks,omitempty"`
+	ExposureNormMode     int                  `json:"exposureNormMode,omitempty"`
 }
 
 type ChannelControl struct {

@@ -26,6 +26,8 @@ type mosaicWorkspace struct {
 	activeFilter       string
 	lastProjectName    string
 	currentProjectPath string
+	queueRunning       bool
+	queueWindow        fyne.Window
 	zoomLevel          float64
 	zoomFitMode        bool
 	levelsSet          bool

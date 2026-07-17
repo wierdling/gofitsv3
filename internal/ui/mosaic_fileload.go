@@ -240,6 +240,9 @@ func (ws *mosaicWorkspace) rebuildOffsetControls() {
 }
 
 func (ws *mosaicWorkspace) openInputFramesPopup() {
+	if ws.queueRunning {
+		return
+	}
 	if len(ws.state.inputs) == 0 {
 		dialog.ShowInformation("Input Frames", "Load at least one FITS file first.", ws.win)
 		return
@@ -466,6 +469,9 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 }
 
 func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
+	if ws.queueRunning {
+		return
+	}
 	// Filter out paths already loaded, matching on both the input's own Path and
 	// (for combined inputs) the original SourcePath so re-adding a source file
 	// whose chips were already combined is recognized as a duplicate.

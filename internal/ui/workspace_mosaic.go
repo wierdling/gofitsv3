@@ -948,6 +948,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	})
 
 	buildBtn := widget.NewButton("Create Mosaic", func() {
+		if ws.queueRunning {
+			return
+		}
 		if len(state.inputs) == 0 {
 			dialog.ShowInformation("Missing Inputs", "Add one or more FITS files first.", win)
 			return
@@ -1327,6 +1330,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	saveMosaicItem := fyne.NewMenuItem("Save Mosaic Project", ws.saveMosaicProject)
 
 	settingsMenu := fyne.NewMenu("Mosaic",
+		fyne.NewMenuItem("Drizzle Queue...", ws.openDrizzleQueue),
+		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Drizzle Settings", ws.openDrizzleSettings),
 		fyne.NewMenuItem("Alignment Settings", ws.openAlignmentSettings),
 		fyne.NewMenuItem("Skysub Settings", ws.openSkysubSettings),

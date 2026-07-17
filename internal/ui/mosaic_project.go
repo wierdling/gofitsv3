@@ -22,6 +22,9 @@ func applyInputState(inp *mosaic.Input, mis models.MosaicInputState) {
 	inp.OffsetY = mis.OffsetY
 	inp.HasManualTransform = mis.HasTransform
 	inp.OffsetLocked = mis.Locked
+	inp.Excluded = mis.Excluded
+	inp.NormalizeExposure = mis.NormalizeExposure
+	inp.ExposureScale = mis.ExposureScale
 	if mis.HasTransform {
 		inp.ManualTransform = processing.AffineTransform{
 			A: mis.TransformA, B: mis.TransformB, C: mis.TransformC,
@@ -56,6 +59,9 @@ func stateForSCIExt(group []models.MosaicInputState, sciExt int, fallback models
 }
 
 func (ws *mosaicWorkspace) saveMosaicProject() {
+	if ws.queueRunning {
+		return
+	}
 	proj := models.MosaicProject{
 		DrizzleSettings:      ws.state.drizzleSettings,
 		DrizzleSettingsSet:   ws.state.drizzleSettingsSet,
@@ -65,15 +71,19 @@ func (ws *mosaicWorkspace) saveMosaicProject() {
 		SkysubSettingsSet:    ws.state.skysubSettingsSet,
 		ActiveFilter:         ws.activeFilter,
 		ArtifactMasks:        ws.state.artifactMasks,
+		ExposureNormMode:     int(ws.state.exposureNormMode),
 	}
 	for _, inp := range ws.state.inputs {
 		mis := models.MosaicInputState{
-			Path:         inp.Path,
-			SCIExt:       inp.SCIExt,
-			OffsetX:      inp.OffsetX,
-			OffsetY:      inp.OffsetY,
-			HasTransform: inp.HasManualTransform,
-			Locked:       inp.OffsetLocked,
+			Path:              inp.Path,
+			SCIExt:            inp.SCIExt,
+			OffsetX:           inp.OffsetX,
+			OffsetY:           inp.OffsetY,
+			HasTransform:      inp.HasManualTransform,
+			Locked:            inp.OffsetLocked,
+			Excluded:          inp.Excluded,
+			NormalizeExposure: inp.NormalizeExposure,
+			ExposureScale:     inp.ExposureScale,
 		}
 		// A combined input's Path points at the working/ copy; persist the
 		// original source file instead so the project references the user's real
@@ -145,6 +155,9 @@ func (ws *mosaicWorkspace) saveMosaicProject() {
 }
 
 func (ws *mosaicWorkspace) loadMosaicProject() {
+	if ws.queueRunning {
+		return
+	}
 	fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
 		if err != nil || r == nil {
 			return
@@ -177,6 +190,8 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 		ws.state.skysubSettings = proj.SkysubSettings
 		ws.state.skysubSettingsSet = proj.SkysubSettingsSet
 		ws.state.artifactMasks = proj.ArtifactMasks
+		ws.state.exposureNormMode = mosaic.NormalizationMode(proj.ExposureNormMode)
+		ws.activeFilter = proj.ActiveFilter
 		ws.resetMTFMidtone()
 		if proj.ActiveFilter != "" {
 			ws.activeFilter = proj.ActiveFilter

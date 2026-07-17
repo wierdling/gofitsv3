@@ -73,6 +73,52 @@ func (ws *mosaicWorkspace) ensureInputPixelsLoaded() error {
 	return nil
 }
 
+// ensureInputPixelsLoadedFor restores pixel arrays for a standalone project
+// load. It intentionally does not touch workspace state.
+func ensureInputPixelsLoadedFor(inputs []mosaic.Input, reference *mosaic.Input) error {
+	cache := map[string][]mosaic.Input{}
+	load := func(path string) ([]mosaic.Input, error) {
+		if v, ok := cache[path]; ok {
+			return v, nil
+		}
+		v, err := mosaic.LoadInputsFromPath(path)
+		if err != nil {
+			return nil, err
+		}
+		cache[path] = v
+		return v, nil
+	}
+	restore := func(dst *mosaic.Input) error {
+		if dst == nil || dst.HDU.Data.Pixels != nil {
+			return nil
+		}
+		loaded, err := load(dst.Path)
+		if err != nil {
+			return fmt.Errorf("reload %s: %w", dst.Path, err)
+		}
+		return assignPixelsFromLoaded(dst, loaded)
+	}
+	for i := range inputs {
+		if err := restore(&inputs[i]); err != nil {
+			return err
+		}
+	}
+	return restore(reference)
+}
+
+func freeInputPixelsFor(inputs []mosaic.Input, reference *mosaic.Input) {
+	for i := range inputs {
+		inputs[i].HDU.Data.Pixels = nil
+		inputs[i].ERRPixels = nil
+		inputs[i].WeightPixels = nil
+	}
+	if reference != nil {
+		reference.HDU.Data.Pixels = nil
+		reference.ERRPixels = nil
+		reference.WeightPixels = nil
+	}
+}
+
 // ensureInputPixelsLoadedAt reloads pixel data for a single input by index when
 // its arrays were previously freed or never loaded (e.g. after a metadata-only
 // load or a drizzle build). Use this when only one frame is needed — such as the
@@ -204,6 +250,11 @@ func (ws *mosaicWorkspace) updateActionButtons() {
 	hasRef := ws.state.referenceInput != nil
 
 	if ws.batchBtn != nil {
+		if ws.queueRunning {
+			ws.batchBtn.Disable()
+		} else {
+			ws.batchBtn.Enable()
+		}
 		if hasInputs {
 			ws.batchBtn.Importance = widget.MediumImportance
 		} else {
@@ -212,6 +263,11 @@ func (ws *mosaicWorkspace) updateActionButtons() {
 		ws.batchBtn.Refresh()
 	}
 	if ws.buildBtn != nil {
+		if ws.queueRunning {
+			ws.buildBtn.Disable()
+		} else {
+			ws.buildBtn.Enable()
+		}
 		if hasInputs {
 			ws.buildBtn.Importance = widget.HighImportance
 		} else {
@@ -220,7 +276,9 @@ func (ws *mosaicWorkspace) updateActionButtons() {
 		ws.buildBtn.Refresh()
 	}
 	if ws.clearBtn != nil {
-		if hasInputs {
+		if ws.queueRunning {
+			ws.clearBtn.Disable()
+		} else if hasInputs {
 			ws.clearBtn.Enable()
 		} else {
 			ws.clearBtn.Disable()
@@ -228,6 +286,11 @@ func (ws *mosaicWorkspace) updateActionButtons() {
 		ws.clearBtn.Refresh()
 	}
 	if ws.setRefBtn != nil {
+		if ws.queueRunning {
+			ws.setRefBtn.Disable()
+		} else {
+			ws.setRefBtn.Enable()
+		}
 		if hasRef {
 			ws.setRefBtn.Importance = widget.MediumImportance
 		} else {
@@ -236,7 +299,9 @@ func (ws *mosaicWorkspace) updateActionButtons() {
 		ws.setRefBtn.Refresh()
 	}
 	if ws.clearRefBtn != nil {
-		if hasRef {
+		if ws.queueRunning {
+			ws.clearRefBtn.Disable()
+		} else if hasRef {
 			ws.clearRefBtn.Enable()
 		} else {
 			ws.clearRefBtn.Disable()

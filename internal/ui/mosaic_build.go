@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -10,8 +11,33 @@ import (
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/histogram"
+	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
 )
+
+func drizzleOptionsFromSettings(s models.DrizzleSettings, sky models.SkysubSettings, debugDir string, progress func(string, int, int), ctx context.Context) mosaic.Options {
+	weightingMode := mosaic.WeightingMode(s.WeightingMode)
+	if weightingMode == mosaic.WeightUniform && s.UseERRWeighting {
+		weightingMode = mosaic.WeightERR
+	}
+	return mosaic.Options{
+		Scale:                 s.Scale,
+		FinalScale:            s.FinalScale,
+		LockToReferenceFrame:  s.LockToReferenceFrame,
+		PixFrac:               s.PixFrac,
+		CRMethod:              mosaic.CRMethod(s.CRMethod),
+		SepKernel:             mosaic.DrizzleKernel(s.SepKernel),
+		FinalKernel:           mosaic.DrizzleKernel(s.FinalKernel),
+		WeightingMode:         weightingMode,
+		SurfaceBrightnessNorm: s.SurfaceBrightnessNorm,
+		CRSeedSNR:             s.CRSeedSNR,
+		CRDerivScale:          s.CRDerivScale,
+		DebugOutputDir:        debugDir,
+		Skysub:                skysubOptionsFromSettings(sky),
+		Progress:              progress,
+		Ctx:                   ctx,
+	}
+}
 
 // autoAlignToReferenceBaseline aligns active inputs against a set reference
 // baseline only. Currently unused (kept for the baseline-alignment workflow).
@@ -86,10 +112,6 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 	// ws.autoAlignToReferenceBaseline()
 
 	s := ws.state.drizzleSettings
-	weightingMode := mosaic.WeightingMode(s.WeightingMode)
-	if weightingMode == mosaic.WeightUniform && s.UseERRWeighting {
-		weightingMode = mosaic.WeightERR
-	}
 
 	// Drop the full-resolution input arrays before drizzling. Build streams each
 	// frame's pixels back from disk one at a time, so peak memory stays near
@@ -100,23 +122,9 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 	buildInputs := ws.inputsWithRef()
 
 	buildSkysubSettings := resolveSkysubSettingsForProject(ws.state.skysubSettings, ws.currentProjectPath)
-	result, err := mosaic.Build(buildInputs, mosaic.Options{
-		Scale:                 s.Scale,
-		FinalScale:            s.FinalScale,
-		LockToReferenceFrame:  s.LockToReferenceFrame,
-		PixFrac:               s.PixFrac,
-		CRMethod:              mosaic.CRMethod(s.CRMethod),
-		SepKernel:             mosaic.DrizzleKernel(s.SepKernel),
-		FinalKernel:           mosaic.DrizzleKernel(s.FinalKernel),
-		WeightingMode:         weightingMode,
-		SurfaceBrightnessNorm: s.SurfaceBrightnessNorm,
-		CRSeedSNR:             s.CRSeedSNR,
-		CRDerivScale:          s.CRDerivScale,
-		DebugOutputDir:        s.DebugOutputDir,
-		Skysub:                skysubOptionsFromSettings(buildSkysubSettings),
-		Progress:              pt.progress,
-		Ctx:                   pt.ctx,
-	})
+	options := drizzleOptionsFromSettings(s, buildSkysubSettings, s.DebugOutputDir, pt.progress, pt.ctx)
+	options.Skysub = skysubOptionsFromSettings(buildSkysubSettings)
+	result, err := mosaic.Build(buildInputs, options)
 
 	pt.hide()
 
