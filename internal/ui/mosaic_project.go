@@ -293,6 +293,10 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 				return
 			}
 
+			// Project state is restored first, then valid per-image sidecars may
+			// replace it once the project's reference input is available.
+			sidecars := loadMosaicAlignmentSidecars(newInputs, newStatuses, newRef)
+
 			fyne.Do(func() {
 				pt.hide()
 				ws.state.inputs = newInputs
@@ -306,6 +310,9 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 				if migratedExposures > 0 {
 					dialog.ShowInformation("Project Migrated",
 						fmt.Sprintf("Migrated %d multi-chip exposure(s) from per-chip to combined form. Save the project to keep the new layout.", migratedExposures), ws.win)
+				}
+				if sidecars.ReferenceChangedNotice != "" {
+					dialog.ShowInformation("Saved Alignments", sidecars.ReferenceChangedNotice, ws.win)
 				}
 			})
 		}()

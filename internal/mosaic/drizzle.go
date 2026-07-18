@@ -102,6 +102,14 @@ func InputLabel(input Input) string {
 	return name
 }
 
+func alignmentInputFiles(inputs []Input) string {
+	files := make([]string, len(inputs))
+	for i := range inputs {
+		files[i] = fmt.Sprintf("%d=%s", i, InputKey(inputs[i]))
+	}
+	return strings.Join(files, ", ")
+}
+
 // CRMethod selects the cosmic-ray removal algorithm used during drizzle.
 type CRMethod int
 
@@ -820,11 +828,11 @@ func DrizzleOrder(inputs []Input) []int {
 }
 
 // SortInputsByWCSDistance reorders inputs (and the parallel statuses slice,
-// if provided and the same length) in-place, grouping chips from the same
-// source file together.  File groups are ordered by the WCS distance of their
-// lowest-SCIExt chip from inputs[0]; chips within each group are ordered by
-// SCIExt so [sci,1] always precedes [sci,2].  inputs[0]'s file group always
-// comes first and inputs[0] itself is always the first element.
+// if provided and the same length) in-place. Chips from the same source file
+// are kept together, and nearby file groups are clustered into one spatial
+// location group. Location groups are then ordered by mosaic position so
+// adjacent footprints do not get interleaved by radial distance. Chips within
+// a file are ordered by SCIExt so [sci,1] precedes [sci,2].
 // If statuses is nil or a different length it is ignored.
 func SortInputsByWCSDistance(inputs []Input, statuses []InputStatus) {
 	if len(inputs) < 2 {
@@ -837,7 +845,9 @@ func SortInputsByWCSDistance(inputs []Input, statuses []InputStatus) {
 	type fileGroup struct {
 		path    string
 		indices []int // original indices into inputs
-		dist    float64
+		x       float64
+		y       float64
+		hasPos  bool
 	}
 	var groups []fileGroup
 	groupIdx := make(map[string]int, len(inputs))
@@ -859,34 +869,104 @@ func SortInputsByWCSDistance(inputs []Input, statuses []InputStatus) {
 		})
 	}
 
-	// Compute each group's WCS distance once. Do not do this in the sort
+	// Compute each group's WCS position once. Do not do this in the sort
 	// comparator; WCS projection is substantially more expensive than compare.
 	for g := range groups {
 		if groups[g].path == ref.Path {
-			groups[g].dist = -1
+			groups[g].x = float64(ref.HDU.Data.Width) / 2
+			groups[g].y = float64(ref.HDU.Data.Height) / 2
+			groups[g].hasPos = true
 			continue
 		}
 		rep := inputs[groups[g].indices[0]]
-		d, err := processing.CenterDistInRefPixels(
-			rep.HDU.Header, rep.HDU.Data.Width, rep.HDU.Data.Height,
-			ref.HDU.Header, ref.HDU.Data.Width, ref.HDU.Data.Height,
-		)
-		if err != nil {
-			d = math.MaxFloat64
+		mapper, err := processing.NewWCSMapper(rep.HDU.Header, nil, nil, ref.HDU.Header, nil, nil)
+		if err == nil {
+			groups[g].x, groups[g].y = mapper.MapPixel(float64(rep.HDU.Data.Width)/2, float64(rep.HDU.Data.Height)/2)
+			groups[g].hasPos = true
 		}
-		groups[g].dist = d
 	}
 
-	// Sort file groups by WCS distance of their representative chip from ref.
-	// The group containing inputs[0] always sorts first.
-	sort.SliceStable(groups, func(a, b int) bool {
-		return groups[a].dist < groups[b].dist
+	// A location is a repeated pointing, not merely a file group. A quarter of
+	// the reference's short dimension tolerates normal dithers while keeping
+	// neighboring tiled footprints separate.
+	locationRadius := 0.25 * math.Min(float64(ref.HDU.Data.Width), float64(ref.HDU.Data.Height))
+	if locationRadius <= 0 {
+		locationRadius = 1
+	}
+	type locationGroup struct {
+		indices []int
+		x, y    float64
+		valid   bool
+		ref     bool
+	}
+	var locations []locationGroup
+	for gi := range groups {
+		if !groups[gi].hasPos {
+			locations = append(locations, locationGroup{indices: []int{gi}})
+			continue
+		}
+		found := -1
+		for li := range locations {
+			if !locations[li].valid {
+				continue
+			}
+			if math.Hypot(groups[gi].x-locations[li].x, groups[gi].y-locations[li].y) <= locationRadius {
+				found = li
+				break
+			}
+		}
+		if found < 0 {
+			locations = append(locations, locationGroup{indices: []int{gi}, x: groups[gi].x, y: groups[gi].y, valid: true})
+			continue
+		}
+		locations[found].indices = append(locations[found].indices, gi)
+	}
+
+	// Stable location ordering keeps the reference location first, then walks
+	// vertically displaced locations before horizontal-only locations. This
+	// matches the common mosaic layout where exposures continue underneath the
+	// reference before the next column to its right. Unknown WCS groups remain
+	// at the end in their original order.
+	refY := float64(ref.HDU.Data.Height) / 2
+	for li := range locations {
+		for _, gi := range locations[li].indices {
+			for _, origIdx := range groups[gi].indices {
+				locations[li].ref = locations[li].ref || origIdx == 0
+			}
+		}
+	}
+	sort.SliceStable(locations, func(a, b int) bool {
+		if locations[a].valid != locations[b].valid {
+			return locations[a].valid
+		}
+		if !locations[a].valid {
+			return false
+		}
+		if locations[a].ref != locations[b].ref {
+			return locations[a].ref
+		}
+		axis := func(location locationGroup) int {
+			if math.Abs(location.y-refY) > locationRadius {
+				return 1
+			}
+			return 2
+		}
+		aAxis, bAxis := axis(locations[a]), axis(locations[b])
+		if aAxis != bAxis {
+			return aAxis < bAxis
+		}
+		if aAxis == 1 && locations[a].y != locations[b].y {
+			return locations[a].y < locations[b].y
+		}
+		return locations[a].x < locations[b].x
 	})
 
 	// Flatten into a flat index order derived from the sorted groups.
 	flatIdx := make([]int, 0, len(inputs))
-	for _, g := range groups {
-		flatIdx = append(flatIdx, g.indices...)
+	for _, location := range locations {
+		for _, gi := range location.indices {
+			flatIdx = append(flatIdx, groups[gi].indices...)
+		}
 	}
 	// Ensure the original inputs[0] is literally first (handles edge case where
 	// another chip of the same file has a lower SCIExt than the reference).
@@ -1007,7 +1087,7 @@ func framesMayOverlap(a, b Input) bool {
 }
 
 func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode, searchRadiusArcsec float64, progress ...AlignProgress) ([]StarAlignmentResult, error) {
-	debuglog.Log("AlignInputsByStarsWithMode: starting")
+	debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: starting files=[%s]", alignmentInputFiles(inputs)))
 	defer debuglog.Log("AlignInputsByStarsWithMode: finished")
 	var prog AlignProgress
 	if len(progress) > 0 {
@@ -1097,7 +1177,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	refCaches[0] = refCache{input: inputs[0], hasWCS: true}
 	if isTweakReg {
 		refCaches[0].stars = catalogs[0]
-		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[0] has %d stars", len(refCaches[0].stars)))
+		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: reference=%s has %d stars", InputKey(refCaches[0].input), len(refCaches[0].stars)))
 	}
 	for r := 1; r < numRefs; r++ {
 		if inputs[r].Excluded {
@@ -1107,14 +1187,14 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
 		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
 		if err0 != nil || err1 != nil {
-			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[%d] WCS error: %v / %v", r, err0, err1))
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: reference=%s WCS error: %v / %v", InputKey(inputs[r]), err0, err1))
 			refCaches[r] = refCache{input: inputs[r]}
 			continue
 		}
 		rc := refCache{input: inputs[r], w0toR: w0toR, wRto0: wRto0, hasWCS: true}
 		if isTweakReg {
 			rc.stars = catalogs[r]
-			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[%d] has %d stars", r, len(rc.stars)))
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: reference=%s has %d stars", InputKey(rc.input), len(rc.stars)))
 		}
 		refCaches[r] = rc
 	}
@@ -1131,11 +1211,14 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	}
 
 	alignOneToRef := func(i int) alignOneResult {
+		var attemptErrors []string
 		for r := 0; r < numRefs; r++ {
 			rc := refCaches[r]
 			if !rc.hasWCS {
+				attemptErrors = append(attemptErrors, fmt.Sprintf("reference %s has no usable WCS", InputKey(rc.input)))
 				continue
 			}
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: matching source=%s reference=%s mode=%s", InputKey(inputs[i]), InputKey(rc.input), fitgeom))
 			var (
 				refinement processing.AffineTransform
 				stats      processing.AlignStats
@@ -1199,16 +1282,18 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				)
 			}
 			if err != nil {
-				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: input[%d] vs ref[%d]: %v", i, r, err))
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: match source=%s reference=%s: %v", InputKey(inputs[i]), InputKey(rc.input), err))
+				attemptErrors = append(attemptErrors, fmt.Sprintf("reference %s: %v", InputKey(rc.input), err))
 				continue
 			}
 			if r > 0 {
 				refinement = processing.ComposeAffineTransforms(rc.wRto0,
 					processing.ComposeAffineTransforms(refinement, rc.w0toR))
 			}
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: direct-aligned source=%s reference=%s matched=%d support=%d rms=%.3f max=%.3f transform=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), InputKey(rc.input), stats.MatchedStars, stats.GlobalInliers, stats.RMS, stats.MaxError, refinement.A, refinement.B, refinement.C, refinement.D, refinement.E, refinement.F))
 			return alignOneResult{i: i, refinement: refinement, stats: stats, ok: true}
 		}
-		return alignOneResult{i: i, errMsg: lastErr[i]}
+		return alignOneResult{i: i, errMsg: strings.Join(attemptErrors, "; ")}
 	}
 
 	// getStars returns an input's pre-extracted catalog (built once, up front, via
@@ -1376,6 +1461,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			bestRMS := math.Inf(1)
 			var bestT processing.AffineTransform
 			var bestStats processing.AlignStats
+			attemptedCandidates := 0
 			for _, j := range ordered {
 				if j == i || !aligned[j] || !results[j].Applied || inputs[j].Excluded {
 					continue
@@ -1390,17 +1476,23 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				}
 				evaluated[[2]int{i, j}] = true
 				if !framesMayOverlap(inputs[i], inputs[j]) {
+					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain skip source=%s reference=%s reason=no WCS-footprint overlap", InputKey(inputs[i]), InputKey(inputs[j])))
 					continue
 				}
 				intProj, ok := projectCorrected(j)
 				if !ok {
+					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain skip source=%s reference=%s reason=reference projection unavailable", InputKey(inputs[i]), InputKey(inputs[j])))
 					continue
 				}
+				attemptedCandidates++
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: matching source=%s reference=%s mode=%s (chain fallback) source-stars=%d reference-stars=%d search-radius=%.2f", InputKey(inputs[i]), InputKey(inputs[j]), fitgeom, len(srcProj), len(intProj), chainSearchRadiusPx))
 				t, stats, err := processing.FitCatalogResidual(srcProj, intProj, refW, refH, chainSearchRadiusPx, fitgeom)
 				if err != nil {
-					lastErr[i] = err.Error()
+					lastErr[i] = fmt.Sprintf("chain via %s: %v", InputKey(inputs[j]), err)
+					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain match failed source=%s reference=%s: %v", InputKey(inputs[i]), InputKey(inputs[j]), err))
 					continue
 				}
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain candidate source=%s reference=%s matched=%d support=%d rms=%.3f max=%.3f transform=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), InputKey(inputs[j]), stats.MatchedStars, stats.GlobalInliers, stats.RMS, stats.MaxError, t.A, t.B, t.C, t.D, t.E, t.F))
 				if stats.GlobalInliers > bestSupport ||
 					(stats.GlobalInliers == bestSupport && stats.RMS < bestRMS) {
 					bestJ = j
@@ -1423,7 +1515,9 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				}
 				aligned[i] = true
 				progressed = true
-				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain-aligned input[%d] via intermediate[%d] (support=%d rms=%.2f)", i, bestJ, bestSupport, bestRMS))
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain-aligned source=%s via intermediate=%s matched=%d support=%d rms=%.3f max=%.3f transform=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), InputKey(inputs[bestJ]), bestStats.MatchedStars, bestSupport, bestRMS, bestStats.MaxError, bestT.A, bestT.B, bestT.C, bestT.D, bestT.E, bestT.F))
+			} else if attemptedCandidates > 0 {
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain unresolved source=%s attempted-candidates=%d last-error=%s", InputKey(inputs[i]), attemptedCandidates, lastErr[i]))
 			}
 		}
 	}
@@ -1470,6 +1564,8 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 						continue
 					}
 					results[i].ManualTransform = processing.ComposeAffineTransforms(updates[i], results[i].ManualTransform)
+					final := results[i].ManualTransform
+					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: bundle update source=%s update=[%.8f %.8f %.3f; %.8f %.8f %.3f] final=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), updates[i].A, updates[i].B, updates[i].C, updates[i].D, updates[i].E, updates[i].F, final.A, final.B, final.C, final.D, final.E, final.F))
 					adjusted++
 				}
 				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: global bundle adjustment improved %d frame(s)", adjusted))
@@ -1500,7 +1596,11 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				HasManualTransform: inputs[i].HasManualTransform,
 				Error:              errMsg,
 			}
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: final source=%s applied=false error=%s", InputKey(inputs[i]), errMsg))
+			continue
 		}
+		result := results[i]
+		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: final source=%s applied=%t matched=%d rms=%.3f max=%.3f offset=(%.3f,%.3f) has-transform=%t transform=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), result.Applied, result.MatchedStars, result.RMS, result.MaxError, result.OffsetX, result.OffsetY, result.HasManualTransform, result.ManualTransform.A, result.ManualTransform.B, result.ManualTransform.C, result.ManualTransform.D, result.ManualTransform.E, result.ManualTransform.F))
 	}
 
 	return results, nil
@@ -1518,7 +1618,7 @@ func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]S
 // linear WCS when needed.  The returned ManualTransform for every aligned image
 // is always expressed in inputs[0] pixel space.
 func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.Star, numRefs int, mode AlignmentMode, searchRadiusArcsec float64) ([]StarAlignmentResult, error) {
-	debuglog.Log("AlignInputsBySelectedStarsWithMode: starting")
+	debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: starting files=[%s]", alignmentInputFiles(inputs)))
 	defer debuglog.Log("AlignInputsBySelectedStarsWithMode: finished")
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
@@ -1589,7 +1689,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
 		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
 		if err0 != nil || err1 != nil {
-			debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: ref[%d] WCS error: %v / %v", r, err0, err1))
+			debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: reference=%s WCS error: %v / %v", InputKey(inputs[r]), err0, err1))
 			refs[r] = refEntry{input: inputs[r]}
 			continue
 		}
@@ -1626,6 +1726,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 			if !ref.hasWCS {
 				continue
 			}
+			debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: matching source=%s reference=%s mode=%s", InputKey(inputs[i]), InputKey(ref.input), fitgeom))
 
 			var (
 				refinement processing.AffineTransform
@@ -1702,7 +1803,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 				)
 			}
 			if err != nil {
-				debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: input[%d] vs ref[%d]: %v", i, r, err))
+				debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: match source=%s reference=%s: %v", InputKey(inputs[i]), InputKey(ref.input), err))
 				lastErr = err.Error()
 				continue
 			}

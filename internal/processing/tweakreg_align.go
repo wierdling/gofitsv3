@@ -313,24 +313,43 @@ func fitCatalogTransform(projected, refStars []Star, refWidth, refHeight int, se
 	}
 
 	var result AffineTransform
+	effectiveFitgeom := fitgeom
+	var recoveryRScaleErr error
 	if fitgeom == "rscale" {
 		rscale, err := SolveRScaleTransformationRANSAC(pairs, 300, 1.5)
 		if err != nil {
-			return AffineTransform{}, AlignStats{}, pairs, err
-		}
-		general, generalErr := SolveTransformationRANSAC(pairs, 2000, 1.5)
-		if generalErr == nil && shouldUpgradeTweakRegFit(pairs, rscale, general, refWidth, refHeight) {
-			rRMS, rMax := residualStats(pairs, rscale)
-			gRMS, gMax := residualStats(pairs, general)
-			debuglog.Log(fmt.Sprintf("fitCatalogTransform: upgrading fitgeom from rscale to general (pairs=%d, rscale rms=%.2f max=%.2f, general rms=%.2f max=%.2f)", len(pairs), rRMS, rMax, gRMS, gMax))
+			debuglog.Log(fmt.Sprintf("fitCatalogTransform: rscale RANSAC failed (pairs=%d projected=%d reference=%d search-radius=%.1f): %v", len(pairs), len(projected), len(refStars), searchRadiusPx, err))
+			if len(pairs) < 3 {
+				return AffineTransform{}, AlignStats{}, pairs, err
+			}
+			recoveryRScaleErr = err
+			debuglog.Log(fmt.Sprintf("fitCatalogTransform: starting guarded general RANSAC recovery (pairs=%d, rscale error=%v)", len(pairs), err))
+			general, generalErr := SolveTransformationRANSAC(pairs, 2000, 1.5)
+			if generalErr != nil {
+				debuglog.Log(fmt.Sprintf("fitCatalogTransform: guarded general RANSAC recovery failed (pairs=%d): %v", len(pairs), generalErr))
+				return AffineTransform{}, AlignStats{}, pairs, fmt.Errorf("rscale RANSAC failed: %w; guarded general recovery failed: %v", err, generalErr)
+			}
 			result = general
+			effectiveFitgeom = "general"
 		} else {
-			result = rscale
+			general, generalErr := SolveTransformationRANSAC(pairs, 2000, 1.5)
+			if generalErr == nil && shouldUpgradeTweakRegFit(pairs, rscale, general, refWidth, refHeight) {
+				rRMS, rMax := residualStats(pairs, rscale)
+				gRMS, gMax := residualStats(pairs, general)
+				debuglog.Log(fmt.Sprintf("fitCatalogTransform: upgrading fitgeom from rscale to general (pairs=%d, rscale rms=%.2f max=%.2f, general rms=%.2f max=%.2f)", len(pairs), rRMS, rMax, gRMS, gMax))
+				result = general
+			} else {
+				if generalErr != nil {
+					debuglog.Log(fmt.Sprintf("fitCatalogTransform: optional general RANSAC comparison failed (pairs=%d): %v", len(pairs), generalErr))
+				}
+				result = rscale
+			}
 		}
 	} else {
 		var err error
 		result, err = SolveTransformationRANSAC(pairs, 2000, 1.5)
 		if err != nil {
+			debuglog.Log(fmt.Sprintf("fitCatalogTransform: general RANSAC failed (pairs=%d projected=%d reference=%d search-radius=%.1f): %v", len(pairs), len(projected), len(refStars), searchRadiusPx, err))
 			return AffineTransform{}, AlignStats{}, pairs, err
 		}
 	}
@@ -338,6 +357,10 @@ func fitCatalogTransform(projected, refStars []Star, refWidth, refHeight int, se
 	rms, maxErr := residualStats(pairs, result)
 	support := transformGlobalSupport(projected, refStars, result, tweakRegGlobalTolPx)
 	stats := AlignStats{MatchedStars: len(pairs), GlobalInliers: support, RMS: rms, MaxError: maxErr}
+	debuglog.Log(fmt.Sprintf("fitCatalogTransform: solved fitgeom=%s transform=[%.8f %.8f %.3f; %.8f %.8f %.3f] pairs=%d support=%d rms=%.3f max=%.3f", effectiveFitgeom, result.A, result.B, result.C, result.D, result.E, result.F, len(pairs), support, rms, maxErr))
+	if recoveryRScaleErr != nil {
+		debuglog.Log(fmt.Sprintf("fitCatalogTransform: guarded general RANSAC recovery succeeded (pairs=%d, rscale=failed: %v, general=success, selected=general recovery, rms=%.3f max=%.3f, transform=[%.8f %.8f %.3f; %.8f %.8f %.3f])", len(pairs), recoveryRScaleErr, rms, maxErr, result.A, result.B, result.C, result.D, result.E, result.F))
+	}
 
 	// Sanity-check: the fitted correction must be near-identity in scale/rotation.
 	// Any computed transform with scale far from 1.0 or a large rotation is

@@ -315,45 +315,19 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					return
 				}
 			}
-			alignInputs := ws.inputsWithRef()
-			numRefs := state.alignmentSettings.NumRefs
-			if numRefs < 1 {
-				numRefs = 1
+			alignInputs, stateIndices := ws.alignmentWorkset()
+			if len(alignInputs) < 2 {
+				fyne.Do(func() {
+					progressDialog.Hide()
+					dialog.ShowInformation("Star Alignment", "All eligible inputs already have saved alignments.", win)
+				})
+				return
 			}
-			// A set reference baseline is the sole alignment reference: it occupies
-			// index 0, so force numRefs=1 regardless of the NumRefs setting.
-			if state.referenceInput != nil {
-				numRefs = 1
-			}
-			results, err := mosaic.AlignInputsBySelectedStarsWithMode(alignInputs, refStars, numRefs, mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec)
+			results, err := mosaic.AlignInputsBySelectedStarsWithMode(alignInputs, refStars, ws.alignmentNumRefs(), mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec)
 
-			type alignRow struct {
-				stateIdx int
-				result   mosaic.StarAlignmentResult
-			}
-			var rows []alignRow
+			var rows []alignmentResultRow
 			if err == nil {
-				var activeIndices []int
-				for i, inp := range state.inputs {
-					if !inp.Excluded {
-						activeIndices = append(activeIndices, i)
-					}
-				}
-				offset := 0
-				if state.referenceInput != nil {
-					offset = 1
-				}
-				for ri := offset; ri < len(results); ri++ {
-					ai := ri - offset
-					if ai >= len(activeIndices) {
-						continue
-					}
-					si := activeIndices[ai]
-					if si >= len(state.inputs) || state.inputs[si].OffsetLocked {
-						continue
-					}
-					rows = append(rows, alignRow{stateIdx: si, result: results[ri]})
-				}
+				rows = buildAlignmentResultRowsForStateIndices(results, stateIndices)
 			}
 
 			fyne.Do(func() {
@@ -392,34 +366,56 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				}
 
 				var d dialog.Dialog
-				applyBtn := widget.NewButton("Apply", func() {
-					for i, r := range rows {
-						if checks[i] == nil || !checks[i].Checked {
-							continue
+				exportBtn := widget.NewButton("Export CSV...", func() {
+					save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, saveErr error) {
+						if saveErr != nil || uc == nil {
+							return
 						}
-						si := r.stateIdx
-						if si >= len(state.inputs) || si >= len(state.statuses) {
-							continue
+						path := uc.URI().Path()
+						_ = uc.Close()
+						if filepath.Ext(path) == "" {
+							path += ".csv"
 						}
-						state.inputs[si].OffsetX = r.result.OffsetX
-						state.inputs[si].OffsetY = r.result.OffsetY
-						state.inputs[si].ManualTransform = r.result.ManualTransform
-						state.inputs[si].HasManualTransform = r.result.HasManualTransform
-						if si == 0 && state.referenceInput == nil {
-							state.statuses[si].Status = "reference"
-						} else {
-							state.statuses[si].Status = "star aligned"
+						file, createErr := os.Create(path)
+						if createErr != nil {
+							dialog.ShowError(createErr, win)
+							return
 						}
-						state.statuses[si].Error = ""
+						writeErr := writeAlignmentCSV(file, rows, state.inputs)
+						closeErr := file.Close()
+						if writeErr != nil {
+							dialog.ShowError(writeErr, win)
+							return
+						}
+						if closeErr != nil {
+							dialog.ShowError(closeErr, win)
+							return
+						}
+						dialog.ShowInformation("Exported", "Alignment CSV exported successfully.", win)
+					}, win)
+					name := "alignment_results.csv"
+					if ws.activeFilter != "" {
+						name = ws.activeFilter + "_alignment_results.csv"
 					}
+					save.SetFileName(name)
+					save.SetFilter(storage.NewExtensionFileFilter([]string{".csv"}))
+					save.Show()
+				})
+				applyBtn := widget.NewButton("Apply", func() {
+					saveErr := ws.applyAlignmentRowsAndSave(rows, func(i int) bool {
+						return checks[i] != nil && checks[i].Checked
+					}, mosaic.MergeSaveAlignmentSidecar)
 					d.Hide()
 					ws.rebuildOffsetControls()
 					ws.updateStatus()
 					go ws.buildDrizzlePreview()
+					if saveErr != nil {
+						dialog.ShowError(saveErr, win)
+					}
 				})
 				scroll := container.NewVScroll(content)
 				scroll.SetMinSize(fyne.NewSize(520, 200))
-				d = dialog.NewCustom("Star Alignment Results", "Dismiss", container.NewVBox(scroll, applyBtn), win)
+				d = dialog.NewCustom("Star Alignment Results", "Dismiss", container.NewVBox(scroll, container.NewGridWithColumns(2, exportBtn, applyBtn)), win)
 				d.Show()
 			})
 		}()
@@ -824,17 +820,15 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					return
 				}
 			}
-			alignInputs := ws.inputsWithRef()
-			numRefs := state.alignmentSettings.NumRefs
-			if numRefs < 1 {
-				numRefs = 1
+			alignInputs, stateIndices := ws.alignmentWorkset()
+			if len(alignInputs) < 2 {
+				pt.hide()
+				fyne.Do(func() {
+					dialog.ShowInformation("Star Alignment", "All eligible inputs already have saved alignments.", win)
+				})
+				return
 			}
-			// A set reference baseline is the sole alignment reference: it occupies
-			// index 0, so force numRefs=1 regardless of the NumRefs setting.
-			if state.referenceInput != nil {
-				numRefs = 1
-			}
-			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, numRefs, alignMode, state.alignmentSettings.SearchRadiusArcsec, mosaic.AlignProgress{
+			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, ws.alignmentNumRefs(), alignMode, state.alignmentSettings.SearchRadiusArcsec, mosaic.AlignProgress{
 				Progress: func(done, total int) { pt.progress("Aligning", done, total) },
 				Ctx:      pt.ctx,
 			})
@@ -845,33 +839,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			}
 
 			// Build the row data entirely off the main goroutine before touching UI.
-			type alignRow struct {
-				stateIdx int
-				result   mosaic.StarAlignmentResult
-			}
-			var rows []alignRow
+			var rows []alignmentResultRow
 			if err == nil {
-				var activeIndices []int
-				for i, inp := range state.inputs {
-					if !inp.Excluded {
-						activeIndices = append(activeIndices, i)
-					}
-				}
-				offset := 0
-				if state.referenceInput != nil {
-					offset = 1
-				}
-				for ri := offset; ri < len(results); ri++ {
-					ai := ri - offset
-					if ai >= len(activeIndices) {
-						continue
-					}
-					si := activeIndices[ai]
-					if si >= len(state.inputs) || state.inputs[si].OffsetLocked {
-						continue
-					}
-					rows = append(rows, alignRow{stateIdx: si, result: results[ri]})
-				}
+				rows = buildAlignmentResultRowsForStateIndices(results, stateIndices)
 			}
 
 			pt.hide()
@@ -910,34 +880,56 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				}
 
 				var d dialog.Dialog
-				applyBtn := widget.NewButton("Apply", func() {
-					for i, r := range rows {
-						if checks[i] == nil || !checks[i].Checked {
-							continue
+				exportBtn := widget.NewButton("Export CSV...", func() {
+					save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, saveErr error) {
+						if saveErr != nil || uc == nil {
+							return
 						}
-						si := r.stateIdx
-						if si >= len(state.inputs) || si >= len(state.statuses) {
-							continue
+						path := uc.URI().Path()
+						_ = uc.Close()
+						if filepath.Ext(path) == "" {
+							path += ".csv"
 						}
-						state.inputs[si].OffsetX = r.result.OffsetX
-						state.inputs[si].OffsetY = r.result.OffsetY
-						state.inputs[si].ManualTransform = r.result.ManualTransform
-						state.inputs[si].HasManualTransform = r.result.HasManualTransform
-						if si == 0 && state.referenceInput == nil {
-							state.statuses[si].Status = "reference"
-						} else {
-							state.statuses[si].Status = "star aligned"
+						file, createErr := os.Create(path)
+						if createErr != nil {
+							dialog.ShowError(createErr, win)
+							return
 						}
-						state.statuses[si].Error = ""
+						writeErr := writeAlignmentCSV(file, rows, state.inputs)
+						closeErr := file.Close()
+						if writeErr != nil {
+							dialog.ShowError(writeErr, win)
+							return
+						}
+						if closeErr != nil {
+							dialog.ShowError(closeErr, win)
+							return
+						}
+						dialog.ShowInformation("Exported", "Alignment CSV exported successfully.", win)
+					}, win)
+					name := "alignment_results.csv"
+					if ws.activeFilter != "" {
+						name = ws.activeFilter + "_alignment_results.csv"
 					}
+					save.SetFileName(name)
+					save.SetFilter(storage.NewExtensionFileFilter([]string{".csv"}))
+					save.Show()
+				})
+				applyBtn := widget.NewButton("Apply", func() {
+					saveErr := ws.applyAlignmentRowsAndSave(rows, func(i int) bool {
+						return checks[i] != nil && checks[i].Checked
+					}, mosaic.MergeSaveAlignmentSidecar)
 					d.Hide()
 					ws.rebuildOffsetControls()
 					ws.updateStatus()
 					go ws.buildDrizzlePreview()
+					if saveErr != nil {
+						dialog.ShowError(saveErr, win)
+					}
 				})
 				scroll := container.NewVScroll(content)
 				scroll.SetMinSize(fyne.NewSize(520, 200))
-				d = dialog.NewCustom("Star Alignment Results", "Dismiss", container.NewVBox(scroll, applyBtn), win)
+				d = dialog.NewCustom("Star Alignment Results", "Dismiss", container.NewVBox(scroll, container.NewGridWithColumns(2, exportBtn, applyBtn)), win)
 				d.Show()
 			})
 		}()
@@ -1173,10 +1165,12 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				return
 			}
 			inp.ReferenceOnly = true
-			state.referenceInput = &inp
-			refLabel.SetText("Reference: " + filepath.Base(path))
-			ws.resetPreview()
-			ws.updateActionButtons()
+			ws.confirmReferenceFrameChange(&inp, func() {
+				state.referenceInput = &inp
+				refLabel.SetText("Reference: " + filepath.Base(path))
+				ws.resetPreview()
+				ws.updateActionButtons()
+			})
 		}, win)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
 		ws.configureLastDir(fd)
@@ -1187,10 +1181,12 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	ws.setRefBtn = setRefBtn
 
 	clearRefBtn := widget.NewButton("Clear Reference", func() {
-		state.referenceInput = nil
-		refLabel.SetText("Reference: none")
-		ws.resetPreview()
-		ws.updateActionButtons()
+		ws.confirmReferenceFrameChange(nil, func() {
+			state.referenceInput = nil
+			refLabel.SetText("Reference: none")
+			ws.resetPreview()
+			ws.updateActionButtons()
+		})
 	})
 	clearRefBtn.Importance = widget.DangerImportance
 	ws.clearRefBtn = clearRefBtn

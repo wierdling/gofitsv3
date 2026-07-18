@@ -127,6 +127,10 @@ func loadMosaicProjectData(ctx context.Context, projectPath string, progress fun
 		chosen.ReferenceOnly = true
 		loaded.ReferenceInput = &chosen
 	}
+	// Queue/non-interactive loading reuses valid sidecars without a dialog.
+	// A changed reference deliberately leaves its saved transforms unused; the
+	// caller's alignment mode can then produce fresh values when requested.
+	loadMosaicAlignmentSidecars(loaded.Inputs, loaded.Statuses, loaded.ReferenceInput)
 	return loaded, nil
 }
 

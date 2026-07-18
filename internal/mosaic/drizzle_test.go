@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 
@@ -380,6 +381,34 @@ func headerWithCRPIX(crpix1, crpix2 float64) fitsio.Header {
 		"CD2_1":  "0",
 		"CD2_2":  "1",
 	}}
+}
+
+func TestSortInputsByWCSDistanceKeepsSpatialLocationsTogether(t *testing.T) {
+	inputs := []Input{
+		makeInput("origin-1.fits", 100, 100, nil, headerWithCRPIX(50, 50)),
+		makeInput("bottom-1.fits", 100, 100, nil, headerWithCRPIX(50, -50)),
+		makeInput("right-1.fits", 100, 100, nil, headerWithCRPIX(-50, 50)),
+		makeInput("origin-2.fits", 100, 100, nil, headerWithCRPIX(50, 50)),
+		makeInput("bottom-2.fits", 100, 100, nil, headerWithCRPIX(50, -50)),
+		makeInput("right-2.fits", 100, 100, nil, headerWithCRPIX(-50, 50)),
+		makeInput("origin-3.fits", 100, 100, nil, headerWithCRPIX(50, 50)),
+		makeInput("bottom-3.fits", 100, 100, nil, headerWithCRPIX(50, -50)),
+		makeInput("right-3.fits", 100, 100, nil, headerWithCRPIX(-50, 50)),
+	}
+
+	SortInputsByWCSDistance(inputs, nil)
+	got := make([]string, len(inputs))
+	for i := range inputs {
+		got[i] = inputs[i].Path
+	}
+	want := []string{
+		"origin-1.fits", "origin-2.fits", "origin-3.fits",
+		"bottom-1.fits", "bottom-2.fits", "bottom-3.fits",
+		"right-1.fits", "right-2.fits", "right-3.fits",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sorted paths = %v, want %v", got, want)
+	}
 }
 
 func TestPropagateSameExposureAlignment(t *testing.T) {

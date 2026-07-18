@@ -722,7 +722,7 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 			mosaic.SortInputsByWCSDistance(newInputs, newStatuses)
 		}
 
-		messages := make([]string, 0, len(offsetMessages)+2)
+		messages := make([]string, 0, len(offsetMessages)+3)
 		if warnings > 0 {
 			messages = append(messages, "Some loaded files are not standard _flc/_flt/_cal inputs. They were kept, but this workflow is tuned for calibrated science exposures.")
 		}
@@ -737,6 +737,12 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 			// Re-sort the full inputs list so overall drizzle order is correct.
 			if len(ws.state.inputs) > 1 {
 				mosaic.SortInputsByWCSDistance(ws.state.inputs, ws.state.statuses)
+			}
+			// Saved transforms are applied only after the full input set has
+			// been assembled and sorted, so the effective reference is known.
+			sidecars := loadMosaicAlignmentSidecars(ws.state.inputs, ws.state.statuses, ws.state.referenceInput)
+			if sidecars.ReferenceChangedNotice != "" {
+				messages = append(messages, sidecars.ReferenceChangedNotice)
 			}
 			ws.resetPreview()
 			ws.rebuildOffsetControls()

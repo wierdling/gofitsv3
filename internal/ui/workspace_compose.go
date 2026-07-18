@@ -1787,13 +1787,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		// to it. imgs always holds the ORIGINAL pixels (offsets are applied only at
 		// render time), so the computed offset is absolute. Store it in the Manual
 		// Offset fields (the source of truth); the refresh below renders it.
-		width := imgs[1].HDU.Data.Width
-		height := imgs[1].HDU.Data.Height
-		refBase := imgs[1].HDU.Data.Pixels
-		baseBlue := imgs[0].HDU.Data.Pixels
-		baseRed := imgs[2].HDU.Data.Pixels
-		bw, bh := imgs[0].HDU.Data.Width, imgs[0].HDU.Data.Height
-		rw, rh := imgs[2].HDU.Data.Width, imgs[2].HDU.Data.Height
+		channels := []composeAlignmentChannel{
+			{Index: 1, OriginalPixels: imgs[0].HDU.Data.Pixels, Width: imgs[0].HDU.Data.Width, Height: imgs[0].HDU.Data.Height},
+			{Index: 2, OriginalPixels: imgs[1].HDU.Data.Pixels, Width: imgs[1].HDU.Data.Width, Height: imgs[1].HDU.Data.Height},
+			{Index: 3, OriginalPixels: imgs[2].HDU.Data.Pixels, Width: imgs[2].HDU.Data.Width, Height: imgs[2].HDU.Data.Height},
+		}
 
 		progressDialog := dialog.NewCustom("Aligning", "Please wait...", widget.NewProgressBarInfinite(), win)
 		progressDialog.Show()
@@ -1803,20 +1801,22 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			// base to the reference, using the same robust pixel-space star matcher
 			// the mosaic builder uses (WCS-independent: channel WCS headers can
 			// disagree with the real pixel registration by ~100 px).
-			alignOne := func(base []float32, w, h int) (processing.AffineTransform, string, error) {
-				_, t, stats, err := processing.AlignChannelByStars(base, w, h, refBase, width, height, 30.0, "general")
+			match := func(target, reference composeAlignmentChannel) (composeAlignmentMatch, error) {
+				_, fitted, stats, err := processing.AlignChannelByStars(
+					target.OriginalPixels, target.Width, target.Height,
+					reference.OriginalPixels, reference.Width, reference.Height, 30.0, "general",
+				)
 				if err != nil {
-					return processing.AffineTransform{}, "", err
+					return composeAlignmentMatch{}, err
 				}
-				back, ierr := processing.InvertAffineTransform(t)
-				if ierr != nil {
-					return processing.AffineTransform{}, "", ierr
-				}
-				return back, fmt.Sprintf("matched=%d inliers=%d rms=%.2f", stats.MatchedStars, stats.GlobalInliers, stats.RMS), nil
+				return composeAlignmentMatchFromFittedAffine(target, reference, fitted, stats), nil
 			}
 
-			backBlue, blueDetail, errBlue := alignOne(baseBlue, bw, bh)
-			backRed, redDetail, errRed := alignOne(baseRed, rw, rh)
+			for i := range channels {
+				channels[i].Footprint = composeAlignmentFootprint{MaxX: float64(channels[i].Width), MaxY: float64(channels[i].Height)}
+				channels[i].UsableStars = processing.ExtractStars(channels[i].OriginalPixels, channels[i].Width, channels[i].Height, 4.0, 3)
+			}
+			alignment := coordinateComposeAlignmentWithEligibility(channels, 2, match, composeAlignmentFallbackPairEligible)
 
 			fyne.Do(func() {
 				progressDialog.Hide()
@@ -1846,18 +1846,30 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					return dx, dy, rot
 				}
 
-				blueLine := blueDetail
+				resultDetail := func(result composeAlignmentChannelResult) string {
+					detail := fmt.Sprintf("matched=%d inliers=%d rms=%.2f", result.Stats.MatchedStars, result.Stats.GlobalInliers, result.Stats.RMS)
+					if !result.Direct {
+						detail += fmt.Sprintf(" via Channel %d", result.ReferenceIndex)
+					}
+					return detail
+				}
+				blueResult := alignment.Channels[1]
+				redResult := alignment.Channels[3]
+				blueLine := resultDetail(blueResult)
 				var bdx, bdy, brot float64
-				if errBlue == nil {
-					bdx, bdy, brot = setAndApply(0, backBlue)
+				var errBlue, errRed error
+				if blueResult.Applicable {
+					bdx, bdy, brot = setAndApply(0, blueResult.Backward)
 				} else {
+					errBlue = composeAlignmentResultError(alignment, 1, blueResult)
 					blueLine = "FAILED: " + errBlue.Error()
 				}
-				redLine := redDetail
+				redLine := resultDetail(redResult)
 				var rdx, rdy, rrot float64
-				if errRed == nil {
-					rdx, rdy, rrot = setAndApply(2, backRed)
+				if redResult.Applicable {
+					rdx, rdy, rrot = setAndApply(2, redResult.Backward)
 				} else {
+					errRed = composeAlignmentResultError(alignment, 3, redResult)
 					redLine = "FAILED: " + errRed.Error()
 				}
 

@@ -45,7 +45,7 @@ func (ws *mosaicWorkspace) autoAlignToReferenceBaseline() {
 	if ws.state.referenceInput == nil || len(ws.state.inputs) == 0 {
 		return
 	}
-	alignInputs := ws.inputsWithRef()
+	alignInputs, stateIndices := ws.alignmentWorkset()
 	if len(alignInputs) < 2 {
 		return
 	}
@@ -53,33 +53,20 @@ func (ws *mosaicWorkspace) autoAlignToReferenceBaseline() {
 	mode := mosaic.AlignmentMode(ws.state.alignmentSettings.AlignmentMode)
 	searchRadius := ws.state.alignmentSettings.SearchRadiusArcsec
 	debuglog.Log(fmt.Sprintf("buildDrizzlePreview: reference baseline set, auto-running AlignInputsByStarsWithMode against baseline only (mode=%d, searchRadius=%.2f)", int(mode), searchRadius))
-	results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, 1, mode, searchRadius)
+	results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, ws.alignmentNumRefs(), mode, searchRadius)
 	if err != nil {
 		debuglog.Log(fmt.Sprintf("buildDrizzlePreview: auto reference star alignment failed: %v", err))
 		return
 	}
 
-	activeIndices := make([]int, 0, len(ws.state.inputs))
-	for i, inp := range ws.state.inputs {
-		if !inp.Excluded {
-			activeIndices = append(activeIndices, i)
-		}
-	}
-
 	applied := 0
 	failed := 0
-	locked := 0
 	for ri := 1; ri < len(results); ri++ {
-		ai := ri - 1
-		if ai >= len(activeIndices) {
+		if ri >= len(stateIndices) {
 			continue
 		}
-		si := activeIndices[ai]
-		if si >= len(ws.state.inputs) {
-			continue
-		}
-		if ws.state.inputs[si].OffsetLocked {
-			locked++
+		si := stateIndices[ri]
+		if si < 0 || si >= len(ws.state.inputs) {
 			continue
 		}
 		if !results[ri].Applied {
@@ -95,7 +82,7 @@ func (ws *mosaicWorkspace) autoAlignToReferenceBaseline() {
 		applied++
 		debuglog.Log(fmt.Sprintf("buildDrizzlePreview: auto reference star alignment applied to %s (x=%.2f, y=%.2f, affine=%v)", mosaic.InputLabel(ws.state.inputs[si]), results[ri].OffsetX, results[ri].OffsetY, results[ri].HasManualTransform))
 	}
-	debuglog.Log(fmt.Sprintf("buildDrizzlePreview: auto reference star alignment summary applied=%d failed=%d locked=%d", applied, failed, locked))
+	debuglog.Log(fmt.Sprintf("buildDrizzlePreview: auto reference star alignment summary applied=%d failed=%d", applied, failed))
 }
 
 // buildDrizzlePreview runs a drizzle build and updates the preview UI.
