@@ -179,6 +179,7 @@ func (defaultDrizzleQueueExecutor) Execute(ctx context.Context, job drizzleQueue
 	if err != nil {
 		return "", err
 	}
+	defer freeInputPixelsFor(loaded.Inputs, loaded.ReferenceInput)
 	filter := strings.TrimSpace(job.Filter)
 	if filter == "" {
 		filter, err = projectFilter(loaded.Project, loaded.Inputs)
@@ -193,7 +194,6 @@ func (defaultDrizzleQueueExecutor) Execute(ctx context.Context, job drizzleQueue
 		if err := alignLoadedProject(ctx, loaded.Inputs, loaded.ReferenceInput, loaded.Project.AlignmentSettings, progress); err != nil {
 			return "", err
 		}
-		freeInputPixelsFor(loaded.Inputs, loaded.ReferenceInput)
 	}
 
 	if ctx != nil && ctx.Err() != nil {
@@ -207,7 +207,6 @@ func (defaultDrizzleQueueExecutor) Execute(ctx context.Context, job drizzleQueue
 		progress("Drizzling", 0, 0)
 	}
 	result, err := mosaic.Build(buildInputs, options)
-	freeInputPixelsFor(loaded.Inputs, loaded.ReferenceInput)
 	if err != nil {
 		return "", err
 	}

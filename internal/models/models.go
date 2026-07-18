@@ -344,20 +344,21 @@ type MosaicProject struct {
 }
 
 type ChannelControl struct {
-	Content          fyne.CanvasObject
-	ModeSelect       *widget.Select
-	BackgroundEntry  NumberField
-	PeakEntry        NumberField
-	ScaledPeakEntry  NumberField
-	AsinhScaleEntry  NumberField
-	MTFMidtoneEntry  NumberField
-	GHSStretchEntry  NumberField
-	GHSLocalEntry    NumberField
-	GHSSymmetryEntry NumberField
-	XOffsetEntry     NumberField
-	YOffsetEntry     NumberField
-	RotOffsetEntry   NumberField
-	ShowClip         CheckField
+	Content           fyne.CanvasObject
+	ModeSelect        *widget.Select
+	BackgroundEntry   NumberField
+	PeakEntry         NumberField
+	ScaledPeakEntry   NumberField
+	AsinhScaleEntry   NumberField
+	MTFMidtoneEntry   NumberField
+	GHSStretchEntry   NumberField
+	GHSLocalEntry     NumberField
+	GHSSymmetryEntry  NumberField
+	MagicPresetSelect *widget.Select
+	XOffsetEntry      NumberField
+	YOffsetEntry      NumberField
+	RotOffsetEntry    NumberField
+	ShowClip          CheckField
 }
 
 type RgbLevels struct {

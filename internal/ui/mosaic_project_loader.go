@@ -37,9 +37,6 @@ func readMosaicProject(path string) (models.MosaicProject, string, error) {
 	if err := json.Unmarshal(data, &project); err != nil {
 		return models.MosaicProject{}, absPath, err
 	}
-	if len(project.Inputs) == 0 {
-		return models.MosaicProject{}, absPath, fmt.Errorf("project %s contains no inputs", filepath.Base(absPath))
-	}
 	return project, absPath, nil
 }
 
@@ -51,6 +48,9 @@ func loadMosaicProjectData(ctx context.Context, projectPath string, progress fun
 	if err != nil {
 		return nil, err
 	}
+	if len(project.Inputs) == 0 {
+		return nil, fmt.Errorf("project %s contains no inputs", filepath.Base(absPath))
+	}
 	if progress == nil {
 		progress = func(string, int, int) {}
 	}
@@ -59,7 +59,7 @@ func loadMosaicProjectData(ctx context.Context, projectPath string, progress fun
 	var order []string
 	groups := map[string][]models.MosaicInputState{}
 	for _, state := range project.Inputs {
-		path := state.Path
+		path := resolveProjectRelativePath(absPath, state.Path)
 		if _, ok := groups[path]; !ok {
 			order = append(order, path)
 		}
@@ -107,6 +107,7 @@ func loadMosaicProjectData(ctx context.Context, projectPath string, progress fun
 		if ctx != nil && ctx.Err() != nil {
 			return nil, mosaic.ErrCancelled
 		}
+		project.ReferencePath = resolveProjectRelativePath(absPath, project.ReferencePath)
 		refInputs, combined, _, refErr := mosaic.LoadInputsForPipeline(project.ReferencePath, mosaic.CombineOptions{Ctx: ctx})
 		if refErr != nil {
 			return nil, fmt.Errorf("load reference %s: %w", filepath.Base(project.ReferencePath), refErr)

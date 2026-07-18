@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +39,17 @@ func TestDrizzleQueueOutputPathSanitizesFilter(t *testing.T) {
 func TestDrizzleQueueOutputPathRejectsEmptyFilter(t *testing.T) {
 	if _, err := drizzleQueueOutputPath("mosaic.json", "***", time.Now()); err == nil {
 		t.Fatal("expected invalid filter error")
+	}
+}
+
+func TestSummarizeQueueErrorLimitsDisplayLength(t *testing.T) {
+	message := strings.Repeat("alignment failure; ", 30)
+	got := summarizeQueueError(message)
+	if len([]rune(got)) != queueErrorDisplayLimit {
+		t.Fatalf("summary rune length = %d, want %d", len([]rune(got)), queueErrorDisplayLimit)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("summary should end with ellipsis: %q", got)
 	}
 }
 

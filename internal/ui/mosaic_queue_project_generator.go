@@ -68,11 +68,11 @@ func generatedProjectPath(dir, filter string) (string, error) {
 func buildGeneratedMosaicProject(template models.MosaicProject, templatePath, outputPath, filter string, paths []string) models.MosaicProject {
 	project := models.MosaicProject{
 		DrizzleSettings:      template.DrizzleSettings,
-		DrizzleSettingsSet:   true,
+		DrizzleSettingsSet:   template.DrizzleSettingsSet,
 		AlignmentSettings:    template.AlignmentSettings,
 		AlignmentSettingsSet: template.AlignmentSettingsSet,
 		SkysubSettings:       template.SkysubSettings,
-		SkysubSettingsSet:    true,
+		SkysubSettingsSet:    template.SkysubSettingsSet,
 		ActiveFilter:         filter,
 		ExposureNormMode:     template.ExposureNormMode,
 		ReferenceSCIExt:      template.ReferenceSCIExt,
@@ -194,16 +194,14 @@ func (q *drizzleQueueWindow) showProjectGeneratorDialog(template models.MosaicPr
 		typeOptions = append(typeOptions, ".cal")
 	}
 	productSelect := NewSafeSelect(typeOptions, nil)
-	if len(typeOptions) > 1 {
-		productSelect.SetSelected(typeOptions[1])
-	} else {
-		productSelect.SetSelected(typeOptions[0])
-	}
+	productSelect.SetSelected(typeOptions[0])
 	if len(typeOptions) == 2 {
 		productSelect.Disable()
 	}
 	alignCheck := widget.NewCheck("Enable alignment for all generated jobs", nil)
 	rows := container.NewVBox()
+	rowsScroll := container.NewVScroll(rows)
+	rowsScroll.SetMinSize(fyne.NewSize(520, 240))
 	selected := map[string]bool{}
 	for filter := range filesByFilter {
 		selected[filter] = true
@@ -228,6 +226,7 @@ func (q *drizzleQueueWindow) showProjectGeneratorDialog(template models.MosaicPr
 			rows.Add(widget.NewLabel("No files match the selected product type."))
 		}
 		rows.Refresh()
+		rowsScroll.Refresh()
 	}
 	productSelect.OnChanged = func(string) { refreshRows() }
 	refreshRows()
@@ -249,7 +248,7 @@ func (q *drizzleQueueWindow) showProjectGeneratorDialog(template models.MosaicPr
 			}
 			refreshRows()
 		}),
-		container.NewVScroll(rows),
+		rowsScroll,
 	)
 	var projectDialog dialog.Dialog
 	projectDialog = dialog.NewCustomConfirm("Create Filter Projects", "Create Projects & Add to Queue", "Cancel", content, func(ok bool) {

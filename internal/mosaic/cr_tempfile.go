@@ -131,7 +131,6 @@ func buildCRMasksDrizzle(
 	crOpts := processing.DrizzleStyleCROptions{
 		SeedSNR:    crSeedSNR,
 		DerivScale: crDerivScale,
-		TwoSided:   n >= 3,
 	}
 
 	masks := make([]BitMask, n)

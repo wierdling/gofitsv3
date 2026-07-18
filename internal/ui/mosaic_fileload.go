@@ -243,6 +243,11 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 	if ws.queueRunning {
 		return
 	}
+	if ws.inputFramesWindow != nil {
+		ws.inputFramesWindow.Show()
+		ws.inputFramesWindow.RequestFocus()
+		return
+	}
 	if len(ws.state.inputs) == 0 {
 		dialog.ShowInformation("Input Frames", "Load at least one FITS file first.", ws.win)
 		return
@@ -463,9 +468,21 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 	table := container.NewBorder(header, nil, nil, nil, scroll)
 	content := container.NewVBox(desc, widget.NewSeparator(), table)
 
-	d := dialog.NewCustom("Input Frames", "Close", content, ws.win)
-	d.Resize(fyne.NewSize(960, 520))
-	d.Show()
+	var inputWindow fyne.Window
+	closeBtn := widget.NewButton("Close", func() {
+		inputWindow.Close()
+	})
+	inputWindow = ws.app.NewWindow("Input Frames")
+	ws.inputFramesWindow = inputWindow
+	inputWindow.SetContent(container.NewBorder(nil, closeBtn, nil, nil, content))
+	inputWindow.SetFixedSize(true)
+	inputWindow.SetOnClosed(func() {
+		ws.inputFramesWindow = nil
+		ws.rebuildOffsetControls()
+	})
+	inputWindow.Resize(fyne.NewSize(960, 520))
+	inputWindow.CenterOnScreen()
+	inputWindow.Show()
 }
 
 func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {

@@ -48,6 +48,9 @@ func TestBuildGeneratedMosaicProjectCopiesSettingsAndReplacesInputs(t *testing.T
 	if project.ArtifactMasks != nil || project.ReferencePath != filepath.Join(filepath.Dir(templatePath), "reference.fits") {
 		t.Fatalf("generated reference/masks = %q / %+v", project.ReferencePath, project.ArtifactMasks)
 	}
+	if project.DrizzleSettingsSet != template.DrizzleSettingsSet || project.SkysubSettingsSet != template.SkysubSettingsSet {
+		t.Fatalf("settings-set flags not preserved: drizzle=%v skysub=%v", project.DrizzleSettingsSet, project.SkysubSettingsSet)
+	}
 	if project.SkysubSettings.RowDestripeMaskDir != filepath.Join(filepath.Dir(templatePath), "masks") {
 		t.Fatalf("generated mask dir = %q", project.SkysubSettings.RowDestripeMaskDir)
 	}
@@ -63,5 +66,29 @@ func TestWriteGeneratedMosaicProjectDoesNotOverwrite(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("project disappeared after rejected write: %v", err)
+	}
+}
+
+func TestReadMosaicProjectAllowsEmptyInputTemplate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "template.json")
+	if err := os.WriteFile(path, []byte(`{"drizzleSettings":{"scale":2.0},"referencePath":"reference.fits"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	project, gotPath, err := readMosaicProject(path)
+	if err != nil {
+		t.Fatalf("readMosaicProject returned error: %v", err)
+	}
+	if gotPath != path || len(project.Inputs) != 0 || project.ReferencePath != "reference.fits" {
+		t.Fatalf("template = %+v, path = %q", project, gotPath)
+	}
+}
+
+func TestLoadMosaicProjectDataRejectsEmptyInputProject(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "template.json")
+	if err := os.WriteFile(path, []byte(`{"referencePath":"reference.fits"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadMosaicProjectData(nil, path, nil); err == nil {
+		t.Fatal("expected empty-input project to be rejected for execution")
 	}
 }

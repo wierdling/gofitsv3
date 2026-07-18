@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -65,6 +66,43 @@ type overlayLayer struct {
 	win      fyne.Window
 	viewport *viewport
 	control  *models.ChannelControl
+}
+
+type composeOverlayPreviewData struct {
+	image      *image.RGBA
+	bins       [256]int
+	width      int
+	height     int
+	sky        float64
+	mean       float64
+	std        float64
+	filterText string
+}
+
+func buildComposeOverlayPreviewData(ctx context.Context, img *models.LoadedImage, flip bool) (*composeOverlayPreviewData, error) {
+	if err := composeMagicCanceled(ctx); err != nil {
+		return nil, err
+	}
+	stretched, mask := processing.ApplyStretchParallel(img)
+	if err := composeMagicCanceled(ctx); err != nil {
+		return nil, err
+	}
+	if flip {
+		stretched = processing.FlipImageData(stretched)
+		mask = processing.FlipMask(mask, stretched.Width, stretched.Height)
+	}
+	stats := histogram.Compute(stretched.Pixels)
+	sky, _ := processing.EstimateBackground(stretched.Pixels)
+	return &composeOverlayPreviewData{
+		image:      processing.ToGrayRGBA(stretched, mask),
+		bins:       stats.Hist,
+		width:      stretched.Width,
+		height:     stretched.Height,
+		sky:        sky,
+		mean:       stats.Mean,
+		std:        stats.Std,
+		filterText: fitsio.FilterString(img.Primary),
+	}, nil
 }
 
 func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*fyne.Menu) {
@@ -647,8 +685,30 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		c[l.idx] = l.control
 		return c
 	}
+	applyLayerPreview := func(l *overlayLayer, data *composeOverlayPreviewData) {
+		l.viewport.image.Image = data.image
+		l.viewport.bins = data.bins
+		l.viewport.histMax = 0
+		l.viewport.origW = data.width
+		l.viewport.origH = data.height
+		l.viewport.blackBox.SetValue(imgs[l.idx].Black)
+		l.viewport.whiteBox.SetValue(imgs[l.idx].White)
+		if l.viewport.StatsLabel != nil {
+			l.viewport.StatsLabel.SetText(fmt.Sprintf("Sky %.3f  μ %.3f  σ %.3f", data.sky, data.mean, data.std))
+		}
+		l.viewport.SetFilterText(data.filterText)
+		l.viewport.histogram.Refresh()
+		if l.viewport.zoomLabel.Selected == "fit" {
+			l.viewport.zoom = l.viewport.fitZoom()
+		}
+		l.viewport.applyZoom()
+		l.viewport.image.Refresh()
+	}
 
 	refreshLayerPreview := func(l *overlayLayer) {
+		if suspendRefresh {
+			return
+		}
 		if l == nil || l.viewport == nil {
 			refresh()
 			return
@@ -668,30 +728,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			refresh()
 			return
 		}
-		stretched, mask := processing.ApplyStretchParallel(imgs[l.idx])
-		if flipCheck.Checked {
-			stretched = processing.FlipImageData(stretched)
-			mask = processing.FlipMask(mask, stretched.Width, stretched.Height)
+		data, err := buildComposeOverlayPreviewData(context.Background(), imgs[l.idx], flipCheck.Checked)
+		if err != nil {
+			return
 		}
-		stats := histogram.Compute(stretched.Pixels)
-		sky, _ := processing.EstimateBackground(stretched.Pixels)
-		l.viewport.image.Image = processing.ToGrayRGBA(stretched, mask)
-		l.viewport.bins = stats.Hist
-		l.viewport.histMax = 0
-		l.viewport.origW = stretched.Width
-		l.viewport.origH = stretched.Height
-		l.viewport.blackBox.SetValue(imgs[l.idx].Black)
-		l.viewport.whiteBox.SetValue(imgs[l.idx].White)
-		if l.viewport.StatsLabel != nil {
-			l.viewport.StatsLabel.SetText(fmt.Sprintf("Sky %.3f  μ %.3f  σ %.3f", sky, stats.Mean, stats.Std))
-		}
-		l.viewport.SetFilterText(fitsio.FilterString(imgs[l.idx].Primary))
-		l.viewport.histogram.Refresh()
-		if l.viewport.zoomLabel.Selected == "fit" {
-			l.viewport.zoom = l.viewport.fitZoom()
-		}
-		l.viewport.applyZoom()
-		l.viewport.image.Refresh()
+		applyLayerPreview(l, data)
 		refresh()
 	}
 
@@ -780,7 +821,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		l.control = nil
 	}
 
-	openOverlayLayerWindow := func(l *overlayLayer) {
+	openOverlayLayerWindowWithPreview := func(l *overlayLayer, preparedPreview *composeOverlayPreviewData) {
 		if l.win != nil {
 			l.win.Show()
 			l.win.RequestFocus()
@@ -985,7 +1026,12 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				updateMenus()
 			}
 		})
-		refreshLayerPreview(l)
+		if preparedPreview != nil {
+			applyLayerPreview(l, preparedPreview)
+			refresh()
+		} else {
+			refreshLayerPreview(l)
+		}
 		l.win.Show()
 		// Newly created floating windows have their controls tapped before Fyne's
 		// canvas cache is populated by the first paint pass, which crashes any
@@ -995,6 +1041,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			time.Sleep(200 * time.Millisecond)
 			fyne.Do(func() { shield.Hide() })
 		}()
+	}
+	openOverlayLayerWindow := func(l *overlayLayer) {
+		openOverlayLayerWindowWithPreview(l, nil)
 	}
 
 	// freeOverlaySlot returns an idx for a new layer, reusing a freed hole when
@@ -1018,19 +1067,35 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		return idx, true
 	}
 
-	addColoredLayer := func() {
-		idx, ok := freeOverlaySlot()
-		if !ok {
-			dialog.ShowInformation("Layer limit", fmt.Sprintf("A maximum of %d colored layers is supported.", maxOverlayLayers), win)
-			return
+	createOverlayLayerAt := func(idx int, settings models.OrangeLayerState) *overlayLayer {
+		for len(imgs) <= idx {
+			imgs = append(imgs, nil)
+			origPixels = append(origPixels, nil)
 		}
 		nextLayerNumber++
 		l := &overlayLayer{
 			idx:      idx,
 			name:     fmt.Sprintf("Layer %d", nextLayerNumber),
-			settings: defaultOverlayLayerSettings(len(overlayLayers)),
+			settings: settings,
 		}
 		overlayLayers = append(overlayLayers, l)
+		return l
+	}
+
+	createOverlayLayer := func(settings models.OrangeLayerState) (*overlayLayer, bool) {
+		idx, ok := freeOverlaySlot()
+		if !ok {
+			return nil, false
+		}
+		return createOverlayLayerAt(idx, settings), true
+	}
+
+	addColoredLayer := func() {
+		l, ok := createOverlayLayer(defaultOverlayLayerSettings(len(overlayLayers)))
+		if !ok {
+			dialog.ShowInformation("Layer limit", fmt.Sprintf("A maximum of %d colored layers is supported.", maxOverlayLayers), win)
+			return
+		}
 		openOverlayLayerWindow(l)
 		if updateMenus != nil {
 			updateMenus()
@@ -2147,6 +2212,126 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	saveProjectItem := fyne.NewMenuItem("Save Compose Project", saveProject)
 	loadProjectItem := fyne.NewMenuItem("Load Compose Project", loadProject)
+	loadFilterSetItem := fyne.NewMenuItem("Load Filter Set...", func() {
+		showComposeMagicFolderPicker(app, win, func(preset string, rows []composeMagicRow) error {
+			if err := validateComposeMagicCapacity(rows, len(overlayLayers)); err != nil {
+				return err
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			var progressDialog *dialog.CustomDialog
+			finished := false
+			cancelButton := widget.NewButton("Cancel", func() {
+				cancel()
+				if progressDialog != nil {
+					progressDialog.Hide()
+				}
+			})
+			progressDialog = dialog.NewCustomWithoutButtons(
+				"Loading Filter Set",
+				container.NewVBox(
+					widget.NewLabel("Loading files and applying Magic + Auto MTF..."),
+					widget.NewProgressBarInfinite(),
+					cancelButton,
+				),
+				win,
+			)
+			progressDialog.SetOnClosed(func() {
+				if !finished {
+					cancel()
+				}
+			})
+			progressDialog.Show()
+			spec := composeMagicSpec{Preset: preset, Rows: append([]composeMagicRow(nil), rows...)}
+			flipPreview := flipCheck.Checked
+			go func() {
+				batch, prepareErr := prepareComposeMagicBatch(ctx, spec, loadImageFromPath)
+				previews := make(map[*models.LoadedImage]*composeOverlayPreviewData)
+				if prepareErr == nil {
+					for _, channel := range batch.Channels {
+						if channel.Row.Assignment != composeMagicCustom {
+							continue
+						}
+						preview, previewErr := buildComposeOverlayPreviewData(ctx, channel.Image, flipPreview)
+						if previewErr != nil {
+							prepareErr = previewErr
+							break
+						}
+						previews[channel.Image] = preview
+					}
+				}
+				fyne.Do(func() {
+					if prepareErr != nil {
+						finished = true
+						progressDialog.Hide()
+						if !errors.Is(prepareErr, context.Canceled) {
+							dialog.ShowError(prepareErr, win)
+						}
+						return
+					}
+					if ctx.Err() != nil {
+						finished = true
+						progressDialog.Hide()
+						return
+					}
+
+					existingSlots := make([]int, len(overlayLayers))
+					for i, layer := range overlayLayers {
+						existingSlots[i] = layer.idx
+					}
+					installPlan, installErr := planComposeMagicInstall(batch, imgs, existingSlots)
+					if installErr != nil {
+						finished = true
+						progressDialog.Hide()
+						dialog.ShowError(installErr, win)
+						return
+					}
+					if ctx.Err() != nil { // Last boundary before the atomic install and composite enable.
+						finished = true
+						progressDialog.Hide()
+						return
+					}
+					withSuspendedRefresh(func() {
+						for idx, image := range installPlan.Base {
+							imgs[idx] = image
+							clearComposeOrigPixels(&origPixels, idx)
+							applyChannelState(idx, channelStateFromImage(image), imgs, viewports, controlSets)
+							closeHeaderWindow(idx)
+						}
+						for _, custom := range installPlan.Customs {
+							channel := custom.Channel
+							settings := defaultOverlayLayerSettings(len(overlayLayers))
+							settings.ColorR = channel.Row.Color.R
+							settings.ColorG = channel.Row.Color.G
+							settings.ColorB = channel.Row.Color.B
+							settings.Open = true
+							layer := createOverlayLayerAt(custom.Slot, settings)
+							imgs[layer.idx] = channel.Image
+							clearComposeOrigPixels(&origPixels, layer.idx)
+							openOverlayLayerWindowWithPreview(layer, previews[channel.Image])
+							if layer.control != nil && layer.control.MagicPresetSelect != nil {
+								layer.control.MagicPresetSelect.SetSelected(batch.Preset)
+							}
+						}
+						renderMu.Lock()
+						for i := 0; i < len(renderCache) && i < 3; i++ {
+							renderCache[i] = composeRenderCache{}
+						}
+						renderMu.Unlock()
+						magicGroup.broadcast(batch.Preset)
+						buildCompositeCheck.SetChecked(true)
+					})
+					finished = true
+					progressDialog.Hide()
+					if updateMenus != nil {
+						updateMenus()
+					}
+					refresh()
+				})
+			}()
+			return nil
+		})
+	})
 	exportRGBItem := fyne.NewMenuItem("Export Compose RGB", exportRGB)
 
 	viewHeaderItems := []*fyne.MenuItem{
@@ -2251,6 +2436,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	// File: project I/O and handing the result off to other tabs / disk.
 	fileMenu := fyne.NewMenu("File",
 		loadProjectItem,
+		loadFilterSetItem,
 		saveProjectItem,
 		fyne.NewMenuItemSeparator(),
 		exportRGBItem,
@@ -2684,7 +2870,11 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		updateStretchParams(imgs[idx].Mode)
 		refresh()
 	})
-	selectBox.SetSelected("Linear")
+	initialMode := stretch.Linear
+	if idx >= 0 && idx < len(imgs) && imgs[idx] != nil {
+		initialMode = imgs[idx].Mode
+	}
+	selectBox.SetSelected(modeToLabel(initialMode))
 
 	backgroundEntry := NewNumberEntry(0.001, 4)
 	peakEntry := NewNumberEntry(0.001, 4)
@@ -2885,19 +3075,20 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 			applyOffset,
 			widget.NewSeparator(),
 		),
-		ModeSelect:       selectBox,
-		BackgroundEntry:  backgroundEntry,
-		PeakEntry:        peakEntry,
-		ScaledPeakEntry:  scaledPeakEntry,
-		AsinhScaleEntry:  asinhScaleEntry,
-		MTFMidtoneEntry:  mtfMidtoneEntry,
-		GHSStretchEntry:  ghsStretchEntry,
-		GHSLocalEntry:    ghsLocalEntry,
-		GHSSymmetryEntry: ghsSymmetryEntry,
-		XOffsetEntry:     xOffsetEntry,
-		YOffsetEntry:     yOffsetEntry,
-		RotOffsetEntry:   rotOffsetEntry,
-		ShowClip:         showClip,
+		ModeSelect:        selectBox,
+		BackgroundEntry:   backgroundEntry,
+		PeakEntry:         peakEntry,
+		ScaledPeakEntry:   scaledPeakEntry,
+		AsinhScaleEntry:   asinhScaleEntry,
+		MTFMidtoneEntry:   mtfMidtoneEntry,
+		GHSStretchEntry:   ghsStretchEntry,
+		GHSLocalEntry:     ghsLocalEntry,
+		GHSSymmetryEntry:  ghsSymmetryEntry,
+		MagicPresetSelect: magicPreset,
+		XOffsetEntry:      xOffsetEntry,
+		YOffsetEntry:      yOffsetEntry,
+		RotOffsetEntry:    rotOffsetEntry,
+		ShowClip:          showClip,
 	}
 }
 

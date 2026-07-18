@@ -41,6 +41,7 @@ type mosaicWorkspace struct {
 	activePicker      *starPickerWidget
 	activeMeasure     *measurePickerWidget
 	starModeRefResult *mosaic.Result
+	inputFramesWindow fyne.Window
 
 	// --- containers swapped during mode changes ---
 	leftStack          *fyne.Container

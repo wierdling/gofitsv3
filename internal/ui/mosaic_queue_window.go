@@ -188,7 +188,7 @@ func (q *drizzleQueueWindow) refresh() {
 		}
 		text := fmt.Sprintf("%s  |  %s  |  %s", filter, job.Status.String(), filepath.Base(job.OutputPath))
 		if job.Err != "" {
-			text += "  |  " + job.Err
+			text += "  |  " + summarizeQueueError(job.Err)
 		}
 		q.rows.Add(container.NewBorder(nil, nil, container.NewHBox(selectBtn, align, name), nil, widget.NewLabel(text)))
 	}
@@ -232,7 +232,7 @@ func (q *drizzleQueueWindow) showSummary() {
 			succeeded++
 		case queueFailed:
 			failed++
-			failures = append(failures, fmt.Sprintf("%s: %s", filepath.Base(job.ProjectPath), job.Err))
+			failures = append(failures, fmt.Sprintf("%s: %s", filepath.Base(job.ProjectPath), summarizeQueueError(job.Err)))
 		case queueCancelled:
 			cancelled++
 		default:
@@ -251,4 +251,16 @@ func (q *drizzleQueueWindow) showSummary() {
 	}
 	q.ws.app.SendNotification(fyne.NewNotification(title, fmt.Sprintf("Succeeded: %d, failed: %d, cancelled: %d, unrun: %d", succeeded, failed, cancelled, pending)))
 	dialog.ShowInformation(title, message, q.win)
+}
+
+const queueErrorDisplayLimit = 200
+
+// summarizeQueueError keeps failure dialogs and queue rows compact while the
+// complete error remains available on the queue job for diagnostics.
+func summarizeQueueError(message string) string {
+	runes := []rune(strings.TrimSpace(message))
+	if len(runes) <= queueErrorDisplayLimit {
+		return string(runes)
+	}
+	return string(runes[:queueErrorDisplayLimit-3]) + "..."
 }
