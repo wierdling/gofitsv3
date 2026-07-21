@@ -3017,10 +3017,13 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 			return
 		}
 		res := processing.ApplyMagicLevels(imgs[idx], processing.ParseMagicPreset(magicPreset.Selected))
+		processing.AutoMTFMidtone(imgs[idx])
 		backgroundEntry.SetValue(imgs[idx].Background)
 		peakEntry.SetValue(imgs[idx].Peak)
 		views[idx].blackBox.SetValue(imgs[idx].Black)
 		views[idx].whiteBox.SetValue(imgs[idx].White)
+		mtfMidtoneEntry.SetValue(imgs[idx].MTFMidtone)
+		selectBox.SetSelected("MTF") // also reveals the MTF row and triggers refresh
 		debuglog.Log(fmt.Sprintf(
 			"Magic[%s] ch%d: black=%.4g white=%.4g sky=%.4g sigma=%.4g clipLow=%.3f%% clipHigh=%.3f%% stars=%v(%.2f%%) whiteSrc=%s whiteN=%d(%.2f%%)",
 			res.Preset, idx, res.Black, res.White, res.Background, res.Sigma,

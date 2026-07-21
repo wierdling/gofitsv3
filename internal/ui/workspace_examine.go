@@ -298,10 +298,11 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			return
 		}
 		processing.ApplyMagicLevels(state.img, processing.ParseMagicPreset(magicPreset.Selected))
+		processing.AutoMTFMidtone(state.img)
 		syncControlsFromImage()
 		refresh()
 	})
-	magicBtn.SetToolTip("Estimate stretch levels using the selected Magic target preset")
+	magicBtn.SetToolTip("Estimate stretch levels using the selected Magic target preset, then apply Auto MTF")
 
 	loadFitsFromPath := func(path string, preserveStretch bool) {
 		progressDialog := dialog.NewCustom("Loading FITS", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
