@@ -269,7 +269,7 @@ func TestComposeMagicCustomControlInstallPreservesMTF(t *testing.T) {
 	origPixels := make([][]float32, idx+1)
 	views := make([]*viewport, idx+1)
 	views[idx] = newViewport()
-	control := channelControls("Custom Image", color.NRGBA{R: 12, G: 34, B: 56, A: 255}, idx, imgs, &origPixels, views, func() {}, nil)
+	control := channelControls("Custom Image", color.NRGBA{R: 12, G: 34, B: 56, A: 255}, idx, imgs, &origPixels, views, func() {}, nil, false)
 	controls := make([]*models.ChannelControl, idx+1)
 	controls[idx] = control
 	applyChannelState(idx, channelStateFromImage(img), imgs, views, controls)

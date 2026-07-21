@@ -37,14 +37,14 @@ func WriteFloat32ImageWithExtensions(path string, header Header, data ImageData,
 	if err := writeHeader(bw, header, data.Width, data.Height); err != nil {
 		return err
 	}
-	if err := writeFloat32Data(bw, data.Pixels); err != nil {
+	if err := writeImageData(bw, data); err != nil {
 		return err
 	}
 	for _, ext := range exts {
 		if err := writeExtensionHeader(bw, ext); err != nil {
 			return err
 		}
-		if err := writeFloat32Data(bw, ext.Data.Pixels); err != nil {
+		if err := writeImageData(bw, ext.Data); err != nil {
 			return err
 		}
 	}
@@ -85,14 +85,27 @@ func writeHeader(w *bufio.Writer, header Header, width, height int) error {
 		cards[key] = value
 	}
 	cards["SIMPLE"] = "T"
-	cards["BITPIX"] = "-32"
-	cards["NAXIS"] = "2"
-	cards["NAXIS1"] = strconv.Itoa(width)
-	cards["NAXIS2"] = strconv.Itoa(height)
+	if width > 0 && height > 0 {
+		cards["BITPIX"] = "-32"
+		cards["NAXIS"] = "2"
+		cards["NAXIS1"] = strconv.Itoa(width)
+		cards["NAXIS2"] = strconv.Itoa(height)
+	} else {
+		// A metadata-only primary HDU is common in multi-extension FITS files.
+		cards["BITPIX"] = "8"
+		cards["NAXIS"] = "0"
+		delete(cards, "NAXIS1")
+		delete(cards, "NAXIS2")
+	}
 	cards["EXTEND"] = "T"
 	delete(cards, "END")
 
-	return emitHeaderCards(w, cards, []string{"SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "EXTEND"})
+	ordered := []string{"SIMPLE", "BITPIX", "NAXIS"}
+	if width > 0 && height > 0 {
+		ordered = append(ordered, "NAXIS1", "NAXIS2")
+	}
+	ordered = append(ordered, "EXTEND")
+	return emitHeaderCards(w, cards, ordered)
 }
 
 func writeExtensionHeader(w *bufio.Writer, ext ImageExtension) error {
@@ -101,7 +114,11 @@ func writeExtensionHeader(w *bufio.Writer, ext ImageExtension) error {
 		cards[key] = value
 	}
 	cards["XTENSION"] = formatFitsString("IMAGE")
-	cards["BITPIX"] = "-32"
+	if len(ext.Data.Int32Pixels) > 0 {
+		cards["BITPIX"] = "32"
+	} else {
+		cards["BITPIX"] = "-32"
+	}
 	cards["NAXIS"] = "2"
 	cards["NAXIS1"] = strconv.Itoa(ext.Data.Width)
 	cards["NAXIS2"] = strconv.Itoa(ext.Data.Height)
@@ -165,6 +182,23 @@ func writeFloat32Data(w *bufio.Writer, pixels []float32) error {
 		return err
 	}
 	return nil
+}
+
+func writeImageData(w *bufio.Writer, data ImageData) error {
+	if len(data.Int32Pixels) > 0 {
+		if len(data.Int32Pixels) != data.Width*data.Height {
+			return fmt.Errorf("int32 pixel count %d does not match %dx%d", len(data.Int32Pixels), data.Width, data.Height)
+		}
+		if err := binary.Write(w, binary.BigEndian, data.Int32Pixels); err != nil {
+			return err
+		}
+		if pad := padding(len(data.Int32Pixels) * 4); pad > 0 {
+			_, err := w.Write(make([]byte, pad))
+			return err
+		}
+		return nil
+	}
+	return writeFloat32Data(w, data.Pixels)
 }
 
 func writeCard(w *bufio.Writer, key, value string) error {

@@ -91,6 +91,7 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 	// Release previous result before building the new one so the old pixel
 	// arrays can be collected before the new ones are allocated.
 	ws.state.result = nil
+	ws.state.resultName = ""
 	markMosaicArtifactMaskDocumentsStale(ws.state.artifactMasks)
 
 	pt := newProgressTracker("Processing", "Aligning, cleaning, and drizzling selected inputs...", ws.win)
@@ -153,7 +154,7 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 		ws.preview.Refresh()
 		ws.mosaicBins = stats.Hist
 		ws.mosaicHistogram.Refresh()
-		ws.statsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f | Size: %dx%d", stats.Mean, stats.Std, result.Width, result.Height))
+		ws.statsLabel.SetText(mosaicStatsText(ws.state.resultName, stats.Mean, stats.Std, result.Width, result.Height))
 		debuglog.Log("buildDrizzlePreview: updateZoom")
 		ws.updateZoom()
 		debuglog.Log("buildDrizzlePreview: UI update done")
@@ -175,6 +176,8 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 		}
 		debuglog.Log("buildDrizzlePreview: preview FITS saved")
 		fyne.Do(func() {
+			ws.state.resultName = filepath.Base(previewPath)
+			ws.statsLabel.SetText(mosaicStatsText(ws.state.resultName, stats.Mean, stats.Std, result.Width, result.Height))
 			dialog.ShowInformation("Preview Saved", fmt.Sprintf("Saved preview FITS to %s.", filepath.Base(previewPath)), ws.win)
 		})
 	}

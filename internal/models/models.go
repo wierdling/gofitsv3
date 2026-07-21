@@ -38,6 +38,9 @@ type LoadedImage struct {
 	GHSStretch  float64 // GHS strength D
 	GHSLocal    float64 // GHS local intensity b
 	GHSSymmetry float64 // GHS symmetry point SP in [0,1]
+	// Rotation90 is the number of clockwise quarter turns baked into the image
+	// data by Compose. It is persisted so a project can restore the same view.
+	Rotation90 int
 
 	// AlignTransform is the backward (output→source) sampling affine produced by
 	// Compose "Align to Channel 2". When HasAlignTransform is set it is applied at
@@ -60,6 +63,7 @@ type ChannelState struct {
 	OffsetX    float64 `json:"offsetX,omitempty"`
 	OffsetY    float64 `json:"offsetY,omitempty"`
 	OffsetRot  float64 `json:"offsetRot,omitempty"`
+	Rotation90 int     `json:"rotation90,omitempty"`
 
 	// Full star-alignment affine (backward sampling) from "Align to Channel 2",
 	// applied underneath the Manual Offset at render time. See LoadedImage.
@@ -86,7 +90,6 @@ type ComposeProject struct {
 	OverlayLayers        []OrangeLayerState      `json:"overlayLayers,omitempty"`
 	OrangeLayer          OrangeLayerState        `json:"orangeLayer,omitempty"`
 	YellowLayer          OrangeLayerState        `json:"yellowLayer,omitempty"`
-	Flip                 bool                    `json:"flip"`
 	SharedHistogramScale bool                    `json:"sharedHistogramScale,omitempty"`
 	DisableComposite     bool                    `json:"disableComposite,omitempty"`
 	MeasureComposite     bool                    `json:"measureComposite,omitempty"`

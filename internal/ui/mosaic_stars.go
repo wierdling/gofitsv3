@@ -25,9 +25,9 @@ func (ws *mosaicWorkspace) exitStarMode() {
 		stats := histogram.Compute(ws.state.result.Pixels)
 		ws.mosaicBins = stats.Hist
 		ws.mosaicHistogram.Refresh()
-		ws.statsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f | Size: %dx%d", stats.Mean, stats.Std, ws.state.result.Width, ws.state.result.Height))
+		ws.statsLabel.SetText(mosaicStatsText(ws.state.resultName, stats.Mean, stats.Std, ws.state.result.Width, ws.state.result.Height))
 	} else {
-		ws.statsLabel.SetText("Mean: -- | Std: -- | Size: --")
+		ws.statsLabel.SetText(mosaicEmptyStatsText())
 		ws.mosaicBins = [256]int{}
 		ws.mosaicHistogram.Refresh()
 	}

@@ -147,10 +147,11 @@ func (ws *mosaicWorkspace) resetMTFMidtone() {
 
 func (ws *mosaicWorkspace) resetPreview() {
 	ws.state.result = nil
+	ws.state.resultName = ""
 	ws.saveBtn.Disable()
 	ws.preview.Image = blankImg()
 	ws.preview.Refresh()
-	ws.statsLabel.SetText("Mean: -- | Std: -- | Size: --")
+	ws.statsLabel.SetText(mosaicEmptyStatsText())
 	ws.mosaicBins = [256]int{}
 	ws.mosaicHistogram.Refresh()
 }

@@ -21,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"gofitsv3/internal/debuglog"
+	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
 	"gofitsv3/internal/processing"
@@ -31,6 +32,7 @@ type mosaicState struct {
 	inputs      []mosaic.Input
 	statuses    []mosaic.InputStatus
 	result      *mosaic.Result
+	resultName  string
 	savePreview bool
 	// referenceInput is an optional drizzled baseline used as the WCS anchor for
 	// star alignment and drizzle. Its pixels are not included in the output.
@@ -57,7 +59,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	preview.FillMode = canvas.ImageFillContain
 	preview.SetMinSize(fyne.NewSize(520, 420))
 
-	statsLabel := widget.NewLabel("Mean: -- | Std: -- | Size: --")
+	statsLabel := widget.NewLabel(mosaicEmptyStatsText())
 	statsLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	statusLabel := widget.NewLabel("No FITS files loaded.")
 	statusLabel.Wrapping = fyne.TextWrapWord
@@ -987,6 +989,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				dialog.ShowError(err, win)
 				return
 			}
+			state.resultName = filepath.Base(path)
+			stats := histogram.Compute(state.result.Pixels)
+			ws.statsLabel.SetText(mosaicStatsText(state.resultName, stats.Mean, stats.Std, state.result.Width, state.result.Height))
 			dialog.ShowInformation("Saved", "Drizzle FITS saved successfully.", win)
 		}, win)
 		drizzleName := "mosaic_drizzle.fits"

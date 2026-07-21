@@ -118,6 +118,23 @@ func TestFlipHelpersReverseRowsInPlace(t *testing.T) {
 	}
 }
 
+func TestRotateImageData90CW(t *testing.T) {
+	data := fitsio.ImageData{Width: 2, Height: 3, Pixels: []float32{1, 2, 3, 4, 5, 6}}
+	got := RotateImageData90CW(data)
+	if got.Width != 3 || got.Height != 2 {
+		t.Fatalf("size = %dx%d, want 3x2", got.Width, got.Height)
+	}
+	want := []float32{5, 3, 1, 6, 4, 2}
+	for i, value := range want {
+		if got.Pixels[i] != value {
+			t.Fatalf("Pixels[%d] = %v, want %v", i, got.Pixels[i], value)
+		}
+	}
+	if data.Width != 2 || data.Height != 3 || data.Pixels[0] != 1 {
+		t.Fatal("RotateImageData90CW changed its source data")
+	}
+}
+
 func TestResizeChannelInterpolatesAndPropagatesNaNSource(t *testing.T) {
 	src := []float32{
 		0, 10,

@@ -139,6 +139,27 @@ func TestStretchedImageDataForReferenceGridUsesDisplayStretch(t *testing.T) {
 	}
 }
 
+func TestImageDataForReferenceGridSkipsWCSForRotatedChannel(t *testing.T) {
+	header := func(crpix1 string) fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": crpix1, "CRPIX2": "2", "CRVAL1": "100", "CRVAL2": "20",
+			"CDELT1": "1", "CDELT2": "1", "PC1_1": "1", "PC1_2": "0", "PC2_1": "0", "PC2_2": "1",
+		}}
+	}
+	img := makeLoadedImageForCompose(2, 2, 0, header("1"))
+	img.HDU.Data.Pixels = []float32{1, 2, 3, 4}
+	img.Rotation90 = 1
+	ref := makeLoadedImageForCompose(2, 2, 0, header("2"))
+
+	got := ImageDataForReferenceGrid(img, ref)
+	want := []float32{1, 2, 3, 4}
+	for i, value := range want {
+		if got.Pixels[i] != value {
+			t.Fatalf("Pixels[%d] = %v, want unwarped rotated data %v", i, got.Pixels[i], value)
+		}
+	}
+}
+
 func makeLoadedImageForCompose(w, h int, value float32, header fitsio.Header) *models.LoadedImage {
 	pixels := make([]float32, w*h)
 	for i := range pixels {

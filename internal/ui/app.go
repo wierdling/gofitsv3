@@ -62,10 +62,15 @@ func Run() error {
 				fyne.NewMenuItemSeparator(),
 				origItems[1],
 				origItems[0],
+				origItems[2],
 				fyne.NewMenuItemSeparator(),
 			}
 			fileMenu.Items = append(fileMenu.Items, origItems[3:]...)
 		}
+		fileMenu.Items = append(fileMenu.Items,
+			fyne.NewMenuItemSeparator(),
+			fyne.NewMenuItem("Resize FITS Files...", func() { showBatchFITSResizePicker(a, win) }),
+		)
 	}
 
 	editTab := container.NewTabItem("Edit", editContent)

@@ -401,7 +401,11 @@ func ImageDataForReferenceGridCtx(ctx context.Context, img, ref *models.LoadedIm
 	if img == nil || ref == nil {
 		return fitsio.ImageData{}
 	}
-	if img == ref || sharedDrizzleGrid(img, ref) {
+	// A baked Compose rotation changes the pixel coordinate system without
+	// rewriting WCS headers. Do not use those stale headers to warp either the
+	// rotated channel or a rotated reference grid.
+	skipWCS := img.Rotation90 != 0 || ref.Rotation90 != 0
+	if img == ref || (!skipWCS && sharedDrizzleGrid(img, ref)) {
 		return fitsio.ImageData{
 			Width:  img.HDU.Data.Width,
 			Height: img.HDU.Data.Height,
@@ -409,19 +413,21 @@ func ImageDataForReferenceGridCtx(ctx context.Context, img, ref *models.LoadedIm
 		}
 	}
 
-	alignedPixels, _, err := AlignChannelUsingWCSCtx(
-		ctx,
-		img.HDU.Data.Pixels,
-		img.HDU.Data.Width,
-		img.HDU.Data.Height,
-		img.HDU.Header,
-		ref.HDU.Data.Pixels,
-		ref.HDU.Data.Width,
-		ref.HDU.Data.Height,
-		ref.HDU.Header,
-	)
-	if err == nil {
-		return fitsio.ImageData{Width: ref.HDU.Data.Width, Height: ref.HDU.Data.Height, Pixels: alignedPixels}
+	if !skipWCS {
+		alignedPixels, _, err := AlignChannelUsingWCSCtx(
+			ctx,
+			img.HDU.Data.Pixels,
+			img.HDU.Data.Width,
+			img.HDU.Data.Height,
+			img.HDU.Header,
+			ref.HDU.Data.Pixels,
+			ref.HDU.Data.Width,
+			ref.HDU.Data.Height,
+			ref.HDU.Header,
+		)
+		if err == nil {
+			return fitsio.ImageData{Width: ref.HDU.Data.Width, Height: ref.HDU.Data.Height, Pixels: alignedPixels}
+		}
 	}
 
 	if img.HDU.Data.Width != ref.HDU.Data.Width || img.HDU.Data.Height != ref.HDU.Data.Height {
@@ -798,6 +804,24 @@ func FlipRGBA(buf []byte, w, h int) []byte {
 		copy(buf[(h-1-y)*row:(h-y)*row], temp)
 	}
 	return buf
+}
+
+// RotateImageData90CW returns data rotated one quarter-turn clockwise. The
+// output dimensions are swapped and the source pixels are left untouched.
+func RotateImageData90CW(data fitsio.ImageData) fitsio.ImageData {
+	w, h := data.Width, data.Height
+	if w <= 0 || h <= 0 || len(data.Pixels) == 0 {
+		return data
+	}
+	out := make([]float32, w*h)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			out[x*h+(h-1-y)] = data.Pixels[y*w+x]
+		}
+	}
+	data.Width, data.Height = h, w
+	data.Pixels = out
+	return data
 }
 
 func ResizeChannel(pixels []float32, oldW, oldH, newW, newH int) []float32 {

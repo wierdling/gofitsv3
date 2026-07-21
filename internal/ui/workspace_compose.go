@@ -79,17 +79,13 @@ type composeOverlayPreviewData struct {
 	filterText string
 }
 
-func buildComposeOverlayPreviewData(ctx context.Context, img *models.LoadedImage, flip bool) (*composeOverlayPreviewData, error) {
+func buildComposeOverlayPreviewData(ctx context.Context, img *models.LoadedImage) (*composeOverlayPreviewData, error) {
 	if err := composeMagicCanceled(ctx); err != nil {
 		return nil, err
 	}
 	stretched, mask := processing.ApplyStretchParallel(img)
 	if err := composeMagicCanceled(ctx); err != nil {
 		return nil, err
-	}
-	if flip {
-		stretched = processing.FlipImageData(stretched)
-		mask = processing.FlipMask(mask, stretched.Width, stretched.Height)
 	}
 	stats := histogram.Compute(stretched.Pixels)
 	sky, _ := processing.EstimateBackground(stretched.Pixels)
@@ -132,8 +128,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	previewSeq := 0
 	var genCancel context.CancelFunc
 
-	flipCheck := NewToggle(nil)
-	flipCheck.SetChecked(true)
 	sharedHistCheck := NewToggle(nil)
 	sharedHistCheck.SetChecked(false)
 	buildCompositeCheck := NewToggle(nil)
@@ -197,13 +191,12 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		previewMu.Unlock()
 		imgSnapshot := renderImages()
 		levelsSnapshot := *levels
-		flip := flipCheck.Checked
 		sharedHistScale := sharedHistCheck.Checked
 		buildComposite := buildCompositeCheck.Checked
 		go func() {
 			start := time.Now()
 			debuglog.Log("compose refresh async: starting preview computation")
-			data := buildComposePreviewData(ctx, imgSnapshot, flip, sharedHistScale, buildComposite, &levelsSnapshot, composeRGBWithOptionalStarless)
+			data := buildComposePreviewData(ctx, imgSnapshot, sharedHistScale, buildComposite, &levelsSnapshot, composeRGBWithOptionalStarless)
 			debuglog.Log(fmt.Sprintf("compose refresh async: preview computation took %s", time.Since(start)))
 			fyne.Do(func() {
 				previewMu.Lock()
@@ -313,7 +306,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			func() { setPicker(idx, "White") },
 		)
 		viewports[idx].overlay.onPointerMove = func(pos fyne.Position) {
-			point, ok := viewports[idx].imagePointAtPosition(pos, flipCheck.Checked)
+			point, ok := viewports[idx].imagePointAtPosition(pos, false)
 			if !ok {
 				if activePicker.channel == idx {
 					viewports[idx].SetPickerValueText(fmt.Sprintf("Pick %s: --", activePicker.target))
@@ -335,7 +328,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			if activePicker.channel != idx {
 				return
 			}
-			point, ok := viewports[idx].imagePointAtPosition(pos, flipCheck.Checked)
+			point, ok := viewports[idx].imagePointAtPosition(pos, false)
 			if !ok {
 				return
 			}
@@ -487,9 +480,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 			format := detectExportFormat(path)
 			stretched, _ := processing.ApplyStretchParallel(imgs[idx])
-			if flipCheck.Checked {
-				stretched = processing.FlipImageData(stretched)
-			}
 			gray := processing.ToGrayRGBA(stretched, make([]byte, len(stretched.Pixels)))
 			showExportOptionsDialog(format, win, func(opts export.Options) {
 				if err := export.FromImage(path, gray, format, opts); err != nil {
@@ -640,7 +630,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					return
 				}
 
-				imgs[idx] = img
+				replaceComposeChannelImage(imgs, idx, img)
 				clearComposeOrigPixels(&origPixels, idx)
 
 				fyne.Do(func() {
@@ -728,7 +718,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			refresh()
 			return
 		}
-		data, err := buildComposeOverlayPreviewData(context.Background(), imgs[l.idx], flipCheck.Checked)
+		data, err := buildComposeOverlayPreviewData(context.Background(), imgs[l.idx])
 		if err != nil {
 			return
 		}
@@ -749,9 +739,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			_ = uc.Close()
 			format := detectExportFormat(path)
 			stretched, _ := processing.ApplyStretchParallel(imgs[l.idx])
-			if flipCheck.Checked {
-				stretched = processing.FlipImageData(stretched)
-			}
 			gray := processing.ToGrayRGBA(stretched, make([]byte, len(stretched.Pixels)))
 			showExportOptionsDialog(format, win, func(opts export.Options) {
 				if err := export.FromImage(path, gray, format, opts); err != nil {
@@ -915,7 +902,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 		l.viewport.SetLoadSave(l.name, "L", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255},
 			func() { loadLayer(l) }, func() { saveLayerGray(l) })
-		l.control = channelControls(l.name+" Image", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255}, l.idx, imgs, &origPixels, layerViews(l), func() { refreshLayerPreview(l) }, nil)
+		l.control = channelControls(l.name+" Image", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255}, l.idx, imgs, &origPixels, layerViews(l), func() { refreshLayerPreview(l) }, nil, false)
 
 		swatch := canvas.NewRectangle(color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255})
 		swatch.SetMinSize(fyne.NewSize(36, 18))
@@ -1155,9 +1142,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	magicGroup := &magicPresetGroup{}
 	controlSets = []*models.ChannelControl{
-		channelControls("Channel 1 (Blue)", color.RGBA{R: 100, G: 149, B: 237, A: 255}, 0, imgs, &origPixels, viewports, refresh, magicGroup),
-		channelControls("Channel 2 (Green)", color.RGBA{R: 80, G: 200, B: 80, A: 255}, 1, imgs, &origPixels, viewports, refresh, magicGroup),
-		channelControls("Channel 3 (Red)", color.RGBA{R: 237, G: 80, B: 80, A: 255}, 2, imgs, &origPixels, viewports, refresh, magicGroup),
+		channelControls("Channel 1 (Blue)", color.RGBA{R: 100, G: 149, B: 237, A: 255}, 0, imgs, &origPixels, viewports, refresh, magicGroup, true),
+		channelControls("Channel 2 (Green)", color.RGBA{R: 80, G: 200, B: 80, A: 255}, 1, imgs, &origPixels, viewports, refresh, magicGroup, true),
+		channelControls("Channel 3 (Red)", color.RGBA{R: 237, G: 80, B: 80, A: 255}, 2, imgs, &origPixels, viewports, refresh, magicGroup, true),
 	}
 
 	// The Manual Offset (X/Y/Rot) fields are the source of truth for each channel's
@@ -1249,9 +1236,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			return nil
 		}
 		buf = processing.ApplyRGBLevels(buf, levels)
-		if flipCheck.Checked {
-			buf = processing.FlipRGBA(buf, w, h)
-		}
 		img := image.NewRGBA(image.Rect(0, 0, w, h))
 		copy(img.Pix, buf)
 		return img
@@ -1430,7 +1414,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	saveProject := func() {
 		hasChannel := false
 		project := models.ComposeProject{
-			Flip:                 flipCheck.Checked,
 			SharedHistogramScale: sharedHistCheck.Checked,
 			DisableComposite:     !buildCompositeCheck.Checked,
 			MeasureComposite:     measureEnabled,
@@ -1456,6 +1439,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				OffsetX:    dx,
 				OffsetY:    dy,
 				OffsetRot:  rot,
+				Rotation90: imgs[i].Rotation90,
 
 				HasAlign: imgs[i].HasAlignTransform,
 				AlignA:   imgs[i].AlignA,
@@ -1635,10 +1619,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					withSuspendedRefresh(func() {
 						for i, img := range imgs[:3] {
 							if img != nil {
+								restoreComposeChannelRotation(img, project.Channels[i].Rotation90)
 								applyChannelState(i, project.Channels[i], imgs, viewports, controlSets)
 							}
 						}
-						flipCheck.SetChecked(project.Flip)
 						sharedHistCheck.SetChecked(project.SharedHistogramScale)
 						buildCompositeCheck.SetChecked(!project.DisableComposite)
 						if stopBlink != nil {
@@ -1757,6 +1741,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}
 				imgs[i] = reloaded
 				clearComposeOrigPixels(&origPixels, i)
+				restoreComposeChannelRotation(reloaded, state.Rotation90)
 				applyChannelState(i, state, imgs, viewports, controlSets)
 			}
 		})
@@ -2047,7 +2032,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	measureLabel.TextStyle = fyne.TextStyle{Monospace: true}
 
 	updateMeasurement = func() {
-		viewports[3].setMeasurementOverlay(measureStart, measureEnd, flipCheck.Checked)
+		viewports[3].setMeasurementOverlay(measureStart, measureEnd, false)
 		switch {
 		case measureStart != nil && measureEnd != nil:
 			m := measurePoints(*measureStart, *measureEnd)
@@ -2072,7 +2057,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		if !measureEnabled {
 			return
 		}
-		point, ok := viewports[3].imagePointAtPosition(pos, flipCheck.Checked)
+		point, ok := viewports[3].imagePointAtPosition(pos, false)
 		if !ok {
 			return
 		}
@@ -2255,7 +2240,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			})
 			progressDialog.Show()
 			spec := composeMagicSpec{Preset: preset, Rows: append([]composeMagicRow(nil), rows...)}
-			flipPreview := flipCheck.Checked
 			go func() {
 				batch, prepareErr := prepareComposeMagicBatch(ctx, spec, loadImageFromPath)
 				previews := make(map[*models.LoadedImage]*composeOverlayPreviewData)
@@ -2264,7 +2248,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						if channel.Row.Assignment != composeMagicCustom {
 							continue
 						}
-						preview, previewErr := buildComposeOverlayPreviewData(ctx, channel.Image, flipPreview)
+						preview, previewErr := buildComposeOverlayPreviewData(ctx, channel.Image)
 						if previewErr != nil {
 							prepareErr = previewErr
 							break
@@ -2305,7 +2289,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					}
 					withSuspendedRefresh(func() {
 						for idx, image := range installPlan.Base {
-							imgs[idx] = image
+							replaceComposeChannelImage(imgs, idx, image)
 							clearComposeOrigPixels(&origPixels, idx)
 							applyChannelState(idx, channelStateFromImage(image), imgs, viewports, controlSets)
 							closeHeaderWindow(idx)
@@ -2527,7 +2511,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		if channelIdx < 0 || channelIdx >= 3 {
 			return
 		}
-		imgs[channelIdx] = img
+		replaceComposeChannelImage(imgs, channelIdx, img)
 		clearComposeOrigPixels(&origPixels, channelIdx)
 		applyChannelState(channelIdx, channelStateFromImage(img), imgs, viewports, controlSets)
 		refresh()
@@ -2561,7 +2545,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	controls := container.NewVBox(
 		widget.NewLabel("Options"),
-		container.NewHBox(flipCheck, widget.NewLabel("Flip image vertically")),
 		container.NewHBox(sharedHistCheck, widget.NewLabel("Shared histogram scale")),
 		histScaleStatus,
 		container.NewHBox(buildCompositeCheck, widget.NewLabel("Build color composite")),
@@ -2723,6 +2706,7 @@ func channelStateFromImage(img *models.LoadedImage) models.ChannelState {
 		Peak:       img.Peak,
 		ScaledPeak: img.ScaledPeak,
 		ShowClip:   img.ShowClip,
+		Rotation90: img.Rotation90,
 
 		HasAlign: img.HasAlignTransform,
 		AlignA:   img.AlignA,
@@ -2831,7 +2815,7 @@ func (g *magicPresetGroup) broadcast(value string) {
 	g.syncing = false
 }
 
-func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func(), magicGroup *magicPresetGroup) *models.ChannelControl {
+func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func(), magicGroup *magicPresetGroup, allowRotate bool) *models.ChannelControl {
 	// Stretch-specific parameter rows. Only the row(s) relevant to the selected
 	// mode are shown; the rest stay hidden to avoid clutter.
 	asinhScaleEntry := NewNumberEntry(0.1, 3)
@@ -3058,6 +3042,18 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		}
 		refresh()
 	})
+	rotate := widget.NewButton("Rotate 90°", func() {
+		if imgs[idx] == nil {
+			return
+		}
+		rotateComposeChannel90CW(imgs[idx])
+		clearComposeChannelAlignment(imgs[idx])
+		xOffsetEntry.SetValue(0)
+		yOffsetEntry.SetValue(0)
+		rotOffsetEntry.SetValue(0)
+		clearComposeOrigPixels(origPixels, idx)
+		refresh()
+	})
 
 	return &models.ChannelControl{
 		Content: container.NewVBox(
@@ -3080,6 +3076,12 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 			container.NewHBox(showClip, widget.NewLabel("Show clipped pixels")),
 			container.NewHBox(outlinedButton(col, auto), outlinedButton(col, autoMTF), outlinedButton(col, apply)),
 			container.NewHBox(outlinedButton(col, magic), magicPreset),
+			func() fyne.CanvasObject {
+				if allowRotate {
+					return outlinedButton(col, rotate)
+				}
+				return layout.NewSpacer()
+			}(),
 			widget.NewLabel("Manual Offset"),
 			offsetRow("X", xOffsetEntry),
 			offsetRow("Y", yOffsetEntry),
@@ -3122,7 +3124,7 @@ type composePreviewData struct {
 	StarlessResult *processing.StarlessResult
 }
 
-func buildComposePreviewData(ctx context.Context, imgs []*models.LoadedImage, flip bool, sharedHistScale bool, buildComposite bool, levels *models.RgbLevels, composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) composePreviewData {
+func buildComposePreviewData(ctx context.Context, imgs []*models.LoadedImage, sharedHistScale bool, buildComposite bool, levels *models.RgbLevels, composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) composePreviewData {
 	start := time.Now()
 	defer func() {
 		debuglog.Log(fmt.Sprintf("buildComposePreviewData: total took %s", time.Since(start)))
@@ -3137,10 +3139,6 @@ func buildComposePreviewData(ctx context.Context, imgs []*models.LoadedImage, fl
 		}
 		channelStart := time.Now()
 		stretched, mask := processing.ApplyStretchParallel(imgs[i])
-		if flip {
-			stretched = processing.FlipImageData(stretched)
-			mask = processing.FlipMask(mask, stretched.Width, stretched.Height)
-		}
 		stats := histogram.Compute(stretched.Pixels)
 		sky, _ := processing.EstimateBackground(stretched.Pixels)
 		channelPixels[i] = stretched.Pixels
@@ -3195,9 +3193,6 @@ func buildComposePreviewData(ctx context.Context, imgs []*models.LoadedImage, fl
 	}
 	out.RGBStats = rgbStats
 	buf = processing.ApplyRGBLevels(buf, levels)
-	if flip {
-		buf = processing.FlipRGBA(buf, w, h)
-	}
 	lumaStats := histogramRGBLuminance(buf)
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	copy(img.Pix, buf)
@@ -3466,7 +3461,7 @@ func applyComposePreviewData(data composePreviewData, views []*viewport, pushHis
 }
 
 // Updated signature to expect an array of histogram.Stats structs
-func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, levels *models.RgbLevels, pushHist func([3]histogram.Stats), composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) {
+func updatePreviews(imgs []*models.LoadedImage, views []*viewport, levels *models.RgbLevels, pushHist func([3]histogram.Stats), composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) {
 	start := time.Now()
 	defer func() {
 		debuglog.Log(fmt.Sprintf("updatePreviews: total took %s", time.Since(start)))
@@ -3492,12 +3487,6 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 		stretchStart := time.Now()
 		stretched, mask := processing.ApplyStretchParallel(imgs[i])
 		debuglog.Log(fmt.Sprintf("updatePreviews: channel %d stretch took %s", i+1, time.Since(stretchStart)))
-		if flip {
-			flipStart := time.Now()
-			stretched = processing.FlipImageData(stretched)
-			mask = processing.FlipMask(mask, stretched.Width, stretched.Height)
-			debuglog.Log(fmt.Sprintf("updatePreviews: channel %d flip took %s", i+1, time.Since(flipStart)))
-		}
 
 		rgbaStart := time.Now()
 		views[i].image.Image = processing.ToGrayRGBA(stretched, mask)
@@ -3564,9 +3553,6 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, flip bool, le
 	buf = processing.ApplyRGBLevels(buf, levels)
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 
-	if flip {
-		buf = processing.FlipRGBA(buf, w, h)
-	}
 	copy(img.Pix, buf)
 	debuglog.Log(fmt.Sprintf("updatePreviews: RGB levels/final image took %s", time.Since(rgbLevelsStart)))
 

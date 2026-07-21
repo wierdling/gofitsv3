@@ -28,6 +28,10 @@ type ImageData struct {
 	Width  int
 	Height int
 	Pixels []float32
+	// Int32Pixels retains exact signed 32-bit image samples for bit-mask
+	// extensions such as DQ and CTX. Pixels is still populated for existing
+	// consumers, but must not be used to round-trip mask bits.
+	Int32Pixels []int32
 }
 
 // File holds all HDUs read from a FITS file.
@@ -314,7 +318,14 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 		}
 	}
 
-	hdu := HDU{Header: hdr, Data: ImageData{Width: width, Height: height, Pixels: pixels}}
+	data := ImageData{Width: width, Height: height, Pixels: pixels}
+	if bitpix == 32 {
+		data.Int32Pixels = make([]int32, total)
+		for i := range data.Int32Pixels {
+			data.Int32Pixels[i] = int32(binary.BigEndian.Uint32(raw[i*4 : i*4+4]))
+		}
+	}
+	hdu := HDU{Header: hdr, Data: data}
 	hdu.ExtName = HeaderString(hdr, "EXTNAME")
 	return hdu, dataBytes, nil
 }
