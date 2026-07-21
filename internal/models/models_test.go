@@ -234,6 +234,7 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 			},
 		},
 	}
+	project.SkysubSettings.EqualizeDisconnectedBackgrounds = true
 
 	var decoded MosaicProject
 	roundTripJSON(t, project, &decoded)
@@ -261,6 +262,9 @@ func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testi
 	}
 	if !decoded.SkysubSettings.Enabled || !decoded.SkysubSettings.SkyLowerSet || decoded.SkysubSettings.SkyUSigma != 3.5 {
 		t.Fatalf("SkysubSettings = %+v, want preserved sky settings", decoded.SkysubSettings)
+	}
+	if !decoded.SkysubSettings.EqualizeDisconnectedBackgrounds {
+		t.Fatalf("EqualizeDisconnectedBackgrounds = false, want round-tripped true")
 	}
 	if !decoded.SkysubSettings.AmpPedestal || !decoded.SkysubSettings.RowDestripe || !decoded.SkysubSettings.NIRCamWisp {
 		t.Fatalf("Skysub detector corrections = %+v, want enabled settings preserved", decoded.SkysubSettings)
@@ -310,7 +314,7 @@ func TestMosaicProjectJSONOmitsOptionalZeroFieldsAndDecodesDefaults(t *testing.T
 		t.Fatalf("json.Marshal error = %v", err)
 	}
 	raw := string(data)
-	for _, field := range []string{"referencePath", "referenceSciExt", "sciExt", "combined", "locked", "transformA", "useERRWeighting"} {
+	for _, field := range []string{"referencePath", "referenceSciExt", "sciExt", "combined", "locked", "transformA", "useERRWeighting", "equalizeDisconnectedBackgrounds"} {
 		if containsJSONField(raw, field) {
 			t.Fatalf("JSON unexpectedly contained omitted field %q: %s", field, raw)
 		}
@@ -334,6 +338,9 @@ func TestMosaicProjectJSONOmitsOptionalZeroFieldsAndDecodesDefaults(t *testing.T
 	}
 	if decoded.SkysubSettings.AmpPedestal || decoded.SkysubSettings.RowDestripe || decoded.SkysubSettings.NIRCamWisp || decoded.SkysubSettings.MIRIArtifactMask {
 		t.Fatalf("artifact corrections = %+v, want omitted fields to stay disabled", decoded.SkysubSettings)
+	}
+	if decoded.SkysubSettings.EqualizeDisconnectedBackgrounds {
+		t.Fatal("EqualizeDisconnectedBackgrounds = true, want legacy default false")
 	}
 	if decoded.SkysubSettings.RowDestripeMaskPath != "" || decoded.SkysubSettings.RowDestripeMaskDir != "" || decoded.SkysubSettings.RowDestripeMaskSigma != 0 || decoded.SkysubSettings.RowDestripeTrendWindow != 0 || decoded.SkysubSettings.RowDestripeDirection != "" {
 		t.Fatalf("row destripe defaults = %+v, want zero values for old projects", decoded.SkysubSettings)

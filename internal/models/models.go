@@ -196,6 +196,10 @@ type SkysubSettings struct {
 	SkyClip     int     `json:"skyClip"`
 	SkyLSigma   float64 `json:"skyLSigma"`
 	SkyUSigma   float64 `json:"skyUSigma"`
+	// EqualizeDisconnectedBackgrounds shifts independently matched overlap
+	// components to the darkest component's background. This is an opt-in,
+	// non-photometric pretty-picture correction.
+	EqualizeDisconnectedBackgrounds bool `json:"equalizeDisconnectedBackgrounds,omitempty"`
 	// AmpPedestal enables NIRCam per-amplifier pedestal removal. Independent
 	// of Enabled/SkyMethod: it fixes an intra-chip readout artifact, not
 	// inter-chip sky level.

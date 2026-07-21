@@ -151,6 +151,7 @@ Background sky brightness can vary due to zodiacal light, scattered light, or sm
     * `match`: Matches relative sky offsets between frames using their overlaps. This preserves the reference frame's overall level instead of forcing everything to zero.
     * `globalmin+match`: Combines global minimum subtraction with frame-to-frame matching.
     * `match+plane`: Like `match`, but also fits a relative gradient plane from overlap differences. This is useful for JWST fields with residual large-scale gradients or extended nebulosity, because it does not estimate the sky from object-filled regions directly.
+  * **Equalize Disconnected Groups**: For `match`, `globalmin+match`, and `match+plane`, optionally shifts overlap groups that have no shared pixels to the darkest group's background. This can flatten detector-to-detector seams in pretty pictures, but it is non-photometric because disconnected groups do not constrain one another. Leave it off for flux measurements and scientific products. **Default: Off**.
   * **Sky Stat**:
     * `median` **(Recommended Default)**: Computes the median value of background pixels.
     * `mode` / `mean`: Statistical modes.
