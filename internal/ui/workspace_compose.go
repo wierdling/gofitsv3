@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"io"
 	"math"
+	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -25,6 +25,7 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/wierdling/gofiledialog"
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/export"
@@ -1472,33 +1473,41 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			dialog.ShowInformation("Nothing to save", "Load at least one channel before saving", win)
 			return
 		}
-		save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
-			if err != nil || uc == nil {
+		if err := gofiledialog.ShowSave(func(paths []string, err error) {
+			if err != nil {
+				dialog.ShowError(err, win)
 				return
 			}
-			defer uc.Close()
+			if len(paths) == 0 {
+				return
+			}
 			data, err := json.MarshalIndent(project, "", "  ")
 			if err != nil {
 				dialog.ShowError(err, win)
 				return
 			}
-			if _, err := uc.Write(data); err != nil {
+			if err := os.WriteFile(paths[0], data, 0644); err != nil {
 				dialog.ShowError(err, win)
 				return
 			}
-		}, win)
-		save.SetFileName("project.gfprj")
-		save.SetFilter(storage.NewExtensionFileFilter([]string{".gfprj"}))
-		save.Show()
+		}, win,
+			gofiledialog.WithFileName("project.gfprj"),
+			gofiledialog.WithFilters(gofiledialog.Filter{Name: "Compose projects", Extensions: []string{".gfprj"}}),
+		); err != nil {
+			dialog.ShowError(err, win)
+		}
 	}
 
 	loadProject := func() {
-		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-			if err != nil || r == nil {
+		if err := gofiledialog.ShowOpen(func(paths []string, err error) {
+			if err != nil {
+				dialog.ShowError(err, win)
 				return
 			}
-			defer r.Close()
-			data, err := io.ReadAll(r)
+			if len(paths) == 0 {
+				return
+			}
+			data, err := os.ReadFile(paths[0])
 			if err != nil {
 				dialog.ShowError(err, win)
 				return
@@ -1682,11 +1691,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					})
 				})
 			}()
-		}, win)
-		fd.SetFilter(storage.NewExtensionFileFilter([]string{".gfprj"}))
-		fd.SetView(dialog.ListView)
-		sizeFileDialog(fd)
-		fd.Show()
+		}, win,
+			gofiledialog.WithFilters(gofiledialog.Filter{Name: "Compose projects", Extensions: []string{".gfprj"}}),
+		); err != nil {
+			dialog.ShowError(err, win)
+		}
 	}
 
 	type vpState struct {

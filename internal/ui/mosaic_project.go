@@ -8,7 +8,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/storage"
+	"github.com/wierdling/gofiledialog"
 
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
@@ -108,12 +108,29 @@ func (ws *mosaicWorkspace) saveMosaicProject() {
 			proj.ReferenceSCIExt = 0
 		}
 	}
-	fd := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
-		if err != nil || uc == nil {
+	name := ws.lastProjectName
+	if name == "" {
+		name = "mosaic_project.json"
+		if ws.activeFilter != "" {
+			name = ws.activeFilter + "_project.json"
+		}
+	}
+	opts := []gofiledialog.Option{
+		gofiledialog.WithFileName(name),
+		gofiledialog.WithFilters(gofiledialog.Filter{Name: "Mosaic projects", Extensions: []string{".json"}}),
+	}
+	if lastDir := ws.app.Preferences().String("lastDir"); lastDir != "" {
+		opts = append(opts, gofiledialog.WithStartDir(lastDir))
+	}
+	if err := gofiledialog.ShowSave(func(paths []string, err error) {
+		if err != nil {
+			dialog.ShowError(err, ws.win)
 			return
 		}
-		path := uc.URI().Path()
-		_ = uc.Close()
+		if len(paths) == 0 {
+			return
+		}
+		path := paths[0]
 		if filepath.Ext(path) == "" {
 			path += ".json"
 		}
@@ -139,31 +156,30 @@ func (ws *mosaicWorkspace) saveMosaicProject() {
 		ws.lastProjectName = filepath.Base(path)
 		ws.app.Preferences().SetString("lastDir", filepath.Dir(path))
 		dialog.ShowInformation("Saved", "Mosaic project saved.", ws.win)
-	}, ws.win)
-	name := ws.lastProjectName
-	if name == "" {
-		name = "mosaic_project.json"
-		if ws.activeFilter != "" {
-			name = ws.activeFilter + "_project.json"
-		}
+	}, ws.win, opts...); err != nil {
+		dialog.ShowError(err, ws.win)
 	}
-	fd.SetFileName(name)
-	fd.SetFilter(storage.NewExtensionFileFilter([]string{".json"}))
-	ws.configureLastDir(fd)
-	sizeFileDialog(fd)
-	fd.Show()
 }
 
 func (ws *mosaicWorkspace) loadMosaicProject() {
 	if ws.queueRunning {
 		return
 	}
-	fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-		if err != nil || r == nil {
+	opts := []gofiledialog.Option{
+		gofiledialog.WithFilters(gofiledialog.Filter{Name: "Mosaic projects", Extensions: []string{".json"}}),
+	}
+	if lastDir := ws.app.Preferences().String("lastDir"); lastDir != "" {
+		opts = append(opts, gofiledialog.WithStartDir(lastDir))
+	}
+	if err := gofiledialog.ShowOpen(func(paths []string, err error) {
+		if err != nil {
+			dialog.ShowError(err, ws.win)
 			return
 		}
-		path := r.URI().Path()
-		r.Close()
+		if len(paths) == 0 {
+			return
+		}
+		path := paths[0]
 		absPath, absErr := filepath.Abs(path)
 		if absErr != nil {
 			dialog.ShowError(absErr, ws.win)
@@ -316,10 +332,7 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 				}
 			})
 		}()
-	}, ws.win)
-	fd.SetFilter(storage.NewExtensionFileFilter([]string{".json"}))
-	ws.configureLastDir(fd)
-	fd.SetView(dialog.ListView)
-	sizeFileDialog(fd)
-	fd.Show()
+	}, ws.win, opts...); err != nil {
+		dialog.ShowError(err, ws.win)
+	}
 }
