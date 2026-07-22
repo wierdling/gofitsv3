@@ -6,10 +6,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
+	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
 )
 
@@ -21,6 +26,10 @@ type FilterFile struct {
 	// duplicated here so a flattened file list is self-describing.
 	Filter     string
 	ProposalID string
+	// Instrument is the observing instrument name (INSTRUME header, e.g.
+	// "WFC3", "ACS", "NIRCAM"), or "Unknown" when absent. Used to facet
+	// multi-instrument batches.
+	Instrument string
 	// ExposureTime is the formatted exposure duration (e.g. "1230s") read from
 	// the primary header, or "Unknown" when absent.
 	ExposureTime string
@@ -54,43 +63,105 @@ func DiscoverFilterFiles(dir string) (map[string][]FilterFile, error) {
 		return nil, err
 	}
 
-	groups := make(map[string][]FilterFile)
+	// Collect candidate paths first (a cheap filename-only filter), then read
+	// their primary headers concurrently: each read is an independent file open
+	// and is dominated by I/O latency, so a worker pool turns the scan from a
+	// serial sum of per-file latencies into a parallel one.
+	paths := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-
 		path := filepath.Join(dir, entry.Name())
-		if !LooksLikeFLC(path) || IsPipelineProductFLC(path) {
+		if !LooksLikeCalibratedInput(path) || IsPipelineProductFLC(path) {
 			continue
 		}
-
-		header, err := fitsio.LoadPrimaryHeader(path)
-		if err != nil {
-			continue
-		}
-		filter := fitsio.FilterString(header)
-		if filter == "" {
-			filter = "Unknown"
-		}
-		proposalID := fitsio.HeaderString(header, "PROPOSID", "PROPOSAL", "PROPOSALID")
-		if proposalID == "" {
-			proposalID = "Unknown"
-		}
-		exposure := formatExposure(loadExposureTime(header))
-		dateObs := parseDateObs(fitsio.HeaderString(header, "DATE-OBS", "DATEOBS"))
-		groups[filter] = append(groups[filter], FilterFile{Path: path, Filter: filter, ProposalID: proposalID, ExposureTime: exposure, DateObs: dateObs})
+		paths = append(paths, path)
 	}
 
+	start := time.Now()
+	debuglog.Log(fmt.Sprintf("DiscoverFilterFiles: scanning %d candidate header(s) in %s", len(paths), dir))
+	found := scanFilterHeaders(paths)
+	debuglog.Log(fmt.Sprintf("DiscoverFilterFiles: scanned %d header(s), %d readable in %s",
+		len(paths), len(found), time.Since(start).Round(time.Millisecond)))
+
+	groups := make(map[string][]FilterFile)
+	for _, f := range found {
+		groups[f.Filter] = append(groups[f.Filter], f)
+	}
 	for filter := range groups {
 		sort.Slice(groups[filter], func(i, j int) bool {
 			return groups[filter][i].Path < groups[filter][j].Path
 		})
 	}
 	if len(groups) == 0 {
-		return nil, fmt.Errorf("no matching calibrated _flc/_flt FITS files with filter headers found in %s", dir)
+		return nil, fmt.Errorf("no matching calibrated _flc/_flt/_cal FITS files with filter headers found in %s", dir)
 	}
 	return groups, nil
+}
+
+// scanFilterHeaders reads the primary header of each path concurrently and
+// returns a FilterFile for every readable one. Files whose header fails to read
+// are silently skipped (as before). Order is not preserved; callers sort.
+func scanFilterHeaders(paths []string) []FilterFile {
+	workers := runtime.NumCPU()
+	if workers > len(paths) {
+		workers = len(paths)
+	}
+	if workers < 1 {
+		return nil
+	}
+
+	results := make([]FilterFile, len(paths))
+	ok := make([]bool, len(paths))
+	var next int64 = -1
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(atomic.AddInt64(&next, 1))
+				if i >= len(paths) {
+					return
+				}
+				header, err := fitsio.LoadPrimaryHeader(paths[i])
+				if err != nil {
+					continue
+				}
+				filter := fitsio.FilterString(header)
+				if filter == "" {
+					filter = "Unknown"
+				}
+				proposalID := fitsio.HeaderString(header, "PROPOSID", "PROPOSAL", "PROPOSALID", "PROGRAM")
+				if proposalID == "" {
+					proposalID = "Unknown"
+				}
+				instrument := fitsio.HeaderString(header, "INSTRUME", "INSTRUMENT")
+				if instrument == "" {
+					instrument = "Unknown"
+				}
+				results[i] = FilterFile{
+					Path:         paths[i],
+					Filter:       filter,
+					ProposalID:   proposalID,
+					Instrument:   instrument,
+					ExposureTime: formatExposure(loadExposureTime(header)),
+					DateObs:      parseDateObs(fitsio.HeaderString(header, "DATE-OBS", "DATEOBS")),
+				}
+				ok[i] = true
+			}
+		}()
+	}
+	wg.Wait()
+
+	found := make([]FilterFile, 0, len(paths))
+	for i := range results {
+		if ok[i] {
+			found = append(found, results[i])
+		}
+	}
+	return found
 }
 
 func FilterOptions(groups map[string][]string) []string {
@@ -128,6 +199,7 @@ func AllFilterFiles(groups map[string][]FilterFile) []FilterFile {
 type FileCriteria struct {
 	Filter      string // exact filter name, "" = any
 	ProposalID  string // exact proposal ID, "" = any
+	Instrument  string // exact instrument name, "" = any
 	Exposure    string // exact exposure label (e.g. "1230s"), "" = any
 	DateMin     string // inclusive "YYYY-MM-DD" lower bound, "" = no lower bound
 	DateMax     string // inclusive "YYYY-MM-DD" upper bound, "" = no upper bound
@@ -144,6 +216,9 @@ func MatchFiles(files []FilterFile, c FileCriteria) []string {
 			continue
 		}
 		if c.ProposalID != "" && f.ProposalID != c.ProposalID {
+			continue
+		}
+		if c.Instrument != "" && f.Instrument != c.Instrument {
 			continue
 		}
 		if c.Exposure != "" && f.ExposureTime != c.Exposure {
@@ -175,6 +250,10 @@ func FilterFacetOptions(files []FilterFile) []string {
 
 func ProposalFacetOptions(files []FilterFile) []string {
 	return facetOptions(files, func(f FilterFile) string { return f.ProposalID }, func(a, b string) bool { return a < b })
+}
+
+func InstrumentFacetOptions(files []FilterFile) []string {
+	return facetOptions(files, func(f FilterFile) string { return f.Instrument }, func(a, b string) bool { return a < b })
 }
 
 func ExposureFacetOptions(files []FilterFile) []string {
@@ -285,8 +364,9 @@ func filterFromOption(option string) string {
 	return option
 }
 
-// ProductType reports the calibrated product type of an input path, "flc" or
-// "flt", or "" when the filename matches neither.
+// ProductType reports the calibrated product type of an input path: "flc"
+// (HST CTE-corrected), "flt" (HST), or "cal" (JWST Stage-2), or "" when the
+// filename matches none.
 func ProductType(path string) string {
 	base := strings.ToLower(filepath.Base(path))
 	switch {
@@ -294,14 +374,16 @@ func ProductType(path string) string {
 		return "flc"
 	case strings.Contains(base, "_flt"):
 		return "flt"
+	case strings.Contains(base, "_cal"):
+		return "cal"
 	default:
 		return ""
 	}
 }
 
-// AvailableProductTypes reports whether any discovered file is an _flc and/or an
-// _flt product, across all filters.
-func AvailableProductTypes(filesByFilter map[string][]FilterFile) (hasFLC, hasFLT bool) {
+// AvailableProductTypes reports which calibrated product types (_flc, _flt,
+// JWST _cal) are present across all discovered files.
+func AvailableProductTypes(filesByFilter map[string][]FilterFile) (hasFLC, hasFLT, hasCal bool) {
 	for _, files := range filesByFilter {
 		for _, file := range files {
 			switch ProductType(file.Path) {
@@ -309,8 +391,10 @@ func AvailableProductTypes(filesByFilter map[string][]FilterFile) (hasFLC, hasFL
 				hasFLC = true
 			case "flt":
 				hasFLT = true
+			case "cal":
+				hasCal = true
 			}
-			if hasFLC && hasFLT {
+			if hasFLC && hasFLT && hasCal {
 				return
 			}
 		}

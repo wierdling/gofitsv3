@@ -47,7 +47,10 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 		var visitGen uint32
 		laplacianThreshold := globalSigma * 10.0
 		growThreshold := globalSigma * 2.0
-		dirs := [][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
+		dirs := [8][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
+		// Reused across seeds within the pass to avoid per-seed allocations.
+		var candidates []int
+		var queue []int
 
 		for y := 2; y < effectiveHeight-2; y++ {
 			for x := 2; x < width-2; x++ {
@@ -87,8 +90,9 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 				}
 
 				replacementVal := estimateWideBackground(currentPixels, width, effectiveHeight, x, y)
-				var candidates []int
-				q := []int{idx}
+				candidates = candidates[:0]
+				queue = queue[:0]
+				queue = append(queue, idx)
 				visitGen++
 				if visitGen == 0 {
 					for i := range visitMarks {
@@ -99,9 +103,8 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 				visitMarks[idx] = visitGen
 				minX, maxX, minY, maxY := x, x, y, y
 
-				for len(q) > 0 {
-					currIdx := q[0]
-					q = q[1:]
+				for head := 0; head < len(queue); head++ {
+					currIdx := queue[head]
 					candidates = append(candidates, currIdx)
 
 					cx := currIdx % width
@@ -134,7 +137,7 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 						}
 						if nVal > replacementVal+growThreshold {
 							visitMarks[nIdx] = visitGen
-							q = append(q, nIdx)
+							queue = append(queue, nIdx)
 						}
 					}
 				}
@@ -172,23 +175,33 @@ func RemoveCosmicRays(pixels []float32, width, height int, globalSigma float64, 
 }
 
 func estimateWideBackground(pixels []float32, width, height int, cx, cy int) float64 {
-	var bg []float64
+	// The 11x11 window holds at most 121 samples, so keep it on the stack to
+	// avoid a heap allocation on every seed pixel.
+	var bg [121]float64
+	n := 0
 	for dy := -5; dy <= 5; dy++ {
+		ny := cy + dy
+		if ny < 0 || ny >= height {
+			continue
+		}
+		base := ny * width
 		for dx := -5; dx <= 5; dx++ {
-			nx, ny := cx+dx, cy+dy
-			if nx >= 0 && nx < width && ny >= 0 && ny < height {
-				val := float64(pixels[ny*width+nx])
-				if !math.IsNaN(val) {
-					bg = append(bg, val)
-				}
+			nx := cx + dx
+			if nx < 0 || nx >= width {
+				continue
+			}
+			val := float64(pixels[base+nx])
+			if !math.IsNaN(val) {
+				bg[n] = val
+				n++
 			}
 		}
 	}
-	if len(bg) == 0 {
+	if n == 0 {
 		return 0
 	}
-	sort.Float64s(bg)
-	return bg[len(bg)/2]
+	sort.Float64s(bg[:n])
+	return bg[n/2]
 }
 
 // FrameInfo holds the data needed for multi-frame cosmic ray detection.
@@ -291,20 +304,21 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 		// Excess (data - blotted model) for every comparable pixel; NaN marks
 		// pixels with no valid data or no model coverage. Computed over the full
 		// frame so the growth stages can also consider border pixels.
-		excesses := make([]float64, npix)
+		nan32 := float32(math.NaN())
+		excesses := make([]float32, npix)
 		for idx := range excesses {
-			excesses[idx] = math.NaN()
+			excesses[idx] = nan32
 		}
 		for idx := 0; idx < npix; idx++ {
 			val := float64(f.Pixels[idx])
-			if math.IsNaN(val) || val <= 0 {
+			if math.IsNaN(val) || math.IsInf(val, 0) || val <= 0 {
 				continue
 			}
 			bv := float64(blotted[idx])
-			if math.IsNaN(bv) {
+			if math.IsNaN(bv) || math.IsInf(bv, 0) {
 				continue
 			}
-			excesses[idx] = val - bv
+			excesses[idx] = float32(val - bv)
 		}
 
 		// Seed pass: flag pixels whose excess clears the per-pixel noise floor
@@ -312,7 +326,7 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 		for y := 1; y < f.Height-1; y++ {
 			for x := 1; x < f.Width-1; x++ {
 				idx := y*f.Width + x
-				excess := excesses[idx]
+				excess := float64(excesses[idx])
 				if math.IsNaN(excess) || excess <= 0 {
 					continue
 				}
@@ -353,7 +367,7 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 //     wings a strict propagation threshold would leave behind.
 //
 // excesses holds data-minus-model per pixel (NaN where not comparable).
-func growCRMask(mask []bool, excesses []float64, width, height int, noiseAt func(idx int) float64, seedSNR float64) {
+func growCRMask(mask []bool, excesses []float32, width, height int, noiseAt func(idx int) float64, seedSNR float64) {
 	dirs8 := [8][2]int{{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}}
 
 	// Stage 1: connected propagation from the seeds.
@@ -377,7 +391,7 @@ func growCRMask(mask []bool, excesses []float64, width, height int, noiseAt func
 			if mask[nIdx] {
 				continue
 			}
-			ex := excesses[nIdx]
+			ex := float64(excesses[nIdx])
 			if math.IsNaN(ex) {
 				continue
 			}
@@ -403,7 +417,7 @@ func growCRMask(mask []bool, excesses []float64, width, height int, noiseAt func
 					if nIdx == idx || mask[nIdx] {
 						continue
 					}
-					ex := excesses[nIdx]
+					ex := float64(excesses[nIdx])
 					if math.IsNaN(ex) {
 						continue
 					}

@@ -23,20 +23,25 @@ type mosaicWorkspace struct {
 	state *mosaicState
 
 	// --- mutable value state (reassigned during the session) ---
-	activeFilter      string
-	lastProjectName   string
-	zoomLevel         float64
-	zoomFitMode       bool
-	levelsSet         bool
-	stretchMode       stretch.Mode
-	mosaicBins        [256]int
-	zoomCustomOption  string
-	zoomSelectSyncing bool
+	activeFilter       string
+	lastProjectName    string
+	currentProjectPath string
+	queueRunning       bool
+	queueWindow        fyne.Window
+	zoomLevel          float64
+	zoomFitMode        bool
+	levelsSet          bool
+	stretchMode        stretch.Mode
+	mtfMidtone         float64
+	mosaicBins         [256]int
+	zoomCustomOption   string
+	zoomSelectSyncing  bool
 
 	// --- mode pointers (non-nil only while in star/measure mode) ---
 	activePicker      *starPickerWidget
 	activeMeasure     *measurePickerWidget
 	starModeRefResult *mosaic.Result
+	inputFramesWindow fyne.Window
 
 	// --- containers swapped during mode changes ---
 	leftStack          *fyne.Container
@@ -72,6 +77,7 @@ type mosaicWorkspace struct {
 	bgEntry         *NumberEntry
 	peakEntry       *NumberEntry
 	scaledPeakEntry *NumberEntry
+	mtfMidtoneEntry *NumberEntry
 	modeSelect      *SafeSelect
 
 	// --- star mode widgets ---

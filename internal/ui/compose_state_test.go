@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"math"
 	"path/filepath"
 	"strings"
@@ -228,11 +229,15 @@ func TestChannelStateRoundTripAndApplyChannelState(t *testing.T) {
 		Background: 2.5,
 		Peak:       8.5,
 		ScaledPeak: 7.5,
+		MTFMidtone: 0.37,
 		ShowClip:   true,
 	}
 	state := channelStateFromImage(img)
 	if state.Path != "channel1.fits" || state.Mode != "Log" || !state.ShowClip {
 		t.Fatalf("channelStateFromImage = %+v", state)
+	}
+	if state.MTFMidtone != 0.37 {
+		t.Fatalf("channelStateFromImage MTFMidtone = %v, want 0.37", state.MTFMidtone)
 	}
 
 	target := &models.LoadedImage{}
@@ -262,6 +267,9 @@ func TestChannelStateRoundTripAndApplyChannelState(t *testing.T) {
 	if target.Background != 2.5 || target.Peak != 8.5 || target.ScaledPeak != 7.5 || !target.ShowClip {
 		t.Fatalf("applied image scalar state = %+v", target)
 	}
+	if target.MTFMidtone != 0.37 {
+		t.Fatalf("applied MTFMidtone = %v, want 0.37", target.MTFMidtone)
+	}
 	if modeSelect.Selected != "Log" {
 		t.Fatalf("ModeSelect.Selected = %q, want Log", modeSelect.Selected)
 	}
@@ -279,7 +287,7 @@ func TestChannelStateRoundTripAndApplyChannelState(t *testing.T) {
 func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing.T) {
 	levels := defaultRGBLevels()
 
-	missing := buildComposePreviewData(make([]*models.LoadedImage, 3), false, false, true, levels, nil)
+	missing := buildComposePreviewData(context.Background(), make([]*models.LoadedImage, 3), false, true, levels, nil)
 	for i := 0; i < 4; i++ {
 		if missing.Views[i].Image == nil {
 			t.Fatalf("missing.Views[%d].Image is nil", i)
@@ -295,7 +303,7 @@ func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing
 		makeLoadedImageForUITest(1, 2, []float32{1, 0}),
 	}
 	overrideResult := &processing.StarlessResult{Width: 1, Height: 2}
-	data := buildComposePreviewData(imgs, true, false, true, levels, func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+	data := buildComposePreviewData(context.Background(), imgs, false, true, levels, func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
 		return []byte{
 			1, 2, 3, 255,
 			10, 20, 30, 255,
@@ -311,8 +319,8 @@ func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing
 	if data.RGBStats[0].Mean != 1 || data.RGBStats[1].Mean != 2 || data.RGBStats[2].Mean != 3 {
 		t.Fatalf("RGBStats = %+v, want override stats", data.RGBStats)
 	}
-	if got := data.Views[3].Image.RGBAAt(0, 0); got.R != 10 || got.G != 20 || got.B != 30 {
-		t.Fatalf("flipped compose first pixel = %#v, want R=10 G=20 B=30", got)
+	if got := data.Views[3].Image.RGBAAt(0, 0); got.R != 1 || got.G != 2 || got.B != 3 {
+		t.Fatalf("compose first pixel = %#v, want R=1 G=2 B=3", got)
 	}
 	if data.Views[3].Bins[18] != 1 {
 		t.Fatalf("composite luminance bin 18 = %d, want 1", data.Views[3].Bins[18])
@@ -330,6 +338,53 @@ func TestBuildComposePreviewDataUsesOverrideAndHandlesMissingChannels(t *testing
 	}
 }
 
+func TestRotateComposeChannel90CWUpdatesPixelsDimensionsAndState(t *testing.T) {
+	img := makeLoadedImageForUITest(2, 3, []float32{1, 2, 3, 4, 5, 6})
+	rotateComposeChannel90CW(img)
+	if img.HDU.Data.Width != 3 || img.HDU.Data.Height != 2 || img.Rotation90 != 1 {
+		t.Fatalf("rotation state = %dx%d turns=%d, want 3x2 turns=1", img.HDU.Data.Width, img.HDU.Data.Height, img.Rotation90)
+	}
+	want := []float32{5, 3, 1, 6, 4, 2}
+	for i, value := range want {
+		if img.HDU.Data.Pixels[i] != value {
+			t.Fatalf("Pixels[%d] = %v, want %v", i, img.HDU.Data.Pixels[i], value)
+		}
+	}
+}
+
+func TestClearComposeChannelAlignment(t *testing.T) {
+	img := makeLoadedImageForUITest(1, 1, []float32{1})
+	img.HasAlignTransform = true
+	img.AlignA, img.AlignB, img.AlignC = 1, 2, 3
+	img.AlignD, img.AlignE, img.AlignF = 4, 5, 6
+
+	clearComposeChannelAlignment(img)
+	if img.HasAlignTransform || img.AlignA != 0 || img.AlignB != 0 || img.AlignC != 0 || img.AlignD != 0 || img.AlignE != 0 || img.AlignF != 0 {
+		t.Fatalf("alignment was not cleared: %+v", img)
+	}
+}
+
+func TestReplaceComposeChannelImagePreservesRotation(t *testing.T) {
+	previous := makeLoadedImageForUITest(2, 3, []float32{1, 2, 3, 4, 5, 6})
+	rotateComposeChannel90CW(previous)
+	imgs := []*models.LoadedImage{previous}
+	replacement := makeLoadedImageForUITest(2, 3, []float32{10, 20, 30, 40, 50, 60})
+
+	replaceComposeChannelImage(imgs, 0, replacement)
+	if imgs[0] != replacement || replacement.Rotation90 != 1 {
+		t.Fatalf("replacement rotation = %d, want 1", replacement.Rotation90)
+	}
+	if replacement.HDU.Data.Width != 3 || replacement.HDU.Data.Height != 2 {
+		t.Fatalf("replacement size = %dx%d, want 3x2", replacement.HDU.Data.Width, replacement.HDU.Data.Height)
+	}
+	want := []float32{50, 30, 10, 60, 40, 20}
+	for i, value := range want {
+		if replacement.HDU.Data.Pixels[i] != value {
+			t.Fatalf("Pixels[%d] = %v, want %v", i, replacement.HDU.Data.Pixels[i], value)
+		}
+	}
+}
+
 func TestBuildComposePreviewDataSharedHistogramScaleRebinsChannels(t *testing.T) {
 	levels := defaultRGBLevels()
 	imgs := []*models.LoadedImage{
@@ -338,7 +393,7 @@ func TestBuildComposePreviewDataSharedHistogramScaleRebinsChannels(t *testing.T)
 		makeLoadedImageForUITest(1, 3, []float32{0.95, 1, 1}),
 	}
 
-	data := buildComposePreviewData(imgs, false, true, true, levels, nil)
+	data := buildComposePreviewData(context.Background(), imgs, true, true, levels, nil)
 
 	for i := 0; i < 3; i++ {
 		if data.Views[i].HistMax != 2 {
@@ -362,7 +417,7 @@ func TestBuildComposePreviewDataSkipsCompositeWhenDisabled(t *testing.T) {
 	}
 	called := false
 
-	data := buildComposePreviewData(imgs, false, false, false, levels, func() ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+	data := buildComposePreviewData(context.Background(), imgs, false, false, levels, func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
 		called = true
 		return nil, 0, 0, [3]histogram.Stats{}, nil, nil
 	})

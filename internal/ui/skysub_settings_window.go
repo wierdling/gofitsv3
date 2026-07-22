@@ -16,19 +16,23 @@ import (
 
 func defaultSkysubSettings() models.SkysubSettings {
 	return models.SkysubSettings{
-		Enabled:     false,
-		SkyMethod:   int(mosaic.SkyMethodLocalMin),
-		SkyStat:     int(mosaic.SkyStatMedian),
-		SkyWidth:    0.1,
-		SkyClip:     5,
-		SkyLSigma:   4.0,
-		SkyUSigma:   4.0,
-		SkyLowerSet: false,
-		SkyUpperSet: false,
+		Enabled:                false,
+		SkyMethod:              int(mosaic.SkyMethodLocalMin),
+		SkyStat:                int(mosaic.SkyStatMedian),
+		SkyWidth:               0.1,
+		SkyClip:                5,
+		SkyLSigma:              4.0,
+		SkyUSigma:              4.0,
+		SkyLowerSet:            false,
+		SkyUpperSet:            false,
+		RowDestripeMaskSigma:   3.0,
+		RowDestripeTrendWindow: 129,
+		RowDestripeDirection:   "rows",
+		NIRCamWispAutoScale:    true,
 	}
 }
 
-var skyMethodNames = []string{"localmin", "globalmin", "match", "globalmin+match"}
+var skyMethodNames = []string{"localmin", "globalmin", "match", "globalmin+match", "match+plane"}
 var skyStatNames = []string{"median", "mode", "mean"}
 
 func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, onSave func(models.SkysubSettings)) {
@@ -37,6 +41,16 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 		enabled = v
 	})
 	enabledCheck.SetChecked(enabled)
+
+	artifactSettings := current
+	artifactSummary := widget.NewLabel(jwstArtifactSummary(artifactSettings))
+	artifactSummary.Wrapping = fyne.TextWrapWord
+	artifactButton := widget.NewButton("JWST Artifact Corrections...", func() {
+		showJWSTArtifactSettingsDialog(win, artifactSettings, func(saved models.SkysubSettings) {
+			artifactSettings = copyJWSTArtifactSettings(artifactSettings, saved)
+			artifactSummary.SetText(jwstArtifactSummary(artifactSettings))
+		})
+	})
 
 	method := current.SkyMethod
 	if method < 0 || method >= len(skyMethodNames) {
@@ -108,6 +122,8 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 
 	notes := widget.NewLabel(
 		"skymethod: localmin/globalmin/match/globalmin+match follow AstroDrizzle naming.\n" +
+			"match finds relative frame offsets from overlaps; match+plane fits a relative offset plus gradient from overlap differences only.\n" +
+			"Use JWST Artifact Corrections for detector-fixed NIRCam/MIRI cleanup before sky matching.\n" +
 			"skywidth: histogram bin width in sigma for mode estimation.\n" +
 			"skylower/skyupper: optional pixel cutoffs in the input image units.\n" +
 			"skyclip, skylsigma, skyusigma: iterative clipping controls for sky estimation.",
@@ -117,6 +133,7 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 
 	form := widget.NewForm(
 		widget.NewFormItem("Enabled", enabledCheck),
+		widget.NewFormItem("JWST artifacts", container.NewVBox(artifactButton, artifactSummary)),
 		widget.NewFormItem("skymethod", methodSelect),
 		widget.NewFormItem("skystat", statSelect),
 		widget.NewFormItem("skywidth", widthEntry),
@@ -186,7 +203,7 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 			return
 		}
 
-		onSave(models.SkysubSettings{
+		saved := models.SkysubSettings{
 			Enabled:     enabled,
 			SkyMethod:   method,
 			SkyStat:     stat,
@@ -198,24 +215,221 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 			SkyClip:     clipVal,
 			SkyLSigma:   lSigmaVal,
 			SkyUSigma:   uSigmaVal,
+		}
+		onSave(copyJWSTArtifactSettings(saved, artifactSettings))
+	}, win)
+	d.Resize(fyne.NewSize(700, 500))
+	d.Show()
+}
+
+func showJWSTArtifactSettingsDialog(win fyne.Window, current models.SkysubSettings, onSave func(models.SkysubSettings)) {
+	ampPedestal := current.AmpPedestal
+	ampPedestalCheck := widget.NewCheck("Remove NIRCam per-amplifier pedestal.", func(v bool) {
+		ampPedestal = v
+	})
+	ampPedestalCheck.SetChecked(ampPedestal)
+
+	rowDestripe := current.RowDestripe
+	rowDestripeCheck := widget.NewCheck("Remove NIRCam 1/f row banding.", func(v bool) {
+		rowDestripe = v
+	})
+	rowDestripeCheck.SetChecked(rowDestripe)
+
+	rowMaskEntry := widget.NewEntry()
+	rowMaskEntry.SetText(current.RowDestripeMaskPath)
+	rowMaskEntry.SetPlaceHolder("optional binary FITS mask; nonzero = excluded")
+
+	rowMaskDirEntry := widget.NewEntry()
+	rowMaskDirEntry.SetText(current.RowDestripeMaskDir)
+	rowMaskDirEntry.SetPlaceHolder("folder containing <input-stem>_rowmask.fits")
+
+	rowMaskSigmaEntry := widget.NewEntry()
+	rowMaskSigma := current.RowDestripeMaskSigma
+	if rowMaskSigma <= 0 {
+		rowMaskSigma = 3.0
+	}
+	rowMaskSigmaEntry.SetText(fmt.Sprintf("%.2f", rowMaskSigma))
+
+	rowTrendEntry := widget.NewEntry()
+	rowTrend := current.RowDestripeTrendWindow
+	if rowTrend <= 0 {
+		rowTrend = 129
+	}
+	rowTrendEntry.SetText(fmt.Sprintf("%d", rowTrend))
+
+	nircamWisp := current.NIRCamWisp
+	nircamWispCheck := widget.NewCheck("Subtract NIRCam wisp template (local files only).", func(v bool) {
+		nircamWisp = v
+	})
+	nircamWispCheck.SetChecked(nircamWisp)
+
+	wispDirEntry := widget.NewEntry()
+	wispDirEntry.SetText(current.NIRCamWispTemplateDir)
+	wispDirEntry.SetPlaceHolder("folder containing nircam_wisp_nrcb4_f200w.fits")
+
+	wispAutoScale := current.NIRCamWispAutoScale
+	if !current.NIRCamWisp && !current.NIRCamWispAutoScale && current.NIRCamWispScale == 0 {
+		wispAutoScale = true
+	}
+	wispAutoScaleCheck := widget.NewCheck("Auto-scale template", func(v bool) {
+		wispAutoScale = v
+	})
+	wispAutoScaleCheck.SetChecked(wispAutoScale)
+
+	wispScaleEntry := widget.NewEntry()
+	wispScaleEntry.SetText(fmt.Sprintf("%.6g", current.NIRCamWispScale))
+	wispScaleEntry.SetPlaceHolder("fixed non-negative scale")
+
+	miriArtifactMask := current.MIRIArtifactMask
+	miriArtifactMaskCheck := widget.NewCheck("Apply MIRI artifact mask (user-provided masks only; no shower subtraction).", func(v bool) {
+		miriArtifactMask = v
+	})
+	miriArtifactMaskCheck.SetChecked(miriArtifactMask)
+
+	miriMaskPathEntry := widget.NewEntry()
+	miriMaskPathEntry.SetText(current.MIRIArtifactMaskPath)
+	miriMaskPathEntry.SetPlaceHolder("optional direct binary FITS mask")
+
+	miriMaskDirEntry := widget.NewEntry()
+	miriMaskDirEntry.SetText(current.MIRIArtifactMaskDir)
+	miriMaskDirEntry.SetPlaceHolder("folder containing <input-stem>_miri_mask.fits")
+
+	notes := widget.NewLabel(
+		"These corrections run before sky matching and are saved with the mosaic project.\n" +
+			"NIRCam wisp/destriping are detector corrections, not sky subtraction. Wisp templates must be local files named nircam_wisp_<detector>_<filter>.fits.\n" +
+			"MIRI masks exclude user-marked pixels. Shower/snowball detection belongs upstream in the current STScI JWST pipeline.",
+	)
+	notes.TextStyle = fyne.TextStyle{Italic: true}
+	notes.Wrapping = fyne.TextWrapWord
+
+	form := widget.NewForm(
+		widget.NewFormItem("NIRCam amp pedestal", ampPedestalCheck),
+		widget.NewFormItem("NIRCam row banding", rowDestripeCheck),
+		widget.NewFormItem("Row mask FITS", rowMaskEntry),
+		widget.NewFormItem("Row mask dir", rowMaskDirEntry),
+		widget.NewFormItem("Row mask sigma", rowMaskSigmaEntry),
+		widget.NewFormItem("Row trend window", rowTrendEntry),
+		widget.NewFormItem("NIRCam wisp template", nircamWispCheck),
+		widget.NewFormItem("Wisp template dir", wispDirEntry),
+		widget.NewFormItem("Wisp scale mode", wispAutoScaleCheck),
+		widget.NewFormItem("Fixed wisp scale", wispScaleEntry),
+		widget.NewFormItem("MIRI artifact mask", miriArtifactMaskCheck),
+		widget.NewFormItem("MIRI mask FITS", miriMaskPathEntry),
+		widget.NewFormItem("MIRI mask dir", miriMaskDirEntry),
+	)
+
+	content := container.NewVBox(form, notes)
+	d := dialog.NewCustomConfirm("JWST Artifact Corrections", "Save", "Cancel", content, func(ok bool) {
+		if !ok {
+			return
+		}
+
+		rowMaskSigmaVal, errRowSigma := strconv.ParseFloat(strings.TrimSpace(rowMaskSigmaEntry.Text), 64)
+		if errRowSigma != nil || rowMaskSigmaVal <= 0 {
+			dialog.ShowInformation("Invalid Value", "row mask sigma must be a positive number.", win)
+			return
+		}
+		rowTrendVal, errRowTrend := strconv.Atoi(strings.TrimSpace(rowTrendEntry.Text))
+		if errRowTrend != nil || rowTrendVal <= 0 {
+			dialog.ShowInformation("Invalid Value", "row trend window must be a positive integer.", win)
+			return
+		}
+		wispScaleVal := 0.0
+		scaleText := strings.TrimSpace(wispScaleEntry.Text)
+		if scaleText != "" {
+			v, err := strconv.ParseFloat(scaleText, 64)
+			if err != nil || v < 0 {
+				dialog.ShowInformation("Invalid Value", "fixed wisp scale must be blank or a non-negative number.", win)
+				return
+			}
+			wispScaleVal = v
+		}
+
+		onSave(models.SkysubSettings{
+			AmpPedestal:            ampPedestal,
+			RowDestripe:            rowDestripe,
+			RowDestripeMaskPath:    strings.TrimSpace(rowMaskEntry.Text),
+			RowDestripeMaskDir:     strings.TrimSpace(rowMaskDirEntry.Text),
+			RowDestripeMaskSigma:   rowMaskSigmaVal,
+			RowDestripeTrendWindow: rowTrendVal,
+			RowDestripeDirection:   "rows",
+			NIRCamWisp:             nircamWisp,
+			NIRCamWispTemplateDir:  strings.TrimSpace(wispDirEntry.Text),
+			NIRCamWispAutoScale:    wispAutoScale,
+			NIRCamWispScale:        wispScaleVal,
+			MIRIArtifactMask:       miriArtifactMask,
+			MIRIArtifactMaskPath:   strings.TrimSpace(miriMaskPathEntry.Text),
+			MIRIArtifactMaskDir:    strings.TrimSpace(miriMaskDirEntry.Text),
 		})
 	}, win)
-	d.Resize(fyne.NewSize(700, 470))
+	d.Resize(fyne.NewSize(760, 560))
 	d.Show()
+}
+
+func copyJWSTArtifactSettings(dst, src models.SkysubSettings) models.SkysubSettings {
+	dst.AmpPedestal = src.AmpPedestal
+	dst.RowDestripe = src.RowDestripe
+	dst.RowDestripeMaskPath = src.RowDestripeMaskPath
+	dst.RowDestripeMaskDir = src.RowDestripeMaskDir
+	dst.RowDestripeMaskSigma = src.RowDestripeMaskSigma
+	dst.RowDestripeTrendWindow = src.RowDestripeTrendWindow
+	dst.RowDestripeDirection = src.RowDestripeDirection
+	dst.NIRCamWisp = src.NIRCamWisp
+	dst.NIRCamWispTemplateDir = src.NIRCamWispTemplateDir
+	dst.NIRCamWispAutoScale = src.NIRCamWispAutoScale
+	dst.NIRCamWispScale = src.NIRCamWispScale
+	dst.MIRIArtifactMask = src.MIRIArtifactMask
+	dst.MIRIArtifactMaskPath = src.MIRIArtifactMaskPath
+	dst.MIRIArtifactMaskDir = src.MIRIArtifactMaskDir
+	return dst
+}
+
+func jwstArtifactSummary(s models.SkysubSettings) string {
+	var enabled []string
+	if s.AmpPedestal {
+		enabled = append(enabled, "NIRCam amp pedestal")
+	}
+	if s.RowDestripe {
+		enabled = append(enabled, "NIRCam row banding")
+	}
+	if s.NIRCamWisp {
+		enabled = append(enabled, "NIRCam wisp")
+	}
+	if s.MIRIArtifactMask {
+		enabled = append(enabled, "MIRI mask")
+	}
+	if len(enabled) == 0 {
+		return "Detector corrections: off. Existing projects with zero values stay unchanged."
+	}
+	return "Detector corrections: " + strings.Join(enabled, ", ") + "."
 }
 
 func skysubOptionsFromSettings(s models.SkysubSettings) mosaic.SkysubOptions {
 	return mosaic.SkysubOptions{
-		Enabled:  s.Enabled,
-		Method:   mosaic.SkyMethod(s.SkyMethod),
-		Stat:     mosaic.SkyStat(s.SkyStat),
-		Width:    s.SkyWidth,
-		Lower:    s.SkyLower,
-		Upper:    s.SkyUpper,
-		HasLower: s.SkyLowerSet,
-		HasUpper: s.SkyUpperSet,
-		Clip:     s.SkyClip,
-		LSigma:   s.SkyLSigma,
-		USigma:   s.SkyUSigma,
+		Enabled:                s.Enabled,
+		AmpPedestal:            s.AmpPedestal,
+		RowDestripe:            s.RowDestripe,
+		RowDestripeMaskPath:    s.RowDestripeMaskPath,
+		RowDestripeMaskDir:     s.RowDestripeMaskDir,
+		RowDestripeMaskSigma:   s.RowDestripeMaskSigma,
+		RowDestripeTrendWindow: s.RowDestripeTrendWindow,
+		RowDestripeDirection:   s.RowDestripeDirection,
+		NIRCamWisp:             s.NIRCamWisp,
+		NIRCamWispTemplateDir:  s.NIRCamWispTemplateDir,
+		NIRCamWispAutoScale:    s.NIRCamWispAutoScale,
+		NIRCamWispScale:        s.NIRCamWispScale,
+		MIRIArtifactMask:       s.MIRIArtifactMask,
+		MIRIArtifactMaskPath:   s.MIRIArtifactMaskPath,
+		MIRIArtifactMaskDir:    s.MIRIArtifactMaskDir,
+		Method:                 mosaic.SkyMethod(s.SkyMethod),
+		Stat:                   mosaic.SkyStat(s.SkyStat),
+		Width:                  s.SkyWidth,
+		Lower:                  s.SkyLower,
+		Upper:                  s.SkyUpper,
+		HasLower:               s.SkyLowerSet,
+		HasUpper:               s.SkyUpperSet,
+		Clip:                   s.SkyClip,
+		LSigma:                 s.SkyLSigma,
+		USigma:                 s.SkyUSigma,
 	}
 }

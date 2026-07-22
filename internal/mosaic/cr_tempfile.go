@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -50,7 +51,14 @@ func buildCRMasksDrizzle(
 		return nil, nil
 	}
 
-	tmpDir, err := os.MkdirTemp("", "gofits-crsep-")
+	// Root the scratch files next to the source images (same drive) rather than
+	// the system temp directory, which may live on a small system volume (e.g.
+	// C:) that lacks room for large separate-drizzle products.
+	tmpBase := crTempBaseDir(planned, dataPlanned)
+	if err := os.MkdirAll(tmpBase, 0o755); err != nil {
+		return nil, fmt.Errorf("create CR temp base %s: %w", tmpBase, err)
+	}
+	tmpDir, err := os.MkdirTemp(tmpBase, "gofits-crsep-")
 	if err != nil {
 		return nil, fmt.Errorf("create CR temp dir: %w", err)
 	}
@@ -76,7 +84,7 @@ func buildCRMasksDrizzle(
 		go func(slot, pi int) {
 			defer sepWG.Done()
 			defer func() { <-sepSem }()
-			pixels, _, perr := prepareFramePixels(planned[pi], opts, skyOffsets[pi], skyPlanes[pi])
+			pixels, _, _, perr := prepareFramePixels(planned[pi], opts, skyOffsets[pi], skyPlanes[pi])
 			if perr != nil {
 				sepErr.Store(fmt.Errorf("load frame %s: %w", InputKey(planned[pi].input), perr))
 				return
@@ -105,7 +113,7 @@ func buildCRMasksDrizzle(
 	// ---- Phase 2: streamed median model ----
 	logMemStats("CR median-model start")
 	debuglog.Log("buildCRMasksDrizzle: building median model from temp files")
-	model, err := buildMedianModelFromFiles(paths, width, height, n)
+	model, err := buildMedianModelFromFiles(paths, width, height, n, func() bool { return opts.cancelled() != nil })
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +128,10 @@ func buildCRMasksDrizzle(
 	if crDerivScale <= 0 {
 		crDerivScale = 1.2
 	}
-	crOpts := processing.DrizzleStyleCROptions{SeedSNR: crSeedSNR, DerivScale: crDerivScale}
+	crOpts := processing.DrizzleStyleCROptions{
+		SeedSNR:    crSeedSNR,
+		DerivScale: crDerivScale,
+	}
 
 	masks := make([]BitMask, n)
 	var maskWG sync.WaitGroup
@@ -136,7 +147,7 @@ func buildCRMasksDrizzle(
 		go func(slot, pi int) {
 			defer maskWG.Done()
 			defer func() { <-maskSem }()
-			pixels, errPix, perr := prepareFramePixels(planned[pi], opts, skyOffsets[pi], skyPlanes[pi])
+			pixels, errPix, _, perr := prepareFramePixels(planned[pi], opts, skyOffsets[pi], skyPlanes[pi])
 			if perr != nil {
 				maskErr.Store(fmt.Errorf("reload frame %s: %w", InputKey(planned[pi].input), perr))
 				return
@@ -192,6 +203,29 @@ func buildCRMasksDrizzle(
 	return masks, nil
 }
 
+// crTempBaseDir picks the directory that holds the CR scratch files. It uses the
+// working/ subdirectory next to the first source image so the scratch lives on
+// the same drive the images were loaded from, never the system temp volume. When
+// no usable source path is available it falls back to the system temp dir.
+func crTempBaseDir(planned []plannedInput, dataPlanned []int) string {
+	for _, pi := range dataPlanned {
+		if pi < 0 || pi >= len(planned) {
+			continue
+		}
+		src := planned[pi].input.SourcePath
+		if src == "" {
+			src = planned[pi].input.Path
+		}
+		if src == "" {
+			continue
+		}
+		if dir := filepath.Dir(src); dir != "" && dir != "." {
+			return filepath.Join(dir, WorkingDirName)
+		}
+	}
+	return os.TempDir()
+}
+
 // sepConcurrency picks how many separate-drizzle frames to process at once. Each
 // holds two output-size float32 buffers, so for large output canvases this drops
 // to one worker to keep peak memory bounded.
@@ -232,7 +266,7 @@ func maskConcurrency() int {
 // horizontal row bands and minmed/median-combines them into a single model image.
 // Uncovered pixels are written as NaN and ignored. n is the original frame count
 // (used for the minmed-vs-median threshold), matching the in-memory path.
-func buildMedianModelFromFiles(paths []string, width, height, n int) ([]float32, error) {
+func buildMedianModelFromFiles(paths []string, width, height, n int, cancel func() bool) ([]float32, error) {
 	model := make([]float32, width*height)
 
 	files := make([]*os.File, len(paths))
@@ -289,6 +323,9 @@ func buildMedianModelFromFiles(paths []string, width, height, n int) ([]float32,
 	vals := make([]float32, 0, active)
 
 	for startRow := 0; startRow < height; startRow += bandRows {
+		if cancel != nil && cancel() {
+			return nil, ErrCancelled
+		}
 		rows := bandRows
 		if startRow+rows > height {
 			rows = height - startRow

@@ -23,7 +23,7 @@ func (ws *mosaicWorkspace) exitMeasureMode() {
 
 	if ws.state.result != nil {
 		black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
-		img := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode)
+		img := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 		ws.preview.Image = img
 		ws.preview.Refresh()
 		stats := histogram.Compute(ws.state.result.Pixels)
@@ -226,7 +226,7 @@ func (ws *mosaicWorkspace) enterMeasureMode() {
 	savedScrollOffset := ws.previewScroll.Offset
 
 	black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
-	refImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode)
+	refImg := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 
 	ws.activeMeasure = newMeasurePickerWidget(refImg, ws.state.result.Width, ws.state.result.Height)
 	ws.activeMeasure.SetZoom(ws.zoomLevel)

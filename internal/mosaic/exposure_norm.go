@@ -48,6 +48,17 @@ func bunitIsRate(bunit string) (rate, known bool) {
 	}
 }
 
+// bunitIsCalibratedFlux reports whether a BUNIT denotes a calibrated flux or
+// surface-brightness unit (e.g. JWST Stage-2 "MJy/sr", or "MJy"/"Jy"/"uJy").
+// These are absolutely calibrated, not total detector counts, so they must
+// never be divided by exposure time. This is recognised explicitly rather than
+// relying on the per-second rate check incidentally matching "/sr".
+func bunitIsCalibratedFlux(bunit string) bool {
+	u := strings.ToUpper(strings.TrimSpace(bunit))
+	u = strings.ReplaceAll(u, " ", "")
+	return strings.Contains(u, "JY") // MJY/SR, MJY, JY, UJY, ...
+}
+
 // exposureScaleFor returns the per-frame normalization factor 1/exptime and
 // whether it is usable. It rejects non-positive, NaN, and Inf exposure times so
 // a bogus scale is never silently applied.
@@ -75,8 +86,9 @@ func resolveNormalization(mode NormalizationMode, bunit string, exptime float64)
 		return true, scale
 	case NormAuto:
 		rate, known := bunitIsRate(bunit)
-		if !known || rate {
-			// Unknown/missing BUNIT defaults to Off; rate units need no divide.
+		if !known || rate || bunitIsCalibratedFlux(bunit) {
+			// Unknown/missing BUNIT defaults to Off; rate units and calibrated
+			// flux/surface-brightness units (e.g. JWST MJy/sr) need no divide.
 			return false, scale
 		}
 		return true, scale

@@ -1,6 +1,7 @@
 package processing
 
 import (
+	"context"
 	"errors"
 	"math"
 
@@ -93,6 +94,13 @@ func WarpImage(targetPixels []float32, width, height int, t AffineTransform) []f
 }
 
 func WarpImageToSize(targetPixels []float32, srcWidth, srcHeight, outWidth, outHeight int, t AffineTransform) []float32 {
+	return WarpImageToSizeCtx(context.Background(), targetPixels, srcWidth, srcHeight, outWidth, outHeight, t)
+}
+
+// WarpImageToSizeCtx behaves like WarpImageToSize but checks ctx for
+// cancellation once per output row, returning a partial (short) result if
+// canceled. Callers that care about cancellation must check ctx.Err().
+func WarpImageToSizeCtx(ctx context.Context, targetPixels []float32, srcWidth, srcHeight, outWidth, outHeight int, t AffineTransform) []float32 {
 	out := make([]float32, outWidth*outHeight)
 	if srcWidth <= 0 || srcHeight <= 0 || len(targetPixels) == 0 {
 		return out
@@ -105,6 +113,9 @@ func WarpImageToSize(targetPixels []float32, srcWidth, srcHeight, outWidth, outH
 		srcHeight = maxHeight
 	}
 	for y := 0; y < outHeight; y++ {
+		if ctx.Err() != nil {
+			return out
+		}
 		for x := 0; x < outWidth; x++ {
 			srcX := t.A*float64(x) + t.B*float64(y) + t.C
 			srcY := t.D*float64(x) + t.E*float64(y) + t.F

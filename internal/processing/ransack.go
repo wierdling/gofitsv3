@@ -58,8 +58,10 @@ func SolveTransformationRANSAC(pairs []MatchedPair, iterations int, threshold fl
 	}
 
 	rng := rand.New(rand.NewSource(deterministicSeed(pairs)))
+	thresholdSq := threshold * threshold
 	var bestInliers []MatchedPair
 	maxInlierCount := 0
+	bestInlierSSE := math.Inf(1)
 
 	for i := 0; i < iterations; i++ {
 		// 1. Pick 3 random distinct pairs
@@ -73,24 +75,31 @@ func SolveTransformationRANSAC(pairs []MatchedPair, iterations int, threshold fl
 
 		// 3. Test all points against this transformation
 		var currentInliers []MatchedPair
+		currentSSE := 0.0
 		for _, p := range pairs {
 			// Predict where the Reference point lands in the Target image
 			predX := transform.A*p.RefX + transform.B*p.RefY + transform.C
 			predY := transform.D*p.RefX + transform.E*p.RefY + transform.F
 
-			// Calculate Euclidean distance error
+			// Squared Euclidean distance error (avoids a Sqrt per point)
 			dx := predX - p.TargetX
 			dy := predY - p.TargetY
-			dist := math.Sqrt(dx*dx + dy*dy)
+			distSq := dx*dx + dy*dy
 
-			if dist <= threshold {
+			if distSq <= thresholdSq {
 				currentInliers = append(currentInliers, p)
+				currentSSE += distSq
 			}
 		}
 
-		// 4. Keep the model with the most inliers
-		if len(currentInliers) > maxInlierCount {
+		// 4. Keep the model with the most inliers, breaking ties on the lower
+		// inlier residual (SSE). Without the tie-break the first equally-supported
+		// model found wins, which is deterministic but not necessarily the best
+		// geometric fit; preferring lower SSE picks the tightest consensus.
+		if len(currentInliers) > maxInlierCount ||
+			(len(currentInliers) == maxInlierCount && currentSSE < bestInlierSSE) {
 			maxInlierCount = len(currentInliers)
+			bestInlierSSE = currentSSE
 			bestInliers = currentInliers
 		}
 	}

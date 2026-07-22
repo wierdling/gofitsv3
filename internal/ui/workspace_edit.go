@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"image"
+	"image/draw"
 	_ "image/jpeg"
 	_ "image/png"
 	"math"
@@ -77,6 +78,13 @@ type editWorkspaceState struct {
 	cleanBlobSlider      *widget.Slider
 	cleanIntensitySlider *widget.Slider
 
+	// crop tool
+	cropOverlay     *cropLayer
+	cropActive      bool
+	cropStatusLabel *widget.Label
+	cropMin         image.Point // selection in image pixels (top-left)
+	cropMax         image.Point // selection in image pixels (bottom-right)
+	cropHasSel      bool
 }
 
 func (es *editWorkspaceState) applyEdits() {
@@ -124,7 +132,22 @@ func (es *editWorkspaceState) screenToImagePt(pos fyne.Position) (image.Point, b
 	if es.zoom <= 0 || es.origW == 0 || es.origH == 0 {
 		return image.Point{}, false
 	}
-	pt, ok := mapViewportPositionToImage(pos, fyne.NewPos(0, 0), es.zoom, es.origW, es.origH, false)
+	// canvasImg uses ImageFillContain inside a NewMax container, so when the
+	// displayed image (origW*zoom x origH*zoom) is smaller than the overlay in
+	// either axis it is centered with a letterbox margin. Back that offset out
+	// before mapping, otherwise the selection maps above/left of the real pixels.
+	dispW := float32(es.origW) * float32(es.zoom)
+	dispH := float32(es.origH) * float32(es.zoom)
+	sz := es.canvasImg.Size()
+	var offX, offY float32
+	if sz.Width > dispW {
+		offX = (sz.Width - dispW) / 2
+	}
+	if sz.Height > dispH {
+		offY = (sz.Height - dispH) / 2
+	}
+	adj := fyne.NewPos(pos.X-offX, pos.Y-offY)
+	pt, ok := mapViewportPositionToImage(adj, fyne.NewPos(0, 0), es.zoom, es.origW, es.origH, false)
 	return image.Pt(pt.X, pt.Y), ok
 }
 
@@ -191,6 +214,56 @@ func (es *editWorkspaceState) undoHeal() {
 	es.canvasImg.Refresh()
 }
 
+// onCropChange converts the overlay's screen-space selection to image pixels
+// and updates the status readout.
+func (es *editWorkspaceState) onCropChange(min, max fyne.Position, active bool) {
+	if !active {
+		es.cropHasSel = false
+		if es.cropStatusLabel != nil {
+			es.cropStatusLabel.SetText("Drag a rectangle over the image, then Apply Crop.")
+		}
+		return
+	}
+	minPt, okMin := es.screenToImagePt(min)
+	maxPt, okMax := es.screenToImagePt(max)
+	if !okMin || !okMax {
+		return
+	}
+	es.cropMin = minPt
+	es.cropMax = image.Pt(maxPt.X+1, maxPt.Y+1) // inclusive pixel -> exclusive bound
+	es.cropHasSel = true
+	if es.cropStatusLabel != nil {
+		es.cropStatusLabel.SetText(fmt.Sprintf("Selection: %d x %d px", es.cropMax.X-es.cropMin.X, es.cropMax.Y-es.cropMin.Y))
+	}
+}
+
+// applyCrop replaces the current image with the selected rectangle.
+func (es *editWorkspaceState) applyCrop() {
+	if !es.cropHasSel {
+		dialog.ShowInformation("No selection", "Drag a rectangle on the image first.", es.win)
+		return
+	}
+	rgba := toRGBA(es.canvasImg.Image)
+	if rgba == nil {
+		return
+	}
+	rect := image.Rectangle{Min: es.cropMin, Max: es.cropMax}.Canon().Intersect(rgba.Bounds())
+	if rect.Dx() < 1 || rect.Dy() < 1 {
+		dialog.ShowInformation("Selection too small", "The selected area is empty. Try again.", es.win)
+		return
+	}
+	cropped := image.NewRGBA(image.Rect(0, 0, rect.Dx(), rect.Dy()))
+	draw.Draw(cropped, cropped.Bounds(), rgba, rect.Min, draw.Src)
+
+	es.cropHasSel = false
+	if es.cropOverlay != nil {
+		es.cropOverlay.Reset()
+	}
+	// setImage makes the cropped result the new edit base (resets sliders,
+	// re-fits zoom, rebuilds histograms).
+	es.setImage(cropped)
+}
+
 func (es *editWorkspaceState) refreshHistograms(img *image.RGBA) {
 	for c := 0; c < 3; c++ {
 		es.rgbBins[c] = [256]int{}
@@ -211,6 +284,10 @@ func (es *editWorkspaceState) refreshHistograms(img *image.RGBA) {
 }
 
 func (es *editWorkspaceState) setImage(img image.Image) {
+	es.setImageOpts(img, false)
+}
+
+func (es *editWorkspaceState) setImageOpts(img image.Image, keepZoomAndScroll bool) {
 	if img == nil {
 		return
 	}
@@ -242,20 +319,27 @@ func (es *editWorkspaceState) setImage(img image.Image) {
 	es.refreshHistograms(rgba)
 	es.canvasImg.Image = rgba
 
-	es.zoom = 1.0
-	if es.imgScroll != nil {
-		sz := es.imgScroll.Size()
-		if sz.Width > 1 && sz.Height > 1 && es.origW > 0 && es.origH > 0 {
-			zw := float64(sz.Width) / float64(es.origW)
-			zh := float64(sz.Height) / float64(es.origH)
-			es.zoom = math.Min(zw, zh)
+	if !keepZoomAndScroll {
+		es.zoom = 1.0
+		if es.imgScroll != nil {
+			sz := es.imgScroll.Size()
+			if sz.Width > 1 && sz.Height > 1 && es.origW > 0 && es.origH > 0 {
+				zw := float64(sz.Width) / float64(es.origW)
+				zh := float64(sz.Height) / float64(es.origH)
+				es.zoom = math.Min(zw, zh)
+			}
 		}
+		es.setZoomSelectLabel("fit")
+		es.applyZoom()
 	}
-	es.setZoomSelectLabel("fit")
-	es.applyZoom()
+
 	es.canvasImg.Refresh()
+	if es.cropOverlay != nil {
+		es.cropOverlay.Reset()
+	}
+	es.cropHasSel = false
 	if es.cleanStatusLabel != nil {
-		es.cleanStatusLabel.SetText("Run this after cross-channel clean to remove tiny pure-color specks.")
+		es.cleanStatusLabel.SetText("Run this after cross-channel clean to remove tiny color specks and black dropout dots.")
 	}
 	if es.editTabs != nil && es.cleanTab != nil {
 		es.editTabs.Select(es.cleanTab)
@@ -283,7 +367,44 @@ func (es *editWorkspaceState) runColorSpeckClean() {
 			if cleaned == nil {
 				return
 			}
-			es.setImage(cleaned)
+
+			// Capture current zoom and scroll position before resetting the image.
+			savedZoom := es.zoom
+			var savedZoomSel string
+			if es.zoomSelect != nil {
+				savedZoomSel = es.zoomSelect.Selected
+			}
+			var savedOffset fyne.Position
+			if es.imgScroll != nil {
+				savedOffset = es.imgScroll.Offset
+			}
+
+			es.setImageOpts(cleaned, true)
+
+			// Restore the captured zoom and scroll position. setImageOpts(...,true)
+			// leaves them untouched, but the image swap + SetMinSize queues a layout
+			// pass that runs after this callback and can re-fit the view, so re-assert
+			// the saved values now and again on the next event-loop tick.
+			restoreView := func() {
+				// Set the label without firing OnChanged: setZoomFromSelect would
+				// recompute zoom from the label and snap "fit" back in.
+				if es.zoomSelect != nil && savedZoomSel != "" {
+					prev := es.zoomSelect.OnChanged
+					es.zoomSelect.OnChanged = nil
+					es.setZoomSelectLabel(savedZoomSel)
+					es.zoomSelect.OnChanged = prev
+				}
+				es.zoom = savedZoom
+				es.applyZoom()
+				if es.imgScroll != nil {
+					es.imgScroll.Offset = savedOffset
+					es.imgScroll.Refresh()
+				}
+			}
+			restoreView()
+			// Defeat any deferred re-fit triggered by the relayout above.
+			go fyne.Do(restoreView)
+
 			if repaired == 0 {
 				es.cleanStatusLabel.SetText("No tiny pure-color specks were detected.")
 				return
@@ -301,7 +422,14 @@ func (es *editWorkspaceState) applyZoom() {
 	es.canvasImg.SetMinSize(fyne.NewSize(w, h))
 	es.canvasImg.Refresh()
 	es.updateHealBrushScreenRadius()
-
+	// A zoom change invalidates the screen-space crop rectangle.
+	if es.cropOverlay != nil && es.cropHasSel {
+		es.cropOverlay.Reset()
+		es.cropHasSel = false
+		if es.cropStatusLabel != nil {
+			es.cropStatusLabel.SetText("Drag a rectangle over the image, then Apply Crop.")
+		}
+	}
 }
 
 func (es *editWorkspaceState) stepZoom(factor float64) {
@@ -459,7 +587,10 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 
 	es.healOverlay = newHealLayer()
 	es.healOverlay.Hide()
-	es.imgScroll = container.NewScroll(container.NewMax(es.canvasImg, es.healOverlay))
+	es.cropOverlay = newCropLayer()
+	es.cropOverlay.Hide()
+	es.cropOverlay.onChange = es.onCropChange
+	es.imgScroll = container.NewScroll(container.NewMax(es.canvasImg, es.healOverlay, es.cropOverlay))
 	es.imgScroll.SetMinSize(fyne.NewSize(400, 300))
 
 	// Zoom controls
@@ -548,6 +679,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 			}
 		}
 		fd.SetView(dialog.ListView)
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 
@@ -631,19 +763,50 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 	es.healStatusLabel.TextStyle = fyne.TextStyle{Italic: true}
 
 	healToggleBtn := widget.NewButton("Heal Tool: OFF", nil)
+	cropToggleBtn := widget.NewButton("Crop Tool: OFF", nil)
+
+	// Heal and crop are mutually exclusive interactions: enabling one disables
+	// the other so their overlays never both capture pointer events.
+	deactivateHeal := func() {
+		es.healActive = false
+		healToggleBtn.SetText("Heal Tool: OFF")
+		es.healOverlay.Hide()
+		es.healOverlay.Reset()
+		es.healStatusLabel.SetText("")
+	}
+	deactivateCrop := func() {
+		es.cropActive = false
+		cropToggleBtn.SetText("Crop Tool: OFF")
+		es.cropOverlay.Hide()
+		es.cropOverlay.Reset()
+		es.cropHasSel = false
+		es.cropStatusLabel.SetText("")
+	}
+
 	healToggleBtn.OnTapped = func() {
 		es.healActive = !es.healActive
 		if es.healActive {
+			deactivateCrop()
 			healToggleBtn.SetText("Heal Tool: ON")
 			es.healOverlay.Show()
 			es.healOverlay.Reset()
 			es.updateHealBrushScreenRadius()
 			es.healStatusLabel.SetText("Step 1: click source (sample area)")
 		} else {
-			healToggleBtn.SetText("Heal Tool: OFF")
-			es.healOverlay.Hide()
-			es.healOverlay.Reset()
-			es.healStatusLabel.SetText("")
+			deactivateHeal()
+		}
+	}
+	cropToggleBtn.OnTapped = func() {
+		es.cropActive = !es.cropActive
+		if es.cropActive {
+			deactivateHeal()
+			cropToggleBtn.SetText("Crop Tool: ON")
+			es.cropOverlay.Show()
+			es.cropOverlay.Reset()
+			es.cropHasSel = false
+			es.cropStatusLabel.SetText("Drag a rectangle over the image, then Apply Crop.")
+		} else {
+			deactivateCrop()
 		}
 	}
 
@@ -651,15 +814,21 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 		es.undoHeal()
 	})
 
-	es.cleanStatusLabel = widget.NewLabel("Run this after cross-channel clean to remove tiny pure-color specks.")
+	es.cleanStatusLabel = widget.NewLabel("Run this after cross-channel clean to remove tiny color specks and black dropout dots.")
 	es.cleanBlobSlider = widget.NewSlider(1, 100)
 	es.cleanBlobSlider.Step = 1
 	es.cleanBlobSlider.SetValue(25)
 	es.cleanIntensitySlider = widget.NewSlider(0, 100)
 	es.cleanIntensitySlider.Step = 1
 	es.cleanIntensitySlider.SetValue(50)
-	cleanBtn := widget.NewButton("Remove Color Specks", func() {
+	cleanBtn := widget.NewButton("Remove Color & Dark Specks", func() {
 		es.runColorSpeckClean()
+	})
+
+	es.cropStatusLabel = widget.NewLabel("")
+	es.cropStatusLabel.TextStyle = fyne.TextStyle{Italic: true}
+	applyCropBtn := widget.NewButton("Apply Crop", func() {
+		es.applyCrop()
 	})
 
 	es.healOverlay.onHealStroke = func(src fyne.Position, dsts []fyne.Position) {
@@ -710,7 +879,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 		sliderRow("Radius", es.sharpRadiusSlider),
 	))
 	cleanTab := container.NewTabItem("Clean", container.NewVBox(
-		widget.NewLabel("Targets small red, green, or blue cosmic-ray leftovers in the composed RGB image."),
+		widget.NewLabel("Targets small red, green, or blue cosmic-ray leftovers and near-black dropout dots in the composed RGB image."),
 		sliderRow("Max Blob Size", es.cleanBlobSlider),
 		sliderRow("Intensity", es.cleanIntensitySlider),
 		cleanBtn,
@@ -722,7 +891,13 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(im
 		sliderRow("Brush Size", es.healBrushSlider),
 		healUndoBtn,
 	))
-	tabs := container.NewAppTabs(levelsTab, curvesTab, sharpenTab, cleanTab, healTab)
+	cropTab := container.NewTabItem("Crop", container.NewVBox(
+		widget.NewLabel("Turn the tool on, drag a rectangle over the image, then apply. The cropped result becomes the new edit base."),
+		cropToggleBtn,
+		es.cropStatusLabel,
+		applyCropBtn,
+	))
+	tabs := container.NewAppTabs(levelsTab, curvesTab, sharpenTab, cleanTab, healTab, cropTab)
 	es.editTabs = tabs
 	es.cleanTab = cleanTab
 

@@ -16,7 +16,7 @@ import (
 
 // buildMosaicPreviewImageWithLevels renders a mosaic result to RGBA using the same
 // ApplyStretchParallel pipeline used throughout the rest of the application.
-func buildMosaicPreviewImageWithLevels(result *mosaic.Result, black, white, background, peak, scaledPeak float64, mode stretch.Mode) *image.RGBA {
+func buildMosaicPreviewImageWithLevels(result *mosaic.Result, black, white, background, peak, scaledPeak float64, mode stretch.Mode, mtfMidtone float64) *image.RGBA {
 	debuglog.Log(fmt.Sprintf("buildMosaicPreviewImage: start %dx%d", result.Width, result.Height))
 	img := &models.LoadedImage{
 		HDU: fitsio.HDU{
@@ -32,6 +32,7 @@ func buildMosaicPreviewImageWithLevels(result *mosaic.Result, black, white, back
 		Background: background,
 		Peak:       peak,
 		ScaledPeak: scaledPeak,
+		MTFMidtone: mtfMidtone,
 	}
 	debuglog.Log("buildMosaicPreviewImage: ApplyStretchParallel")
 	stretched, mask := processing.ApplyStretchParallel(img)
@@ -194,6 +195,8 @@ func modeNameForMode(m stretch.Mode) string {
 		return "Sqrt"
 	case stretch.HistEq:
 		return "HistEq"
+	case stretch.MTF:
+		return "MTF"
 	default:
 		return "Asinh"
 	}

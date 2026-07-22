@@ -1,9 +1,11 @@
 package mosaic
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 
@@ -93,6 +95,31 @@ func TestBuildExposureWeightingNormalizesToRate(t *testing.T) {
 		}
 		if math.Abs(float64(result.Weights[i]-210)) > 1e-6 {
 			t.Fatalf("weight[%d] = %v, want 210", i, result.Weights[i])
+		}
+	}
+}
+
+func TestBuildExposureWeightingPreservesCalibratedFlux(t *testing.T) {
+	// JWST-style calibrated frames (MJy/sr) are already absolute flux, not
+	// counts, so Exposure/ERR weighting must NOT divide them by EXPTIME the way
+	// it does for count data (see TestBuildExposureWeightingNormalizesToRate).
+	ref := makeInput("ref_cal.fits", 2, 2, filledPixels(2, 2, 100), headerWithCRPIX(10, 10))
+	ref.ExposureTime = 100
+	ref.PrimaryHeader.Cards["EXPTIME"] = "100"
+	ref.BUnit = "MJy/sr"
+	other := makeInput("other_cal.fits", 2, 2, filledPixels(2, 2, 100), headerWithCRPIX(10, 10))
+	other.ExposureTime = 110
+	other.PrimaryHeader.Cards["EXPTIME"] = "110"
+	other.BUnit = "MJy/sr"
+
+	result, err := Build([]Input{ref, other}, Options{Scale: 1, WeightingMode: WeightExposure})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+
+	for i := range result.Pixels {
+		if math.Abs(float64(result.Pixels[i]-100)) > 1e-4 {
+			t.Fatalf("pixel[%d] = %v, want 100 (calibrated flux must not be divided by EXPTIME)", i, result.Pixels[i])
 		}
 	}
 }
@@ -265,7 +292,7 @@ func TestNormalizeSurfaceBrightnessInputsScalesSCIAndERRByMappedArea(t *testing.
 			},
 		},
 	}
-	sci, errPix, err := prepareFramePixels(planned[0], Options{SurfaceBrightnessNorm: true}, 0, skyPlane{})
+	sci, errPix, _, err := prepareFramePixels(planned[0], Options{SurfaceBrightnessNorm: true}, 0, skyPlane{})
 	if err != nil {
 		t.Fatalf("prepareFramePixels returned error: %v", err)
 	}
@@ -280,6 +307,54 @@ func TestNormalizeSurfaceBrightnessInputsScalesSCIAndERRByMappedArea(t *testing.
 	}
 	if planned[0].input.HDU.Data.Pixels[0] != 8 || planned[0].input.ERRPixels[0] != 4 {
 		t.Fatal("prepareFramePixels mutated original input")
+	}
+}
+
+func TestDrizzlePixelWeightPrefersWeightPixels(t *testing.T) {
+	// ExposureTime 0 so the ERR fallback returns 1/(e*e) directly (the rate
+	// conversion branch is gated on exptime > 0).
+	p := plannedInput{input: Input{ERRPixels: []float32{2, 4}}}
+
+	// A present, positive WeightPixels value is used verbatim.
+	p.input.WeightPixels = []float32{5, 0}
+	if got := drizzlePixelWeight(p, 0, WeightERR); got != 5 {
+		t.Fatalf("weight[0] with WeightPixels = %v, want 5", got)
+	}
+	// A zero WeightPixels value falls through to the ERR-derived weight.
+	if got := drizzlePixelWeight(p, 1, WeightERR); got != 1.0/16.0 {
+		t.Fatalf("weight[1] zero-WHT fallback = %v, want %v", got, 1.0/16.0)
+	}
+	// A non-finite WeightPixels value also falls through.
+	p.input.WeightPixels = []float32{float32(math.NaN()), 4}
+	if got := drizzlePixelWeight(p, 0, WeightERR); got != 1.0/4.0 {
+		t.Fatalf("weight[0] NaN-WHT fallback = %v, want %v", got, 1.0/4.0)
+	}
+	// Nil WeightPixels leaves the pure-ERR behavior unchanged.
+	p.input.WeightPixels = nil
+	if got := drizzlePixelWeight(p, 0, WeightERR); got != 1.0/4.0 {
+		t.Fatalf("weight[0] nil WeightPixels = %v, want %v", got, 1.0/4.0)
+	}
+}
+
+func TestPrepareFramePixelsScalesWeightPixels(t *testing.T) {
+	planned := []plannedInput{
+		{
+			sourcePixelScale: 2, // area 4 → sbScale 0.25 → inverse-variance scale 16
+			input: Input{
+				HDU:          fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 1, Pixels: []float32{8, 8}}},
+				WeightPixels: []float32{4, 4},
+			},
+		},
+	}
+	_, _, wht, err := prepareFramePixels(planned[0], Options{SurfaceBrightnessNorm: true}, 0, skyPlane{})
+	if err != nil {
+		t.Fatalf("prepareFramePixels returned error: %v", err)
+	}
+	if got := wht[0]; got != 64 {
+		t.Fatalf("scaled WeightPixels = %v, want 64", got)
+	}
+	if planned[0].input.WeightPixels[0] != 4 {
+		t.Fatal("prepareFramePixels mutated original WeightPixels")
 	}
 }
 
@@ -306,6 +381,34 @@ func headerWithCRPIX(crpix1, crpix2 float64) fitsio.Header {
 		"CD2_1":  "0",
 		"CD2_2":  "1",
 	}}
+}
+
+func TestSortInputsByWCSDistanceKeepsSpatialLocationsTogether(t *testing.T) {
+	inputs := []Input{
+		makeInput("origin-1.fits", 100, 100, nil, headerWithCRPIX(50, 50)),
+		makeInput("bottom-1.fits", 100, 100, nil, headerWithCRPIX(50, -50)),
+		makeInput("right-1.fits", 100, 100, nil, headerWithCRPIX(-50, 50)),
+		makeInput("origin-2.fits", 100, 100, nil, headerWithCRPIX(50, 50)),
+		makeInput("bottom-2.fits", 100, 100, nil, headerWithCRPIX(50, -50)),
+		makeInput("right-2.fits", 100, 100, nil, headerWithCRPIX(-50, 50)),
+		makeInput("origin-3.fits", 100, 100, nil, headerWithCRPIX(50, 50)),
+		makeInput("bottom-3.fits", 100, 100, nil, headerWithCRPIX(50, -50)),
+		makeInput("right-3.fits", 100, 100, nil, headerWithCRPIX(-50, 50)),
+	}
+
+	SortInputsByWCSDistance(inputs, nil)
+	got := make([]string, len(inputs))
+	for i := range inputs {
+		got[i] = inputs[i].Path
+	}
+	want := []string{
+		"origin-1.fits", "origin-2.fits", "origin-3.fits",
+		"bottom-1.fits", "bottom-2.fits", "bottom-3.fits",
+		"right-1.fits", "right-2.fits", "right-3.fits",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sorted paths = %v, want %v", got, want)
+	}
 }
 
 func TestPropagateSameExposureAlignment(t *testing.T) {
@@ -414,6 +517,175 @@ func TestAlignInputsBySelectedStarsAppliesAffineRefinement(t *testing.T) {
 		if math.Hypot(x-refStars[i].X, y-refStars[i].Y) > 2.0 {
 			t.Fatalf("star %d remapped to (%.2f, %.2f), want near (%.2f, %.2f)", i, x, y, refStars[i].X, refStars[i].Y)
 		}
+	}
+}
+
+// TestAlignInputsByStarsIsDeterministic guards the whole multi-frame aligner
+// (not just the RANSAC solver) against run-to-run variation. The aligner aligns
+// frames concurrently and previously enqueued the results in goroutine-completion
+// order, which let the chain fallback pick a different intermediate per run and
+// produced a different mosaic. Every stage must now be deterministic, so running
+// the identical inputs twice must yield byte-identical results.
+func TestAlignInputsByStarsIsDeterministic(t *testing.T) {
+	refStars := []processing.Star{
+		{X: 60, Y: 60}, {X: 220, Y: 60}, {X: 380, Y: 60},
+		{X: 140, Y: 220}, {X: 300, Y: 220}, {X: 220, Y: 340},
+	}
+	refPixels := makeTestStarField(400, 400, refStars)
+	wcsHdr := func() fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "200", "CRPIX2": "200",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "0.0001", "CD1_2": "0", "CD2_1": "0", "CD2_2": "0.0001",
+		}}
+	}
+
+	// One reference plus several targets at small, distinct rotations+shifts so
+	// the concurrent primary pass runs many goroutines whose completion order is a
+	// race.
+	makeInputs := func() []Input {
+		inputs := []Input{makeInput("ref_flc.fits", 400, 400, refPixels, wcsHdr())}
+		offsets := []struct {
+			angleDeg, dx, dy float64
+		}{
+			{1.5, 2.0, -1.0}, {-2.0, -1.5, 2.5}, {0.8, -3.0, -2.0}, {2.5, 1.0, 1.5},
+		}
+		for k, o := range offsets {
+			ts := transformStarsAroundCenter(refStars, 200, 200, o.angleDeg*math.Pi/180, o.dx, o.dy)
+			px := makeTestStarField(400, 400, ts)
+			inputs = append(inputs, makeInput(fmt.Sprintf("target%d_flc.fits", k), 400, 400, px, wcsHdr()))
+		}
+		return inputs
+	}
+
+	first, err := AlignInputsByStarsWithMode(makeInputs(), 1, AlignmentModeTweakRegRScale, 2.0)
+	if err != nil {
+		t.Fatalf("first align returned error: %v", err)
+	}
+	// Guard against a vacuous pass: the test is only meaningful if alignment
+	// actually ran and produced transforms for the targets.
+	for i := 1; i < len(first); i++ {
+		if !first[i].Applied || !first[i].HasManualTransform {
+			t.Fatalf("target %d did not align (Applied=%v HasManualTransform=%v, err=%q); test would be vacuous",
+				i, first[i].Applied, first[i].HasManualTransform, first[i].Error)
+		}
+	}
+	// Run several more times; any nondeterminism (map iteration, goroutine order,
+	// unstable sort tie) tends to surface only intermittently, so repeat.
+	for run := 0; run < 8; run++ {
+		next, err := AlignInputsByStarsWithMode(makeInputs(), 1, AlignmentModeTweakRegRScale, 2.0)
+		if err != nil {
+			t.Fatalf("run %d align returned error: %v", run, err)
+		}
+		if len(next) != len(first) {
+			t.Fatalf("run %d produced %d results, want %d", run, len(next), len(first))
+		}
+		for i := range first {
+			if next[i] != first[i] {
+				t.Fatalf("run %d result[%d] differs:\n first: %+v\n  this: %+v", run, i, first[i], next[i])
+			}
+		}
+	}
+}
+
+// TestAlignInputsStreamingMatchesResident verifies the streaming alignment path
+// (metadata-only inputs whose pixels are reloaded on demand) produces exactly the
+// same result as the resident path (all pixels held in memory). Synthetic star
+// fields are written to temp FITS files and loaded both ways, so the test
+// exercises the real on-demand reload and the catalog-based TweakReg estimator.
+func TestAlignInputsStreamingMatchesResident(t *testing.T) {
+	refStars := []processing.Star{
+		{X: 60, Y: 60}, {X: 220, Y: 60}, {X: 380, Y: 60},
+		{X: 140, Y: 220}, {X: 300, Y: 220}, {X: 220, Y: 340},
+	}
+	wcsHdr := func() fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": "200", "CRPIX2": "200",
+			"CRVAL1": "100", "CRVAL2": "22",
+			"CD1_1": "0.0001", "CD1_2": "0", "CD2_1": "0", "CD2_2": "0.0001",
+		}}
+	}
+
+	dir := t.TempDir()
+	// Write one reference plus several rotated/shifted targets to temp FITS files.
+	type frame struct {
+		angleDeg, dx, dy float64
+	}
+	frames := []frame{{0, 0, 0}, {1.5, 2.0, -1.0}, {-2.0, -1.5, 2.5}, {0.8, -3.0, -2.0}}
+	// 600x600 float32 = ~1.4 MiB per frame, above LoadFileMetadata's small-data
+	// decode threshold, so metadata loads leave the pixels on disk and alignment
+	// genuinely streams them back on demand.
+	const dim = 600
+	var paths []string
+	for k, f := range frames {
+		stars := refStars
+		if k > 0 {
+			stars = transformStarsAroundCenter(refStars, 200, 200, f.angleDeg*math.Pi/180, f.dx, f.dy)
+		}
+		px := makeTestStarField(dim, dim, stars)
+		path := filepath.Join(dir, fmt.Sprintf("frame%d_flc.fits", k))
+		if err := fitsio.WriteFloat32Image(path, wcsHdr(), fitsio.ImageData{Width: dim, Height: dim, Pixels: px}); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+		paths = append(paths, path)
+	}
+
+	loadAll := func(loader func(string) ([]Input, error)) []Input {
+		var inputs []Input
+		for _, p := range paths {
+			ins, err := loader(p)
+			if err != nil {
+				t.Fatalf("load %s: %v", p, err)
+			}
+			inputs = append(inputs, ins...)
+		}
+		return inputs
+	}
+
+	resident := loadAll(LoadInputsFromPath)
+	streamed := loadAll(LoadInputsMetadataFromPath)
+
+	// Confirm the streaming inputs really hold no pixels (the memory win) but can
+	// still be reloaded (Path is set).
+	for i := range streamed {
+		if streamed[i].HDU.Data.Pixels != nil {
+			t.Fatalf("streamed input[%d] unexpectedly carries resident pixels", i)
+		}
+		if streamed[i].Path == "" {
+			t.Fatalf("streamed input[%d] has no Path to stream from", i)
+		}
+	}
+
+	mode := AlignmentModeTweakRegRScale
+	resResident, err := AlignInputsByStarsWithMode(resident, 1, mode, 2.0)
+	if err != nil {
+		t.Fatalf("align (resident) error: %v", err)
+	}
+	resStreamed, err := AlignInputsByStarsWithMode(streamed, 1, mode, 2.0)
+	if err != nil {
+		t.Fatalf("align (streamed) error: %v", err)
+	}
+
+	if len(resResident) != len(resStreamed) {
+		t.Fatalf("result count: resident %d, streamed %d", len(resResident), len(resStreamed))
+	}
+	for i := range resResident {
+		if resResident[i] != resStreamed[i] {
+			t.Fatalf("result[%d] differs between resident and streamed paths:\n resident: %+v\n streamed: %+v",
+				i, resResident[i], resStreamed[i])
+		}
+	}
+
+	// Guard against a vacuous pass: at least one target must have actually aligned,
+	// so the equivalence check covered the fitting math, not just failures.
+	aligned := 0
+	for i := 1; i < len(resStreamed); i++ {
+		if resStreamed[i].Applied && resStreamed[i].HasManualTransform {
+			aligned++
+		}
+	}
+	if aligned == 0 {
+		t.Fatal("no target aligned; equivalence held but the fit was not exercised")
 	}
 }
 
@@ -655,5 +927,32 @@ func TestComputeMatchedSkyOffsetsChainsAcrossMosaic(t *testing.T) {
 		if math.Abs(offsets[i]-want[i]) > 1e-6 {
 			t.Fatalf("offsets[%d] = %v, want %v (all offsets: %v)", i, offsets[i], want[i], offsets)
 		}
+	}
+}
+
+func TestBuildOutputHeaderUsesMetaSourceFilterNotWCSReference(t *testing.T) {
+	ref := Input{
+		Path:          "ref_astrometry.fits",
+		ReferenceOnly: true,
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F814W'", "INSTRUME": "'ACS'"}},
+		HDU:           fitsio.HDU{Header: headerWithCRPIX(3, 3)},
+	}
+	sci := Input{
+		Path:          "sci_f656n.fits",
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F656N'", "INSTRUME": "'WFC3'"}},
+		HDU:           fitsio.HDU{Header: headerWithCRPIX(3, 3)},
+	}
+
+	hdr := buildOutputHeader(ref, sci, 4, 4, 0, 0, 1, 1)
+
+	if got := fitsio.HeaderString(hdr, "FILTER"); got != "F656N" {
+		t.Fatalf("FILTER = %q, want F656N (from science input, not WCS reference)", got)
+	}
+	if got := fitsio.HeaderString(hdr, "INSTRUME"); got != "WFC3" {
+		t.Fatalf("INSTRUME = %q, want WFC3 (from science input, not WCS reference)", got)
+	}
+	// WCS geometry still anchored to ref.
+	if _, ok := hdr.Cards["CRPIX1"]; !ok {
+		t.Fatal("expected CRPIX1 to be carried over from ref")
 	}
 }

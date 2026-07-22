@@ -100,6 +100,31 @@ func TestCleanColorSpecksRGBAHighIntensityCatchesFainterBlob(t *testing.T) {
 	}
 }
 
+func TestCleanColorSpecksRGBARepairsDarkDropout(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 9, 9))
+	fillRGBA(img, color.RGBA{R: 120, G: 122, B: 118, A: 255})
+	img.SetRGBA(4, 4, color.RGBA{R: 4, G: 2, B: 6, A: 255})
+
+	cleaned, repaired := CleanColorSpecksRGBA(img, DefaultColorSpeckCleanConfig())
+	if repaired != 1 {
+		t.Fatalf("repaired = %d, want 1", repaired)
+	}
+	got := cleaned.RGBAAt(4, 4)
+	if got.R < 100 || got.G < 100 || got.B < 100 {
+		t.Fatalf("dark dropout not filled from background: %#v", got)
+	}
+}
+
+func TestCleanColorSpecksRGBAPreservesUniformlyDarkRegion(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 9, 9))
+	fillRGBA(img, color.RGBA{R: 10, G: 12, B: 9, A: 255})
+
+	_, repaired := CleanColorSpecksRGBA(img, DefaultColorSpeckCleanConfig())
+	if repaired != 0 {
+		t.Fatalf("repaired = %d, want 0 (dark region must be preserved)", repaired)
+	}
+}
+
 func fillRGBA(img *image.RGBA, c color.RGBA) {
 	b := img.Bounds()
 	for y := b.Min.Y; y < b.Max.Y; y++ {

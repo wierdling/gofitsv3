@@ -15,6 +15,7 @@ import (
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/instrument"
 	"gofitsv3/internal/processing"
 )
 
@@ -48,6 +49,15 @@ type Input struct {
 	// same dimensions as HDU.Data. Nil when the file has no ERR extension.
 	// Used as inverse-variance weights during drizzle: weight *= 1/err².
 	ERRPixels []float32
+	// SourcePath is the original multi-chip file this combined working input was
+	// generated from. Empty for ordinary inputs. Used for the display label,
+	// dedupe, project persistence, and locating the working/ directory.
+	SourcePath string
+	// WeightPixels holds the per-pixel drizzle weight from a combined working
+	// file's WHT extension, same dimensions as HDU.Data. When present it is used
+	// verbatim as the WeightERR pixel weight in place of the ERR-derived inverse
+	// variance. Nil for ordinary inputs.
+	WeightPixels []float32
 	// ReferenceOnly marks this input as a WCS anchor only. It participates in
 	// alignment and coordinate-system setup but its pixels are not drizzled into
 	// the output. Use this to align a new filter to a previously drizzled baseline.
@@ -75,6 +85,13 @@ func InputKey(input Input) string {
 }
 
 func InputLabel(input Input) string {
+	if input.SourcePath != "" {
+		name := filepath.Base(input.SourcePath)
+		if name == "" {
+			name = input.SourcePath
+		}
+		return name + " [comb]"
+	}
 	name := filepath.Base(input.Path)
 	if name == "" {
 		name = input.Path
@@ -83,6 +100,14 @@ func InputLabel(input Input) string {
 		return fmt.Sprintf("%s[sci,%d]", name, input.SCIExt)
 	}
 	return name
+}
+
+func alignmentInputFiles(inputs []Input) string {
+	files := make([]string, len(inputs))
+	for i := range inputs {
+		files[i] = fmt.Sprintf("%d=%s", i, InputKey(inputs[i]))
+	}
+	return strings.Join(files, ", ")
 }
 
 // CRMethod selects the cosmic-ray removal algorithm used during drizzle.
@@ -221,6 +246,20 @@ func normalizeAlignmentMode(mode AlignmentMode) AlignmentMode {
 	}
 }
 
+// AlignmentStreamsPixels reports whether the given alignment mode runs entirely
+// on streamed star catalogs (the TweakReg modes) and therefore does not require
+// every input's pixel arrays to be resident in memory. The legacy warp-based
+// modes (GeneralAffine, RScale) still warp full images and need resident pixels,
+// so callers should preload them before alignment.
+func AlignmentStreamsPixels(mode AlignmentMode) bool {
+	switch normalizeAlignmentMode(mode) {
+	case AlignmentModeTweakRegRScale, AlignmentModeTweakRegGeneral:
+		return true
+	default:
+		return false
+	}
+}
+
 type Options struct {
 	// Scale is the internal output/input pixel size ratio used directly when
 	// FinalScale is zero.  A value of 2.0 doubles the output dimensions.
@@ -235,8 +274,14 @@ type Options struct {
 	// on a 0.04 arcsec/px camera yields Scale = 2, doubling each dimension).
 	// If WCS plate scale cannot be determined, FinalScale is treated as Scale.
 	FinalScale float64
-	CRMethod   CRMethod
-	PixFrac    float64
+	// LockToReferenceFrame pins the output canvas to a ReferenceOnly baseline at
+	// inputs[0]: the output dimensions, origin, and plate scale become exactly the
+	// baseline's, so every channel drizzled against the same baseline is
+	// pixel-identical (same size, orientation, and scale) for compositing.
+	// When set, Scale is forced to 1 and FinalScale is ignored.
+	LockToReferenceFrame bool
+	CRMethod             CRMethod
+	PixFrac              float64
 	// SepKernel is the kernel used during the per-frame drizzle step.
 	// Defaults to KernelSquare when zero.
 	SepKernel DrizzleKernel
@@ -391,6 +436,15 @@ type plannedInput struct {
 	mapper           *processing.WCSMapper      // per-pixel WCS projection, used for drizzle
 	sourcePixelScale float64                    // source pixel size in reference-pixel units
 	statusIndex      int
+	// cancel, when non-nil, is polled at row intervals inside the per-frame
+	// drizzle kernels so a single large frame can be interrupted partway through
+	// rather than only between frames. Returns true once the build is cancelled.
+	cancel func() bool
+}
+
+// cancelled reports whether this frame's drizzle should abort early.
+func (p *plannedInput) cancelled() bool {
+	return p.cancel != nil && p.cancel()
 }
 
 // mapPixel projects a 0-indexed source pixel through the full WCS pipeline
@@ -406,6 +460,11 @@ func (p *plannedInput) mapPixel(x, y float64) (float64, float64) {
 		return rx, ry
 	}
 	return processing.ApplyAffineTransform(p.sourceToRef, x, y)
+}
+
+func (p *plannedInput) mapOutputPixel(x, y, originX, originY, scale float64) (float64, float64) {
+	refX, refY := p.mapPixel(x, y)
+	return (refX - originX) * scale, (refY - originY) * scale
 }
 
 // nativePlateScaleArcsec returns the native plate scale of the image described
@@ -428,6 +487,37 @@ func nativePlateScaleArcsec(header fitsio.Header) (float64, bool) {
 	return 0, false
 }
 
+// NativePlateScaleArcsec returns an input's native plate scale in arcseconds per
+// pixel. It prefers the WCS in the input's SCI header (CD matrix, then CDELT1)
+// and falls back to the nominal per-detector scale from the instrument table.
+// ok is false only when neither source yields a positive scale. Exported for the
+// UI's "match finest input" scale preset.
+func NativePlateScaleArcsec(in Input) (float64, bool) {
+	if ps, ok := nativePlateScaleArcsec(in.HDU.Header); ok && ps > 0 {
+		return ps, true
+	}
+	if info, ok := instrument.FromHeader(in.HDU.Header); ok && info.PixelScale > 0 {
+		return info.PixelScale, true
+	}
+	return 0, false
+}
+
+// referenceFrameDims returns the pixel dimensions of a baseline frame, preferring
+// the loaded image dimensions and falling back to the NAXIS1/NAXIS2 header cards
+// (which stay valid after the pixel buffer is freed for streaming). Returns
+// (0, 0) when neither source is available.
+func referenceFrameDims(in Input) (int, int) {
+	if in.HDU.Data.Width > 0 && in.HDU.Data.Height > 0 {
+		return in.HDU.Data.Width, in.HDU.Data.Height
+	}
+	w, okW := fitsio.HeaderFloat(in.HDU.Header, "NAXIS1")
+	h, okH := fitsio.HeaderFloat(in.HDU.Header, "NAXIS2")
+	if okW && okH {
+		return int(w), int(h)
+	}
+	return 0, 0
+}
+
 func Build(inputs []Input, options Options) (*Result, error) {
 	debuglog.Log(fmt.Sprintf("Build: starting drizzle, %d inputs", len(inputs)))
 	defer debuglog.Log("Build: finished")
@@ -436,10 +526,23 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	}
 	logMemStats("before planning")
 
-	// Resolve FinalScale (arcsec/pixel) → internal Scale multiplier.
-	// Use the same WCS anchor that will be used for the output header, so a
-	// ReferenceOnly baseline and same-scale filter runs produce matching grids.
-	if options.FinalScale > 0 {
+	// Lock the output grid to a ReferenceOnly baseline at inputs[0]: the baseline
+	// defines the exact output canvas (dimensions, origin, plate scale), so every
+	// channel drizzled against the same baseline is pixel-identical. This forces
+	// Scale = 1 (the baseline already encodes the target plate scale) and pins the
+	// canvas bounds below, overriding FinalScale.
+	lockFrame := options.LockToReferenceFrame && !inputs[0].Excluded && inputs[0].ReferenceOnly
+	var lockW, lockH int
+	if lockFrame {
+		lockW, lockH = referenceFrameDims(inputs[0])
+		if lockW < 1 || lockH < 1 {
+			return nil, fmt.Errorf("lock to reference frame: baseline %s has no readable dimensions", InputKey(inputs[0]))
+		}
+		options.Scale = 1
+	} else if options.FinalScale > 0 {
+		// Resolve FinalScale (arcsec/pixel) → internal Scale multiplier.
+		// Use the same WCS anchor that will be used for the output header, so a
+		// ReferenceOnly baseline and same-scale filter runs produce matching grids.
 		ref := wcsReferenceInput(inputs)
 		if ps, ok := nativePlateScaleArcsec(ref.HDU.Header); ok && ps > 0 {
 			options.Scale = ps / options.FinalScale
@@ -466,6 +569,22 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		return nil, err
 	}
 
+	// When locking to the baseline frame, discard the data-derived footprint and
+	// pin the canvas to the baseline's exact pixel grid (origin 0,0 at Scale 1),
+	// so the output header WCS equals the baseline's and dimensions match exactly.
+	if lockFrame {
+		minX, minY = 0, 0
+		maxX, maxY = float64(lockW-1), float64(lockH-1)
+	}
+
+	// Let the heavy per-frame drizzle kernels (and the streamed CR median model)
+	// poll for cancellation mid-frame so a single large frame doesn't have to
+	// finish before the build aborts.
+	cancelFn := func() bool { return options.cancelled() != nil }
+	for i := range planned {
+		planned[i].cancel = cancelFn
+	}
+
 	width := int(math.Ceil((maxX - minX + 1) * options.Scale))
 	height := int(math.Ceil((maxY - minY + 1) * options.Scale))
 	debuglog.Log(fmt.Sprintf("Build: planInputs done, %d planned inputs, output canvas %dx%d", len(planned), width, height))
@@ -474,6 +593,16 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	}
 	if height < 1 {
 		height = 1
+	}
+	// A bad WCS solution or a misaligned frame's manual transform can push
+	// minX/minY/maxX/maxY far outside the real mosaic footprint, producing a
+	// canvas so large the output allocation crashes the process with an OOM
+	// panic instead of a reportable error. Reject implausible canvases here,
+	// at the single chokepoint where width/height are derived from the
+	// per-frame bounds.
+	const maxCanvasPixels = 500_000_000 // ~2GB per float32 buffer
+	if int64(width)*int64(height) > maxCanvasPixels {
+		return nil, fmt.Errorf("output canvas too large (%dx%d = %d pixels); check for a misaligned or badly-WCS'd input frame", width, height, int64(width)*int64(height))
 	}
 
 	includedCount := 0
@@ -550,7 +679,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		if err := os.MkdirAll(options.DebugOutputDir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create debug output directory: %w", err)
 		}
-		debugBaseHeader = buildOutputHeader(wcsReferenceInput(inputs), width, height, minX, minY, options.Scale, 1)
+		debugBaseHeader = buildOutputHeader(wcsReferenceInput(inputs), firstDataInput(inputs), width, height, minX, minY, options.Scale, 1)
 	}
 
 	for i := range planned {
@@ -563,12 +692,14 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		options.reportProgress("Drizzling", finalSlot, len(dataPlanned))
 		finalSlot++
 		debuglog.Log(fmt.Sprintf("Build: final drizzle frame %d (%s)", finalSlot, InputKey(planned[i].input)))
-		pixels, errPix, perr := prepareFramePixels(planned[i], options, skyOffset[i], skyPlanes[i])
+		pixels, errPix, whtPix, perr := prepareFramePixels(planned[i], options, skyOffset[i], skyPlanes[i])
 		if perr != nil {
 			return nil, fmt.Errorf("load frame %s: %w", InputKey(planned[i].input), perr)
 		}
-		// drizzlePlannedInput reads ERR weights from planned[i].input.ERRPixels.
+		// drizzlePlannedInput reads weights from planned[i].input.WeightPixels
+		// (combined working frames) or ERRPixels (ordinary frames).
 		planned[i].input.ERRPixels = errPix
+		planned[i].input.WeightPixels = whtPix
 		var crMask BitMask
 		cleaned := false
 
@@ -626,6 +757,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		// stays at roughly one input frame plus the output accumulators.
 		pixels = nil
 		planned[i].input.ERRPixels = nil
+		planned[i].input.WeightPixels = nil
 		if finalSlot%8 == 0 {
 			logMemStats(fmt.Sprintf("drizzled %d/%d frames", finalSlot, len(dataPlanned)))
 		}
@@ -681,7 +813,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		OriginX:             minX,
 		OriginY:             minY,
 		Scale:               options.Scale,
-		OutputHeader:        buildOutputHeader(wcsReferenceInput(inputs), width, height, minX, minY, options.Scale, includedCount),
+		OutputHeader:        buildOutputHeader(wcsReferenceInput(inputs), firstDataInput(inputs), width, height, minX, minY, options.Scale, includedCount),
 		Inputs:              statuses,
 		InputFootprints:     footprints,
 		InputFootprintPaths: footprintPaths,
@@ -696,11 +828,11 @@ func DrizzleOrder(inputs []Input) []int {
 }
 
 // SortInputsByWCSDistance reorders inputs (and the parallel statuses slice,
-// if provided and the same length) in-place, grouping chips from the same
-// source file together.  File groups are ordered by the WCS distance of their
-// lowest-SCIExt chip from inputs[0]; chips within each group are ordered by
-// SCIExt so [sci,1] always precedes [sci,2].  inputs[0]'s file group always
-// comes first and inputs[0] itself is always the first element.
+// if provided and the same length) in-place. Chips from the same source file
+// are kept together, and nearby file groups are clustered into one spatial
+// location group. Location groups are then ordered by mosaic position so
+// adjacent footprints do not get interleaved by radial distance. Chips within
+// a file are ordered by SCIExt so [sci,1] precedes [sci,2].
 // If statuses is nil or a different length it is ignored.
 func SortInputsByWCSDistance(inputs []Input, statuses []InputStatus) {
 	if len(inputs) < 2 {
@@ -713,7 +845,9 @@ func SortInputsByWCSDistance(inputs []Input, statuses []InputStatus) {
 	type fileGroup struct {
 		path    string
 		indices []int // original indices into inputs
-		dist    float64
+		x       float64
+		y       float64
+		hasPos  bool
 	}
 	var groups []fileGroup
 	groupIdx := make(map[string]int, len(inputs))
@@ -735,34 +869,104 @@ func SortInputsByWCSDistance(inputs []Input, statuses []InputStatus) {
 		})
 	}
 
-	// Compute each group's WCS distance once. Do not do this in the sort
+	// Compute each group's WCS position once. Do not do this in the sort
 	// comparator; WCS projection is substantially more expensive than compare.
 	for g := range groups {
 		if groups[g].path == ref.Path {
-			groups[g].dist = -1
+			groups[g].x = float64(ref.HDU.Data.Width) / 2
+			groups[g].y = float64(ref.HDU.Data.Height) / 2
+			groups[g].hasPos = true
 			continue
 		}
 		rep := inputs[groups[g].indices[0]]
-		d, err := processing.CenterDistInRefPixels(
-			rep.HDU.Header, rep.HDU.Data.Width, rep.HDU.Data.Height,
-			ref.HDU.Header, ref.HDU.Data.Width, ref.HDU.Data.Height,
-		)
-		if err != nil {
-			d = math.MaxFloat64
+		mapper, err := processing.NewWCSMapper(rep.HDU.Header, nil, nil, ref.HDU.Header, nil, nil)
+		if err == nil {
+			groups[g].x, groups[g].y = mapper.MapPixel(float64(rep.HDU.Data.Width)/2, float64(rep.HDU.Data.Height)/2)
+			groups[g].hasPos = true
 		}
-		groups[g].dist = d
 	}
 
-	// Sort file groups by WCS distance of their representative chip from ref.
-	// The group containing inputs[0] always sorts first.
-	sort.SliceStable(groups, func(a, b int) bool {
-		return groups[a].dist < groups[b].dist
+	// A location is a repeated pointing, not merely a file group. A quarter of
+	// the reference's short dimension tolerates normal dithers while keeping
+	// neighboring tiled footprints separate.
+	locationRadius := 0.25 * math.Min(float64(ref.HDU.Data.Width), float64(ref.HDU.Data.Height))
+	if locationRadius <= 0 {
+		locationRadius = 1
+	}
+	type locationGroup struct {
+		indices []int
+		x, y    float64
+		valid   bool
+		ref     bool
+	}
+	var locations []locationGroup
+	for gi := range groups {
+		if !groups[gi].hasPos {
+			locations = append(locations, locationGroup{indices: []int{gi}})
+			continue
+		}
+		found := -1
+		for li := range locations {
+			if !locations[li].valid {
+				continue
+			}
+			if math.Hypot(groups[gi].x-locations[li].x, groups[gi].y-locations[li].y) <= locationRadius {
+				found = li
+				break
+			}
+		}
+		if found < 0 {
+			locations = append(locations, locationGroup{indices: []int{gi}, x: groups[gi].x, y: groups[gi].y, valid: true})
+			continue
+		}
+		locations[found].indices = append(locations[found].indices, gi)
+	}
+
+	// Stable location ordering keeps the reference location first, then walks
+	// vertically displaced locations before horizontal-only locations. This
+	// matches the common mosaic layout where exposures continue underneath the
+	// reference before the next column to its right. Unknown WCS groups remain
+	// at the end in their original order.
+	refY := float64(ref.HDU.Data.Height) / 2
+	for li := range locations {
+		for _, gi := range locations[li].indices {
+			for _, origIdx := range groups[gi].indices {
+				locations[li].ref = locations[li].ref || origIdx == 0
+			}
+		}
+	}
+	sort.SliceStable(locations, func(a, b int) bool {
+		if locations[a].valid != locations[b].valid {
+			return locations[a].valid
+		}
+		if !locations[a].valid {
+			return false
+		}
+		if locations[a].ref != locations[b].ref {
+			return locations[a].ref
+		}
+		axis := func(location locationGroup) int {
+			if math.Abs(location.y-refY) > locationRadius {
+				return 1
+			}
+			return 2
+		}
+		aAxis, bAxis := axis(locations[a]), axis(locations[b])
+		if aAxis != bAxis {
+			return aAxis < bAxis
+		}
+		if aAxis == 1 && locations[a].y != locations[b].y {
+			return locations[a].y < locations[b].y
+		}
+		return locations[a].x < locations[b].x
 	})
 
 	// Flatten into a flat index order derived from the sorted groups.
 	flatIdx := make([]int, 0, len(inputs))
-	for _, g := range groups {
-		flatIdx = append(flatIdx, g.indices...)
+	for _, location := range locations {
+		for _, gi := range location.indices {
+			flatIdx = append(flatIdx, groups[gi].indices...)
+		}
 	}
 	// Ensure the original inputs[0] is literally first (handles edge case where
 	// another chip of the same file has a lower SCIExt than the reference).
@@ -883,7 +1087,7 @@ func framesMayOverlap(a, b Input) bool {
 }
 
 func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode, searchRadiusArcsec float64, progress ...AlignProgress) ([]StarAlignmentResult, error) {
-	debuglog.Log("AlignInputsByStarsWithMode: starting")
+	debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: starting files=[%s]", alignmentInputFiles(inputs)))
 	defer debuglog.Log("AlignInputsByStarsWithMode: finished")
 	var prog AlignProgress
 	if len(progress) > 0 {
@@ -944,12 +1148,6 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			aligned[r] = true
 		}
 	}
-	queue := make([]int, 0, numRefs)
-	for r := 0; r < numRefs; r++ {
-		if !inputs[r].Excluded {
-			queue = append(queue, r)
-		}
-	}
 	lastErr := make([]string, len(inputs))
 	ordered := sortedByDistFromRef(inputs)
 
@@ -961,6 +1159,13 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		fitgeom = "general"
 	}
 
+	// Build every input's star catalog up front, streaming pixels from disk so
+	// the whole dataset never needs to be resident at once. All downstream
+	// alignment (primary TweakReg fit, chain fallback, bundle adjustment) runs on
+	// these catalogs; pixels are reloaded on demand only for the legacy warp modes
+	// and the alignment debug hook.
+	catalogs := extractStarCatalogsForAlignment(inputs)
+
 	type refCache struct {
 		input  Input
 		stars  []processing.Star
@@ -971,9 +1176,8 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	refCaches := make([]refCache, numRefs)
 	refCaches[0] = refCache{input: inputs[0], hasWCS: true}
 	if isTweakReg {
-		refCaches[0].stars = processing.ExtractAndLimitStars(
-			inputs[0].HDU.Data.Pixels, inputs[0].HDU.Data.Width, inputs[0].HDU.Data.Height, 4.0, 3, 200)
-		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[0] extracted %d stars", len(refCaches[0].stars)))
+		refCaches[0].stars = catalogs[0]
+		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: reference=%s has %d stars", InputKey(refCaches[0].input), len(refCaches[0].stars)))
 	}
 	for r := 1; r < numRefs; r++ {
 		if inputs[r].Excluded {
@@ -983,15 +1187,14 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
 		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
 		if err0 != nil || err1 != nil {
-			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[%d] WCS error: %v / %v", r, err0, err1))
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: reference=%s WCS error: %v / %v", InputKey(inputs[r]), err0, err1))
 			refCaches[r] = refCache{input: inputs[r]}
 			continue
 		}
 		rc := refCache{input: inputs[r], w0toR: w0toR, wRto0: wRto0, hasWCS: true}
 		if isTweakReg {
-			rc.stars = processing.ExtractAndLimitStars(
-				inputs[r].HDU.Data.Pixels, inputs[r].HDU.Data.Width, inputs[r].HDU.Data.Height, 4.0, 3, 200)
-			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: ref[%d] extracted %d stars", r, len(rc.stars)))
+			rc.stars = catalogs[r]
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: reference=%s has %d stars", InputKey(rc.input), len(rc.stars)))
 		}
 		refCaches[r] = rc
 	}
@@ -1008,11 +1211,14 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	}
 
 	alignOneToRef := func(i int) alignOneResult {
+		var attemptErrors []string
 		for r := 0; r < numRefs; r++ {
 			rc := refCaches[r]
 			if !rc.hasWCS {
+				attemptErrors = append(attemptErrors, fmt.Sprintf("reference %s has no usable WCS", InputKey(rc.input)))
 				continue
 			}
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: matching source=%s reference=%s mode=%s", InputKey(inputs[i]), InputKey(rc.input), fitgeom))
 			var (
 				refinement processing.AffineTransform
 				stats      processing.AlignStats
@@ -1028,19 +1234,40 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 					err = fmt.Errorf("WCSMapper: %v", mapErr)
 					break
 				}
-				refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
-					inputs[i].HDU.Data.Pixels,
-					inputs[i].HDU.Data.Width,
-					inputs[i].HDU.Data.Height,
-					mapper,
-					rc.input.HDU.Data.Pixels,
-					rc.stars,
-					rc.input.HDU.Data.Width,
-					rc.input.HDU.Data.Height,
-					rc.input.HDU.Header,
-					searchRadiusArcsec,
-					fitgeom,
-				)
+				if processing.AlignmentDebugHook != nil {
+					// Debug visualization needs the actual pixels; reload the pair
+					// on demand so the common (non-debug) path stays pixel-free.
+					srcPix, _, _, _, srcErr := resolveFramePixels(inputs[i], Options{})
+					refPix, _, _, _, refErr := resolveFramePixels(rc.input, Options{})
+					if srcErr != nil || refErr != nil {
+						err = fmt.Errorf("debug pixel reload: %v / %v", srcErr, refErr)
+						break
+					}
+					refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
+						srcPix,
+						inputs[i].HDU.Data.Width,
+						inputs[i].HDU.Data.Height,
+						mapper,
+						refPix,
+						rc.stars,
+						rc.input.HDU.Data.Width,
+						rc.input.HDU.Data.Height,
+						rc.input.HDU.Header,
+						searchRadiusArcsec,
+						fitgeom,
+					)
+				} else {
+					refinement, stats, err = processing.EstimateTweakRegAlignmentFromCatalogs(
+						catalogs[i],
+						mapper,
+						rc.stars,
+						rc.input.HDU.Data.Width,
+						rc.input.HDU.Data.Height,
+						rc.input.HDU.Header,
+						searchRadiusArcsec,
+						fitgeom,
+					)
+				}
 			case AlignmentModeRScale:
 				refinement, err = processing.EstimateRScaleAfterWCS(
 					inputs[i].HDU.Data.Pixels, inputs[i].HDU.Data.Width, inputs[i].HDU.Data.Height, inputs[i].HDU.Header,
@@ -1055,161 +1282,293 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				)
 			}
 			if err != nil {
-				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: input[%d] vs ref[%d]: %v", i, r, err))
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: match source=%s reference=%s: %v", InputKey(inputs[i]), InputKey(rc.input), err))
+				attemptErrors = append(attemptErrors, fmt.Sprintf("reference %s: %v", InputKey(rc.input), err))
 				continue
 			}
 			if r > 0 {
 				refinement = processing.ComposeAffineTransforms(rc.wRto0,
 					processing.ComposeAffineTransforms(refinement, rc.w0toR))
 			}
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: direct-aligned source=%s reference=%s matched=%d support=%d rms=%.3f max=%.3f transform=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), InputKey(rc.input), stats.MatchedStars, stats.GlobalInliers, stats.RMS, stats.MaxError, refinement.A, refinement.B, refinement.C, refinement.D, refinement.E, refinement.F))
 			return alignOneResult{i: i, refinement: refinement, stats: stats, ok: true}
 		}
-		return alignOneResult{i: i, errMsg: lastErr[i]}
+		return alignOneResult{i: i, errMsg: strings.Join(attemptErrors, "; ")}
 	}
 
-	// triedChain records (intermediate, image) pairs already attempted in the
-	// chain fallback so a genuinely-unalignable image is not re-matched against
-	// every aligned intermediate — the O(aligned × unaligned) blow-up that made
-	// auto-alignment hang on large, partially-overlapping mosaics.
-	triedChain := make(map[[2]int]bool)
-
-	// starCatalog caches each input's extracted star catalog so the chain
-	// fallback matches against pre-extracted catalogs (cheap, no image warp and
-	// no repeated extraction) instead of re-warping + re-extracting per pair.
-	starCatalog := make(map[int][]processing.Star)
+	// getStars returns an input's pre-extracted catalog (built once, up front, via
+	// streaming). The chain fallback matches against these catalogs — no image
+	// warp and no repeated extraction.
 	getStars := func(idx int) []processing.Star {
-		if s, ok := starCatalog[idx]; ok {
-			return s
-		}
-		s := processing.ExtractAndLimitStars(
-			inputs[idx].HDU.Data.Pixels, inputs[idx].HDU.Data.Width, inputs[idx].HDU.Data.Height, 4.0, 3, 200)
-		starCatalog[idx] = s
-		return s
+		return catalogs[idx]
 	}
 
-	primaryPassDone := false
-	for len(queue) > 0 {
+	// mapperCache caches each input's WCS mapper into inputs[0] pixel space.
+	type mapperEntry struct {
+		m  *processing.WCSMapper
+		ok bool
+	}
+	mapperCache := make(map[int]mapperEntry)
+	getMapper := func(idx int) (*processing.WCSMapper, bool) {
+		if e, seen := mapperCache[idx]; seen {
+			return e.m, e.ok
+		}
+		m, err := processing.NewWCSMapper(
+			inputs[idx].HDU.Header, inputs[idx].D2IX, inputs[idx].D2IY,
+			inputs[0].HDU.Header, inputs[0].D2IX, inputs[0].D2IY,
+		)
+		e := mapperEntry{m: m, ok: err == nil}
+		mapperCache[idx] = e
+		return e.m, e.ok
+	}
+	// projectRaw maps a frame's catalog into inputs[0] pixel space using only its
+	// WCS placement (mapper + base offset), i.e. before any residual correction —
+	// the "projected source" role for a residual fit.
+	projectRaw := func(idx int) ([]processing.Star, bool) {
+		m, ok := getMapper(idx)
+		if !ok {
+			return nil, false
+		}
+		src := getStars(idx)
+		out := make([]processing.Star, len(src))
+		for k, s := range src {
+			rx, ry := m.MapPixel(s.X, s.Y)
+			out[k] = processing.Star{X: rx + inputs[idx].OffsetX, Y: ry + inputs[idx].OffsetY, Flux: s.Flux}
+		}
+		return out, true
+	}
+	// projectCorrected maps an already-aligned frame's catalog into inputs[0] pixel
+	// space using its FULL solution (mapper + offset + ManualTransform), exactly as
+	// plannedInput.mapPixel does at render. Chaining off this (not the raw WCS
+	// placement) propagates the intermediate's own residual into the new frame.
+	projectCorrected := func(idx int) ([]processing.Star, bool) {
+		m, ok := getMapper(idx)
+		if !ok {
+			return nil, false
+		}
+		src := getStars(idx)
+		// Use the computed solution once it exists; otherwise fall back to the
+		// frame's accepted placement (the path designated references take, since
+		// their results entry is only filled at the very end).
+		offX, offY := inputs[idx].OffsetX, inputs[idx].OffsetY
+		mt, hasMT := inputs[idx].ManualTransform, inputs[idx].HasManualTransform
+		if results[idx].Applied {
+			offX, offY = results[idx].OffsetX, results[idx].OffsetY
+			mt, hasMT = results[idx].ManualTransform, results[idx].HasManualTransform
+		}
+		out := make([]processing.Star, len(src))
+		for k, s := range src {
+			rx, ry := m.MapPixel(s.X, s.Y)
+			rx += offX
+			ry += offY
+			if hasMT {
+				rx, ry = processing.ApplyAffineTransform(mt, rx, ry)
+			}
+			out[k] = processing.Star{X: rx, Y: ry, Flux: s.Flux}
+		}
+		return out, true
+	}
+
+	refW := inputs[0].HDU.Data.Width
+	refH := inputs[0].HDU.Data.Height
+	chainSearchRadiusPx := 30.0
+	if ps, ok := nativePlateScaleArcsec(inputs[0].HDU.Header); ok && ps > 0 {
+		chainSearchRadiusPx = searchRadiusArcsec / ps
+	}
+
+	// --- Primary pass: align every non-reference frame directly to a designated
+	// reference, concurrently. alignOneToRef tries all references internally, and
+	// results are stored by index, so goroutine completion order cannot affect the
+	// outcome.
+	var toAlign []int
+	for _, i := range ordered {
+		if !aligned[i] && !inputs[i].Excluded {
+			toAlign = append(toAlign, i)
+		}
+	}
+	if len(toAlign) > 0 {
+		prog.report(0, len(toAlign))
+		ch := make(chan alignOneResult, len(toAlign))
+		sem := make(chan struct{}, runtime.NumCPU())
+		var wg sync.WaitGroup
+		for _, i := range toAlign {
+			if prog.cancelled() {
+				break
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				ch <- alignOneToRef(i)
+			}(i)
+		}
+		wg.Wait()
+		close(ch)
 		if prog.cancelled() {
 			return nil, ErrCancelled
 		}
-		refIdx := queue[0]
-		queue = queue[1:]
+		done := 0
+		for r := range ch {
+			done++
+			prog.report(done, len(toAlign))
+			if r.ok {
+				results[r.i] = StarAlignmentResult{
+					OffsetX:            inputs[r.i].OffsetX,
+					OffsetY:            inputs[r.i].OffsetY,
+					ManualTransform:    r.refinement,
+					HasManualTransform: true,
+					Applied:            true,
+					MatchedStars:       r.stats.MatchedStars,
+					RMS:                r.stats.RMS,
+					MaxError:           r.stats.MaxError,
+				}
+				aligned[r.i] = true
+			} else {
+				lastErr[r.i] = r.errMsg
+			}
+		}
+	}
 
-		if refIdx < numRefs {
-			// Designated reference: run (or re-use) the full multi-ref TweakReg pass.
-			// Only run once — alignOneToRef already tries every reference internally.
-			if primaryPassDone {
+	// --- Chain fallback: frames that did not align directly to a reference are
+	// aligned to an already-aligned intermediate. Each frame fits a FULL residual
+	// (rscale/general, including rotation/scale — not the old translation-only
+	// correction) against the intermediate's fully-corrected catalog, and chooses
+	// the intermediate that corroborates with the most catalog stars (ties broken
+	// by lower RMS, then lower index — all deterministic). Iterated to a fixed
+	// point so a frame aligned in one pass can be an intermediate in the next.
+	//
+	// evaluated memoizes (frame, intermediate) pairs already fit-attempted: an
+	// intermediate's solution is fixed once set, so a failed pair never succeeds
+	// later, which keeps the total work bounded (≈ unaligned × aligned, pruned by
+	// framesMayOverlap) instead of re-fitting every pass.
+	evaluated := make(map[[2]int]bool)
+	for progressed := true; progressed; {
+		progressed = false
+		for _, i := range ordered {
+			if aligned[i] || inputs[i].Excluded {
 				continue
 			}
-			primaryPassDone = true
-			// Collect unaligned inputs and run them concurrently against the reference.
-			var toAlign []int
-			for _, i := range ordered {
-				if !aligned[i] && !inputs[i].Excluded {
-					toAlign = append(toAlign, i)
-				}
-			}
-			if len(toAlign) == 0 {
-				continue
-			}
-
-			prog.report(0, len(toAlign))
-			ch := make(chan alignOneResult, len(toAlign))
-			sem := make(chan struct{}, runtime.NumCPU())
-			var wg sync.WaitGroup
-			for _, i := range toAlign {
-				if prog.cancelled() {
-					break
-				}
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(i int) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					ch <- alignOneToRef(i)
-				}(i)
-			}
-			wg.Wait()
-			close(ch)
-
 			if prog.cancelled() {
 				return nil, ErrCancelled
 			}
-
-			done := 0
-			for r := range ch {
-				done++
-				prog.report(done, len(toAlign))
-				if r.ok {
-					results[r.i] = StarAlignmentResult{
-						OffsetX:            inputs[r.i].OffsetX,
-						OffsetY:            inputs[r.i].OffsetY,
-						ManualTransform:    r.refinement,
-						HasManualTransform: true,
-						Applied:            true,
-						MatchedStars:       r.stats.MatchedStars,
-						RMS:                r.stats.RMS,
-						MaxError:           r.stats.MaxError,
-					}
-					aligned[r.i] = true
-					queue = append(queue, r.i)
-				} else {
-					lastErr[r.i] = r.errMsg
+			srcProj, ok := projectRaw(i)
+			if !ok {
+				continue
+			}
+			bestJ := -1
+			bestSupport := -1
+			bestRMS := math.Inf(1)
+			var bestT processing.AffineTransform
+			var bestStats processing.AlignStats
+			attemptedCandidates := 0
+			for _, j := range ordered {
+				if j == i || !aligned[j] || !results[j].Applied || inputs[j].Excluded {
+					continue
+				}
+				// Chips of the same exposure are rigid and barely overlap; never
+				// star-match them — propagateSameExposureAlignment handles siblings.
+				if inputs[i].Path == inputs[j].Path {
+					continue
+				}
+				if evaluated[[2]int{i, j}] {
+					continue
+				}
+				evaluated[[2]int{i, j}] = true
+				if !framesMayOverlap(inputs[i], inputs[j]) {
+					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain skip source=%s reference=%s reason=no WCS-footprint overlap", InputKey(inputs[i]), InputKey(inputs[j])))
+					continue
+				}
+				intProj, ok := projectCorrected(j)
+				if !ok {
+					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain skip source=%s reference=%s reason=reference projection unavailable", InputKey(inputs[i]), InputKey(inputs[j])))
+					continue
+				}
+				attemptedCandidates++
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: matching source=%s reference=%s mode=%s (chain fallback) source-stars=%d reference-stars=%d search-radius=%.2f", InputKey(inputs[i]), InputKey(inputs[j]), fitgeom, len(srcProj), len(intProj), chainSearchRadiusPx))
+				t, stats, err := processing.FitCatalogResidual(srcProj, intProj, refW, refH, chainSearchRadiusPx, fitgeom)
+				if err != nil {
+					lastErr[i] = fmt.Sprintf("chain via %s: %v", InputKey(inputs[j]), err)
+					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain match failed source=%s reference=%s: %v", InputKey(inputs[i]), InputKey(inputs[j]), err))
+					continue
+				}
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain candidate source=%s reference=%s matched=%d support=%d rms=%.3f max=%.3f transform=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), InputKey(inputs[j]), stats.MatchedStars, stats.GlobalInliers, stats.RMS, stats.MaxError, t.A, t.B, t.C, t.D, t.E, t.F))
+				if stats.GlobalInliers > bestSupport ||
+					(stats.GlobalInliers == bestSupport && stats.RMS < bestRMS) {
+					bestJ = j
+					bestSupport = stats.GlobalInliers
+					bestRMS = stats.RMS
+					bestT = t
+					bestStats = stats
 				}
 			}
-		} else {
-			// Chain fallback: translate unaligned images against an already-aligned intermediate.
-			// (refIdx here is always a non-reference intermediate, never a designated reference.)
-			for _, i := range ordered {
-				if aligned[i] || inputs[i].Excluded {
-					continue
-				}
-				if prog.cancelled() {
-					return nil, ErrCancelled
-				}
-				// Skip pairs already attempted, and pairs whose WCS footprints
-				// cannot overlap (cheap center-distance test, no image warp). For
-				// a mosaic most intermediate/image pairs are far apart, so this
-				// avoids the expensive warp+star-match on pairs that can never align.
-				if triedChain[[2]int{refIdx, i}] {
-					continue
-				}
-				triedChain[[2]int{refIdx, i}] = true
-				// Chips of the same exposure (same file, different SCIExt) are rigid
-				// and barely overlap each other; never star-match them across chips —
-				// propagateSameExposureAlignment gives the sibling its solution later.
-				if inputs[i].Path == inputs[refIdx].Path {
-					continue
-				}
-				if !framesMayOverlap(inputs[i], inputs[refIdx]) {
-					continue
-				}
-				// Catalog-based residual translation against the already-aligned
-				// intermediate: projects cached star catalogs through the WCS, no
-				// full-image warp or re-extraction (which previously made this
-				// path hang on large mosaics).
-				dx, dy, _, err := processing.EstimateTranslationFromCatalogs(
-					getStars(i), inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
-					getStars(refIdx), inputs[refIdx].HDU.Header, inputs[refIdx].D2IX, inputs[refIdx].D2IY,
-				)
-				if err != nil {
-					lastErr[i] = err.Error()
-					continue
-				}
-				bToA, err := processing.ComputeWCSTransform(inputs[refIdx].HDU.Header, inputs[0].HDU.Header)
-				if err != nil {
-					lastErr[i] = err.Error()
-					continue
-				}
+			if bestJ >= 0 {
 				results[i] = StarAlignmentResult{
-					OffsetX:            bToA.A*dx + bToA.B*dy + results[refIdx].OffsetX,
-					OffsetY:            bToA.D*dx + bToA.E*dy + results[refIdx].OffsetY,
-					ManualTransform:    processing.IdentityTransform(),
-					HasManualTransform: false,
+					OffsetX:            inputs[i].OffsetX,
+					OffsetY:            inputs[i].OffsetY,
+					ManualTransform:    bestT,
+					HasManualTransform: true,
 					Applied:            true,
+					MatchedStars:       bestStats.MatchedStars,
+					RMS:                bestStats.RMS,
+					MaxError:           bestStats.MaxError,
 				}
 				aligned[i] = true
-				queue = append(queue, i)
+				progressed = true
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain-aligned source=%s via intermediate=%s matched=%d support=%d rms=%.3f max=%.3f transform=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), InputKey(inputs[bestJ]), bestStats.MatchedStars, bestSupport, bestRMS, bestStats.MaxError, bestT.A, bestT.B, bestT.C, bestT.D, bestT.E, bestT.F))
+			} else if attemptedCandidates > 0 {
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain unresolved source=%s attempted-candidates=%d last-error=%s", InputKey(inputs[i]), attemptedCandidates, lastErr[i]))
+			}
+		}
+	}
+
+	// Global bundle adjustment: every frame so far was fit to the reference (or an
+	// intermediate) independently, so overlapping non-reference frames can disagree
+	// with each other even while each agrees with the reference. This simultaneously
+	// minimizes the cross-frame star residual over all overlaps, holding the
+	// references fixed. It runs before same-exposure propagation so rigid sibling
+	// chips inherit the adjusted solution rather than being adjusted independently.
+	// The adjustment is applied only when it strictly reduces the global residual,
+	// so it can never make an alignment worse.
+	{
+		cats := make([][]processing.Star, len(inputs))
+		fixed := make([]bool, len(inputs))
+		anyAdjustable := false
+		for i := range inputs {
+			if inputs[i].Excluded || !aligned[i] {
+				fixed[i] = true
+				continue
+			}
+			if c, ok := projectCorrected(i); ok {
+				cats[i] = c
+			} else {
+				fixed[i] = true
+				continue
+			}
+			// References and frames without a fitted residual are held fixed; only
+			// star-aligned non-reference frames may move.
+			if i < numRefs || !results[i].Applied || !results[i].HasManualTransform {
+				fixed[i] = true
+			} else {
+				anyAdjustable = true
+			}
+		}
+		if anyAdjustable {
+			mayOverlap := func(a, b int) bool {
+				return inputs[a].Path != inputs[b].Path && framesMayOverlap(inputs[a], inputs[b])
+			}
+			if updates, ok := processing.GlobalBundleAdjust(cats, fixed, mayOverlap, fitgeom, refW, refH, 5); ok {
+				adjusted := 0
+				for i := range updates {
+					if fixed[i] || updates[i] == processing.IdentityTransform() {
+						continue
+					}
+					results[i].ManualTransform = processing.ComposeAffineTransforms(updates[i], results[i].ManualTransform)
+					final := results[i].ManualTransform
+					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: bundle update source=%s update=[%.8f %.8f %.3f; %.8f %.8f %.3f] final=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), updates[i].A, updates[i].B, updates[i].C, updates[i].D, updates[i].E, updates[i].F, final.A, final.B, final.C, final.D, final.E, final.F))
+					adjusted++
+				}
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: global bundle adjustment improved %d frame(s)", adjusted))
 			}
 		}
 	}
@@ -1237,7 +1596,11 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				HasManualTransform: inputs[i].HasManualTransform,
 				Error:              errMsg,
 			}
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: final source=%s applied=false error=%s", InputKey(inputs[i]), errMsg))
+			continue
 		}
+		result := results[i]
+		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: final source=%s applied=%t matched=%d rms=%.3f max=%.3f offset=(%.3f,%.3f) has-transform=%t transform=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), result.Applied, result.MatchedStars, result.RMS, result.MaxError, result.OffsetX, result.OffsetY, result.HasManualTransform, result.ManualTransform.A, result.ManualTransform.B, result.ManualTransform.C, result.ManualTransform.D, result.ManualTransform.E, result.ManualTransform.F))
 	}
 
 	return results, nil
@@ -1255,7 +1618,7 @@ func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]S
 // linear WCS when needed.  The returned ManualTransform for every aligned image
 // is always expressed in inputs[0] pixel space.
 func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.Star, numRefs int, mode AlignmentMode, searchRadiusArcsec float64) ([]StarAlignmentResult, error) {
-	debuglog.Log("AlignInputsBySelectedStarsWithMode: starting")
+	debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: starting files=[%s]", alignmentInputFiles(inputs)))
 	defer debuglog.Log("AlignInputsBySelectedStarsWithMode: finished")
 	if len(inputs) == 0 {
 		return nil, fmt.Errorf("no FITS inputs selected")
@@ -1326,7 +1689,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
 		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
 		if err0 != nil || err1 != nil {
-			debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: ref[%d] WCS error: %v / %v", r, err0, err1))
+			debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: reference=%s WCS error: %v / %v", InputKey(inputs[r]), err0, err1))
 			refs[r] = refEntry{input: inputs[r]}
 			continue
 		}
@@ -1343,6 +1706,12 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 		fitgeom = "general"
 	}
 
+	// Build each target's star catalog up front by streaming pixels, so the whole
+	// dataset is never resident at once. The reference catalogs come from the
+	// user-picked refStars (and their WCS projections), so only the non-reference
+	// targets are extracted here.
+	catalogs := extractStarCatalogsForAlignment(inputs)
+
 	// Align closest images first so results are more stable across runs.
 	for _, i := range sortedByDistFromRef(inputs) {
 		if i < numRefs || inputs[i].Excluded {
@@ -1357,6 +1726,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 			if !ref.hasWCS {
 				continue
 			}
+			debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: matching source=%s reference=%s mode=%s", InputKey(inputs[i]), InputKey(ref.input), fitgeom))
 
 			var (
 				refinement processing.AffineTransform
@@ -1373,19 +1743,40 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 					err = fmt.Errorf("WCSMapper: %v", mapErr)
 					break
 				}
-				refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
-					inputs[i].HDU.Data.Pixels,
-					inputs[i].HDU.Data.Width,
-					inputs[i].HDU.Data.Height,
-					mapper,
-					ref.input.HDU.Data.Pixels,
-					ref.stars,
-					ref.input.HDU.Data.Width,
-					ref.input.HDU.Data.Height,
-					ref.input.HDU.Header,
-					searchRadiusArcsec,
-					fitgeom,
-				)
+				if processing.AlignmentDebugHook != nil {
+					// Debug visualization needs the actual pixels; reload the pair
+					// on demand so the common (non-debug) path stays pixel-free.
+					srcPix, _, _, _, srcErr := resolveFramePixels(inputs[i], Options{})
+					refPix, _, _, _, refErr := resolveFramePixels(ref.input, Options{})
+					if srcErr != nil || refErr != nil {
+						err = fmt.Errorf("debug pixel reload: %v / %v", srcErr, refErr)
+						break
+					}
+					refinement, stats, err = processing.EstimateTweakRegAlignmentWithRefStars(
+						srcPix,
+						inputs[i].HDU.Data.Width,
+						inputs[i].HDU.Data.Height,
+						mapper,
+						refPix,
+						ref.stars,
+						ref.input.HDU.Data.Width,
+						ref.input.HDU.Data.Height,
+						ref.input.HDU.Header,
+						searchRadiusArcsec,
+						fitgeom,
+					)
+				} else {
+					refinement, stats, err = processing.EstimateTweakRegAlignmentFromCatalogs(
+						catalogs[i],
+						mapper,
+						ref.stars,
+						ref.input.HDU.Data.Width,
+						ref.input.HDU.Data.Height,
+						ref.input.HDU.Header,
+						searchRadiusArcsec,
+						fitgeom,
+					)
+				}
 			case AlignmentModeRScale:
 				refinement, err = processing.EstimateRScaleFromRefStars(
 					ref.stars,
@@ -1412,7 +1803,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 				)
 			}
 			if err != nil {
-				debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: input[%d] vs ref[%d]: %v", i, r, err))
+				debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: match source=%s reference=%s: %v", InputKey(inputs[i]), InputKey(ref.input), err))
 				lastErr = err.Error()
 				continue
 			}
@@ -1635,9 +2026,25 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 	return planned, statuses, minX, minY, maxX, maxY, nil
 }
 
-func buildOutputHeader(ref Input, width, height int, originX, originY, scale float64, includedCount int) fitsio.Header {
+// buildOutputHeader assembles the drizzled output header. WCS geometry
+// (CTYPE/CRPIX/CD/CDELT) is anchored to ref, which with lock-to-reference
+// drizzle may be a WCS-only frame from a different filter/instrument than what
+// was actually combined. Identity metadata (filter, instrument, detector) is
+// therefore taken from metaSource, the first real science input, instead of
+// ref, so the output header describes what was drizzled rather than the WCS
+// anchor.
+func buildOutputHeader(ref, metaSource Input, width, height int, originX, originY, scale float64, includedCount int) fitsio.Header {
 	merged := mergeHeaders(ref.PrimaryHeader, ref.HDU.Header)
 	cards := fitsio.CloneHeader(merged).Cards
+
+	metaMerged := mergeHeaders(metaSource.PrimaryHeader, metaSource.HDU.Header)
+	for _, key := range []string{"FILTER", "FILTNAM1", "FILTNAM2", "FILTER1", "FILTER2", "PUPIL", "INSTRUME", "DETECTOR"} {
+		if v, ok := metaMerged.Cards[key]; ok {
+			cards[key] = v
+		} else {
+			delete(cards, key)
+		}
+	}
 
 	for _, key := range []string{
 		"END", "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "XTENSION", "PCOUNT", "GCOUNT", "EXTNAME", "EXTVER",
@@ -1867,8 +2274,28 @@ func frameExposureNormalized(input Input) bool {
 		isFinite64(input.ExposureScale) && input.ExposureScale > 0
 }
 
+// bunitIsAlreadyRate reports whether a BUNIT denotes data that is already in
+// per-time rate or absolutely-calibrated flux/surface-brightness units (e.g.
+// "ELECTRONS/S", JWST "MJy/sr"), as opposed to total detector counts. Such data
+// must never be divided by EXPTIME for Exposure/ERR weighting.
+func bunitIsAlreadyRate(bunit string) bool {
+	if rate, known := bunitIsRate(bunit); known && rate {
+		return true
+	}
+	return bunitIsCalibratedFlux(bunit)
+}
+
+// framePixelsAreRate reports whether this frame's SCI/ERR pixels are already a
+// rate (or calibrated flux) and so must NOT be divided by EXPTIME during
+// Exposure/ERR weighting. True when prepareFramePixels already normalized the
+// frame, or when BUNIT indicates a rate/calibrated-flux unit. This is broader
+// than frameExposureNormalized, which only reports the explicit pre-scale path.
+func framePixelsAreRate(input Input) bool {
+	return frameExposureNormalized(input) || bunitIsAlreadyRate(input.BUnit)
+}
+
 func normalizedPixelsForWeighting(input Input, pixels []float32, weightingMode WeightingMode) []float32 {
-	if frameExposureNormalized(input) {
+	if framePixelsAreRate(input) {
 		// Pixels are already a rate; no further per-exptime scaling.
 		return pixels
 	}
@@ -1898,11 +2325,21 @@ func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) fl
 			return float32(exptime)
 		}
 	case WeightERR:
+		// A combined working frame carries its per-pixel drizzle weight (the
+		// rate-space inverse variance accumulated when the chips were combined)
+		// directly in WeightPixels; use it verbatim rather than re-deriving one
+		// from ERR.
+		if wht := p.input.WeightPixels; wht != nil && idx < len(wht) {
+			if w := wht[idx]; w > 0 && isFinite32(w) {
+				return w
+			}
+		}
 		if errPix := p.input.ERRPixels; errPix != nil && idx < len(errPix) {
 			if e := errPix[idx]; e > 0 && isFinite32(e) {
-				// When the frame is already exposure-normalized, ERR is in rate
-				// units too, so use it directly. Otherwise convert to a rate sigma.
-				if !frameExposureNormalized(p.input) && exptime > 0 {
+				// When the frame is already a rate (pre-normalized or calibrated
+				// flux), ERR is in the same units, so use it directly. Otherwise
+				// convert the count-based sigma to a rate sigma.
+				if !framePixelsAreRate(p.input) && exptime > 0 {
 					rateErr := e / float32(exptime)
 					if rateErr > 0 && isFinite32(rateErr) {
 						return 1.0 / (rateErr * rateErr)
@@ -1916,9 +2353,9 @@ func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) fl
 }
 
 func drizzlePixelValue(p plannedInput, idx int, value float32, weightingMode WeightingMode) float32 {
-	if frameExposureNormalized(p.input) {
-		// Pixels were already converted to a rate by prepareFramePixels; do not
-		// divide by EXPTIME again.
+	if framePixelsAreRate(p.input) {
+		// Pixels are already a rate (pre-normalized or calibrated flux units);
+		// do not divide by EXPTIME.
 		return value
 	}
 	switch weightingMode {
@@ -1935,6 +2372,9 @@ func drizzlePlannedInputPoint(p plannedInput, sums, weights []float32, width, he
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle point: row %d/%d (%s)", y, data.Height, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -1947,9 +2387,7 @@ func drizzlePlannedInputPoint(p plannedInput, sums, weights []float32, width, he
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			drizzlePixelPoint(sums, weights, width, height, outX, outY, value, drizzlePixelWeight(p, idx, weightingMode))
 		}
 	}
@@ -1963,6 +2401,9 @@ func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, h
 	const maxExtremeLog = 3
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle square: row %d/%d extreme=%d (%s)", y, data.Height, extremeCount, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -1975,9 +2416,7 @@ func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, h
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			if outX < -1e9 || outX > 1e9 || outY < -1e9 || outY > 1e9 || math.IsNaN(outX) || math.IsNaN(outY) {
 				extremeCount++
 				if extremeCount == 1 && p.mapper != nil {
@@ -2002,6 +2441,9 @@ func drizzlePlannedInputTurbo(p plannedInput, sums, weights []float32, width, he
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle turbo: row %d/%d (%s)", y, data.Height, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -2014,9 +2456,7 @@ func drizzlePlannedInputTurbo(p plannedInput, sums, weights []float32, width, he
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			drizzlePixelTurboPrepared(sums, weights, width, height, outX, outY, half, value, drizzlePixelWeight(p, idx, weightingMode))
 		}
 	}
@@ -2029,6 +2469,9 @@ func drizzlePlannedInputGaussian(p plannedInput, sums, weights []float32, width,
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle gaussian: row %d/%d (%s)", y, data.Height, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -2041,9 +2484,7 @@ func drizzlePlannedInputGaussian(p plannedInput, sums, weights []float32, width,
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			drizzlePixelGaussianPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, weightingMode))
 		}
 	}
@@ -2056,6 +2497,9 @@ func drizzlePlannedInputTophat(p plannedInput, sums, weights []float32, width, h
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle tophat: row %d/%d (%s)", y, data.Height, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -2068,9 +2512,7 @@ func drizzlePlannedInputTophat(p plannedInput, sums, weights []float32, width, h
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			drizzlePixelTophatPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, weightingMode))
 		}
 	}
@@ -2081,6 +2523,9 @@ func drizzlePlannedInputLanczos(p plannedInput, sums, weights []float32, width, 
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
+			if p.cancelled() {
+				return
+			}
 			debuglog.Log(fmt.Sprintf("drizzle lanczos%d: row %d/%d (%s)", n, y, data.Height, InputKey(p.input)))
 		}
 		row := y * data.Width
@@ -2093,9 +2538,7 @@ func drizzlePlannedInputLanczos(p plannedInput, sums, weights []float32, width, 
 			if !isFinite32(value) {
 				continue
 			}
-			refX, refY := p.mapPixel(float64(x), float64(y))
-			outX := (refX - minX) * scale
-			outY := (refY - minY) * scale
+			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
 			drizzlePixelLanczosPrepared(sums, weights, width, height, outX, outY, value, n, drizzlePixelWeight(p, idx, weightingMode))
 		}
 	}
@@ -2371,6 +2814,19 @@ func drizzleBuildStatus(skysubApplied, cleaned bool) string {
 func LooksLikeFLC(path string) bool {
 	base := strings.ToLower(filepath.Base(path))
 	return strings.Contains(base, "_flc") || strings.Contains(base, "_flt")
+}
+
+// LooksLikeCal reports whether path is a JWST Stage-2 calibrated product
+// (_cal.fits), the per-exposure input used to build mosaics.
+func LooksLikeCal(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	return strings.Contains(base, "_cal")
+}
+
+// LooksLikeCalibratedInput reports whether path is a supported calibrated
+// science exposure: HST _flc/_flt or JWST _cal.
+func LooksLikeCalibratedInput(path string) bool {
+	return LooksLikeFLC(path) || LooksLikeCal(path)
 }
 
 func formatFloat(v float64) string {

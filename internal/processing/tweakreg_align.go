@@ -132,24 +132,59 @@ func EstimateTweakRegAlignmentWithRefStars(
 	searchRadiusArcsec float64,
 	fitgeom string,
 ) (AffineTransform, AlignStats, error) {
-	if mapper == nil {
-		return AffineTransform{}, AlignStats{}, fmt.Errorf("WCSMapper is required for TweakReg alignment")
-	}
+	const maxCatalogStars = 200
+	sourceStars := ExtractAndLimitStars(sourcePixels, sourceWidth, sourceHeight, 4.0, 3, maxCatalogStars)
+	result, stats, projected, pairs, err := estimateTweakRegFromCatalogs(
+		sourceStars, mapper, refStars, refWidth, refHeight, refHeader, searchRadiusArcsec, fitgeom)
 
-	// Capture diagnostic data for the debug hook, regardless of success or failure.
-	var dbgRef, dbgSrc []Star
-	var dbgPairs []MatchedPair
+	// Fire the debug hook with the image-backed diagnostic data; it is only set
+	// during debug-alignment sessions.
 	if AlignmentDebugHook != nil {
-		defer func() {
-			AlignmentDebugHook(AlignmentDiag{
-				RefPixels:   refPixels,
-				RefW:        refWidth,
-				RefH:        refHeight,
-				RefStars:    dbgRef,
-				SourceStars: dbgSrc,
-				Pairs:       dbgPairs,
-			})
-		}()
+		AlignmentDebugHook(AlignmentDiag{
+			RefPixels:   refPixels,
+			RefW:        refWidth,
+			RefH:        refHeight,
+			RefStars:    refStars,
+			SourceStars: projected,
+			Pairs:       pairs,
+		})
+	}
+	return result, stats, err
+}
+
+// EstimateTweakRegAlignmentFromCatalogs aligns a pre-extracted source star
+// catalog to a reference star catalog through the WCS mapper, with no image
+// pixels. Given the same source catalog it is exactly equivalent to
+// EstimateTweakRegAlignmentWithRefStars; it exists so the mosaic alignment path
+// can stream pixels — extract each catalog once, then align on catalogs alone —
+// keeping the memory footprint bounded for large mosaics.
+func EstimateTweakRegAlignmentFromCatalogs(
+	sourceStars []Star,
+	mapper *WCSMapper,
+	refStars []Star,
+	refWidth, refHeight int, refHeader fitsio.Header,
+	searchRadiusArcsec float64,
+	fitgeom string,
+) (AffineTransform, AlignStats, error) {
+	result, stats, _, _, err := estimateTweakRegFromCatalogs(
+		sourceStars, mapper, refStars, refWidth, refHeight, refHeader, searchRadiusArcsec, fitgeom)
+	return result, stats, err
+}
+
+// estimateTweakRegFromCatalogs is the catalog-only core shared by the pixel and
+// streaming TweakReg entry points. It projects the source catalog into reference
+// pixel space through the WCS mapper and fits the residual against the reference
+// catalog, returning the projected source stars and matched pairs for diagnostics.
+func estimateTweakRegFromCatalogs(
+	sourceStars []Star,
+	mapper *WCSMapper,
+	refStars []Star,
+	refWidth, refHeight int, refHeader fitsio.Header,
+	searchRadiusArcsec float64,
+	fitgeom string,
+) (AffineTransform, AlignStats, []Star, []MatchedPair, error) {
+	if mapper == nil {
+		return AffineTransform{}, AlignStats{}, nil, nil, fmt.Errorf("WCSMapper is required for TweakReg alignment")
 	}
 
 	plateScale, ok := plateScaleArcsecPerPixel(refHeader)
@@ -158,16 +193,13 @@ func EstimateTweakRegAlignmentWithRefStars(
 	}
 	searchRadiusPx := searchRadiusArcsec / plateScale
 
-	const maxCatalogStars = 200
-	sourceStars := ExtractAndLimitStars(sourcePixels, sourceWidth, sourceHeight, 4.0, 3, maxCatalogStars)
-	debuglog.Log(fmt.Sprintf("EstimateTweakRegAlignmentWithRefStars: %d source stars detected, %d ref stars provided", len(sourceStars), len(refStars)))
+	debuglog.Log(fmt.Sprintf("estimateTweakRegFromCatalogs: %d source stars, %d ref stars provided", len(sourceStars), len(refStars)))
 	if len(sourceStars) < 2 {
-		return AffineTransform{}, AlignStats{}, fmt.Errorf("too few stars in source image (%d)", len(sourceStars))
+		return AffineTransform{}, AlignStats{}, nil, nil, fmt.Errorf("too few stars in source image (%d)", len(sourceStars))
 	}
 	if len(refStars) < 2 {
-		return AffineTransform{}, AlignStats{}, fmt.Errorf("too few stars in reference image (%d)", len(refStars))
+		return AffineTransform{}, AlignStats{}, nil, nil, fmt.Errorf("too few stars in reference image (%d)", len(refStars))
 	}
-	dbgRef = refStars
 
 	// Project source stars to reference pixel space through the full WCS pipeline.
 	projected := make([]Star, 0, len(sourceStars))
@@ -179,18 +211,28 @@ func EstimateTweakRegAlignmentWithRefStars(
 		}
 		projected = append(projected, Star{X: rx, Y: ry, Flux: s.Flux})
 	}
-	dbgSrc = projected
-	debuglog.Log(fmt.Sprintf("EstimateTweakRegAlignmentWithRefStars: %d/%d source stars project into reference frame", len(projected), len(sourceStars)))
+	debuglog.Log(fmt.Sprintf("estimateTweakRegFromCatalogs: %d/%d source stars project into reference frame", len(projected), len(sourceStars)))
 	if len(projected) < 2 {
-		return AffineTransform{}, AlignStats{}, fmt.Errorf("too few source stars project into reference frame (%d)", len(projected))
+		return AffineTransform{}, AlignStats{}, projected, nil, fmt.Errorf("too few source stars project into reference frame (%d)", len(projected))
 	}
 
 	result, stats, pairs, err := fitCatalogTransform(projected, refStars, refWidth, refHeight, searchRadiusPx, fitgeom)
-	dbgPairs = pairs
 	if err != nil {
-		return AffineTransform{}, stats, err
+		return AffineTransform{}, stats, projected, pairs, err
 	}
-	return result, stats, nil
+	return result, stats, projected, pairs, nil
+}
+
+// FitCatalogResidual fits the residual transform mapping the projected source
+// catalog onto the target catalog when both are already expressed in the same
+// (reference) pixel space, applying the full robustness cascade and gates used
+// by the primary TweakReg path. It is the catalog-only entry point used by the
+// mosaic chain fallback to align a frame to an already-aligned intermediate with
+// a complete rscale/affine correction — not merely a translation. fitgeom is
+// "rscale" or "general".
+func FitCatalogResidual(projected, target []Star, refWidth, refHeight int, searchRadiusPx float64, fitgeom string) (AffineTransform, AlignStats, error) {
+	t, stats, _, err := fitCatalogTransform(projected, target, refWidth, refHeight, searchRadiusPx, fitgeom)
+	return t, stats, err
 }
 
 // fitCatalogTransform matches a projected source catalog against a reference
@@ -271,24 +313,43 @@ func fitCatalogTransform(projected, refStars []Star, refWidth, refHeight int, se
 	}
 
 	var result AffineTransform
+	effectiveFitgeom := fitgeom
+	var recoveryRScaleErr error
 	if fitgeom == "rscale" {
 		rscale, err := SolveRScaleTransformationRANSAC(pairs, 300, 1.5)
 		if err != nil {
-			return AffineTransform{}, AlignStats{}, pairs, err
-		}
-		general, generalErr := SolveTransformationRANSAC(pairs, 2000, 1.5)
-		if generalErr == nil && shouldUpgradeTweakRegFit(pairs, rscale, general, refWidth, refHeight) {
-			rRMS, rMax := residualStats(pairs, rscale)
-			gRMS, gMax := residualStats(pairs, general)
-			debuglog.Log(fmt.Sprintf("fitCatalogTransform: upgrading fitgeom from rscale to general (pairs=%d, rscale rms=%.2f max=%.2f, general rms=%.2f max=%.2f)", len(pairs), rRMS, rMax, gRMS, gMax))
+			debuglog.Log(fmt.Sprintf("fitCatalogTransform: rscale RANSAC failed (pairs=%d projected=%d reference=%d search-radius=%.1f): %v", len(pairs), len(projected), len(refStars), searchRadiusPx, err))
+			if len(pairs) < 3 {
+				return AffineTransform{}, AlignStats{}, pairs, err
+			}
+			recoveryRScaleErr = err
+			debuglog.Log(fmt.Sprintf("fitCatalogTransform: starting guarded general RANSAC recovery (pairs=%d, rscale error=%v)", len(pairs), err))
+			general, generalErr := SolveTransformationRANSAC(pairs, 2000, 1.5)
+			if generalErr != nil {
+				debuglog.Log(fmt.Sprintf("fitCatalogTransform: guarded general RANSAC recovery failed (pairs=%d): %v", len(pairs), generalErr))
+				return AffineTransform{}, AlignStats{}, pairs, fmt.Errorf("rscale RANSAC failed: %w; guarded general recovery failed: %v", err, generalErr)
+			}
 			result = general
+			effectiveFitgeom = "general"
 		} else {
-			result = rscale
+			general, generalErr := SolveTransformationRANSAC(pairs, 2000, 1.5)
+			if generalErr == nil && shouldUpgradeTweakRegFit(pairs, rscale, general, refWidth, refHeight) {
+				rRMS, rMax := residualStats(pairs, rscale)
+				gRMS, gMax := residualStats(pairs, general)
+				debuglog.Log(fmt.Sprintf("fitCatalogTransform: upgrading fitgeom from rscale to general (pairs=%d, rscale rms=%.2f max=%.2f, general rms=%.2f max=%.2f)", len(pairs), rRMS, rMax, gRMS, gMax))
+				result = general
+			} else {
+				if generalErr != nil {
+					debuglog.Log(fmt.Sprintf("fitCatalogTransform: optional general RANSAC comparison failed (pairs=%d): %v", len(pairs), generalErr))
+				}
+				result = rscale
+			}
 		}
 	} else {
 		var err error
 		result, err = SolveTransformationRANSAC(pairs, 2000, 1.5)
 		if err != nil {
+			debuglog.Log(fmt.Sprintf("fitCatalogTransform: general RANSAC failed (pairs=%d projected=%d reference=%d search-radius=%.1f): %v", len(pairs), len(projected), len(refStars), searchRadiusPx, err))
 			return AffineTransform{}, AlignStats{}, pairs, err
 		}
 	}
@@ -296,6 +357,10 @@ func fitCatalogTransform(projected, refStars []Star, refWidth, refHeight int, se
 	rms, maxErr := residualStats(pairs, result)
 	support := transformGlobalSupport(projected, refStars, result, tweakRegGlobalTolPx)
 	stats := AlignStats{MatchedStars: len(pairs), GlobalInliers: support, RMS: rms, MaxError: maxErr}
+	debuglog.Log(fmt.Sprintf("fitCatalogTransform: solved fitgeom=%s transform=[%.8f %.8f %.3f; %.8f %.8f %.3f] pairs=%d support=%d rms=%.3f max=%.3f", effectiveFitgeom, result.A, result.B, result.C, result.D, result.E, result.F, len(pairs), support, rms, maxErr))
+	if recoveryRScaleErr != nil {
+		debuglog.Log(fmt.Sprintf("fitCatalogTransform: guarded general RANSAC recovery succeeded (pairs=%d, rscale=failed: %v, general=success, selected=general recovery, rms=%.3f max=%.3f, transform=[%.8f %.8f %.3f; %.8f %.8f %.3f])", len(pairs), recoveryRScaleErr, rms, maxErr, result.A, result.B, result.C, result.D, result.E, result.F))
+	}
 
 	// Sanity-check: the fitted correction must be near-identity in scale/rotation.
 	// Any computed transform with scale far from 1.0 or a large rotation is

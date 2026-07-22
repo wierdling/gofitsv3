@@ -28,6 +28,10 @@ type ImageData struct {
 	Width  int
 	Height int
 	Pixels []float32
+	// Int32Pixels retains exact signed 32-bit image samples for bit-mask
+	// extensions such as DQ and CTX. Pixels is still populated for existing
+	// consumers, but must not be used to round-trip mask bits.
+	Int32Pixels []int32
 }
 
 // File holds all HDUs read from a FITS file.
@@ -43,7 +47,7 @@ func LoadFile(path string) (*File, error) {
 	}
 	defer f.Close()
 
-	reader := bufio.NewReader(f)
+	reader := bufio.NewReaderSize(f, 64*1024)
 	var hdus []HDU
 
 	for {
@@ -73,6 +77,109 @@ func LoadFile(path string) (*File, error) {
 		return nil, fmt.Errorf("no HDUs read from %s", path)
 	}
 	return &File{HDUs: hdus}, nil
+}
+
+// LoadFileMetadata reads every HDU's header but decodes pixel data only for
+// small data units (e.g. D2IMARR distortion tables, which the build planner
+// needs). Large science arrays (SCI/ERR/DQ) are skipped with seeks, so each
+// HDU's dimensions and WCS are available without the memory or I/O cost of its
+// pixels. Skipped HDUs carry Width/Height (from NAXISn) but nil Pixels.
+//
+// It walks HDU boundaries exactly as LoadFile does (NAXIS1*NAXIS2*|BITPIX|/8
+// per data unit, padded to 2880), so any file LoadFile parses, this parses too.
+func LoadFileMetadata(path string) (*File, error) {
+	// Decode data units up to this size (distortion tables are a few KiB); skip
+	// anything larger (the science arrays we want to stream on demand instead).
+	const decodeLimit = 1 << 20
+	return loadFileFiltered(path, func(hdr Header) bool {
+		return imageDataBytes(hdr) <= decodeLimit
+	})
+}
+
+// LoadFileSelective reads every HDU's header but decodes pixel data only for
+// image HDUs where decode(hdr) returns true. Skipped HDUs carry Width/Height
+// (from NAXISn) but nil Pixels. This lets callers read just the extensions they
+// need (e.g. a single SCI chip and its DQ) without paying the memory or I/O cost
+// of the rest of the file.
+func LoadFileSelective(path string, decode func(hdr Header) bool) (*File, error) {
+	return loadFileFiltered(path, decode)
+}
+
+// loadFileFiltered walks every HDU header and decodes a data unit only when it
+// has image data (NAXIS>=2, supported BITPIX) and decode(hdr) returns true. It
+// underpins LoadFileMetadata and LoadFileSelective.
+func loadFileFiltered(path string, decode func(hdr Header) bool) (*File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var hdus []HDU
+	var pos int64
+	for {
+		if _, err := f.Seek(pos, io.SeekStart); err != nil {
+			return nil, err
+		}
+		hdr, headerBytes, err := readHeader(bufio.NewReaderSize(f, 64*1024))
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		pos += int64(headerBytes)
+
+		dataBytes := imageDataBytes(hdr)
+		if dataBytes > 0 && decode(hdr) {
+			if _, err := f.Seek(pos, io.SeekStart); err != nil {
+				return nil, err
+			}
+			hdu, _, err := readImage(bufio.NewReaderSize(f, 64*1024), hdr)
+			if err != nil {
+				return nil, err
+			}
+			hdus = append(hdus, hdu)
+		} else {
+			hdu := HDU{Header: hdr, ExtName: HeaderString(hdr, "EXTNAME")}
+			if parseInt(hdr.Cards["NAXIS"]) >= 2 {
+				hdu.Data = ImageData{
+					Width:  parseInt(hdr.Cards["NAXIS1"]),
+					Height: parseInt(hdr.Cards["NAXIS2"]),
+				}
+			}
+			hdus = append(hdus, hdu)
+		}
+		pos += int64(dataBytes + padding(dataBytes))
+	}
+	if len(hdus) == 0 {
+		return nil, fmt.Errorf("no HDUs read from %s", path)
+	}
+	return &File{HDUs: hdus}, nil
+}
+
+// imageDataBytes returns the byte size of an HDU's data unit using the same
+// 2-D NAXIS1*NAXIS2*|BITPIX|/8 convention readImage consumes, so LoadFileMetadata
+// stays byte-for-byte aligned with LoadFile. Returns 0 for non-image HDUs and
+// unsupported BITPIX values.
+func imageDataBytes(hdr Header) int {
+	if parseInt(hdr.Cards["NAXIS"]) < 2 {
+		return 0
+	}
+	var bpp int
+	switch parseInt(hdr.Cards["BITPIX"]) {
+	case 8:
+		bpp = 1
+	case 16:
+		bpp = 2
+	case 32, -32:
+		bpp = 4
+	case -64:
+		bpp = 8
+	default:
+		return 0
+	}
+	return parseInt(hdr.Cards["NAXIS1"]) * parseInt(hdr.Cards["NAXIS2"]) * bpp
 }
 
 func (f *File) SelectSCI() []HDU {
@@ -161,58 +268,64 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 	height := parseInt(hdr.Cards["NAXIS2"])
 
 	total := width * height
-	pixels := make([]float32, total)
-	dataBytes := 0
 
+	bytesPerPixel := 0
 	switch bitpix {
 	case 8:
-		buf := make([]byte, total)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return HDU{}, 0, err
-		}
-		dataBytes = len(buf)
-		for i, b := range buf {
-			pixels[i] = float32(b)
-		}
+		bytesPerPixel = 1
 	case 16:
-		buf := make([]int16, total)
-		if err := binary.Read(r, binary.BigEndian, buf); err != nil {
-			return HDU{}, 0, err
-		}
-		dataBytes = len(buf) * 2
-		for i, v := range buf {
-			pixels[i] = float32(v)
-		}
-	case 32:
-		buf := make([]int32, total)
-		if err := binary.Read(r, binary.BigEndian, buf); err != nil {
-			return HDU{}, 0, err
-		}
-		dataBytes = len(buf) * 4
-		for i, v := range buf {
-			pixels[i] = float32(v)
-		}
-	case -32:
-		buf := make([]float32, total)
-		if err := binary.Read(r, binary.BigEndian, buf); err != nil {
-			return HDU{}, 0, err
-		}
-		dataBytes = len(buf) * 4
-		copy(pixels, buf)
+		bytesPerPixel = 2
+	case 32, -32:
+		bytesPerPixel = 4
 	case -64:
-		buf := make([]float64, total)
-		if err := binary.Read(r, binary.BigEndian, buf); err != nil {
-			return HDU{}, 0, err
-		}
-		dataBytes = len(buf) * 8
-		for i, v := range buf {
-			pixels[i] = float32(v)
-		}
+		bytesPerPixel = 8
 	default:
 		return HDU{}, 0, fmt.Errorf("unsupported BITPIX %d", bitpix)
 	}
 
-	hdu := HDU{Header: hdr, Data: ImageData{Width: width, Height: height, Pixels: pixels}}
+	// Read the raw pixel block once, then decode straight into the float32
+	// output in a single pass. This avoids binary.Read's reflection-free but
+	// still allocation-heavy path (a typed intermediate slice plus its own
+	// full-size byte buffer) and the extra element-by-element conversion loop,
+	// roughly halving both transient memory and decode work per HDU.
+	dataBytes := total * bytesPerPixel
+	raw := make([]byte, dataBytes)
+	if _, err := io.ReadFull(r, raw); err != nil {
+		return HDU{}, 0, err
+	}
+
+	pixels := make([]float32, total)
+	switch bitpix {
+	case 8:
+		for i, b := range raw {
+			pixels[i] = float32(b)
+		}
+	case 16:
+		for i := 0; i < total; i++ {
+			pixels[i] = float32(int16(binary.BigEndian.Uint16(raw[i*2 : i*2+2])))
+		}
+	case 32:
+		for i := 0; i < total; i++ {
+			pixels[i] = float32(int32(binary.BigEndian.Uint32(raw[i*4 : i*4+4])))
+		}
+	case -32:
+		for i := 0; i < total; i++ {
+			pixels[i] = math.Float32frombits(binary.BigEndian.Uint32(raw[i*4 : i*4+4]))
+		}
+	case -64:
+		for i := 0; i < total; i++ {
+			pixels[i] = float32(math.Float64frombits(binary.BigEndian.Uint64(raw[i*8 : i*8+8])))
+		}
+	}
+
+	data := ImageData{Width: width, Height: height, Pixels: pixels}
+	if bitpix == 32 {
+		data.Int32Pixels = make([]int32, total)
+		for i := range data.Int32Pixels {
+			data.Int32Pixels[i] = int32(binary.BigEndian.Uint32(raw[i*4 : i*4+4]))
+		}
+	}
+	hdu := HDU{Header: hdr, Data: data}
 	hdu.ExtName = HeaderString(hdr, "EXTNAME")
 	return hdu, dataBytes, nil
 }

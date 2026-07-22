@@ -52,6 +52,110 @@ func TestRANSACIsDeterministic(t *testing.T) {
 	}
 }
 
+// TestFitCatalogResidualRecoversRScale verifies the catalog-only residual fit
+// (used by the mosaic chain fallback) recovers a small rotation+scale+shift, not
+// just a translation — the correctness upgrade over the old translation-only
+// chain. The returned transform must map the source catalog onto the target.
+func TestFitCatalogResidualRecoversRScale(t *testing.T) {
+	// A spatially distributed source catalog so rotation/scale are well constrained.
+	var src []Star
+	for gx := 0; gx < 5; gx++ {
+		for gy := 0; gy < 5; gy++ {
+			src = append(src, Star{X: 40 + float64(gx)*120, Y: 40 + float64(gy)*120, Flux: 1000})
+		}
+	}
+	// True residual: 1.5° rotation, 1.01 scale, (3,-2) shift about the centre.
+	const cx, cy = 320.0, 320.0
+	angle := 1.5 * math.Pi / 180
+	scale := 1.01
+	sinA, cosA := math.Sin(angle)*scale, math.Cos(angle)*scale
+	target := make([]Star, len(src))
+	for i, s := range src {
+		dx, dy := s.X-cx, s.Y-cy
+		target[i] = Star{
+			X:    cx + (dx*cosA - dy*sinA) + 3,
+			Y:    cy + (dx*sinA + dy*cosA) - 2,
+			Flux: s.Flux,
+		}
+	}
+
+	tr, stats, err := FitCatalogResidual(src, target, 640, 640, 30, "rscale")
+	if err != nil {
+		t.Fatalf("FitCatalogResidual returned error: %v", err)
+	}
+	if stats.MatchedStars < 10 {
+		t.Fatalf("expected most stars matched, got %d", stats.MatchedStars)
+	}
+	for i, s := range src {
+		x, y := ApplyAffineTransform(tr, s.X, s.Y)
+		if math.Hypot(x-target[i].X, y-target[i].Y) > 0.5 {
+			t.Fatalf("star %d mapped to (%.2f,%.2f), want (%.2f,%.2f)", i, x, y, target[i].X, target[i].Y)
+		}
+	}
+	// The fit must capture rotation/scale, not collapse to a pure translation.
+	if math.Abs(tr.B) < 1e-4 && math.Abs(tr.D) < 1e-4 {
+		t.Fatalf("fit has no rotation component: %+v", tr)
+	}
+}
+
+// TestRefineCentroidSubPixel verifies the iterative centroid refinement recovers
+// a sub-pixel star centre from an integer-rounded starting guess.
+func TestRefineCentroidSubPixel(t *testing.T) {
+	const w, h = 41, 41
+	const trueX, trueY = 20.37, 19.62
+	const sigma = 1.6
+	pix := make([]float32, w*h)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dx := float64(x) - trueX
+			dy := float64(y) - trueY
+			pix[y*w+x] = float32(1000 * math.Exp(-(dx*dx+dy*dy)/(2*sigma*sigma)))
+		}
+	}
+	gx, gy := refineCentroid(pix, w, h, 20, 20, 0, 6.0)
+	if d := math.Hypot(gx-trueX, gy-trueY); d > 0.05 {
+		t.Fatalf("refined centroid (%.3f,%.3f) is %.3f px off true (%.3f,%.3f)", gx, gy, d, trueX, trueY)
+	}
+}
+
+// TestGlobalBundleAdjustReducesResidual verifies the bundle adjustment pulls an
+// adjustable frame into agreement with the fixed frames it overlaps, and leaves
+// fixed frames untouched.
+func TestGlobalBundleAdjustReducesResidual(t *testing.T) {
+	var grid []Star
+	for gx := 0; gx < 5; gx++ {
+		for gy := 0; gy < 5; gy++ {
+			grid = append(grid, Star{X: 60 + float64(gx)*100, Y: 60 + float64(gy)*100})
+		}
+	}
+	cats := make([][]Star, 3)
+	cats[0] = append([]Star(nil), grid...) // reference, fixed
+	cats[1] = append([]Star(nil), grid...) // another fixed frame
+	// Frame 2 carries a small consistent error (<bundleMatchRadiusPx so the
+	// correspondences still form): 1.5 px in x, -1.0 px in y.
+	bad := AffineTransform{A: 1, C: 1.5, E: 1, F: -1.0}
+	cats[2] = make([]Star, len(grid))
+	for i, s := range grid {
+		x, y := ApplyAffineTransform(bad, s.X, s.Y)
+		cats[2][i] = Star{X: x, Y: y}
+	}
+
+	fixed := []bool{true, true, false}
+	updates, ok := GlobalBundleAdjust(cats, fixed, func(a, b int) bool { return true }, "general", 600, 600, 5)
+	if !ok {
+		t.Fatalf("bundle adjustment did not improve the global residual")
+	}
+	if updates[0] != IdentityTransform() || updates[1] != IdentityTransform() {
+		t.Fatalf("fixed frames must not move: %+v %+v", updates[0], updates[1])
+	}
+	for i, s := range cats[2] {
+		x, y := ApplyAffineTransform(updates[2], s.X, s.Y)
+		if d := math.Hypot(x-grid[i].X, y-grid[i].Y); d > 0.1 {
+			t.Fatalf("frame 2 star %d still %.3f px off after adjustment", i, d)
+		}
+	}
+}
+
 func TestTransformGlobalSupport(t *testing.T) {
 	stars := []Star{
 		{X: 10, Y: 12}, {X: 120, Y: 30}, {X: 200, Y: 80}, {X: 60, Y: 150},

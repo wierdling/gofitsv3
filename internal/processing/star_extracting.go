@@ -256,6 +256,15 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 			if fluxSum > 0 {
 				centerX /= fluxSum
 				centerY /= fluxSum
+				// Refine to sub-pixel accuracy. The connected-component blob is
+				// truncated at the detection threshold, so a whole-blob flux-weighted
+				// centroid is biased whenever the PSF wings are clipped asymmetrically
+				// (the common case off-centre or near a neighbour). Iterating an
+				// intensity-weighted centroid in a fixed window around the estimate,
+				// with the local sky subtracted, converges to the PSF photocentre and
+				// lowers the floor on every downstream alignment.
+				radius := math.Sqrt(float64(len(blob))/math.Pi) + 1.5
+				centerX, centerY = refineCentroid(pixels, width, height, centerX, centerY, localBg, radius)
 				stars = append(stars, Star{X: centerX, Y: centerY, Flux: fluxSum, Peak: peakNetFlux, Area: len(blob)})
 			}
 		}
@@ -265,8 +274,74 @@ func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, m
 	// In nebula fields, extended emission knots have high integrated flux but
 	// low peak brightness. Real stars are compact and bright per pixel, so
 	// peak-sorted lists contain mostly actual stars rather than nebula features.
-	sort.Slice(stars, func(i, j int) bool { return stars[i].Peak > stars[j].Peak })
+	// Sort brightest-first, with position tiebreakers so the ordering is fully
+	// deterministic even when two sources share an identical peak (e.g. saturated
+	// pixels clamped to the same value). A stable order is required upstream: the
+	// matcher uses the brightest-N, so any reordering would change which stars are
+	// matched and make alignment non-reproducible.
+	sort.Slice(stars, func(i, j int) bool {
+		if stars[i].Peak != stars[j].Peak {
+			return stars[i].Peak > stars[j].Peak
+		}
+		if stars[i].X != stars[j].X {
+			return stars[i].X < stars[j].X
+		}
+		return stars[i].Y < stars[j].Y
+	})
 	return stars
+}
+
+// refineCentroid sharpens an initial star position (x0,y0) by iterating an
+// intensity-weighted centre-of-gravity within a circular window of the given
+// radius, subtracting the local sky level bg so only source flux is weighted.
+// Recentring the window each iteration lets it converge on the PSF photocentre
+// independent of the threshold-truncated blob shape. It is deterministic and
+// only moves the estimate by a fraction of a pixel, so it never reassigns a
+// detection to a neighbouring source.
+func refineCentroid(pixels []float32, width, height int, x0, y0, bg, radius float64) (float64, float64) {
+	if radius < 1.5 {
+		radius = 1.5
+	}
+	r := int(math.Ceil(radius))
+	radiusSq := radius * radius
+	cx, cy := x0, y0
+	for iter := 0; iter < 5; iter++ {
+		ix := int(math.Round(cx))
+		iy := int(math.Round(cy))
+		var sum, sx, sy float64
+		for dy := -r; dy <= r; dy++ {
+			yy := iy + dy
+			if yy < 0 || yy >= height {
+				continue
+			}
+			for dx := -r; dx <= r; dx++ {
+				if float64(dx*dx+dy*dy) > radiusSq {
+					continue
+				}
+				xx := ix + dx
+				if xx < 0 || xx >= width {
+					continue
+				}
+				v := float64(pixels[yy*width+xx]) - bg
+				if v <= 0 || math.IsNaN(v) {
+					continue
+				}
+				sum += v
+				sx += float64(xx) * v
+				sy += float64(yy) * v
+			}
+		}
+		if sum <= 0 {
+			break
+		}
+		nx, ny := sx/sum, sy/sum
+		converged := math.Hypot(nx-cx, ny-cy) < 0.01
+		cx, cy = nx, ny
+		if converged {
+			break
+		}
+	}
+	return cx, cy
 }
 
 func EstimateBackground(pixels []float32) (float64, float64) {

@@ -36,3 +36,6 @@ vendor/
 Thumbs.db
 *.zip
 .claude/
+
+# --- Docs images (not pushed) ---
+docs/Images/

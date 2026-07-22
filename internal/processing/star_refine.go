@@ -664,7 +664,18 @@ func matchStarsByMutualProximity(refStars, targetStars []Star, maxStars int, max
 	if len(candidates) == 0 {
 		return nil
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].distSq < candidates[j].distSq })
+	// Sort by proximity, with index tiebreakers so equal-distance candidates keep
+	// a deterministic order (an unstable sort could otherwise reorder ties between
+	// runs and change which mutual matches survive the greedy one-to-one pass).
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].distSq != candidates[j].distSq {
+			return candidates[i].distSq < candidates[j].distSq
+		}
+		if candidates[i].refIdx != candidates[j].refIdx {
+			return candidates[i].refIdx < candidates[j].refIdx
+		}
+		return candidates[i].targetIdx < candidates[j].targetIdx
+	})
 
 	pairs := make([]MatchedPair, 0, len(candidates))
 	usedRef := make([]bool, len(refStars))

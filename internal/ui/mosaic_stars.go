@@ -19,15 +19,15 @@ func (ws *mosaicWorkspace) exitStarMode() {
 
 	if ws.state.result != nil {
 		black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
-		img := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode)
+		img := buildMosaicPreviewImageWithLevels(ws.state.result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 		ws.preview.Image = img
 		ws.preview.Refresh()
 		stats := histogram.Compute(ws.state.result.Pixels)
 		ws.mosaicBins = stats.Hist
 		ws.mosaicHistogram.Refresh()
-		ws.statsLabel.SetText(fmt.Sprintf("Mean: %.4f | Std: %.4f | Size: %dx%d", stats.Mean, stats.Std, ws.state.result.Width, ws.state.result.Height))
+		ws.statsLabel.SetText(mosaicStatsText(ws.state.resultName, stats.Mean, stats.Std, ws.state.result.Width, ws.state.result.Height))
 	} else {
-		ws.statsLabel.SetText("Mean: -- | Std: -- | Size: --")
+		ws.statsLabel.SetText(mosaicEmptyStatsText())
 		ws.mosaicBins = [256]int{}
 		ws.mosaicHistogram.Refresh()
 	}
@@ -47,8 +47,9 @@ func (ws *mosaicWorkspace) enterStarMode() {
 		refResult = ws.state.result
 	} else {
 		// No drizzle result yet: the reference preview comes from input[0]'s
-		// pixels, which may have been freed by a prior build. Reload on demand.
-		if err := ws.ensureInputPixelsLoaded(); err != nil {
+		// pixels, which may be unloaded (metadata-only load) or freed by a prior
+		// build. Reload only that one frame so the whole dataset stays on disk.
+		if err := ws.ensureInputPixelsLoadedAt(0); err != nil {
 			dialog.ShowError(err, ws.win)
 			return
 		}
@@ -64,7 +65,7 @@ func (ws *mosaicWorkspace) enterStarMode() {
 		ws.autoLevels(refResult.Pixels)
 	}
 	black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
-	refImg := buildMosaicPreviewImageWithLevels(refResult, black, white, bg, peak, scaledPeak, ws.stretchMode)
+	refImg := buildMosaicPreviewImageWithLevels(refResult, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 
 	ws.activePicker = newStarPickerWidget(refImg, refResult.Width, refResult.Height)
 	ws.activePicker.SetZoom(ws.zoomLevel)

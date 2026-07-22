@@ -106,18 +106,19 @@ func TestEstimateAffineAfterWCSWithRotation(t *testing.T) {
 func makeSyntheticStarFieldForRefine(width, height int, centers [][2]int) []float32 {
 	pixels := make([]float32, width*height)
 	for _, c := range centers {
-		for dy := -1; dy <= 1; dy++ {
-			for dx := -1; dx <= 1; dx++ {
+		for dy := -3; dy <= 3; dy++ {
+			for dx := -3; dx <= 3; dx++ {
 				x := c[0] + dx
 				y := c[1] + dy
 				if x < 0 || x >= width || y < 0 || y >= height {
 					continue
 				}
-				weight := float32(20)
-				if dx == 0 && dy == 0 {
-					weight = 100
+				d2 := float64(dx*dx + dy*dy)
+				v := float32(100.0 * math.Exp(-d2/(2.0*1.2*1.2)))
+				if v < 1.0 {
+					v = 0
 				}
-				pixels[y*width+x] = weight
+				pixels[y*width+x] = v
 			}
 		}
 	}

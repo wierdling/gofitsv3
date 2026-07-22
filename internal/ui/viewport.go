@@ -183,6 +183,7 @@ type viewport struct {
 	customZoom    string
 	histColor     [4]uint8 // bar color; if zero, use default white-bg/gray-bar style
 	StatsLabel    *widget.Label
+	FilterLabel   *widget.Label
 	pickerLabel   *widget.Label
 	pickerBox     fyne.CanvasObject
 	actionRow     *fyne.Container
@@ -192,7 +193,7 @@ type viewport struct {
 	onPickWhite   func()
 }
 
-var presetZoomOptions = []string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}
+var presetZoomOptions = []string{"fit", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}
 
 func newViewport() *viewport {
 	img := canvas.NewImageFromImage(blankImg())
@@ -210,7 +211,7 @@ func newViewport() *viewport {
 
 	vp.blackBox = NewNumberEntry(0.001, 4)
 	vp.whiteBox = NewNumberEntry(0.001, 4)
-	vp.zoomLabel = NewSafeSelect([]string{"fit in preview", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}, func(s string) {
+	vp.zoomLabel = NewSafeSelect([]string{"fit", "1%", "5%", "10%", "20%", "25%", "50%", "75%", "100%", "200%", "300%"}, func(s string) {
 		vp.setZoomFromSelect(s)
 	})
 	vp.zoomOut = widget.NewButton("-", func() { vp.stepZoom(0.95) })
@@ -219,17 +220,21 @@ func newViewport() *viewport {
 	vp.StatsLabel = widget.NewLabel("Sky --  μ --  σ --")
 	vp.StatsLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.StatsLabel.Alignment = fyne.TextAlignCenter
+	vp.FilterLabel = widget.NewLabel("")
+	vp.FilterLabel.TextStyle = fyne.TextStyle{Italic: true}
 	vp.pickerLabel = widget.NewLabel("Value: --")
 	vp.pickerLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.pickerBox = container.New(layout.NewGridWrapLayout(fyne.NewSize(135, vp.pickerLabel.MinSize().Height)), vp.pickerLabel)
 
 	vp.actionRow = container.NewHBox(layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer())
 
+	histRow := container.NewBorder(nil, nil, container.NewHBox(hpad(6), vp.FilterLabel, hpad(6)), nil, vp.histogram)
+
 	header := container.NewVBox(
 		vpad(4),
 		vp.actionRow,
 		vpad(4),
-		vp.histogram,
+		histRow,
 	)
 	footerRow := container.NewHBox(
 		hpad(6),
@@ -247,7 +252,7 @@ func newViewport() *viewport {
 	footer := container.NewVBox(footerRow, vpad(5))
 	vp.container = container.NewBorder(header, footer, nil, nil, vp.scroll)
 
-	vp.zoomLabel.SetSelected("fit in preview")
+	vp.zoomLabel.SetSelected("fit")
 
 	return vp
 }
@@ -270,6 +275,13 @@ func (vp *viewport) SetPickerValueText(text string) {
 		vp.pickerBox.Refresh()
 		canvas.Refresh(vp.pickerBox)
 	}
+}
+
+func (vp *viewport) SetFilterText(text string) {
+	if vp == nil || vp.FilterLabel == nil {
+		return
+	}
+	vp.FilterLabel.SetText(text)
 }
 
 func (vp *viewport) SetLoadSave(chanLabel, letter string, col color.Color, loadFn, saveFn func()) {
@@ -335,7 +347,7 @@ func (vp *viewport) setZoomLabelValue(option string) {
 
 func (vp *viewport) setZoomFromSelect(sel string) {
 	switch sel {
-	case "fit in preview":
+	case "fit":
 		vp.zoom = vp.fitZoom()
 	default:
 		sel = strings.TrimSuffix(sel, "%")
@@ -347,7 +359,7 @@ func (vp *viewport) setZoomFromSelect(sel string) {
 }
 
 func (vp *viewport) stepZoom(factor float64) {
-	if vp.zoomLabel.Selected == "fit in preview" {
+	if vp.zoomLabel.Selected == "fit" {
 		vp.zoom = vp.fitZoom()
 	}
 	vp.zoom *= factor
@@ -456,7 +468,26 @@ func blankImg() *image.RGBA {
 }
 
 func (vp *viewport) imagePointAtPosition(pos fyne.Position, flipped bool) (imagePoint, bool) {
-	return mapViewportPositionToImage(pos, fyne.NewPos(0, 0), vp.zoom, vp.origW, vp.origH, flipped)
+	adj := pos
+	if vp.overlay != nil && vp.zoom > 0 && vp.origW > 0 && vp.origH > 0 {
+		// img/overlay sit in a NewMax container, which stretches both to fill
+		// the scroll viewport whenever the zoomed image is smaller than it.
+		// ImageFillContain then centers the actual pixels with a letterbox
+		// margin, so that margin must be backed out before mapping (mirrors
+		// screenToImagePt in workspace_edit.go).
+		dispW := float32(vp.origW) * float32(vp.zoom)
+		dispH := float32(vp.origH) * float32(vp.zoom)
+		sz := vp.overlay.Size()
+		var offX, offY float32
+		if sz.Width > dispW {
+			offX = (sz.Width - dispW) / 2
+		}
+		if sz.Height > dispH {
+			offY = (sz.Height - dispH) / 2
+		}
+		adj = fyne.NewPos(pos.X-offX, pos.Y-offY)
+	}
+	return mapViewportPositionToImage(adj, fyne.NewPos(0, 0), vp.zoom, vp.origW, vp.origH, flipped)
 }
 
 func (vp *viewport) setMeasurementOverlay(first *imagePoint, second *imagePoint, flipped bool) {

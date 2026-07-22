@@ -38,6 +38,9 @@ type LoadedImage struct {
 	GHSStretch  float64 // GHS strength D
 	GHSLocal    float64 // GHS local intensity b
 	GHSSymmetry float64 // GHS symmetry point SP in [0,1]
+	// Rotation90 is the number of clockwise quarter turns baked into the image
+	// data by Compose. It is persisted so a project can restore the same view.
+	Rotation90 int
 
 	// AlignTransform is the backward (output→source) sampling affine produced by
 	// Compose "Align to Channel 2". When HasAlignTransform is set it is applied at
@@ -60,6 +63,7 @@ type ChannelState struct {
 	OffsetX    float64 `json:"offsetX,omitempty"`
 	OffsetY    float64 `json:"offsetY,omitempty"`
 	OffsetRot  float64 `json:"offsetRot,omitempty"`
+	Rotation90 int     `json:"rotation90,omitempty"`
 
 	// Full star-alignment affine (backward sampling) from "Align to Channel 2",
 	// applied underneath the Manual Offset at render time. See LoadedImage.
@@ -79,9 +83,13 @@ type ChannelState struct {
 }
 
 type ComposeProject struct {
-	Channels             [3]ChannelState         `json:"channels"`
+	Channels [3]ChannelState `json:"channels"`
+	// OverlayLayers holds the arbitrary set of colored overlay layers. OrangeLayer
+	// and YellowLayer are legacy fields kept only so projects saved before the
+	// generic layer system still load (migrated into OverlayLayers on read).
+	OverlayLayers        []OrangeLayerState      `json:"overlayLayers,omitempty"`
 	OrangeLayer          OrangeLayerState        `json:"orangeLayer,omitempty"`
-	Flip                 bool                    `json:"flip"`
+	YellowLayer          OrangeLayerState        `json:"yellowLayer,omitempty"`
 	SharedHistogramScale bool                    `json:"sharedHistogramScale,omitempty"`
 	DisableComposite     bool                    `json:"disableComposite,omitempty"`
 	MeasureComposite     bool                    `json:"measureComposite,omitempty"`
@@ -97,6 +105,11 @@ type OrangeLayerState struct {
 	ColorG  uint8        `json:"colorG"`
 	ColorB  uint8        `json:"colorB"`
 	Opacity float64      `json:"opacity"`
+	// HighlightProtect (0..1) controls the overlay blend: the tinted layer is
+	// combined additively as out = base + layer - k*base*layer. k=1 reproduces a
+	// screen blend (soft, never clips), k=0 is pure additive (max detail, may
+	// clip). Lower values keep more overlay detail in bright regions.
+	HighlightProtect float64 `json:"highlightProtect,omitempty"`
 }
 
 type StarlessComposeSettings struct {
@@ -130,14 +143,19 @@ type DrizzleSettings struct {
 	// final_scale semantics).  When > 0, the internal multiplier is computed from
 	// the reference image WCS.  Scale is used as a raw multiplier fallback when
 	// FinalScale is zero.
-	FinalScale      float64 `json:"finalScale"`
-	Scale           float64 `json:"scale"`
-	PixFrac         float64 `json:"pixFrac"`
-	CRMethod        int     `json:"crMethod"`
-	SepKernel       int     `json:"sepKernel"`
-	FinalKernel     int     `json:"finalKernel"`
-	WeightingMode   int     `json:"weightingMode"`
-	UseERRWeighting bool    `json:"useERRWeighting,omitempty"`
+	FinalScale float64 `json:"finalScale"`
+	// LockToReferenceFrame pins the output canvas (dimensions, origin, and plate
+	// scale) to the reference baseline frame so separately-drizzled channels come
+	// out pixel-identical for compositing. Overrides FinalScale/Scale. Requires a
+	// reference baseline to be set.
+	LockToReferenceFrame bool    `json:"lockToReferenceFrame,omitempty"`
+	Scale                float64 `json:"scale"`
+	PixFrac              float64 `json:"pixFrac"`
+	CRMethod             int     `json:"crMethod"`
+	SepKernel            int     `json:"sepKernel"`
+	FinalKernel          int     `json:"finalKernel"`
+	WeightingMode        int     `json:"weightingMode"`
+	UseERRWeighting      bool    `json:"useERRWeighting,omitempty"`
 	// SurfaceBrightnessNorm normalizes mixed-scale chips by their mapped pixel
 	// area before drizzle. Useful for WFPC2 PC+WF mosaics.
 	SurfaceBrightnessNorm bool `json:"surfaceBrightnessNorm,omitempty"`
@@ -178,51 +196,172 @@ type SkysubSettings struct {
 	SkyClip     int     `json:"skyClip"`
 	SkyLSigma   float64 `json:"skyLSigma"`
 	SkyUSigma   float64 `json:"skyUSigma"`
+	// AmpPedestal enables NIRCam per-amplifier pedestal removal. Independent
+	// of Enabled/SkyMethod: it fixes an intra-chip readout artifact, not
+	// inter-chip sky level.
+	AmpPedestal bool `json:"ampPedestal"`
+	// RowDestripe enables NIRCam per-amplifier 1/f row-banding removal,
+	// independent of Enabled/SkyMethod for the same reason as AmpPedestal.
+	RowDestripe bool `json:"rowDestripe"`
+	// RowDestripeMaskPath is an optional binary FITS mask. Non-zero finite
+	// pixels are excluded from row statistics.
+	RowDestripeMaskPath string `json:"rowDestripeMaskPath,omitempty"`
+	// RowDestripeMaskDir contains per-input masks named
+	// <input-stem>_rowmask.fits. Non-zero finite pixels are excluded from row
+	// statistics for the matching calibrated NIRCam input only.
+	RowDestripeMaskDir string `json:"rowDestripeMaskDir,omitempty"`
+	// RowDestripeMaskSigma is the automatic positive-residual source-mask
+	// threshold. Zero loads the default.
+	RowDestripeMaskSigma float64 `json:"rowDestripeMaskSigma,omitempty"`
+	// RowDestripeTrendWindow is the row smoothing window. Zero loads the default.
+	RowDestripeTrendWindow int `json:"rowDestripeTrendWindow,omitempty"`
+	// RowDestripeDirection is reserved for future column support; current value
+	// is blank or "rows".
+	RowDestripeDirection string `json:"rowDestripeDirection,omitempty"`
+	// NIRCamWisp enables local template subtraction for detector-fixed NIRCam
+	// wisps before sky matching. It is default-off and never downloads templates.
+	NIRCamWisp bool `json:"nircamWisp"`
+	// NIRCamWispTemplateDir is a local directory containing files named like
+	// nircam_wisp_nrcb4_f200w.fits.
+	NIRCamWispTemplateDir string `json:"nircamWispTemplateDir,omitempty"`
+	// NIRCamWispAutoScale fits a non-negative template scale when enabled.
+	NIRCamWispAutoScale bool `json:"nircamWispAutoScale"`
+	// NIRCamWispScale is used only when NIRCamWispAutoScale is false.
+	NIRCamWispScale float64 `json:"nircamWispScale,omitempty"`
+	// MIRIArtifactMask enables user-provided masks for calibrated MIRI artifacts.
+	MIRIArtifactMask bool `json:"miriArtifactMask"`
+	// MIRIArtifactMaskPath is an optional binary FITS mask applied to MIRI inputs.
+	MIRIArtifactMaskPath string `json:"miriArtifactMaskPath,omitempty"`
+	// MIRIArtifactMaskDir contains per-input masks named <input-stem>_miri_mask.fits.
+	MIRIArtifactMaskDir string `json:"miriArtifactMaskDir,omitempty"`
+}
+
+type ArtifactMaskSourceMode string
+
+const (
+	ArtifactMaskSourceInput  ArtifactMaskSourceMode = "input"
+	ArtifactMaskSourceMosaic ArtifactMaskSourceMode = "mosaic"
+)
+
+type ArtifactMaskPurpose string
+
+const (
+	ArtifactMaskPurposeMIRIArtifact ArtifactMaskPurpose = "miriArtifact"
+	ArtifactMaskPurposeRowDestripe  ArtifactMaskPurpose = "rowDestripe"
+)
+
+type ArtifactMaskOperationMode string
+
+const (
+	ArtifactMaskOperationAdd   ArtifactMaskOperationMode = "add"
+	ArtifactMaskOperationErase ArtifactMaskOperationMode = "erase"
+)
+
+type ArtifactMaskRegionKind string
+
+const (
+	ArtifactMaskRegionRaster     ArtifactMaskRegionKind = "raster"
+	ArtifactMaskRegionBrush      ArtifactMaskRegionKind = "brush"
+	ArtifactMaskRegionRectangle  ArtifactMaskRegionKind = "rectangle"
+	ArtifactMaskRegionPolygon    ArtifactMaskRegionKind = "polygon"
+	ArtifactMaskRegionMorphology ArtifactMaskRegionKind = "morphology"
+)
+
+type ArtifactMaskPoint struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
+type ArtifactMaskTarget struct {
+	Key      string `json:"key"`
+	Path     string `json:"path"`
+	SCIExt   int    `json:"sciExt,omitempty"`
+	Selected bool   `json:"selected"`
+}
+
+type ArtifactMaskOperation struct {
+	Mode   ArtifactMaskOperationMode `json:"mode"`
+	Kind   ArtifactMaskRegionKind    `json:"kind"`
+	X      int                       `json:"x,omitempty"`
+	Y      int                       `json:"y,omitempty"`
+	Width  int                       `json:"width,omitempty"`
+	Height int                       `json:"height,omitempty"`
+	Radius int                       `json:"radius,omitempty"`
+	Points []ArtifactMaskPoint       `json:"points,omitempty"`
+	Mask   []byte                    `json:"mask,omitempty"`
+}
+
+type ArtifactMaskDocument struct {
+	ID         string                  `json:"id,omitempty"`
+	Name       string                  `json:"name,omitempty"`
+	Purpose    ArtifactMaskPurpose     `json:"purpose,omitempty"`
+	SourceMode ArtifactMaskSourceMode  `json:"sourceMode"`
+	SourceKey  string                  `json:"sourceKey,omitempty"`
+	Width      int                     `json:"width"`
+	Height     int                     `json:"height"`
+	Targets    []ArtifactMaskTarget    `json:"targets,omitempty"`
+	Operations []ArtifactMaskOperation `json:"operations,omitempty"`
+	Stale      bool                    `json:"stale,omitempty"`
+}
+
+type ArtifactMaskProject struct {
+	Version   int                    `json:"version,omitempty"`
+	Documents []ArtifactMaskDocument `json:"documents,omitempty"`
 }
 
 type MosaicInputState struct {
-	Path         string  `json:"path"`
-	SCIExt       int     `json:"sciExt,omitempty"`
-	OffsetX      float64 `json:"offsetX"`
-	OffsetY      float64 `json:"offsetY"`
-	HasTransform bool    `json:"hasTransform"`
-	Locked       bool    `json:"locked,omitempty"`
-	TransformA   float64 `json:"transformA,omitempty"`
-	TransformB   float64 `json:"transformB,omitempty"`
-	TransformC   float64 `json:"transformC,omitempty"`
-	TransformD   float64 `json:"transformD,omitempty"`
-	TransformE   float64 `json:"transformE,omitempty"`
-	TransformF   float64 `json:"transformF,omitempty"`
+	Path   string `json:"path"`
+	SCIExt int    `json:"sciExt,omitempty"`
+	// Combined marks an entry whose Path is the original multi-chip source file
+	// that gets drizzled into a single working image on load. Absent (false) for
+	// ordinary single-chip inputs and for pre-combine legacy projects.
+	Combined          bool    `json:"combined,omitempty"`
+	OffsetX           float64 `json:"offsetX"`
+	OffsetY           float64 `json:"offsetY"`
+	HasTransform      bool    `json:"hasTransform"`
+	Locked            bool    `json:"locked,omitempty"`
+	Excluded          bool    `json:"excluded,omitempty"`
+	NormalizeExposure bool    `json:"normalizeExposure,omitempty"`
+	ExposureScale     float64 `json:"exposureScale,omitempty"`
+	TransformA        float64 `json:"transformA,omitempty"`
+	TransformB        float64 `json:"transformB,omitempty"`
+	TransformC        float64 `json:"transformC,omitempty"`
+	TransformD        float64 `json:"transformD,omitempty"`
+	TransformE        float64 `json:"transformE,omitempty"`
+	TransformF        float64 `json:"transformF,omitempty"`
 }
 
 type MosaicProject struct {
-	Inputs               []MosaicInputState `json:"inputs"`
-	ReferencePath        string             `json:"referencePath,omitempty"`
-	ReferenceSCIExt      int                `json:"referenceSciExt,omitempty"`
-	DrizzleSettings      DrizzleSettings    `json:"drizzleSettings"`
-	DrizzleSettingsSet   bool               `json:"drizzleSettingsSet"`
-	AlignmentSettings    AlignmentSettings  `json:"alignmentSettings"`
-	AlignmentSettingsSet bool               `json:"alignmentSettingsSet"`
-	SkysubSettings       SkysubSettings     `json:"skysubSettings"`
-	SkysubSettingsSet    bool               `json:"skysubSettingsSet"`
-	ActiveFilter         string             `json:"activeFilter,omitempty"`
+	Inputs               []MosaicInputState   `json:"inputs"`
+	ReferencePath        string               `json:"referencePath,omitempty"`
+	ReferenceSCIExt      int                  `json:"referenceSciExt,omitempty"`
+	DrizzleSettings      DrizzleSettings      `json:"drizzleSettings"`
+	DrizzleSettingsSet   bool                 `json:"drizzleSettingsSet"`
+	AlignmentSettings    AlignmentSettings    `json:"alignmentSettings"`
+	AlignmentSettingsSet bool                 `json:"alignmentSettingsSet"`
+	SkysubSettings       SkysubSettings       `json:"skysubSettings"`
+	SkysubSettingsSet    bool                 `json:"skysubSettingsSet"`
+	ActiveFilter         string               `json:"activeFilter,omitempty"`
+	ArtifactMasks        *ArtifactMaskProject `json:"artifactMasks,omitempty"`
+	ExposureNormMode     int                  `json:"exposureNormMode,omitempty"`
 }
 
 type ChannelControl struct {
-	Content          fyne.CanvasObject
-	ModeSelect       *widget.Select
-	BackgroundEntry  NumberField
-	PeakEntry        NumberField
-	ScaledPeakEntry  NumberField
-	AsinhScaleEntry  NumberField
-	MTFMidtoneEntry  NumberField
-	GHSStretchEntry  NumberField
-	GHSLocalEntry    NumberField
-	GHSSymmetryEntry NumberField
-	XOffsetEntry     NumberField
-	YOffsetEntry     NumberField
-	RotOffsetEntry   NumberField
-	ShowClip         CheckField
+	Content           fyne.CanvasObject
+	ModeSelect        *widget.Select
+	BackgroundEntry   NumberField
+	PeakEntry         NumberField
+	ScaledPeakEntry   NumberField
+	AsinhScaleEntry   NumberField
+	MTFMidtoneEntry   NumberField
+	GHSStretchEntry   NumberField
+	GHSLocalEntry     NumberField
+	GHSSymmetryEntry  NumberField
+	MagicPresetSelect *widget.Select
+	XOffsetEntry      NumberField
+	YOffsetEntry      NumberField
+	RotOffsetEntry    NumberField
+	ShowClip          CheckField
 }
 
 type RgbLevels struct {

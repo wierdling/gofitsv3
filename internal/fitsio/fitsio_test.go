@@ -270,6 +270,88 @@ func TestFilterStringSkipsClearAndNumericValues(t *testing.T) {
 	}
 }
 
+func TestHeaderStringPreservesSlashInQuotedValue(t *testing.T) {
+	// JWST BUNIT is 'MJy/sr'; the "/" is part of the string, not a comment.
+	header := Header{Cards: map[string]string{
+		"BUNIT": "'MJy/sr '           / brightness units",
+	}}
+	if got := HeaderString(header, "BUNIT"); got != "MJy/sr" {
+		t.Fatalf("HeaderString(BUNIT) = %q, want MJy/sr", got)
+	}
+}
+
+func TestHeaderStringUnquotedValueStripsComment(t *testing.T) {
+	header := Header{Cards: map[string]string{
+		"FILTER1": "25                  / first filter number",
+	}}
+	if got := HeaderString(header, "FILTER1"); got != "25" {
+		t.Fatalf("HeaderString(FILTER1) = %q, want 25", got)
+	}
+}
+
+func TestHeaderStringUnescapesDoubledQuote(t *testing.T) {
+	// FITS escapes a literal single quote by doubling it.
+	header := Header{Cards: map[string]string{
+		"OBJECT": "'Barnard''s Star'    / target",
+	}}
+	if got := HeaderString(header, "OBJECT"); got != "Barnard's Star" {
+		t.Fatalf("HeaderString(OBJECT) = %q, want Barnard's Star", got)
+	}
+}
+
+func TestFilterStringFallsBackToPupilForJWST(t *testing.T) {
+	// JWST NIRCam stores some bandpasses in the pupil wheel with FILTER=CLEAR.
+	header := Header{Cards: map[string]string{
+		"FILTER": "'CLEAR'",
+		"PUPIL":  "'F162M'",
+	}}
+	if got := FilterString(header); got != "F162M" {
+		t.Fatalf("FilterString = %q, want F162M", got)
+	}
+}
+
+func TestFilterStringPrefersFilterOverPupil(t *testing.T) {
+	// MIRI (and NIRCam wide bands) carry the real filter in FILTER.
+	header := Header{Cards: map[string]string{
+		"FILTER": "'F770W'",
+		"PUPIL":  "'CLEAR'",
+	}}
+	if got := FilterString(header); got != "F770W" {
+		t.Fatalf("FilterString = %q, want F770W", got)
+	}
+}
+
+func TestFilterStringPrefersPupilFilterOverWideBlocker(t *testing.T) {
+	// NIRCam medium/narrow filters live in the pupil wheel paired with a wide
+	// blocking filter; the pupil filter is the operative bandpass.
+	cases := []struct{ filter, pupil, want string }{
+		{"F150W2", "F162M", "F162M"}, // short-wave narrow in pupil
+		{"F444W", "F470N", "F470N"},  // long-wave narrow in pupil
+	}
+	for _, c := range cases {
+		header := Header{Cards: map[string]string{
+			"FILTER": "'" + c.filter + "'",
+			"PUPIL":  "'" + c.pupil + "'",
+		}}
+		if got := FilterString(header); got != c.want {
+			t.Fatalf("FilterString(FILTER=%s,PUPIL=%s) = %q, want %q", c.filter, c.pupil, got, c.want)
+		}
+	}
+}
+
+func TestFilterStringIgnoresNonFilterPupilElements(t *testing.T) {
+	// Grisms, weak lenses, masks, etc. in the pupil must not be taken as filters.
+	for _, pupil := range []string{"CLEAR", "GRISMR", "WLP8", "MASKRND", "FLAT"} {
+		header := Header{Cards: map[string]string{
+			"FILTER": "'F356W'",
+			"PUPIL":  "'" + pupil + "'",
+		}}
+		if got := FilterString(header); got != "F356W" {
+			t.Fatalf("FilterString(PUPIL=%s) = %q, want F356W", pupil, got)
+		}
+	}
+}
+
 func TestWriteFloat32ImageRoundTripAndHeaderFormatting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roundtrip.fits")
 	header := Header{Cards: map[string]string{
@@ -307,6 +389,71 @@ func TestWriteFloat32ImageRoundTripAndHeaderFormatting(t *testing.T) {
 	}
 	if got := formatEndCard(); len(got) != 80 || !strings.HasPrefix(got, "END") {
 		t.Fatalf("formatEndCard invalid")
+	}
+}
+
+func TestWriteFloat32ImageWithExtensionsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ext_roundtrip.fits")
+	header := Header{Cards: map[string]string{"OBJECT": "'Nebula'"}}
+	sci := ImageData{Width: 2, Height: 2, Pixels: []float32{1, 2, 3, 4}}
+	wht := ImageData{Width: 2, Height: 2, Pixels: []float32{0.25, 0.5, 0.75, 1}}
+	if err := WriteFloat32ImageWithExtensions(path, header, sci, ImageExtension{ExtName: "WHT", Data: wht}); err != nil {
+		t.Fatalf("WriteFloat32ImageWithExtensions error = %v", err)
+	}
+
+	file, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("round-trip LoadFile error = %v", err)
+	}
+	if len(file.HDUs) != 2 {
+		t.Fatalf("len(HDUs) = %d, want 2", len(file.HDUs))
+	}
+	if file.HDUs[0].Data.Pixels[3] != 4 {
+		t.Fatalf("primary pixels = %v", file.HDUs[0].Data.Pixels)
+	}
+	whtHDU := file.GetHDU("WHT")
+	if whtHDU == nil {
+		t.Fatal("GetHDU(WHT) = nil, want WHT extension")
+	}
+	if whtHDU.ExtName != "WHT" {
+		t.Fatalf("ExtName = %q, want WHT", whtHDU.ExtName)
+	}
+	if whtHDU.Header.Cards["XTENSION"] != "'IMAGE   '" {
+		t.Fatalf("XTENSION = %q", whtHDU.Header.Cards["XTENSION"])
+	}
+	for i, want := range wht.Pixels {
+		if whtHDU.Data.Pixels[i] != want {
+			t.Fatalf("WHT pixel[%d] = %v, want %v", i, whtHDU.Data.Pixels[i], want)
+		}
+	}
+}
+
+func TestWriteFloat32ImageWithExtensionsMetadataSkipsLargeExtension(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ext_metadata.fits")
+	// 513*512*4 bytes > 1 MiB, so LoadFileMetadata skips decoding the extension.
+	const w, h = 513, 512
+	wht := ImageData{Width: w, Height: h, Pixels: make([]float32, w*h)}
+	sci := ImageData{Width: 2, Height: 2, Pixels: []float32{1, 2, 3, 4}}
+	if err := WriteFloat32ImageWithExtensions(path, Header{Cards: map[string]string{}}, sci, ImageExtension{ExtName: "WHT", Data: wht}); err != nil {
+		t.Fatalf("WriteFloat32ImageWithExtensions error = %v", err)
+	}
+
+	file, err := LoadFileMetadata(path)
+	if err != nil {
+		t.Fatalf("LoadFileMetadata error = %v", err)
+	}
+	if len(file.HDUs) != 2 {
+		t.Fatalf("len(HDUs) = %d, want 2", len(file.HDUs))
+	}
+	ext := file.HDUs[1]
+	if ext.ExtName != "WHT" {
+		t.Fatalf("ExtName = %q, want WHT", ext.ExtName)
+	}
+	if ext.Data.Width != w || ext.Data.Height != h {
+		t.Fatalf("dimensions = %dx%d, want %dx%d", ext.Data.Width, ext.Data.Height, w, h)
+	}
+	if ext.Data.Pixels != nil {
+		t.Fatalf("large extension pixels should be nil, got len %d", len(ext.Data.Pixels))
 	}
 }
 

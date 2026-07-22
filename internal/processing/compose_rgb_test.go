@@ -1,6 +1,7 @@
 package processing
 
 import (
+	"context"
 	"testing"
 
 	"gofitsv3/internal/fitsio"
@@ -22,7 +23,7 @@ func TestComposeRGBUsesGreenReferenceGrid(t *testing.T) {
 		"PC1_1": "1", "PC1_2": "0", "PC2_1": "0", "PC2_2": "1",
 	}})
 
-	buf, w, h, _ := ComposeRGB([]*models.LoadedImage{blue, green, red})
+	buf, w, h, _ := ComposeRGB(context.Background(), []*models.LoadedImage{blue, green, red})
 	if w != 6 || h != 5 {
 		t.Fatalf("ComposeRGB size = %dx%d, want 6x5", w, h)
 	}
@@ -38,7 +39,7 @@ func TestComposeRGBWithOrangeScreensTintedLayerWithOpacity(t *testing.T) {
 	red := makeLoadedImageForCompose(1, 1, 0, header)
 	orange := makeLoadedImageForCompose(1, 1, 10, header)
 
-	buf, w, h, _ := ComposeRGBWithOrange([]*models.LoadedImage{blue, green, red}, orange, models.OrangeLayerState{
+	buf, w, h, _ := ComposeRGBWithOrange(context.Background(), []*models.LoadedImage{blue, green, red}, orange, models.OrangeLayerState{
 		ColorR:  255,
 		ColorG:  128,
 		ColorB:  0,
@@ -48,6 +49,32 @@ func TestComposeRGBWithOrangeScreensTintedLayerWithOpacity(t *testing.T) {
 		t.Fatalf("ComposeRGBWithOrange size = %dx%d, want 1x1", w, h)
 	}
 	if got, want := []byte{buf[0], buf[1], buf[2], buf[3]}, []byte{128, 64, 0, 255}; got[0] != want[0] || got[1] != want[1] || got[2] != want[2] || got[3] != want[3] {
+		t.Fatalf("pixel = %v, want %v", got, want)
+	}
+}
+
+func TestComposeRGBWithOverlayHighlightProtectedAdditive(t *testing.T) {
+	header := fitsio.Header{Cards: map[string]string{"DRIZSCAL": "1", "ORIGOFFX": "0", "ORIGOFFY": "0"}}
+	// Base RGB channels stretch to 0.4 (value 4, White 10) -> byte 102 each.
+	blue := makeLoadedImageForCompose(1, 1, 4, header)
+	green := makeLoadedImageForCompose(1, 1, 4, header)
+	red := makeLoadedImageForCompose(1, 1, 4, header)
+	// Overlay stretches to 0.2 (value 2, White 10), tint red-only.
+	overlay := makeLoadedImageForCompose(1, 1, 2, header)
+
+	buf, _, _, _ := ComposeRGBWithOverlays(context.Background(), []*models.LoadedImage{blue, green, red}, []OverlayLayer{{
+		Image: overlay,
+		Settings: models.OrangeLayerState{
+			ColorR:           255,
+			ColorG:           0,
+			ColorB:           0,
+			Opacity:          1,
+			HighlightProtect: 0.5,
+		},
+	}})
+
+	// R: base 0.4 + layer 0.2 - 0.5*0.4*0.2 = 0.56 -> 143. G/B: tint 0, unchanged 102.
+	if got, want := []byte{buf[0], buf[1], buf[2], buf[3]}, []byte{143, 102, 102, 255}; got[0] != want[0] || got[1] != want[1] || got[2] != want[2] || got[3] != want[3] {
 		t.Fatalf("pixel = %v, want %v", got, want)
 	}
 }
@@ -77,7 +104,7 @@ func TestStretchForReferenceGridSkipsRewarpForSharedDrizzleGrid(t *testing.T) {
 	img.Peak = 1
 	img.ScaledPeak = 1
 
-	got := stretchForReferenceGrid(img, ref)
+	got := stretchForReferenceGrid(context.Background(), img, ref)
 	want := img.HDU.Data.Pixels
 	if got.Width != img.HDU.Data.Width || got.Height != img.HDU.Data.Height {
 		t.Fatalf("stretchForReferenceGrid size = %dx%d, want %dx%d", got.Width, got.Height, img.HDU.Data.Width, img.HDU.Data.Height)
@@ -109,6 +136,27 @@ func TestStretchedImageDataForReferenceGridUsesDisplayStretch(t *testing.T) {
 	}
 	if got.Pixels[0] != 0 || got.Pixels[1] != 1 {
 		t.Fatalf("pixels = %v, want [0 1]", got.Pixels)
+	}
+}
+
+func TestImageDataForReferenceGridSkipsWCSForRotatedChannel(t *testing.T) {
+	header := func(crpix1 string) fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": crpix1, "CRPIX2": "2", "CRVAL1": "100", "CRVAL2": "20",
+			"CDELT1": "1", "CDELT2": "1", "PC1_1": "1", "PC1_2": "0", "PC2_1": "0", "PC2_2": "1",
+		}}
+	}
+	img := makeLoadedImageForCompose(2, 2, 0, header("1"))
+	img.HDU.Data.Pixels = []float32{1, 2, 3, 4}
+	img.Rotation90 = 1
+	ref := makeLoadedImageForCompose(2, 2, 0, header("2"))
+
+	got := ImageDataForReferenceGrid(img, ref)
+	want := []float32{1, 2, 3, 4}
+	for i, value := range want {
+		if got.Pixels[i] != value {
+			t.Fatalf("Pixels[%d] = %v, want unwarped rotated data %v", i, got.Pixels[i], value)
+		}
 	}
 }
 

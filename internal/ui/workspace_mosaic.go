@@ -21,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"gofitsv3/internal/debuglog"
+	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
 	"gofitsv3/internal/processing"
@@ -31,6 +32,7 @@ type mosaicState struct {
 	inputs      []mosaic.Input
 	statuses    []mosaic.InputStatus
 	result      *mosaic.Result
+	resultName  string
 	savePreview bool
 	// referenceInput is an optional drizzled baseline used as the WCS anchor for
 	// star alignment and drizzle. Its pixels are not included in the output.
@@ -41,14 +43,15 @@ type mosaicState struct {
 	alignmentSettingsSet bool
 	skysubSettings       models.SkysubSettings
 	skysubSettingsSet    bool
+	artifactMasks        *models.ArtifactMaskProject
 	// exposureNormMode controls per-frame exposure-time normalization applied
 	// before drizzle. Defaults to Off so existing behavior is preserved.
 	exposureNormMode mosaic.NormalizationMode
 }
 
-func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu) {
+func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu, *fyne.MenuItem, *fyne.MenuItem) {
 	state := &mosaicState{drizzleSettings: defaultDrizzleSettings(), alignmentSettings: defaultAlignmentSettings(), skysubSettings: defaultSkysubSettings()}
-	ws := &mosaicWorkspace{app: app, win: win, state: state, zoomLevel: 1.0, stretchMode: stretch.Asinh}
+	ws := &mosaicWorkspace{app: app, win: win, state: state, zoomLevel: 1.0, stretchMode: stretch.Asinh, mtfMidtone: stretch.DefaultMTFMidtone}
 	// ws.activeFilter is set when a filter batch is loaded; used for default save names.
 	// ws.lastProjectName is updated on save/load so the save dialog pre-populates the same name.
 
@@ -56,7 +59,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	preview.FillMode = canvas.ImageFillContain
 	preview.SetMinSize(fyne.NewSize(520, 420))
 
-	statsLabel := widget.NewLabel("Mean: -- | Std: -- | Size: --")
+	statsLabel := widget.NewLabel(mosaicEmptyStatsText())
 	statsLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	statusLabel := widget.NewLabel("No FITS files loaded.")
 	statusLabel.Wrapping = fyne.TextWrapWord
@@ -66,6 +69,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	offsetScroll.SetMinSize(fyne.NewSize(260, 180))
 	offsetHeader := container.NewVBox()
 	saveBtn := widget.NewButton("Save Drizzle FITS", func() {})
+	saveBtn.Importance = widget.HighImportance
 	saveBtn.Disable()
 	sendToExamineBtn := widget.NewButton("Send to Examine", func() {
 		if globalSendToExamine == nil || state.result == nil {
@@ -121,12 +125,14 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	bgEntry := NewNumberEntry(0.001, 4)
 	peakEntry := NewNumberEntry(1, 1)
 	scaledPeakEntry := NewNumberEntry(1, 1)
+	mtfMidtoneEntry := NewNumberEntry(0.01, 3)
 
 	blackEntry.SetValue(0)
 	whiteEntry.SetValue(1)
 	bgEntry.SetValue(0)
 	peakEntry.SetValue(1000)
 	scaledPeakEntry.SetValue(1000)
+	mtfMidtoneEntry.SetValue(stretch.DefaultMTFMidtone)
 
 	// Mirror create-once widgets onto ws so methods extracted from this
 	// constructor can read them. The locals remain in use within the
@@ -136,6 +142,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	ws.bgEntry = bgEntry
 	ws.peakEntry = peakEntry
 	ws.scaledPeakEntry = scaledPeakEntry
+	ws.mtfMidtoneEntry = mtfMidtoneEntry
 	ws.statusLabel = statusLabel
 	ws.saveOffsetsBtn = saveOffsetsBtn
 	ws.loadOffsetsBtn = loadOffsetsBtn
@@ -206,6 +213,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				}
 			}
 		}
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 
@@ -249,6 +257,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			}
 		}
 		fd.SetView(dialog.ListView)
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 
@@ -295,47 +304,32 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			if state.alignmentSettings.DebugAlignment {
 				defer installAlignmentDebugHook(win)()
 			}
-			if err := ws.ensureInputPixelsLoaded(); err != nil {
+			// TweakReg modes stream each frame's pixels on demand during
+			// alignment, so only the legacy warp-based modes (and the debug hook,
+			// which needs image backdrops) require every frame resident up front.
+			alignMode := mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode)
+			if !mosaic.AlignmentStreamsPixels(alignMode) || state.alignmentSettings.DebugAlignment {
+				if err := ws.ensureInputPixelsLoaded(); err != nil {
+					fyne.Do(func() {
+						progressDialog.Hide()
+						dialog.ShowError(err, win)
+					})
+					return
+				}
+			}
+			alignInputs, stateIndices := ws.alignmentWorkset()
+			if len(alignInputs) < 2 {
 				fyne.Do(func() {
 					progressDialog.Hide()
-					dialog.ShowError(err, win)
+					dialog.ShowInformation("Star Alignment", "All eligible inputs already have saved alignments.", win)
 				})
 				return
 			}
-			alignInputs := ws.inputsWithRef()
-			numRefs := state.alignmentSettings.NumRefs
-			if numRefs < 1 {
-				numRefs = 1
-			}
-			results, err := mosaic.AlignInputsBySelectedStarsWithMode(alignInputs, refStars, numRefs, mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec)
+			results, err := mosaic.AlignInputsBySelectedStarsWithMode(alignInputs, refStars, ws.alignmentNumRefs(), mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec)
 
-			type alignRow struct {
-				stateIdx int
-				result   mosaic.StarAlignmentResult
-			}
-			var rows []alignRow
+			var rows []alignmentResultRow
 			if err == nil {
-				var activeIndices []int
-				for i, inp := range state.inputs {
-					if !inp.Excluded {
-						activeIndices = append(activeIndices, i)
-					}
-				}
-				offset := 0
-				if state.referenceInput != nil {
-					offset = 1
-				}
-				for ri := offset; ri < len(results); ri++ {
-					ai := ri - offset
-					if ai >= len(activeIndices) {
-						continue
-					}
-					si := activeIndices[ai]
-					if si >= len(state.inputs) || state.inputs[si].OffsetLocked {
-						continue
-					}
-					rows = append(rows, alignRow{stateIdx: si, result: results[ri]})
-				}
+				rows = buildAlignmentResultRowsForStateIndices(results, stateIndices)
 			}
 
 			fyne.Do(func() {
@@ -374,34 +368,56 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				}
 
 				var d dialog.Dialog
-				applyBtn := widget.NewButton("Apply", func() {
-					for i, r := range rows {
-						if checks[i] == nil || !checks[i].Checked {
-							continue
+				exportBtn := widget.NewButton("Export CSV...", func() {
+					save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, saveErr error) {
+						if saveErr != nil || uc == nil {
+							return
 						}
-						si := r.stateIdx
-						if si >= len(state.inputs) || si >= len(state.statuses) {
-							continue
+						path := uc.URI().Path()
+						_ = uc.Close()
+						if filepath.Ext(path) == "" {
+							path += ".csv"
 						}
-						state.inputs[si].OffsetX = r.result.OffsetX
-						state.inputs[si].OffsetY = r.result.OffsetY
-						state.inputs[si].ManualTransform = r.result.ManualTransform
-						state.inputs[si].HasManualTransform = r.result.HasManualTransform
-						if si == 0 && state.referenceInput == nil {
-							state.statuses[si].Status = "reference"
-						} else {
-							state.statuses[si].Status = "star aligned"
+						file, createErr := os.Create(path)
+						if createErr != nil {
+							dialog.ShowError(createErr, win)
+							return
 						}
-						state.statuses[si].Error = ""
+						writeErr := writeAlignmentCSV(file, rows, state.inputs)
+						closeErr := file.Close()
+						if writeErr != nil {
+							dialog.ShowError(writeErr, win)
+							return
+						}
+						if closeErr != nil {
+							dialog.ShowError(closeErr, win)
+							return
+						}
+						dialog.ShowInformation("Exported", "Alignment CSV exported successfully.", win)
+					}, win)
+					name := "alignment_results.csv"
+					if ws.activeFilter != "" {
+						name = ws.activeFilter + "_alignment_results.csv"
 					}
+					save.SetFileName(name)
+					save.SetFilter(storage.NewExtensionFileFilter([]string{".csv"}))
+					save.Show()
+				})
+				applyBtn := widget.NewButton("Apply", func() {
+					saveErr := ws.applyAlignmentRowsAndSave(rows, func(i int) bool {
+						return checks[i] != nil && checks[i].Checked
+					}, mosaic.MergeSaveAlignmentSidecar)
 					d.Hide()
 					ws.rebuildOffsetControls()
 					ws.updateStatus()
 					go ws.buildDrizzlePreview()
+					if saveErr != nil {
+						dialog.ShowError(saveErr, win)
+					}
 				})
 				scroll := container.NewVScroll(content)
 				scroll.SetMinSize(fyne.NewSize(520, 200))
-				d = dialog.NewCustom("Star Alignment Results", "Dismiss", container.NewVBox(scroll, applyBtn), win)
+				d = dialog.NewCustom("Star Alignment Results", "Dismiss", container.NewVBox(scroll, container.NewGridWithColumns(2, exportBtn, applyBtn)), win)
 				d.Show()
 			})
 		}()
@@ -451,6 +467,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
 		ws.configureLastDir(fd)
 		fd.SetView(dialog.ListView)
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 
@@ -480,6 +497,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					filterSelect := NewSafeSelect(mosaic.FilterFacetOptions(files), nil)
 					proposalSelect := NewSafeSelect(mosaic.ProposalFacetOptions(files), nil)
 					exposureSelect := NewSafeSelect(mosaic.ExposureFacetOptions(files), nil)
+					instrumentSelect := NewSafeSelect(mosaic.InstrumentFacetOptions(files), nil)
 
 					// Date range is bounded by the actual observation dates, as a
 					// min/max pair of selects (omitted when no DATE-OBS is present).
@@ -502,6 +520,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						c := mosaic.FileCriteria{
 							Filter:      mosaic.FacetValue(filterSelect.Selected),
 							ProposalID:  mosaic.FacetValue(proposalSelect.Selected),
+							Instrument:  mosaic.FacetValue(instrumentSelect.Selected),
 							Exposure:    mosaic.FacetValue(exposureSelect.Selected),
 							ProductType: productType(),
 						}
@@ -531,7 +550,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					filteredFiles := func() []mosaic.FilterFile {
 						filter := mosaic.FacetValue(filterSelect.Selected)
 						product := productType()
-						if filter == "" && product == "" {
+						instrument := mosaic.FacetValue(instrumentSelect.Selected)
+						if filter == "" && product == "" && instrument == "" {
 							return files
 						}
 						filtered := make([]mosaic.FilterFile, 0, len(files))
@@ -542,27 +562,71 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 							if product != "" && mosaic.ProductType(f.Path) != product {
 								continue
 							}
+							if instrument != "" && f.Instrument != instrument {
+								continue
+							}
 							filtered = append(filtered, f)
 						}
 						return filtered
 					}
 
-					setSelectSelection := func(sel *SafeSelect, options []string, selected string) {
+					var updating bool
+
+					// upstreamFilteredFiles applies the facets that sit above Filter in
+					// the cascade (product type and instrument), so the Filter list and
+					// everything below it narrow to the chosen product/instrument.
+					upstreamFilteredFiles := func() []mosaic.FilterFile {
+						product := productType()
+						instrument := mosaic.FacetValue(instrumentSelect.Selected)
+						if product == "" && instrument == "" {
+							return files
+						}
+						filtered := make([]mosaic.FilterFile, 0, len(files))
+						for _, f := range files {
+							if product != "" && mosaic.ProductType(f.Path) != product {
+								continue
+							}
+							if instrument != "" && f.Instrument != instrument {
+								continue
+							}
+							filtered = append(filtered, f)
+						}
+						return filtered
+					}
+
+					setSelectSelection := func(sel *SafeSelect, options []string) {
+						oldFacet := mosaic.FacetValue(sel.Selected)
 						sel.Options = options
 						sel.Refresh()
-						if selected != "" {
-							sel.SetSelected(selected)
-							return
+						if oldFacet != "" {
+							for _, opt := range options {
+								if mosaic.FacetValue(opt) == oldFacet {
+									sel.SetSelected(opt)
+									return
+								}
+							}
 						}
 						if len(options) > 0 {
 							sel.SetSelected(options[0])
+						} else {
+							sel.SetSelected("")
 						}
 					}
 
 					updateDependentOptions := func() {
+						if updating {
+							return
+						}
+						updating = true
+						defer func() { updating = false }()
+
+						// 1. Update filter options based on product type and instrument
+						setSelectSelection(filterSelect, mosaic.FilterFacetOptions(upstreamFilteredFiles()))
+
+						// 2. Update dependent selections based on both product type and filter
 						filtered := filteredFiles()
-						setSelectSelection(proposalSelect, mosaic.ProposalFacetOptions(filtered), "Any ("+fmt.Sprintf("%d files", len(filtered))+")")
-						setSelectSelection(exposureSelect, mosaic.ExposureFacetOptions(filtered), "Any ("+fmt.Sprintf("%d files", len(filtered))+")")
+						setSelectSelection(proposalSelect, mosaic.ProposalFacetOptions(filtered))
+						setSelectSelection(exposureSelect, mosaic.ExposureFacetOptions(filtered))
 						if dateMinSelect != nil {
 							dates := mosaic.DateValues(filtered)
 							dateMinSelect.Options = append([]string(nil), dates...)
@@ -580,6 +644,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					}
 
 					updateSelectedFiles := func() {
+						if updating {
+							return
+						}
 						paths := mosaic.MatchFiles(files, criteria())
 						fileChecks = make([]fileCheck, len(paths))
 						checkBoxes = make([]*widget.Check, len(paths))
@@ -607,27 +674,43 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					}
 					proposalSelect.OnChanged = func(string) { updateSelectedFiles() }
 					exposureSelect.OnChanged = func(string) { updateSelectedFiles() }
+					instrumentSelect.OnChanged = func(string) {
+						updateDependentOptions()
+						updateSelectedFiles()
+					}
 					if dateMinSelect != nil {
 						dateMinSelect.OnChanged = func(string) { updateSelectedFiles() }
 						dateMaxSelect.OnChanged = func(string) { updateSelectedFiles() }
 					}
 
-					hasFLC, hasFLT := mosaic.AvailableProductTypes(filesByFilter)
-					typeRadio = widget.NewRadioGroup([]string{".flc", ".flt"}, nil)
-					typeRadio.Horizontal = true
+					hasFLC, hasFLT, hasCal := mosaic.AvailableProductTypes(filesByFilter)
+					var typeOptions []string
 					if hasFLC {
-						typeRadio.SetSelected(".flc")
-					} else {
-						typeRadio.SetSelected(".flt")
+						typeOptions = append(typeOptions, ".flc")
+					}
+					if hasFLT {
+						typeOptions = append(typeOptions, ".flt")
+					}
+					if hasCal {
+						typeOptions = append(typeOptions, ".cal")
+					}
+					typeRadio = widget.NewRadioGroup(typeOptions, nil)
+					typeRadio.Horizontal = true
+					if len(typeOptions) > 0 {
+						typeRadio.SetSelected(typeOptions[0])
 					}
 					// Only one product type present: lock the choice to it.
-					if !(hasFLC && hasFLT) {
+					if len(typeOptions) <= 1 {
 						typeRadio.Disable()
 					}
 					typeRadio.OnChanged = func(string) {
 						updateDependentOptions()
 						updateSelectedFiles()
 					}
+
+					// Instrument defaults to "Any" so mixed-instrument batches are
+					// discoverable; the user narrows it when combining a single one.
+					instrumentSelect.SetSelected(instrumentSelect.Options[0])
 
 					// Default to a concrete filter (preserving the prior
 					// single-filter workflow) and the full available date range.
@@ -651,6 +734,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 					formItems := []*widget.FormItem{
 						widget.NewFormItem("Image Type", typeRadio),
+						widget.NewFormItem("Instrument", instrumentSelect),
 						widget.NewFormItem("Filter", filterSelect),
 						widget.NewFormItem("Proposal ID", proposalSelect),
 						widget.NewFormItem("Exposure Time", exposureSelect),
@@ -678,6 +762,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						// "Any" filter loads a mixed-filter batch; activeFilter is
 						// left empty so per-filter prefs/save names are skipped.
 						ws.activeFilter = mosaic.FacetValue(filterSelect.Selected)
+						ws.resetMTFMidtone()
 						if ws.activeFilter != "" {
 							ws.loadLevelPrefsAndMode(ws.activeFilter)
 						}
@@ -703,6 +788,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				fd.SetLocation(l)
 			}
 		}
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 	ws.batchBtn = batchBtn
@@ -715,7 +801,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		ws.enterMeasureMode()
 	})
 
-	starAlignBtn := widget.NewButton("Align By Stars", func() {
+	starAlignBtn := widget.NewButton("Align / Register Frames", func() {
 		if len(state.inputs) < 2 {
 			dialog.ShowInformation("Missing Inputs", "Load at least two FITS files before star alignment.", win)
 			return
@@ -725,17 +811,26 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			if state.alignmentSettings.DebugAlignment {
 				defer installAlignmentDebugHook(win)()
 			}
-			if err := ws.ensureInputPixelsLoaded(); err != nil {
+			// TweakReg modes stream each frame's pixels on demand during
+			// alignment, so only the legacy warp-based modes (and the debug hook,
+			// which needs image backdrops) require every frame resident up front.
+			alignMode := mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode)
+			if !mosaic.AlignmentStreamsPixels(alignMode) || state.alignmentSettings.DebugAlignment {
+				if err := ws.ensureInputPixelsLoaded(); err != nil {
+					pt.hide()
+					fyne.Do(func() { dialog.ShowError(err, win) })
+					return
+				}
+			}
+			alignInputs, stateIndices := ws.alignmentWorkset()
+			if len(alignInputs) < 2 {
 				pt.hide()
-				fyne.Do(func() { dialog.ShowError(err, win) })
+				fyne.Do(func() {
+					dialog.ShowInformation("Star Alignment", "All eligible inputs already have saved alignments.", win)
+				})
 				return
 			}
-			alignInputs := ws.inputsWithRef()
-			numRefs := state.alignmentSettings.NumRefs
-			if numRefs < 1 {
-				numRefs = 1
-			}
-			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, numRefs, mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec, mosaic.AlignProgress{
+			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, ws.alignmentNumRefs(), alignMode, state.alignmentSettings.SearchRadiusArcsec, mosaic.AlignProgress{
 				Progress: func(done, total int) { pt.progress("Aligning", done, total) },
 				Ctx:      pt.ctx,
 			})
@@ -746,33 +841,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			}
 
 			// Build the row data entirely off the main goroutine before touching UI.
-			type alignRow struct {
-				stateIdx int
-				result   mosaic.StarAlignmentResult
-			}
-			var rows []alignRow
+			var rows []alignmentResultRow
 			if err == nil {
-				var activeIndices []int
-				for i, inp := range state.inputs {
-					if !inp.Excluded {
-						activeIndices = append(activeIndices, i)
-					}
-				}
-				offset := 0
-				if state.referenceInput != nil {
-					offset = 1
-				}
-				for ri := offset; ri < len(results); ri++ {
-					ai := ri - offset
-					if ai >= len(activeIndices) {
-						continue
-					}
-					si := activeIndices[ai]
-					if si >= len(state.inputs) || state.inputs[si].OffsetLocked {
-						continue
-					}
-					rows = append(rows, alignRow{stateIdx: si, result: results[ri]})
-				}
+				rows = buildAlignmentResultRowsForStateIndices(results, stateIndices)
 			}
 
 			pt.hide()
@@ -811,34 +882,56 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				}
 
 				var d dialog.Dialog
-				applyBtn := widget.NewButton("Apply", func() {
-					for i, r := range rows {
-						if checks[i] == nil || !checks[i].Checked {
-							continue
+				exportBtn := widget.NewButton("Export CSV...", func() {
+					save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, saveErr error) {
+						if saveErr != nil || uc == nil {
+							return
 						}
-						si := r.stateIdx
-						if si >= len(state.inputs) || si >= len(state.statuses) {
-							continue
+						path := uc.URI().Path()
+						_ = uc.Close()
+						if filepath.Ext(path) == "" {
+							path += ".csv"
 						}
-						state.inputs[si].OffsetX = r.result.OffsetX
-						state.inputs[si].OffsetY = r.result.OffsetY
-						state.inputs[si].ManualTransform = r.result.ManualTransform
-						state.inputs[si].HasManualTransform = r.result.HasManualTransform
-						if si == 0 && state.referenceInput == nil {
-							state.statuses[si].Status = "reference"
-						} else {
-							state.statuses[si].Status = "star aligned"
+						file, createErr := os.Create(path)
+						if createErr != nil {
+							dialog.ShowError(createErr, win)
+							return
 						}
-						state.statuses[si].Error = ""
+						writeErr := writeAlignmentCSV(file, rows, state.inputs)
+						closeErr := file.Close()
+						if writeErr != nil {
+							dialog.ShowError(writeErr, win)
+							return
+						}
+						if closeErr != nil {
+							dialog.ShowError(closeErr, win)
+							return
+						}
+						dialog.ShowInformation("Exported", "Alignment CSV exported successfully.", win)
+					}, win)
+					name := "alignment_results.csv"
+					if ws.activeFilter != "" {
+						name = ws.activeFilter + "_alignment_results.csv"
 					}
+					save.SetFileName(name)
+					save.SetFilter(storage.NewExtensionFileFilter([]string{".csv"}))
+					save.Show()
+				})
+				applyBtn := widget.NewButton("Apply", func() {
+					saveErr := ws.applyAlignmentRowsAndSave(rows, func(i int) bool {
+						return checks[i] != nil && checks[i].Checked
+					}, mosaic.MergeSaveAlignmentSidecar)
 					d.Hide()
 					ws.rebuildOffsetControls()
 					ws.updateStatus()
 					go ws.buildDrizzlePreview()
+					if saveErr != nil {
+						dialog.ShowError(saveErr, win)
+					}
 				})
 				scroll := container.NewVScroll(content)
 				scroll.SetMinSize(fyne.NewSize(520, 200))
-				d = dialog.NewCustom("Star Alignment Results", "Dismiss", container.NewVBox(scroll, applyBtn), win)
+				d = dialog.NewCustom("Star Alignment Results", "Dismiss", container.NewVBox(scroll, container.NewGridWithColumns(2, exportBtn, applyBtn)), win)
 				d.Show()
 			})
 		}()
@@ -849,12 +942,15 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	})
 
 	buildBtn := widget.NewButton("Create Mosaic", func() {
+		if ws.queueRunning {
+			return
+		}
 		if len(state.inputs) == 0 {
 			dialog.ShowInformation("Missing Inputs", "Add one or more FITS files first.", win)
 			return
 		}
 		if !state.drizzleSettingsSet {
-			showDrizzleSettingsDialog(win, state.drizzleSettings, func(s models.DrizzleSettings) {
+			showDrizzleSettingsDialog(win, state.drizzleSettings, state.inputs, func(s models.DrizzleSettings) {
 				state.drizzleSettings = s
 				state.drizzleSettingsSet = true
 				go ws.buildDrizzlePreview()
@@ -893,6 +989,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				dialog.ShowError(err, win)
 				return
 			}
+			state.resultName = filepath.Base(path)
+			stats := histogram.Compute(state.result.Pixels)
+			ws.statsLabel.SetText(mosaicStatsText(state.resultName, stats.Mean, stats.Std, state.result.Width, state.result.Height))
 			dialog.ShowInformation("Saved", "Drizzle FITS saved successfully.", win)
 		}, win)
 		drizzleName := "mosaic_drizzle.fits"
@@ -977,6 +1076,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		bgEntry.SetValue(0)
 		peakEntry.SetValue(1000)
 		scaledPeakEntry.SetValue(1000)
+		ws.resetMTFMidtone()
 		ws.updateStatus()
 		ws.resetPreview()
 		ws.rebuildOffsetControls()
@@ -989,7 +1089,18 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	statusScroll.SetMinSize(fyne.NewSize(260, 160))
 
 	// Level controls form.
-	modeSelect := NewSafeSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq"}, func(s string) {
+	var mtfMidtoneRow fyne.CanvasObject
+	updateStretchParams := func() {
+		if mtfMidtoneRow == nil {
+			return
+		}
+		if ws.stretchMode == stretch.MTF {
+			mtfMidtoneRow.Show()
+		} else {
+			mtfMidtoneRow.Hide()
+		}
+	}
+	modeSelect := NewSafeSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq", "MTF"}, func(s string) {
 		switch s {
 		case "Linear":
 			ws.stretchMode = stretch.Linear
@@ -999,9 +1110,12 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			ws.stretchMode = stretch.Sqrt
 		case "HistEq":
 			ws.stretchMode = stretch.HistEq
+		case "MTF":
+			ws.stretchMode = stretch.MTF
 		default:
 			ws.stretchMode = stretch.Asinh
 		}
+		updateStretchParams()
 	})
 	modeSelect.SetSelected("Asinh")
 	ws.modeSelect = modeSelect
@@ -1009,11 +1123,17 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		lbl := widget.NewLabel(label)
 		return container.NewBorder(nil, nil, container.New(&minWidthLayout{w: 90}, lbl), nil, w)
 	}
+	mtfMidtoneRow = makeFormRow("MTF midtone", mtfMidtoneEntry)
+	updateStretchParams()
+	magicPreset := widget.NewSelect([]string{"Balanced", "Nebula", "Galaxy"}, nil)
+	magicPreset.SetSelected("Balanced")
 	levelsForm := container.New(&fixedVSpacingLayout{15},
 		makeFormRow("Mode", modeSelect),
 		makeFormRow("Background", bgEntry),
 		makeFormRow("Peak", peakEntry),
 		makeFormRow("Scaled Peak", scaledPeakEntry),
+		mtfMidtoneRow,
+		makeFormRow("Magic preset", magicPreset),
 	)
 	autoLevelsBtn := widget.NewButton("Auto Scaling", func() {
 		if state.result != nil {
@@ -1024,7 +1144,14 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			ws.applyLevelsToPreview()
 		}
 	})
+	autoMTFBtn := widget.NewButton("Auto MTF", func() {
+		ws.autoMTFLevels(ws.currentPreviewResult())
+	})
+	magicBtn := widget.NewButton("Magic", func() {
+		ws.magicLevels(ws.currentPreviewResult(), processing.ParseMagicPreset(magicPreset.Selected))
+	})
 	applyLevelsBtn := widget.NewButton("Apply Values", func() {
+		ws.mtfMidtone = ws.mtfMidtoneEntry.Value()
 		ws.applyLevelsToPreview()
 		ws.saveLevelPrefs()
 	})
@@ -1043,23 +1170,28 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				return
 			}
 			inp.ReferenceOnly = true
-			state.referenceInput = &inp
-			refLabel.SetText("Reference: " + filepath.Base(path))
-			ws.resetPreview()
-			ws.updateActionButtons()
+			ws.confirmReferenceFrameChange(&inp, func() {
+				state.referenceInput = &inp
+				refLabel.SetText("Reference: " + filepath.Base(path))
+				ws.resetPreview()
+				ws.updateActionButtons()
+			})
 		}, win)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
 		ws.configureLastDir(fd)
 		fd.SetView(dialog.ListView)
+		sizeFileDialog(fd)
 		fd.Show()
 	})
 	ws.setRefBtn = setRefBtn
 
 	clearRefBtn := widget.NewButton("Clear Reference", func() {
-		state.referenceInput = nil
-		refLabel.SetText("Reference: none")
-		ws.resetPreview()
-		ws.updateActionButtons()
+		ws.confirmReferenceFrameChange(nil, func() {
+			state.referenceInput = nil
+			refLabel.SetText("Reference: none")
+			ws.resetPreview()
+			ws.updateActionButtons()
+		})
 	})
 	clearRefBtn.Importance = widget.DangerImportance
 	ws.clearRefBtn = clearRefBtn
@@ -1081,7 +1213,8 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			r.SetMinSize(fyne.NewSize(1, 20))
 			return r
 		}(),
-		container.NewGridWithColumns(2, autoLevelsBtn, applyLevelsBtn),
+		container.NewGridWithColumns(2, autoLevelsBtn, autoMTFBtn),
+		container.NewGridWithColumns(2, magicBtn, applyLevelsBtn),
 		widget.NewSeparator(),
 		widget.NewLabel("Mosaic / Drizzle"),
 		container.NewGridWithColumns(2, loadBtn, batchBtn),
@@ -1125,7 +1258,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	ws.previewSwap = container.NewStack(ws.previewScroll)
 
 	// Zoom controls for the preview pane header.
-	zoomPresets := []string{"fit in preview", "6%", "12%", "25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%"}
+	zoomPresets := []string{"fit", "6%", "12%", "25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%"}
 	zoomSelect := NewSafeSelect(zoomPresets, nil)
 	zoomCustomEntry := widget.NewEntry()
 	zoomCustomEntry.SetPlaceHolder("custom %")
@@ -1142,7 +1275,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		if ws.zoomSelectSyncing {
 			return
 		}
-		if sel == "fit in preview" {
+		if sel == "fit" {
 			ws.zoomFitMode = true
 			ws.updateZoom()
 			return
@@ -1184,7 +1317,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 	// Default to "fit in preview" on startup.
 	ws.zoomFitMode = true
-	zoomSelect.SetSelected("fit in preview")
+	zoomSelect.SetSelected("fit")
 
 	ws.rebuildOffsetControls()
 	ws.updateStatus()
@@ -1194,19 +1327,23 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 	// ---- Settings menu -----------------------------------------------
 
+	loadMosaicItem := fyne.NewMenuItem("Load Mosaic Project", ws.loadMosaicProject)
+	saveMosaicItem := fyne.NewMenuItem("Save Mosaic Project", ws.saveMosaicProject)
+
 	settingsMenu := fyne.NewMenu("Mosaic",
-		fyne.NewMenuItem("Load Mosaic Project", ws.loadMosaicProject),
-		fyne.NewMenuItem("Save Mosaic Project", ws.saveMosaicProject),
+		fyne.NewMenuItem("Drizzle Queue...", ws.openDrizzleQueue),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Drizzle Settings", ws.openDrizzleSettings),
 		fyne.NewMenuItem("Alignment Settings", ws.openAlignmentSettings),
 		fyne.NewMenuItem("Skysub Settings", ws.openSkysubSettings),
 		fyne.NewMenuItem("Exposure Normalization", ws.openExposureReview),
+		fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem("Create Artifact Masks...", ws.openArtifactMaskEditor),
 	)
 	footerBottomPad := canvas.NewRectangle(color.Transparent)
 	footerBottomPad.SetMinSize(fyne.NewSize(1, 20))
 	previewPane := container.NewBorder(previewHeader, container.NewVBox(previewFooter, footerBottomPad), nil, nil, ws.previewSwap)
 	split := container.NewHSplit(container.New(&sidePaddedLayout{20}, ws.leftStack), previewPane)
 	split.SetOffset(0.38)
-	return split, settingsMenu
+	return split, settingsMenu, loadMosaicItem, saveMosaicItem
 }
