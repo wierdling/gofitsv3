@@ -128,6 +128,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var previewMu sync.Mutex
 	previewSeq := 0
 	var genCancel context.CancelFunc
+	var blinkMu sync.Mutex
+	var blinkPrepared []composeBlinkFrame
+	blinkSeq := 0
 
 	sharedHistCheck := NewToggle(nil)
 	sharedHistCheck.SetChecked(false)
@@ -136,7 +139,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	blinkCheck := NewToggle(nil)
 	blinkCheck.SetChecked(false)
 	blinkExcludedIdx := 0
-	var blinkExcludeSelect *SafeSelect
+	// nil means no generalized selection was persisted; this preserves legacy
+	// project migration and lets future defaults select all loaded sources.
+	var blinkChannels []int
+	var chooseBlinkChannels func()
 	var updateHistScaleLabel func()
 	var updateBlinkStatus func()
 	var startBlink func()
@@ -147,6 +153,17 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var measureStart *imagePoint
 	var measureEnd *imagePoint
 	var updateMeasurement func()
+	composeBlinkSources := func() []composeBlinkSource {
+		overlays := make([]composeBlinkOverlaySource, 0, len(overlayLayers))
+		for _, layer := range overlayLayers {
+			path := ""
+			if layer.idx < len(imgs) && imgs[layer.idx] != nil {
+				path = imgs[layer.idx].Path
+			}
+			overlays = append(overlays, composeBlinkOverlaySource{RuntimeIndex: layer.idx, Name: layer.name, Path: path, BlinkID: layer.settings.BlinkID})
+		}
+		return enumerateComposeBlinkSources(imgs, overlays)
+	}
 
 	// Updated signature to pass the stats
 	pushRGBHist := func(stats [3]histogram.Stats) {
@@ -189,8 +206,24 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		genCancel = cancel
 		previewSeq++
 		seq := previewSeq
+		// Invalidate frames from the superseded generation immediately. Keep the
+		// active ticker sequence intact: ordinary preview refreshes must resume
+		// cycling as soon as replacement frames are applied. stopBlink remains
+		// the explicit ticker invalidation path.
+		blinkMu.Lock()
+		blinkPrepared = nil
+		blinkMu.Unlock()
 		previewMu.Unlock()
 		imgSnapshot := renderImages()
+		blinkSourcesSnapshot := composeBlinkSources()
+		blinkSelectionSnapshot := append([]int(nil), blinkChannels...)
+		blinkEnabled := blinkCheck.Checked
+		if blinkEnabled && blinkChannels == nil {
+			blinkSelectionSnapshot = resolveComposeBlinkSelection(blinkSourcesSnapshot, nil, true, blinkExcludedIdx)
+		}
+		if blinkEnabled && len(filterComposeBlinkSelection(blinkSelectionSnapshot, blinkSourcesSnapshot)) < 2 {
+			blinkSelectionSnapshot = nil
+		}
 		levelsSnapshot := *levels
 		sharedHistScale := sharedHistCheck.Checked
 		buildComposite := buildCompositeCheck.Checked
@@ -198,6 +231,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			start := time.Now()
 			debuglog.Log("compose refresh async: starting preview computation")
 			data := buildComposePreviewData(ctx, imgSnapshot, sharedHistScale, buildComposite, &levelsSnapshot, composeRGBWithOptionalStarless)
+			if blinkEnabled {
+				data.BlinkFrames = buildComposeBlinkFrames(ctx, imgSnapshot, blinkSourcesSnapshot, blinkSelectionSnapshot, data.Views)
+			}
 			debuglog.Log(fmt.Sprintf("compose refresh async: preview computation took %s", time.Since(start)))
 			fyne.Do(func() {
 				previewMu.Lock()
@@ -211,6 +247,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					return
 				}
 				applyComposePreviewData(data, viewports, pushRGBHist)
+				blinkMu.Lock()
+				blinkPrepared = append([]composeBlinkFrame(nil), data.BlinkFrames...)
+				blinkMu.Unlock()
 				if refreshBlinkFrame != nil {
 					refreshBlinkFrame()
 				}
@@ -794,6 +833,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	removeLayer := func(l *overlayLayer) {
+		oldSources := composeBlinkSources()
 		for i, x := range overlayLayers {
 			if x == l {
 				overlayLayers = append(overlayLayers[:i], overlayLayers[i+1:]...)
@@ -807,6 +847,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		l.win = nil
 		l.viewport = nil
 		l.control = nil
+		if blinkChannels != nil {
+			blinkChannels = remapComposeBlinkSelection(blinkChannels, oldSources, composeBlinkSources())
+		}
 	}
 
 	openOverlayLayerWindowWithPreview := func(l *overlayLayer, preparedPreview *composeOverlayPreviewData) {
@@ -1061,6 +1104,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			origPixels = append(origPixels, nil)
 		}
 		nextLayerNumber++
+		if settings.BlinkID == "" {
+			settings.BlinkID = fmt.Sprintf("overlay-%d", nextLayerNumber)
+		}
 		l := &overlayLayer{
 			idx:      idx,
 			name:     fmt.Sprintf("Layer %d", nextLayerNumber),
@@ -1422,6 +1468,20 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			BlinkExcludedFilter:  blinkExcludedIdx,
 			StarlessSettings:     starlessSettings,
 		}
+		if blinkChannels != nil {
+			selection := append([]int(nil), blinkChannels...)
+			project.BlinkChannels = &selection
+			keys := make([]string, 0, len(selection))
+			for _, index := range selection {
+				for _, source := range composeBlinkSources() {
+					if source.ProjectIndex == index {
+						keys = append(keys, source.Key)
+						break
+					}
+				}
+			}
+			project.BlinkChannelKeys = &keys
+		}
 		for i := 0; i < 3; i++ {
 			if imgs[i] == nil {
 				continue
@@ -1556,9 +1616,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			for i, st := range layerStates {
 				s := st
 				s.Open = true
-				if s.ColorR == 0 && s.ColorG == 0 && s.ColorB == 0 && s.Opacity == 0 {
-					s = defaultOverlayLayerSettings(i)
-				}
+				s = normalizeComposeOverlayState(s, i)
 				nextLayerNumber++
 				overlayLayers = append(overlayLayers, &overlayLayer{
 					idx:      3 + i,
@@ -1639,8 +1697,14 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						}
 						blinkCheck.SetChecked(false)
 						blinkExcludedIdx = clampComposeBlinkFilter(project.BlinkExcludedFilter)
-						if blinkExcludeSelect != nil {
-							blinkExcludeSelect.SetSelected(composeBlinkFilterNames[blinkExcludedIdx])
+						if project.BlinkChannelKeys != nil {
+							blinkChannels = resolveComposeBlinkKeys(*project.BlinkChannelKeys, composeBlinkSources())
+						} else if project.BlinkChannels != nil {
+							selection := make([]int, len(*project.BlinkChannels))
+							copy(selection, *project.BlinkChannels)
+							blinkChannels = resolveComposeBlinkSelection(composeBlinkSources(), selection, project.BlinkFilters, project.BlinkExcludedFilter)
+						} else {
+							blinkChannels = resolveComposeBlinkSelection(composeBlinkSources(), nil, project.BlinkFilters, project.BlinkExcludedFilter)
 						}
 						blinkCheck.SetChecked(project.BlinkFilters)
 						measureEnabled = project.MeasureComposite
@@ -2085,36 +2149,35 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	blinkStatus := widget.NewLabel("")
 	blinkStatus.Wrapping = fyne.TextWrapWord
-	var blinkMu sync.Mutex
-	blinkSeq := 0
 	blinkFrame := 0
 
 	applyBlinkFrame := func() {
 		if !blinkCheck.Checked {
 			return
 		}
-		a, b := composeBlinkPair(blinkExcludedIdx)
-		if a < 0 || b < 0 {
+		blinkMu.Lock()
+		frames := append([]composeBlinkFrame(nil), blinkPrepared...)
+		blinkMu.Unlock()
+		if len(frames) < 2 {
 			return
 		}
-		srcIdx := a
-		if blinkFrame%2 == 1 {
-			srcIdx = b
-		}
-		src := viewports[srcIdx]
 		dst := viewports[3]
-		if src == nil || dst == nil || src.image == nil || src.image.Image == nil || src.origW == 0 || src.origH == 0 {
+		if dst == nil {
 			if updateBlinkStatus != nil {
 				updateBlinkStatus()
 			}
 			return
 		}
-		dst.image.Image = src.image.Image
-		dst.origW, dst.origH = src.origW, src.origH
-		dst.bins = src.bins
-		dst.histMax = src.histMax
+		frame := frames[blinkFrame%len(frames)].Preview
+		if frame.Image == nil || frame.OrigW == 0 || frame.OrigH == 0 {
+			return
+		}
+		dst.image.Image = frame.Image
+		dst.origW, dst.origH = frame.OrigW, frame.OrigH
+		dst.bins = frame.Bins
+		dst.histMax = frame.HistMax
 		if dst.StatsLabel != nil {
-			dst.StatsLabel.SetText(fmt.Sprintf("Blink: %s", composeBlinkFilterNames[srcIdx]))
+			dst.StatsLabel.SetText(fmt.Sprintf("Blink: %s", frames[blinkFrame%len(frames)].Name))
 		}
 		dst.histogram.Refresh()
 		if dst.zoomLabel.Selected == "fit" {
@@ -2125,20 +2188,30 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	updateBlinkStatus = func() {
-		a, b := composeBlinkPair(blinkExcludedIdx)
-		if a < 0 || b < 0 {
-			blinkStatus.SetText("Blink: choose one filter to turn off")
-			return
+		sources := composeBlinkSources()
+		selection := blinkChannels
+		if selection == nil {
+			selection = resolveComposeBlinkSelection(sources, nil, false, 0)
 		}
+		selection = filterComposeBlinkSelection(selection, sources)
 		if !blinkCheck.Checked {
-			blinkStatus.SetText(fmt.Sprintf("Blink: off (%s would be excluded)", composeBlinkFilterNames[blinkExcludedIdx]))
+			blinkStatus.SetText("Blink: off")
 			return
 		}
-		if imgs[a] == nil || imgs[b] == nil {
-			blinkStatus.SetText(fmt.Sprintf("Blink: load %s and %s", composeBlinkFilterNames[a], composeBlinkFilterNames[b]))
+		if len(selection) < 2 {
+			blinkStatus.SetText("Blink: choose at least two channels")
 			return
 		}
-		blinkStatus.SetText(fmt.Sprintf("Blink: %s <-> %s (%s off)", composeBlinkFilterNames[a], composeBlinkFilterNames[b], composeBlinkFilterNames[blinkExcludedIdx]))
+		names := make([]string, 0, len(selection))
+		for _, index := range selection {
+			for _, source := range sources {
+				if source.ProjectIndex == index {
+					names = append(names, source.Name)
+					break
+				}
+			}
+		}
+		blinkStatus.SetText(fmt.Sprintf("Blink: %s", strings.Join(names, " <-> ")))
 	}
 
 	stopBlink = func() {
@@ -2157,6 +2230,14 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	startBlink = func() {
 		stopBlink()
 		if !blinkCheck.Checked {
+			updateBlinkStatus()
+			return
+		}
+		if blinkChannels == nil {
+			blinkChannels = resolveComposeBlinkSelection(composeBlinkSources(), nil, false, 0)
+		}
+		if len(filterComposeBlinkSelection(blinkChannels, composeBlinkSources())) < 2 {
+			stopBlink()
 			updateBlinkStatus()
 			return
 		}
@@ -2203,14 +2284,52 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		updateBlinkStatus()
 		refresh()
 	}
-	blinkExcludeSelect = NewSafeSelect(composeBlinkFilterNames, func(s string) {
-		blinkExcludedIdx = composeBlinkFilterIndex(s)
-		updateBlinkStatus()
-		if blinkCheck.Checked {
-			startBlink()
+	chooseBlinkChannels = func() {
+		sources := composeBlinkSources()
+		if len(sources) < 2 {
+			dialog.ShowInformation("Blink", "Load at least two channels first.", win)
+			return
 		}
-	})
-	blinkExcludeSelect.SetSelected(composeBlinkFilterNames[blinkExcludedIdx])
+		current := blinkChannels
+		if current == nil {
+			current = resolveComposeBlinkSelection(sources, nil, false, 0)
+		}
+		selected := make(map[int]bool, len(current))
+		for _, index := range current {
+			selected[index] = true
+		}
+		checks := make([]*widget.Check, len(sources))
+		content := container.NewVBox()
+		for i, source := range sources {
+			check := widget.NewCheck(source.Name, nil)
+			check.SetChecked(selected[source.ProjectIndex])
+			checks[i] = check
+			content.Add(check)
+		}
+		d := dialog.NewCustomConfirm("Choose Blink Channels", "Apply", "Cancel", container.NewVScroll(content), func(ok bool) {
+			if !ok {
+				return
+			}
+			selection := make([]int, 0, len(sources))
+			for i, check := range checks {
+				if check.Checked {
+					selection = append(selection, sources[i].ProjectIndex)
+				}
+			}
+			if len(selection) < 2 {
+				dialog.ShowInformation("Blink", "Select at least two channels.", win)
+				return
+			}
+			blinkChannels = selection
+			updateBlinkStatus()
+			if blinkCheck.Checked {
+				startBlink()
+			} else {
+				refresh()
+			}
+		}, win)
+		d.Show()
+	}
 	updateBlinkStatus()
 
 	//alignBtn := widget.NewButton("1. Align to Channel 2 (Green)", alignChannels)
@@ -2366,10 +2485,14 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			if !ok {
 				return
 			}
+			oldSources := composeBlinkSources()
 			for i := 0; i < 3; i++ {
 				imgs[i] = nil
 				clearComposeOrigPixels(&origPixels, i)
 				viewports[i].image.Image = blankImg()
+			}
+			if blinkChannels != nil {
+				blinkChannels = remapComposeBlinkSelection(blinkChannels, oldSources, composeBlinkSources())
 			}
 			viewports[3].image.Image = blankImg()
 			refresh()
@@ -2395,6 +2518,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}
 			}
 			overlayLayers = nil
+			blinkChannels = nil
+			if stopBlink != nil {
+				stopBlink()
+			}
+			blinkCheck.SetChecked(false)
 			for i := range imgs {
 				imgs[i] = nil
 				clearComposeOrigPixels(&origPixels, i)
@@ -2552,22 +2680,29 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 	updateHistScaleLabel()
 
-	controls := container.NewVBox(
-		widget.NewLabel("Options"),
+	options := container.NewVBox(
 		container.NewHBox(sharedHistCheck, widget.NewLabel("Shared histogram scale")),
 		histScaleStatus,
-		container.NewHBox(buildCompositeCheck, widget.NewLabel("Build color composite")),
 		container.NewHBox(blinkCheck, widget.NewLabel("Blink filters")),
-		container.NewBorder(nil, nil, widget.NewLabel("Off"), nil, blinkExcludeSelect),
+		widget.NewButton("Choose channels...", chooseBlinkChannels),
 		blinkStatus,
 		container.NewHBox(measureCheck, widget.NewLabel("Measure composite")),
 		clearBtn,
 		resetBtn,
+	)
+	channels := container.NewVBox(
+		container.NewHBox(buildCompositeCheck, widget.NewLabel("Build color composite")),
 		widget.NewSeparator(),
 		measureLabel,
 		widget.NewSeparator(),
 		channelTabs,
 	)
+	controls := widget.NewAccordion(
+		widget.NewAccordionItem("Options", options),
+		widget.NewAccordionItem("Channels", channels),
+	)
+	controls.MultiOpen = true
+	controls.Open(1)
 
 	controlsScroll := container.NewVScroll(controls)
 	controlsScroll.SetMinSize(fyne.NewSize(260, 200))
@@ -3134,6 +3269,48 @@ type composePreviewData struct {
 	Views          [4]composeViewportPreview
 	RGBStats       [3]histogram.Stats
 	StarlessResult *processing.StarlessResult
+	BlinkFrames    []composeBlinkFrame
+}
+
+type composeBlinkFrame struct {
+	ProjectIndex int
+	Name         string
+	Preview      composeViewportPreview
+}
+
+// buildComposeBlinkFrames prepares all selected Blink sources from the same
+// immutable render snapshot used by the compose preview generation. RGB frames
+// reuse the already-stretched previews; overlay frames are stretched here in
+// the worker goroutine and never from the ticker/UI callback.
+func buildComposeBlinkFrames(ctx context.Context, imgs []*models.LoadedImage, sources []composeBlinkSource, selection []int, base [4]composeViewportPreview) []composeBlinkFrame {
+	frames := make([]composeBlinkFrame, 0, len(selection))
+	for _, projectIndex := range selection {
+		if err := composeMagicCanceled(ctx); err != nil {
+			return nil
+		}
+		var source *composeBlinkSource
+		for i := range sources {
+			if sources[i].ProjectIndex == projectIndex {
+				source = &sources[i]
+				break
+			}
+		}
+		if source == nil || source.RuntimeIndex < 0 || source.RuntimeIndex >= len(imgs) || imgs[source.RuntimeIndex] == nil {
+			continue
+		}
+		preview := composeViewportPreview{}
+		if source.RuntimeIndex < 3 {
+			preview = base[source.RuntimeIndex]
+		} else {
+			data, err := buildComposeOverlayPreviewData(ctx, imgs[source.RuntimeIndex])
+			if err != nil {
+				return nil
+			}
+			preview = composeViewportPreview{Image: data.image, Bins: data.bins, StatsText: fmt.Sprintf("Sky %.3f  μ %.3f  σ %.3f", data.sky, data.mean, data.std), FilterText: data.filterText, OrigW: data.width, OrigH: data.height, Black: imgs[source.RuntimeIndex].Black, White: imgs[source.RuntimeIndex].White}
+		}
+		frames = append(frames, composeBlinkFrame{ProjectIndex: projectIndex, Name: source.Name, Preview: preview})
+	}
+	return frames
 }
 
 func buildComposePreviewData(ctx context.Context, imgs []*models.LoadedImage, sharedHistScale bool, buildComposite bool, levels *models.RgbLevels, composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) composePreviewData {
@@ -3293,6 +3470,16 @@ func defaultOverlayLayerSettings(n int) models.OrangeLayerState {
 	}
 }
 
+func normalizeComposeOverlayState(s models.OrangeLayerState, index int) models.OrangeLayerState {
+	if s.ColorR == 0 && s.ColorG == 0 && s.ColorB == 0 && s.Opacity == 0 {
+		s = defaultOverlayLayerSettings(index)
+	}
+	if s.BlinkID == "" {
+		s.BlinkID = fmt.Sprintf("overlay-legacy-%d", index)
+	}
+	return s
+}
+
 func composeBlinkPair(excluded int) (int, int) {
 	excluded = clampComposeBlinkFilter(excluded)
 	pair := [2]int{-1, -1}
@@ -3305,6 +3492,168 @@ func composeBlinkPair(excluded int) (int, int) {
 		next++
 	}
 	return pair[0], pair[1]
+}
+
+// composeBlinkOverlaySource describes an overlay's sparse runtime slot. The
+// project index is assigned later from the stable source enumeration, so a
+// removed overlay cannot shift the meaning of a saved selection unexpectedly.
+type composeBlinkOverlaySource struct {
+	RuntimeIndex int
+	Name         string
+	Path         string
+	BlinkID      string
+}
+
+type composeBlinkSource struct {
+	Name         string
+	Key          string
+	RuntimeIndex int
+	ProjectIndex int
+}
+
+// enumerateComposeBlinkSources returns loaded RGB channels followed by loaded
+// overlays in runtime-slot order. ProjectIndex is compact and deterministic;
+// RuntimeIndex retains the sparse slot used by the live compose workspace.
+func enumerateComposeBlinkSources(imgs []*models.LoadedImage, overlays []composeBlinkOverlaySource) []composeBlinkSource {
+	sources := make([]composeBlinkSource, 0, len(imgs))
+	for i := 0; i < len(composeBlinkFilterNames) && i < len(imgs); i++ {
+		if imgs[i] == nil {
+			continue
+		}
+		sources = append(sources, composeBlinkSource{
+			Name:         composeBlinkFilterNames[i],
+			Key:          fmt.Sprintf("rgb:%d", i),
+			RuntimeIndex: i,
+			ProjectIndex: len(sources),
+		})
+	}
+	ordered := append([]composeBlinkOverlaySource(nil), overlays...)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].RuntimeIndex < ordered[j].RuntimeIndex })
+	for _, overlay := range ordered {
+		if overlay.RuntimeIndex < len(composeBlinkFilterNames) || overlay.RuntimeIndex < 0 || overlay.RuntimeIndex >= len(imgs) || imgs[overlay.RuntimeIndex] == nil {
+			continue
+		}
+		name := overlay.Name
+		if name == "" {
+			name = fmt.Sprintf("Overlay %d", overlay.RuntimeIndex-len(composeBlinkFilterNames)+1)
+		}
+		key := fmt.Sprintf("overlay-slot:%d", overlay.RuntimeIndex)
+		if overlay.BlinkID != "" {
+			key = "overlay-id:" + overlay.BlinkID
+		}
+		sources = append(sources, composeBlinkSource{
+			Name:         name,
+			Key:          key,
+			RuntimeIndex: overlay.RuntimeIndex,
+			ProjectIndex: len(sources),
+		})
+	}
+	return sources
+}
+
+func resolveComposeBlinkKeys(keys []string, sources []composeBlinkSource) []int {
+	byKey := make(map[string]int, len(sources))
+	for _, source := range sources {
+		if source.Key != "" {
+			byKey[source.Key] = source.ProjectIndex
+		}
+	}
+	result := make([]int, 0, len(keys))
+	seen := make(map[int]bool)
+	for _, key := range keys {
+		if index, ok := byKey[key]; ok && !seen[index] {
+			result = append(result, index)
+			seen[index] = true
+		}
+	}
+	return result
+}
+
+// filterComposeBlinkSelection drops stale project indices and duplicate
+// entries while preserving the user's ordering.
+func filterComposeBlinkSelection(selection []int, sources []composeBlinkSource) []int {
+	valid := make(map[int]bool, len(sources))
+	for _, source := range sources {
+		valid[source.ProjectIndex] = true
+	}
+	result := make([]int, 0, len(selection))
+	seen := make(map[int]bool, len(selection))
+	for _, index := range selection {
+		if valid[index] && !seen[index] {
+			result = append(result, index)
+			seen[index] = true
+		}
+	}
+	return result
+}
+
+// resolveComposeBlinkSelection applies a saved custom selection, or migrates
+// the legacy two-of-three RGB setting when no generalized selection exists.
+// New projects default to all currently loaded sources.
+func resolveComposeBlinkSelection(sources []composeBlinkSource, custom []int, legacyEnabled bool, legacyExcluded int) []int {
+	if custom != nil {
+		return filterComposeBlinkSelection(custom, sources)
+	}
+	if legacyEnabled {
+		result := make([]int, 0, len(composeBlinkFilterNames)-1)
+		excluded := clampComposeBlinkFilter(legacyExcluded)
+		for _, source := range sources {
+			if source.RuntimeIndex < len(composeBlinkFilterNames) && source.RuntimeIndex != excluded {
+				result = append(result, source.ProjectIndex)
+			}
+		}
+		return result
+	}
+	result := make([]int, len(sources))
+	for i := range sources {
+		result[i] = sources[i].ProjectIndex
+	}
+	return result
+}
+
+func composeBlinkRuntimeIndices(selection []int, sources []composeBlinkSource) []int {
+	selected := filterComposeBlinkSelection(selection, sources)
+	byProject := make(map[int]int, len(sources))
+	for _, source := range sources {
+		byProject[source.ProjectIndex] = source.RuntimeIndex
+	}
+	result := make([]int, 0, len(selected))
+	for _, index := range selected {
+		result = append(result, byProject[index])
+	}
+	return result
+}
+
+// remapComposeBlinkSelection carries a selection across runtime changes (for
+// example, removing a sparse overlay slot) by runtime identity. Slots absent
+// from the new source list are dropped, so a later slot reuse is not selected.
+func remapComposeBlinkSelection(selection []int, oldSources, newSources []composeBlinkSource) []int {
+	oldRuntime := composeBlinkRuntimeIndices(selection, oldSources)
+	byRuntime := make(map[int]int, len(newSources))
+	for _, source := range newSources {
+		byRuntime[source.RuntimeIndex] = source.ProjectIndex
+	}
+	remapped := make([]int, 0, len(oldRuntime))
+	for _, runtimeIndex := range oldRuntime {
+		if projectIndex, ok := byRuntime[runtimeIndex]; ok {
+			remapped = append(remapped, projectIndex)
+		}
+	}
+	return filterComposeBlinkSelection(remapped, newSources)
+}
+
+// cycleComposeBlinkSelection returns the next selected project index after
+// current. It wraps and starts at the first selection when current is stale.
+func cycleComposeBlinkSelection(selection []int, current int) (int, bool) {
+	if len(selection) == 0 {
+		return 0, false
+	}
+	for i, index := range selection {
+		if index == current {
+			return selection[(i+1)%len(selection)], true
+		}
+	}
+	return selection[0], true
 }
 
 func composePixelValueAt(img *models.LoadedImage, point imagePoint) (float64, bool) {

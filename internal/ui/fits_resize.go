@@ -9,27 +9,15 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
+	"github.com/wierdling/gofiledialog"
 
 	"gofitsv3/internal/fitsio"
 )
 
-// showBatchFITSResizePicker opens a FITS file picker. Fyne's file dialog is
-// single-select, so further files can be added from the resize dialog.
 func showBatchFITSResizePicker(app fyne.App, win fyne.Window) {
-	picker := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
-		if err != nil {
-			dialog.ShowError(err, win)
-			return
-		}
-		if reader == nil {
-			return
-		}
-		path := reader.URI().Path()
-		reader.Close()
-		app.Preferences().SetString("lastDir", filepath.Dir(path))
-		width, height, validateErr := fitsio.ValidateResizeInputs([]string{path}, 2)
+	showFITSOpenDialog(app, win, func(paths []string) {
+		width, height, validateErr := fitsio.ValidateResizeInputs([]string{paths[0]}, 2)
 		if validateErr != nil {
 			dialog.ShowError(validateErr, win)
 			return
@@ -38,16 +26,33 @@ func showBatchFITSResizePicker(app fyne.App, win fyne.Window) {
 			dialog.ShowInformation("Cannot Resize FITS", "The selected image is too small for a power-of-two reduction.", win)
 			return
 		}
-		showBatchFITSResizeDialog(app, win, []string{path})
-	}, win)
-	picker.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
-	if lastDir := app.Preferences().String("lastDir"); lastDir != "" {
-		if location, err := storage.ListerForURI(storage.NewFileURI(lastDir)); err == nil {
-			picker.SetLocation(location)
-		}
+		showBatchFITSResizeDialog(app, win, paths)
+	})
+}
+
+func showFITSOpenDialog(app fyne.App, win fyne.Window, onChosen func([]string)) {
+	opts := []gofiledialog.Option{
+		gofiledialog.WithTitle("Open FITS Files"),
+		gofiledialog.WithFilters(gofiledialog.Filter{Name: "FITS files", Extensions: []string{".fits", ".fit", ".fts"}}),
+		gofiledialog.WithMultiSelect(true),
 	}
-	sizeFileDialog(picker)
-	picker.Show()
+	if lastDir := app.Preferences().String("lastDir"); lastDir != "" {
+		opts = append(opts, gofiledialog.WithStartDir(lastDir))
+	}
+	if err := gofiledialog.ShowOpen(func(paths []string, err error) {
+		if err != nil {
+			dialog.ShowError(err, win)
+			return
+		}
+		paths = deduplicatePaths(paths)
+		if len(paths) == 0 {
+			return
+		}
+		app.Preferences().SetString("lastDir", filepath.Dir(paths[0]))
+		onChosen(paths)
+	}, win, opts...); err != nil {
+		dialog.ShowError(err, win)
+	}
 }
 
 func showBatchFITSResizeDialog(app fyne.App, win fyne.Window, paths []string) {
@@ -88,37 +93,23 @@ func showBatchFITSResizeDialog(app fyne.App, win fyne.Window, paths []string) {
 	}
 	var resizeDialog *dialog.CustomDialog
 	addFile := func() {
-		picker := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
-			if err != nil {
-				dialog.ShowError(err, win)
-				return
-			}
-			if reader == nil {
-				return
-			}
-			path := reader.URI().Path()
-			reader.Close()
-			for _, existing := range paths {
-				if existing == path {
-					return
+		showFITSOpenDialog(app, win, func(chosen []string) {
+			added := 0
+			for _, path := range chosen {
+				if containsPath(paths, path) {
+					continue
 				}
+				paths = append(paths, path)
+				selected[path] = true
+				check := widget.NewCheck(filepath.Base(path), func(checked bool) { selected[path] = checked })
+				check.SetChecked(true)
+				rows.Add(check)
+				added++
 			}
-			app.Preferences().SetString("lastDir", filepath.Dir(path))
-			paths = append(paths, path)
-			selected[path] = true
-			check := widget.NewCheck(filepath.Base(path), func(checked bool) { selected[path] = checked })
-			check.SetChecked(true)
-			rows.Add(check)
-			rows.Refresh()
-		}, win)
-		picker.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
-		if lastDir := app.Preferences().String("lastDir"); lastDir != "" {
-			if location, err := storage.ListerForURI(storage.NewFileURI(lastDir)); err == nil {
-				picker.SetLocation(location)
+			if added > 0 {
+				rows.Refresh()
 			}
-		}
-		sizeFileDialog(picker)
-		picker.Show()
+		})
 	}
 	run := widget.NewButton("Resize", func() {
 		chosen := make([]string, 0, len(paths))
@@ -137,13 +128,35 @@ func showBatchFITSResizeDialog(app fyne.App, win fyne.Window, paths []string) {
 	})
 	run.Importance = widget.HighImportance
 	content := container.NewBorder(
-		container.NewVBox(widget.NewLabel("Add same-size FITS files and choose a power-of-two reduction."), widget.NewForm(widget.NewFormItem("Reduction", factorSelect)), discardNote, widget.NewButton("Add FITS File...", addFile), widget.NewSeparator()),
+		container.NewVBox(widget.NewLabel("Add same-size FITS files and choose a power-of-two reduction."), widget.NewForm(widget.NewFormItem("Reduction", factorSelect)), discardNote, widget.NewButton("Add FITS Files...", addFile), widget.NewSeparator()),
 		container.NewHBox(widget.NewButton("Cancel", func() { resizeDialog.Hide() }), run),
 		nil, nil, container.NewVScroll(rows),
 	)
 	resizeDialog = dialog.NewCustomWithoutButtons("Resize FITS Files", content, win)
 	resizeDialog.Resize(fyne.NewSize(520, 460))
 	resizeDialog.Show()
+}
+
+func deduplicatePaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	result := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		result = append(result, path)
+	}
+	return result
+}
+
+func containsPath(paths []string, target string) bool {
+	for _, path := range paths {
+		if path == target {
+			return true
+		}
+	}
+	return false
 }
 
 func resizeFactors(width, height int) []int {

@@ -165,11 +165,11 @@ func TestMosaicInputFramesRowsAlignWithHeaderForLongReferenceName(t *testing.T) 
 	header.Resize(header.MinSize())
 	row.Resize(row.MinSize())
 
-	if got := header.Objects[2].Size().Width; got != 160 {
-		t.Errorf("header Name width = %v, want 160", got)
+	if got := header.Objects[2].Size().Width; got != mosaicInputNameColumnWidth {
+		t.Errorf("header Name width = %v, want %v", got, mosaicInputNameColumnWidth)
 	}
-	if got := row.Objects[2].Size().Width; got != 160 {
-		t.Errorf("row Name width = %v, want 160", got)
+	if got := row.Objects[2].Size().Width; got != mosaicInputNameColumnWidth {
+		t.Errorf("row Name width = %v, want %v", got, mosaicInputNameColumnWidth)
 	}
 	for _, column := range []int{3, 4, 5} {
 		headerCell := header.Objects[column]

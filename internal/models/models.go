@@ -87,18 +87,24 @@ type ComposeProject struct {
 	// OverlayLayers holds the arbitrary set of colored overlay layers. OrangeLayer
 	// and YellowLayer are legacy fields kept only so projects saved before the
 	// generic layer system still load (migrated into OverlayLayers on read).
-	OverlayLayers        []OrangeLayerState      `json:"overlayLayers,omitempty"`
-	OrangeLayer          OrangeLayerState        `json:"orangeLayer,omitempty"`
-	YellowLayer          OrangeLayerState        `json:"yellowLayer,omitempty"`
-	SharedHistogramScale bool                    `json:"sharedHistogramScale,omitempty"`
-	DisableComposite     bool                    `json:"disableComposite,omitempty"`
-	MeasureComposite     bool                    `json:"measureComposite,omitempty"`
-	BlinkFilters         bool                    `json:"blinkFilters,omitempty"`
-	BlinkExcludedFilter  int                     `json:"blinkExcludedFilter,omitempty"`
-	StarlessSettings     StarlessComposeSettings `json:"starlessSettings"`
+	OverlayLayers        []OrangeLayerState `json:"overlayLayers,omitempty"`
+	OrangeLayer          OrangeLayerState   `json:"orangeLayer,omitempty"`
+	YellowLayer          OrangeLayerState   `json:"yellowLayer,omitempty"`
+	SharedHistogramScale bool               `json:"sharedHistogramScale,omitempty"`
+	DisableComposite     bool               `json:"disableComposite,omitempty"`
+	MeasureComposite     bool               `json:"measureComposite,omitempty"`
+	BlinkFilters         bool               `json:"blinkFilters,omitempty"`
+	BlinkExcludedFilter  int                `json:"blinkExcludedFilter,omitempty"`
+	// BlinkChannels stores the selected channel indices in compact project order.
+	// An omitted value preserves the legacy BlinkFilters/BlinkExcludedFilter
+	// behavior when loading older projects.
+	BlinkChannels    *[]int                  `json:"blinkChannels,omitempty"`
+	BlinkChannelKeys *[]string               `json:"blinkChannelKeys,omitempty"`
+	StarlessSettings StarlessComposeSettings `json:"starlessSettings"`
 }
 
 type OrangeLayerState struct {
+	BlinkID string       `json:"blinkId,omitempty"`
 	Open    bool         `json:"open,omitempty"`
 	Channel ChannelState `json:"channel"`
 	ColorR  uint8        `json:"colorR"`

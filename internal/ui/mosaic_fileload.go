@@ -28,6 +28,8 @@ import (
 // layouts allow content to grow and are used for different UI behavior.
 type mosaicFixedWidthLayout struct{ w float32 }
 
+const mosaicInputNameColumnWidth = 320
+
 func (l *mosaicFixedWidthLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
 	for _, object := range objects {
 		object.Move(fyne.NewPos(0, 0))
@@ -57,7 +59,7 @@ func (ws *mosaicWorkspace) rebuildOffsetControls() {
 
 	// nameCell keeps the header and row name columns aligned even for long names.
 	nameCell := func(obj fyne.CanvasObject) fyne.CanvasObject {
-		return container.New(&mosaicFixedWidthLayout{160}, obj)
+		return container.New(&mosaicFixedWidthLayout{mosaicInputNameColumnWidth}, obj)
 	}
 	hdrLabel := func(text string) fyne.CanvasObject {
 		return widget.NewLabelWithStyle(text, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})

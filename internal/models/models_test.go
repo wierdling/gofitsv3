@@ -136,6 +136,30 @@ func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T
 	}
 }
 
+func TestComposeProjectBlinkChannelsRoundTrip(t *testing.T) {
+	channels := []int{0, 3, 7}
+	project := ComposeProject{BlinkChannels: &channels}
+	data, err := json.Marshal(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ComposeProject
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.BlinkChannels == nil || len(*decoded.BlinkChannels) != 3 || (*decoded.BlinkChannels)[1] != 3 || (*decoded.BlinkChannels)[2] != 7 {
+		t.Fatalf("blink channels = %#v, want [0 3 7]", decoded.BlinkChannels)
+	}
+	empty := []int{}
+	data, err = json.Marshal(ComposeProject{BlinkChannels: &empty})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) == "{}" {
+		t.Fatal("explicit empty blink selection was omitted")
+	}
+}
+
 func TestMosaicProjectRoundTripPreservesNestedSettingsAndOptionalFields(t *testing.T) {
 	project := MosaicProject{
 		Inputs: []MosaicInputState{
