@@ -471,6 +471,26 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		fd.Show()
 	})
 
+	directoryBtn := widget.NewButton("Add FITS Directory", func() {
+		fd := dialog.NewFolderOpen(func(listable fyne.ListableURI, err error) {
+			if err != nil || listable == nil {
+				return
+			}
+			dir := listable.Path()
+			app.Preferences().SetString("lastDir", dir)
+			paths, scanErr := mosaic.DiscoverFITSFiles(dir)
+			if scanErr != nil {
+				dialog.ShowError(scanErr, win)
+				return
+			}
+			ws.loadPaths(paths, "Loading FITS Directory")
+		}, win)
+		ws.configureLastDir(fd)
+		fd.Resize(fyne.NewSize(640, 480))
+		fd.Show()
+	})
+	ws.directoryBtn = directoryBtn
+
 	batchBtn := widget.NewButton("Add Filter Batch", func() {
 		fd := dialog.NewFolderOpen(func(listable fyne.ListableURI, err error) {
 			if err != nil || listable == nil {
@@ -1218,6 +1238,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	)
 	drizzleCommands := container.NewVBox(
 		container.NewGridWithColumns(2, loadBtn, batchBtn),
+		directoryBtn,
 		container.NewHBox(savePreviewToggle, widget.NewLabel("Save Preview")),
 		widget.NewSeparator(),
 		widget.NewLabel("Baseline Reference"),

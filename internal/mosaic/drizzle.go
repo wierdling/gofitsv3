@@ -1164,7 +1164,46 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	// alignment (primary TweakReg fit, chain fallback, bundle adjustment) runs on
 	// these catalogs; pixels are reloaded on demand only for the legacy warp modes
 	// and the alignment debug hook.
-	catalogs := extractStarCatalogsForAlignment(inputs)
+	// Automatic TweakReg gets a larger candidate pool so cross-exposure
+	// consensus can rescue faint recurring sources before the native 500-star
+	// fit cap is applied. Legacy and selected-star paths retain the 500 cap.
+	catalogCap := processing.TweakRegCatalogMaxStars
+	if isTweakReg {
+		catalogCap = 2000
+	}
+	candidateCatalogs := extractStarCatalogsForAlignment(inputs, catalogCap)
+	catalogs := candidateCatalogs
+	if isTweakReg {
+		projected := make([][]projectedCatalogDetection, len(inputs))
+		exposures := make([]string, len(inputs))
+		for i := range inputs {
+			exposures[i] = inputs[i].SourcePath
+			if exposures[i] == "" {
+				exposures[i] = inputs[i].Path
+			}
+			mapper, err := processing.NewWCSMapper(
+				inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
+				inputs[0].HDU.Header, inputs[0].D2IX, inputs[0].D2IY,
+			)
+			if err != nil {
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: consensus projection input[%d] %s failed: %v; using fallback catalog", i, InputKey(inputs[i]), err))
+				continue
+			}
+			projected[i] = make([]projectedCatalogDetection, 0, len(candidateCatalogs[i]))
+			for j, star := range candidateCatalogs[i] {
+				x, y := mapper.MapPixel(star.X, star.Y)
+				if !finite(x) || !finite(y) {
+					continue
+				}
+				projected[i] = append(projected[i], projectedCatalogDetection{inputIndex: i, starIndex: j, x: x, y: y})
+			}
+		}
+		var stats []alignmentConsensusStats
+		catalogs, stats = selectCrossFrameConsensusCatalogs(candidateCatalogs, projected, exposures, processing.TweakRegCatalogMaxStars, consensusMatchRadius)
+		for i := range stats {
+			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: consensus input[%d] %s raw=%d corroborated=%d strong=%d selected=%d fallback=%t", i, InputKey(inputs[i]), stats[i].Candidates, stats[i].Corroborated, stats[i].Strong, stats[i].Selected, stats[i].Fallback))
+		}
+	}
 
 	type refCache struct {
 		input  Input
@@ -1710,7 +1749,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 	// dataset is never resident at once. The reference catalogs come from the
 	// user-picked refStars (and their WCS projections), so only the non-reference
 	// targets are extracted here.
-	catalogs := extractStarCatalogsForAlignment(inputs)
+	catalogs := extractStarCatalogsForAlignment(inputs, processing.TweakRegCatalogMaxStars)
 
 	// Align closest images first so results are more stable across runs.
 	for _, i := range sortedByDistFromRef(inputs) {

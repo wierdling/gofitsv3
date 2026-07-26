@@ -42,6 +42,32 @@ func IsPipelineProductFLC(path string) bool {
 	return pipelineFLCPattern.MatchString(filepath.Base(path))
 }
 
+// DiscoverFITSFiles returns every FITS file directly in dir, sorted by path.
+// Subdirectories are deliberately not traversed, so generated working/ combine
+// products are never selected as source exposures on a later directory load.
+func DiscoverFITSFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(entry.Name())) {
+		case ".fits", ".fit", ".fts":
+			paths = append(paths, filepath.Join(dir, entry.Name()))
+		}
+	}
+	sort.Strings(paths)
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no FITS files found in %s", dir)
+	}
+	return paths, nil
+}
+
 func DiscoverFilters(dir string) (map[string][]string, error) {
 	filesByFilter, err := DiscoverFilterFiles(dir)
 	if err != nil {

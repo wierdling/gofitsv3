@@ -17,6 +17,34 @@ func TestIsPipelineProductFLC(t *testing.T) {
 	}
 }
 
+func TestDiscoverFITSFilesSelectsDirectFITSFilesOnly(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"z.FITS", "a.fit", "m.fts", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, WorkingDirName), 0o755); err != nil {
+		t.Fatalf("create working dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, WorkingDirName, "ignored_comb.fits"), nil, 0o644); err != nil {
+		t.Fatalf("write working file: %v", err)
+	}
+
+	paths, err := DiscoverFITSFiles(dir)
+	if err != nil {
+		t.Fatalf("DiscoverFITSFiles error: %v", err)
+	}
+	got := make([]string, len(paths))
+	for i, path := range paths {
+		got[i] = filepath.Base(path)
+	}
+	want := []string{"a.fit", "m.fts", "z.FITS"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DiscoverFITSFiles = %v, want %v", got, want)
+	}
+}
+
 func TestDiscoverFiltersGroupsRawFLCFiles(t *testing.T) {
 	dir := t.TempDir()
 	writeMinimalFITS(t, filepath.Join(dir, "rawa_flc.fits"), "F502N")

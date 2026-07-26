@@ -65,6 +65,7 @@ type mosaicWorkspace struct {
 	saveOffsetsBtn   *widget.Button
 	loadOffsetsBtn   *widget.Button
 	batchBtn         *widget.Button
+	directoryBtn     *widget.Button
 	buildBtn         *widget.Button
 	clearBtn         *widget.Button
 	setRefBtn        *widget.Button

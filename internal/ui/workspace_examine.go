@@ -27,6 +27,8 @@ var globalSendToExamine func(pixels []float32, width, height int)
 
 type examineState struct {
 	img            *models.LoadedImage
+	images         []*models.LoadedImage
+	selectedChip   int
 	headerLines    []string
 	flip           bool
 	measureEnabled bool
@@ -34,6 +36,42 @@ type examineState struct {
 	measureStart   *imagePoint
 	measureEnd     *imagePoint
 	measurement    *rulerMeasurement
+}
+
+func examineChipLabel(img *models.LoadedImage, ordinal int) string {
+	extver := ""
+	if img != nil {
+		extver = fitsio.HeaderString(img.HDU.Header, "EXTVER")
+	}
+	if extver == "" {
+		extver = fmt.Sprintf("%d", ordinal)
+	}
+	return fmt.Sprintf("SCI %d (EXTVER %s)", ordinal, extver)
+}
+
+func examineChipLabels(images []*models.LoadedImage) []string {
+	labels := make([]string, len(images))
+	for i, img := range images {
+		labels[i] = examineChipLabel(img, i+1)
+	}
+	return labels
+}
+
+func examineChipIndex(images []*models.LoadedImage, extver string, fallback int) int {
+	if len(images) == 0 {
+		return -1
+	}
+	if extver != "" {
+		for i, img := range images {
+			if img != nil && fitsio.HeaderString(img.HDU.Header, "EXTVER") == extver {
+				return i
+			}
+		}
+	}
+	if fallback >= 0 && fallback < len(images) {
+		return fallback
+	}
+	return 0
 }
 
 func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
@@ -46,6 +84,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	reloadBtn := ttwidget.NewButton("Reload Current FITS", func() {})
 	reloadBtn.SetToolTip("Reload the current FITS from disk, keeping the current stretch settings")
 	reloadBtn.Disable()
+	var chipSelect *SafeSelect
 
 	pathLabel := widget.NewLabel("No FITS loaded.")
 	pathLabel.Wrapping = fyne.TextWrapWord
@@ -307,14 +346,17 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	loadFitsFromPath := func(path string, preserveStretch bool) {
 		progressDialog := dialog.NewCustom("Loading FITS", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
 		progressDialog.Show()
+		var savedState models.ChannelState
+		selectedExtVer := ""
+		selectedChip := 0
+		if preserveStretch && state.img != nil {
+			savedState = channelStateFromImage(state.img)
+			selectedExtVer = fitsio.HeaderString(state.img.HDU.Header, "EXTVER")
+			selectedChip = state.selectedChip
+		}
 
 		go func() {
-			var savedState models.ChannelState
-			if preserveStretch && state.img != nil {
-				savedState = channelStateFromImage(state.img)
-			}
-
-			img, loadErr := loadImageFromPath(path)
+			imgs, loadErr := loadImagesFromPath(path)
 			fyne.Do(func() {
 				progressDialog.Hide()
 				if loadErr != nil {
@@ -322,7 +364,13 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 					return
 				}
 
-				state.img = img
+				state.images = imgs
+				state.selectedChip = examineChipIndex(imgs, selectedExtVer, selectedChip)
+				if state.selectedChip < 0 {
+					state.img = nil
+					return
+				}
+				state.img = imgs[state.selectedChip]
 				if preserveStretch {
 					state.img.Mode = labelToMode(savedState.Mode)
 					state.img.Black = savedState.Black
@@ -333,8 +381,20 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 					state.img.MTFMidtone = savedState.MTFMidtone
 					state.img.ShowClip = savedState.ShowClip
 				}
-				state.headerLines = utils.FormatHeadersLines(img.Primary, img.HDU.Header)
+				state.headerLines = utils.FormatHeadersLines(state.img.Primary, state.img.HDU.Header)
 				pathLabel.SetText(path)
+				if chipSelect != nil {
+					chipSelect.Options = examineChipLabels(state.images)
+					chipSelect.SetSelectedIndex(state.selectedChip)
+					if len(state.images) > 1 {
+						chipSelect.Enable()
+						chipSelect.Show()
+					} else {
+						chipSelect.Disable()
+						chipSelect.Hide()
+					}
+					chipSelect.Refresh()
+				}
 				syncControlsFromImage()
 				clearMeasurement()
 				headerList.Refresh()
@@ -342,6 +402,23 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			})
 		}()
 	}
+
+	chipSelect = NewSafeSelect(nil, func(_ string) {
+		idx := chipSelect.SelectedIndex()
+		if idx < 0 || idx >= len(state.images) || idx == state.selectedChip {
+			return
+		}
+		state.selectedChip = idx
+		state.img = state.images[idx]
+		state.headerLines = utils.FormatHeadersLines(state.img.Primary, state.img.HDU.Header)
+		pathLabel.SetText(state.img.Path)
+		syncControlsFromImage()
+		clearMeasurement()
+		headerList.Refresh()
+		refresh()
+	})
+	chipSelect.Disable()
+	chipSelect.Hide()
 
 	loadFits := func() {
 		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
@@ -421,6 +498,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		container.NewHBox(autoBtn, autoMTFBtn, applyBtn),
 		container.NewHBox(magicBtn, magicPreset),
 		widget.NewSeparator(),
+		widget.NewLabel("SCI chip"),
+		chipSelect,
 		widget.NewLabel("Examine Tools"),
 		measureCheck,
 		coordLabel,
@@ -456,6 +535,12 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		_, img.White = processing.AutoLevels(pixels)
 		img.Peak = img.White
 		state.img = img
+		state.images = nil
+		state.selectedChip = 0
+		chipSelect.Options = nil
+		chipSelect.Disable()
+		chipSelect.Hide()
+		chipSelect.Refresh()
 		state.headerLines = []string{"Mosaic drizzle result", fmt.Sprintf("Size: %dx%d", width, height)}
 		pathLabel.SetText("(mosaic result)")
 		syncControlsFromImage()

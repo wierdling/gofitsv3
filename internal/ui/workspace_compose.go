@@ -1125,15 +1125,45 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	addColoredLayer := func() {
-		l, ok := createOverlayLayer(defaultOverlayLayerSettings(len(overlayLayers)))
-		if !ok {
-			dialog.ShowInformation("Layer limit", fmt.Sprintf("A maximum of %d colored layers is supported.", maxOverlayLayers), win)
-			return
+		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+			if err != nil || r == nil {
+				return
+			}
+			path := r.URI().Path()
+			app.Preferences().SetString("lastDir", filepath.Dir(path))
+			progressDialog := dialog.NewCustom("Loading Layer Image", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
+			progressDialog.Show()
+			go func() {
+				img, loadErr := loadImageFromPath(path)
+				fyne.Do(func() {
+					progressDialog.Hide()
+					if loadErr != nil {
+						dialog.ShowError(loadErr, win)
+						return
+					}
+					l, ok := createOverlayLayer(defaultOverlayLayerSettings(len(overlayLayers)))
+					if !ok {
+						dialog.ShowInformation("Layer limit", fmt.Sprintf("A maximum of %d colored layers is supported.", maxOverlayLayers), win)
+						return
+					}
+					imgs[l.idx] = img
+					openOverlayLayerWindow(l)
+					if updateMenus != nil {
+						updateMenus()
+					}
+				})
+			}()
+		}, win)
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
+		if last := app.Preferences().String("lastDir"); last != "" {
+			uri := storage.NewFileURI(last)
+			if l, err := storage.ListerForURI(uri); err == nil {
+				fd.SetLocation(l)
+			}
 		}
-		openOverlayLayerWindow(l)
-		if updateMenus != nil {
-			updateMenus()
-		}
+		fd.SetView(dialog.ListView)
+		sizeFileDialog(fd)
+		fd.Show()
 	}
 
 	// gatherLegendEntries snapshots the currently loaded base channels and the

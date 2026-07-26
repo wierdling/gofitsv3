@@ -262,6 +262,14 @@ func (ws *mosaicWorkspace) updateActionButtons() {
 		}
 		ws.batchBtn.Refresh()
 	}
+	if ws.directoryBtn != nil {
+		if ws.queueRunning {
+			ws.directoryBtn.Disable()
+		} else {
+			ws.directoryBtn.Enable()
+		}
+		ws.directoryBtn.Refresh()
+	}
 	if ws.buildBtn != nil {
 		if ws.queueRunning {
 			ws.buildBtn.Disable()
