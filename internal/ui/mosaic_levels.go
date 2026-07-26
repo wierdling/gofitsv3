@@ -117,7 +117,7 @@ func (ws *mosaicWorkspace) magicLevels(result *mosaic.Result, preset processing.
 		res.Preset, res.Black, res.White, res.Background, res.Sigma,
 		res.ClipLowPercent, res.ClipHighPercent, res.StarsExcluded, res.StarPixelPercent,
 		res.WhiteSampleSource, res.WhiteSampleCount, res.WhiteSamplePercent))
-	ws.applyLevelsToPreview()
+	ws.autoMTFLevels(result)
 }
 
 func (ws *mosaicWorkspace) saveLevelPrefs() {

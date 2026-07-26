@@ -49,6 +49,11 @@ type SkysubOptions struct {
 	Clip     int
 	LSigma   float64
 	USigma   float64
+	// EqualizeDisconnectedBackgrounds shifts independently matched overlap
+	// components to the darkest component's background. It is deliberately
+	// opt-in because disconnected footprints provide no photometric constraint
+	// on their relative zero points.
+	EqualizeDisconnectedBackgrounds bool
 	// AmpPedestal enables NIRCam per-amplifier pedestal removal (see
 	// amp_pedestal.go). Independent of Enabled/Method: it corrects an
 	// intra-chip readout artifact, not inter-chip sky level, so it applies
@@ -235,6 +240,7 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyP
 
 	subtractSky := make([]float64, n)
 	var matched []bool
+	var matchComponents [][]int
 	switch options.Method {
 	case SkyMethodGlobalMin:
 		globalMin := math.Inf(1)
@@ -252,8 +258,9 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyP
 			}
 		}
 	case SkyMethodMatchPlane:
-		planes, planeMatched := computeDifferenceSkyPlanes(planned, maps, options)
+		planes, planeMatched, components := computeDifferenceSkyPlanesWithComponents(planned, maps, options)
 		matched = planeMatched
+		matchComponents = components
 		for i := range planned {
 			if planned[i].input.ReferenceOnly {
 				continue
@@ -271,7 +278,7 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyP
 		}
 	case SkyMethodMatch, SkyMethodGlobalMinMatch:
 		var rel []float64
-		rel, matched = computeMatchedSkyOffsets(planned, maps, options)
+		rel, matched, matchComponents = computeMatchedSkyOffsetsWithComponents(planned, maps, options)
 		if options.Method == SkyMethodMatch {
 			for i := range planned {
 				if planned[i].input.ReferenceOnly {
@@ -339,6 +346,8 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyP
 			subtractSky[i] = groupMin[InputKey(planned[i].input)]
 		}
 	}
+
+	equalizeDisconnectedSkyComponents(planned, maps, rawSky, subtractSky, skyPlanes, matchComponents, options)
 
 	logSkysubPlan(planned, rawSky, subtractSky, maps)
 
@@ -685,6 +694,11 @@ func medianFloat64(values []float64) float64 {
 // rawSky[i] for unmatched inputs rather than treating their relative offset as
 // a valid zero.
 func computeMatchedSkyOffsets(planned []plannedInput, maps []map[int64]float64, options SkysubOptions) ([]float64, []bool) {
+	offsets, matched, _ := computeMatchedSkyOffsetsWithComponents(planned, maps, options)
+	return offsets, matched
+}
+
+func computeMatchedSkyOffsetsWithComponents(planned []plannedInput, maps []map[int64]float64, options SkysubOptions) ([]float64, []bool, [][]int) {
 	offsets := make([]float64, len(planned))
 	matched := make([]bool, len(planned))
 	edges := make([]skyEdge, 0)
@@ -713,8 +727,9 @@ func computeMatchedSkyOffsets(planned []plannedInput, maps []map[int64]float64, 
 			edges = append(edges, skyEdge{i: i, j: j, delta: delta, weight: math.Sqrt(float64(len(diffs))), cells: len(diffs)})
 		}
 	}
+	allComponents := activeSkyComponents(planned, edges)
 	if len(edges) == 0 {
-		return offsets, matched
+		return offsets, matched, allComponents
 	}
 	components := connectedSkyComponents(len(planned), edges)
 	for _, component := range components {
@@ -743,7 +758,7 @@ func computeMatchedSkyOffsets(planned []plannedInput, maps []map[int64]float64, 
 		}
 		logSkyMatchEdges(planned, compEdges, compOffsets)
 	}
-	return offsets, matched
+	return offsets, matched, allComponents
 }
 
 // dropOutlierSkyEdgesAndResolve computes each edge's residual against the
@@ -921,6 +936,11 @@ type skyPlaneEdge struct {
 // connected to at least one usable overlap edge; callers should fall back to
 // a plain sky estimate for unmatched inputs, same as the scalar solve.
 func computeDifferenceSkyPlanes(planned []plannedInput, maps []map[int64]float64, options SkysubOptions) ([]skyPlane, []bool) {
+	planes, matched, _ := computeDifferenceSkyPlanesWithComponents(planned, maps, options)
+	return planes, matched
+}
+
+func computeDifferenceSkyPlanesWithComponents(planned []plannedInput, maps []map[int64]float64, options SkysubOptions) ([]skyPlane, []bool, [][]int) {
 	planes := make([]skyPlane, len(planned))
 	matched := make([]bool, len(planned))
 
@@ -942,8 +962,9 @@ func computeDifferenceSkyPlanes(planned []plannedInput, maps []map[int64]float64
 			connectivity = append(connectivity, skyEdge{i: i, j: j})
 		}
 	}
+	allComponents := activeSkyComponents(planned, connectivity)
 	if len(edges) == 0 {
-		return planes, matched
+		return planes, matched, allComponents
 	}
 
 	components := connectedSkyComponents(len(planned), connectivity)
@@ -971,7 +992,7 @@ func computeDifferenceSkyPlanes(planned []plannedInput, maps []map[int64]float64
 			planes[idx] = compPlanes[idx]
 		}
 	}
-	return planes, matched
+	return planes, matched, allComponents
 }
 
 // logSkyPlaneEdges reports each edge's post-fit residual RMS (over all its
@@ -1368,6 +1389,153 @@ func connectedSkyComponents(n int, edges []skyEdge) [][]int {
 		components = append(components, comp)
 	}
 	return components
+}
+
+// activeSkyComponents returns the complete graph partition for contributing
+// data inputs. Unlike connectedSkyComponents, it includes singleton frames
+// that have no usable overlap edge; those are independent background gauges
+// too when disconnected-background equalization is enabled.
+func activeSkyComponents(planned []plannedInput, edges []skyEdge) [][]int {
+	adj := make([][]int, len(planned))
+	for _, edge := range edges {
+		adj[edge.i] = append(adj[edge.i], edge.j)
+		adj[edge.j] = append(adj[edge.j], edge.i)
+	}
+	seen := make([]bool, len(planned))
+	var components [][]int
+	for i := range planned {
+		if seen[i] || planned[i].input.ReferenceOnly {
+			continue
+		}
+		queue := []int{i}
+		seen[i] = true
+		var component []int
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			component = append(component, cur)
+			for _, next := range adj[cur] {
+				if seen[next] || planned[next].input.ReferenceOnly {
+					continue
+				}
+				seen[next] = true
+				queue = append(queue, next)
+			}
+		}
+		components = append(components, component)
+	}
+	return components
+}
+
+// equalizeDisconnectedSkyComponents removes the otherwise arbitrary scalar
+// gauge between independent overlap graphs. Each frame contributes the median
+// of its coarse map after its already-planned correction, then each component
+// uses the median frame baseline. Brighter components receive a uniform extra
+// subtraction to meet the darkest finite component. This is intentionally
+// opt-in and non-photometric.
+func equalizeDisconnectedSkyComponents(planned []plannedInput, maps []map[int64]float64, rawSky, subtractSky []float64, planes []skyPlane, components [][]int, options SkysubOptions) {
+	if !options.EqualizeDisconnectedBackgrounds || len(components) < 2 {
+		return
+	}
+	switch options.Method {
+	case SkyMethodMatch, SkyMethodGlobalMinMatch, SkyMethodMatchPlane:
+	default:
+		return
+	}
+
+	baselines := make([]float64, len(components))
+	for i := range baselines {
+		baselines[i] = math.NaN()
+	}
+	target := math.Inf(1)
+	validComponents := 0
+	for componentIndex, component := range components {
+		frameBaselines := make([]float64, 0, len(component))
+		for _, frameIndex := range component {
+			baseline, ok := correctedFrameBackground(frameIndex, maps, rawSky, subtractSky, planes)
+			if ok {
+				frameBaselines = append(frameBaselines, baseline)
+			}
+		}
+		if len(frameBaselines) == 0 {
+			continue
+		}
+		baseline := quickSelectMedian(frameBaselines)
+		if !isFiniteSky64(baseline) {
+			continue
+		}
+		baselines[componentIndex] = baseline
+		validComponents++
+		if baseline < target {
+			target = baseline
+		}
+	}
+	if validComponents < 2 || !isFiniteSky64(target) {
+		return
+	}
+
+	for componentIndex, component := range components {
+		baseline := baselines[componentIndex]
+		if !isFiniteSky64(baseline) {
+			continue
+		}
+		shift := baseline - target
+		if shift < 0 {
+			shift = 0
+		}
+		for _, frameIndex := range component {
+			if options.Method == SkyMethodMatchPlane {
+				if shift != 0 {
+					planes[frameIndex].C += shift
+					planes[frameIndex].Valid = true
+				}
+			} else {
+				subtractSky[frameIndex] += shift
+			}
+		}
+		if skyDebugLog {
+			debuglog.Log(fmt.Sprintf(
+				"SKYSUB COMPONENT members=%v baseline=%.6f target=%.6f shift=%.6f",
+				component,
+				baseline,
+				target,
+				shift,
+			))
+		}
+	}
+}
+
+func correctedFrameBackground(frameIndex int, maps []map[int64]float64, rawSky, subtractSky []float64, planes []skyPlane) (float64, bool) {
+	if frameIndex < 0 || frameIndex >= len(rawSky) || frameIndex >= len(subtractSky) || frameIndex >= len(planes) {
+		return 0, false
+	}
+	values := make([]float64, 0)
+	if frameIndex < len(maps) {
+		values = make([]float64, 0, len(maps[frameIndex]))
+		for key, value := range maps[frameIndex] {
+			if !isFiniteSky64(value) {
+				continue
+			}
+			x, y := overlapCellCenter(key)
+			corrected := value - subtractSky[frameIndex] - planes[frameIndex].value(x, y)
+			if isFiniteSky64(corrected) {
+				values = append(values, corrected)
+			}
+		}
+	}
+	if len(values) > 0 {
+		return quickSelectMedian(values), true
+	}
+
+	// A frame with no usable coarse cells is still an independent component.
+	// Its robust full-frame sky is the best available estimate; plane C is a
+	// sensible scalar fallback because no map coordinates exist to evaluate a
+	// slope against.
+	fallback := rawSky[frameIndex] - subtractSky[frameIndex]
+	if planes[frameIndex].Valid {
+		fallback -= planes[frameIndex].C
+	}
+	return fallback, isFiniteSky64(fallback)
 }
 
 func solveSkyComponent(component []int, edges []skyEdge) map[int]float64 {

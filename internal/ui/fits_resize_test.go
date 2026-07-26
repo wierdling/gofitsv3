@@ -2,6 +2,19 @@ package ui
 
 import "testing"
 
+func TestDeduplicatePathsPreservesOrder(t *testing.T) {
+	got := deduplicatePaths([]string{"first.fits", "second.fit", "first.fits", "third.fts", "second.fit"})
+	want := []string{"first.fits", "second.fit", "third.fts"}
+	if len(got) != len(want) {
+		t.Fatalf("deduplicatePaths() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("deduplicatePaths() = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestResizeFactorsAndDiscardNoteAllowIncompleteEdges(t *testing.T) {
 	got := resizeFactors(5, 3)
 	if len(got) != 1 || got[0] != 2 {

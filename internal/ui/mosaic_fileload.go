@@ -23,6 +23,30 @@ import (
 	"gofitsv3/internal/processing"
 )
 
+// mosaicFixedWidthLayout keeps a table column at exactly the requested width.
+// It is intentionally local to the Mosaic input-frame table; other min-width
+// layouts allow content to grow and are used for different UI behavior.
+type mosaicFixedWidthLayout struct{ w float32 }
+
+const mosaicInputNameColumnWidth = 320
+
+func (l *mosaicFixedWidthLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	for _, object := range objects {
+		object.Move(fyne.NewPos(0, 0))
+		object.Resize(fyne.NewSize(l.w, size.Height))
+	}
+}
+
+func (l *mosaicFixedWidthLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var height float32
+	for _, object := range objects {
+		if object.MinSize().Height > height {
+			height = object.MinSize().Height
+		}
+	}
+	return fyne.NewSize(l.w, height)
+}
+
 func (ws *mosaicWorkspace) rebuildOffsetControls() {
 	ws.offsetControls.Objects = nil
 	ws.offsetHeader.Objects = nil
@@ -33,10 +57,9 @@ func (ws *mosaicWorkspace) rebuildOffsetControls() {
 		return
 	}
 
-	// nameCell wraps a label in a container with a minimum width so every row's
-	// name column is the same width regardless of text length.
+	// nameCell keeps the header and row name columns aligned even for long names.
 	nameCell := func(obj fyne.CanvasObject) fyne.CanvasObject {
-		return container.New(&minWidthLayout{160}, obj)
+		return container.New(&mosaicFixedWidthLayout{mosaicInputNameColumnWidth}, obj)
 	}
 	hdrLabel := func(text string) fyne.CanvasObject {
 		return widget.NewLabelWithStyle(text, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
@@ -88,13 +111,13 @@ func (ws *mosaicWorkspace) rebuildOffsetControls() {
 	for idx := range ws.state.inputs {
 		name := mosaic.InputLabel(ws.state.inputs[idx])
 		xEntry := NewNumberEntry(1, 2)
-		xEntry.MinWidth = 1
+		xEntry.MinWidth = entryColW
 		xEntry.SetValue(ws.state.inputs[idx].OffsetX)
 		yEntry := NewNumberEntry(1, 2)
-		yEntry.MinWidth = 1
+		yEntry.MinWidth = entryColW
 		yEntry.SetValue(ws.state.inputs[idx].OffsetY)
 		rotEntry := NewNumberEntry(0.01, 4)
-		rotEntry.MinWidth = 1
+		rotEntry.MinWidth = entryColW
 		currentRot := 0.0
 		if ws.state.inputs[idx].HasManualTransform {
 			t := ws.state.inputs[idx].ManualTransform
@@ -226,9 +249,11 @@ func (ws *mosaicWorkspace) rebuildOffsetControls() {
 			downBtn.Disable()
 		}
 
+		nameLabel := widget.NewLabel(name)
+		nameLabel.Truncation = fyne.TextTruncateEllipsis
 		row := container.NewHBox(
 			upBtn, downBtn,
-			nameCell(widget.NewLabel(name)),
+			nameCell(nameLabel),
 			xEntry, yEntry, rotEntry,
 			flashBtn, applyBtn,
 			container.New(&minWidthLayout{w: lockColW}, container.NewCenter(lockCheck)),
@@ -256,13 +281,13 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 	desc := widget.NewLabel("Select records by exposure or date. Changes update the Input Frames tab immediately.")
 
 	nameCell := func(obj fyne.CanvasObject) fyne.CanvasObject {
-		return container.New(&minWidthLayout{160}, obj)
+		return container.New(&mosaicFixedWidthLayout{160}, obj)
 	}
 	hdrLabel := func(text string) fyne.CanvasObject {
 		return widget.NewLabelWithStyle(text, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 	}
 	hdrCell := func(text string, w float32) fyne.CanvasObject {
-		return container.New(&minWidthLayout{w: w}, hdrLabel(text))
+		return container.New(&mosaicFixedWidthLayout{w: w}, hdrLabel(text))
 	}
 	hdrSpace := func(w float32) fyne.CanvasObject {
 		r := canvas.NewRectangle(color.Transparent)
@@ -306,13 +331,13 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 		input := ws.state.inputs[idx]
 		name := mosaic.InputLabel(input)
 		xEntry := NewNumberEntry(1, 2)
-		xEntry.MinWidth = 1
+		xEntry.MinWidth = entryColW
 		xEntry.SetValue(input.OffsetX)
 		yEntry := NewNumberEntry(1, 2)
-		yEntry.MinWidth = 1
+		yEntry.MinWidth = entryColW
 		yEntry.SetValue(input.OffsetY)
 		rotEntry := NewNumberEntry(0.01, 4)
-		rotEntry.MinWidth = 1
+		rotEntry.MinWidth = entryColW
 		if input.HasManualTransform {
 			t := input.ManualTransform
 			rotEntry.SetValue(math.Atan2(t.D, t.A) * 180 / math.Pi)
@@ -327,6 +352,8 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 		} else {
 			expLabel.SetText("-")
 		}
+		dateLabel.Truncation = fyne.TextTruncateEllipsis
+		expLabel.Truncation = fyne.TextTruncateEllipsis
 
 		includeCheck := widget.NewCheck("", func(index int) func(bool) {
 			return func(included bool) {
@@ -452,11 +479,14 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 			downBtn.Disable()
 		}
 
+		nameLabel := widget.NewLabel(name)
+		nameLabel.Truncation = fyne.TextTruncateEllipsis
 		row := container.NewHBox(
 			upBtn, downBtn,
-			nameCell(widget.NewLabel(name)),
+			nameCell(nameLabel),
 			xEntry, yEntry, rotEntry,
-			dateLabel, expLabel,
+			container.New(&mosaicFixedWidthLayout{w: dateColW}, dateLabel),
+			container.New(&mosaicFixedWidthLayout{w: expColW}, expLabel),
 			flashBtn, applyBtn,
 			container.New(&minWidthLayout{w: lockColW}, container.NewCenter(lockCheck)),
 			container.New(&minWidthLayout{w: inclColW}, container.NewCenter(includeCheck)),

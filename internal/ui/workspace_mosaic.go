@@ -471,6 +471,26 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		fd.Show()
 	})
 
+	directoryBtn := widget.NewButton("Add FITS Directory", func() {
+		fd := dialog.NewFolderOpen(func(listable fyne.ListableURI, err error) {
+			if err != nil || listable == nil {
+				return
+			}
+			dir := listable.Path()
+			app.Preferences().SetString("lastDir", dir)
+			paths, scanErr := mosaic.DiscoverFITSFiles(dir)
+			if scanErr != nil {
+				dialog.ShowError(scanErr, win)
+				return
+			}
+			ws.loadPaths(paths, "Loading FITS Directory")
+		}, win)
+		ws.configureLastDir(fd)
+		fd.Resize(fyne.NewSize(640, 480))
+		fd.Show()
+	})
+	ws.directoryBtn = directoryBtn
+
 	batchBtn := widget.NewButton("Add Filter Batch", func() {
 		fd := dialog.NewFolderOpen(func(listable fyne.ListableURI, err error) {
 			if err != nil || listable == nil {
@@ -788,7 +808,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				fd.SetLocation(l)
 			}
 		}
-		sizeFileDialog(fd)
+		fd.Resize(fyne.NewSize(640, 480))
 		fd.Show()
 	})
 	ws.batchBtn = batchBtn
@@ -1200,13 +1220,13 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		ws.openInputFramesPopup()
 	})
 
+	inputFramesTable := newMosaicInputFramesScroll(offsetHeader, offsetScroll)
 	inputTabs := container.NewAppTabs(
-		container.NewTabItem("Input Frames", container.NewBorder(offsetHeader, nil, nil, nil, offsetScroll)),
+		container.NewTabItem("Input Frames", inputFramesTable),
 		container.NewTabItem("Input Status", statusScroll),
 	)
 
-	controls := container.NewVBox(
-		widget.NewLabel("Preview Levels"),
+	previewSettings := container.NewVBox(
 		levelsForm,
 		func() fyne.CanvasObject {
 			r := canvas.NewRectangle(color.Transparent)
@@ -1215,9 +1235,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		}(),
 		container.NewGridWithColumns(2, autoLevelsBtn, autoMTFBtn),
 		container.NewGridWithColumns(2, magicBtn, applyLevelsBtn),
-		widget.NewSeparator(),
-		widget.NewLabel("Mosaic / Drizzle"),
+	)
+	drizzleCommands := container.NewVBox(
 		container.NewGridWithColumns(2, loadBtn, batchBtn),
+		directoryBtn,
 		container.NewHBox(savePreviewToggle, widget.NewLabel("Save Preview")),
 		widget.NewSeparator(),
 		widget.NewLabel("Baseline Reference"),
@@ -1230,10 +1251,15 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			container.NewGridWithColumns(2, loadOffsetsBtn, clearOffsetsBtn),
 			container.NewGridWithColumns(2, clearBtn, layout.NewSpacer()),
 		),
-		widget.NewSeparator(),
-		inputFramesBtn,
-		inputTabs,
 	)
+	inputFrames := container.NewBorder(inputFramesBtn, nil, nil, nil, inputTabs)
+	controls := widget.NewAccordion(
+		widget.NewAccordionItem("Preview Settings", previewSettings),
+		widget.NewAccordionItem("Drizzle Commands", drizzleCommands),
+		widget.NewAccordionItem("Input Frames", inputFrames),
+	)
+	controls.MultiOpen = true
+	controls.OpenAll()
 
 	// Now assign all the variables that enterStarMode/exitStarMode need.
 	// Wrap controls with a 20px right pad so the vertical scrollbar never
@@ -1346,4 +1372,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	split := container.NewHSplit(container.New(&sidePaddedLayout{20}, ws.leftStack), previewPane)
 	split.SetOffset(0.38)
 	return split, settingsMenu, loadMosaicItem, saveMosaicItem
+}
+
+func newMosaicInputFramesScroll(offsetHeader *fyne.Container, offsetScroll *container.Scroll) *container.Scroll {
+	table := container.NewBorder(offsetHeader, nil, nil, nil, offsetScroll)
+	scroll := container.NewHScroll(table)
+	scroll.SetMinSize(fyne.NewSize(260, 180))
+	return scroll
 }

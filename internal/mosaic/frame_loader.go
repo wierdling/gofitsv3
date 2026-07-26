@@ -11,14 +11,13 @@ import (
 	"gofitsv3/internal/processing"
 )
 
-// alignStarThresholdSigma, alignStarMinArea, and alignStarMaxCount are the star
-// extraction parameters used for alignment catalogs. They match the values the
+// alignStarThresholdSigma and alignStarMinArea are the star extraction
+// parameters used for alignment catalogs. They match the values the
 // pixel-based TweakReg path (and the former getStars cache) used, so a catalog
 // built here is identical to one the old code extracted inline.
 const (
 	alignStarThresholdSigma = 4.0
 	alignStarMinArea        = 3
-	alignStarMaxCount       = 200
 )
 
 // extractStarCatalogsForAlignment extracts each input's star catalog, streaming
@@ -31,7 +30,10 @@ const (
 // alignment modes preload them) those are used directly; otherwise the frame is
 // loaded from disk, its catalog extracted, and the pixels dropped before the next
 // frame on that worker.
-func extractStarCatalogsForAlignment(inputs []Input) [][]processing.Star {
+func extractStarCatalogsForAlignment(inputs []Input, maxStars int) [][]processing.Star {
+	if maxStars <= 0 {
+		maxStars = processing.TweakRegCatalogMaxStars
+	}
 	catalogs := make([][]processing.Star, len(inputs))
 	workers := alignExtractionWorkers(inputs)
 	if workers > len(inputs) {
@@ -70,7 +72,7 @@ func extractStarCatalogsForAlignment(inputs []Input) [][]processing.Star {
 					}
 				}
 				catalogs[i] = processing.ExtractAndLimitStars(
-					sci, w, h, alignStarThresholdSigma, alignStarMinArea, alignStarMaxCount)
+					sci, w, h, alignStarThresholdSigma, alignStarMinArea, maxStars)
 			}
 		}()
 	}

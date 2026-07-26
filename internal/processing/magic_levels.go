@@ -7,8 +7,9 @@ import (
 	"gofitsv3/internal/models"
 )
 
-// MagicPreset selects how the white point is estimated. The black point is the
-// same across presets; only the white-sample population and percentile differ.
+// MagicPreset selects how the stretch levels are estimated. Galaxy uses a
+// slightly raised black-point percentile for a darker sky; presets otherwise
+// differ in their white-sample population and percentile.
 type MagicPreset int
 
 const (
@@ -97,6 +98,11 @@ const (
 	// black->white distance, so the estimated bright content does not sit right
 	// at the clip point. Used by the galaxy/balanced presets.
 	whiteSafetyMargin = 1.05
+
+	// galaxyBlackClipPercent raises the galaxy floor modestly above the generic
+	// 0.1th-percentile floor. This clips only a small robust noise tail while
+	// making the sky render darker; other presets retain their existing floor.
+	galaxyBlackClipPercent = 1.0
 
 	// nebulaWhiteSafetyMargin is intentionally <= 1: for nebulae we want the
 	// bright nebulosity to reach white and just begin to clip, so we do not push
@@ -197,6 +203,9 @@ func MagicLevels(pixels []float32, width, height int, valid []bool, preset Magic
 	// Black point: a low percentile of valid pixels so only a tiny fraction
 	// clips low, rather than the true minimum.
 	black := percentileSorted(sample, targetBlackClipPercent)
+	if preset == MagicGalaxy {
+		black = percentileSorted(sample, galaxyBlackClipPercent)
+	}
 	res.Black = black
 
 	// Detect compact bright sources (stars) on the full-resolution grid.

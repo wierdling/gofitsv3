@@ -120,9 +120,16 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 	}
 	uSigmaEntry.SetText(fmt.Sprintf("%.2f", uSigma))
 
+	equalizeDisconnectedBackgrounds := current.EqualizeDisconnectedBackgrounds
+	equalizeCheck := widget.NewCheck("Equalize disconnected overlap groups to the darkest background.", func(v bool) {
+		equalizeDisconnectedBackgrounds = v
+	})
+	equalizeCheck.SetChecked(equalizeDisconnectedBackgrounds)
+
 	notes := widget.NewLabel(
 		"skymethod: localmin/globalmin/match/globalmin+match follow AstroDrizzle naming.\n" +
 			"match finds relative frame offsets from overlaps; match+plane fits a relative offset plus gradient from overlap differences only.\n" +
+			"Disconnected background equalization applies only to overlap-based methods and is non-photometric: use it for pretty pictures, not flux measurements.\n" +
 			"Use JWST Artifact Corrections for detector-fixed NIRCam/MIRI cleanup before sky matching.\n" +
 			"skywidth: histogram bin width in sigma for mode estimation.\n" +
 			"skylower/skyupper: optional pixel cutoffs in the input image units.\n" +
@@ -135,6 +142,7 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 		widget.NewFormItem("Enabled", enabledCheck),
 		widget.NewFormItem("JWST artifacts", container.NewVBox(artifactButton, artifactSummary)),
 		widget.NewFormItem("skymethod", methodSelect),
+		widget.NewFormItem("Disconnected groups", equalizeCheck),
 		widget.NewFormItem("skystat", statSelect),
 		widget.NewFormItem("skywidth", widthEntry),
 		widget.NewFormItem("skylower", lowerEntry),
@@ -216,6 +224,7 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 			SkyLSigma:   lSigmaVal,
 			SkyUSigma:   uSigmaVal,
 		}
+		saved.EqualizeDisconnectedBackgrounds = equalizeDisconnectedBackgrounds
 		onSave(copyJWSTArtifactSettings(saved, artifactSettings))
 	}, win)
 	d.Resize(fyne.NewSize(700, 500))
@@ -405,7 +414,7 @@ func jwstArtifactSummary(s models.SkysubSettings) string {
 }
 
 func skysubOptionsFromSettings(s models.SkysubSettings) mosaic.SkysubOptions {
-	return mosaic.SkysubOptions{
+	options := mosaic.SkysubOptions{
 		Enabled:                s.Enabled,
 		AmpPedestal:            s.AmpPedestal,
 		RowDestripe:            s.RowDestripe,
@@ -432,4 +441,6 @@ func skysubOptionsFromSettings(s models.SkysubSettings) mosaic.SkysubOptions {
 		LSigma:                 s.SkyLSigma,
 		USigma:                 s.SkyUSigma,
 	}
+	options.EqualizeDisconnectedBackgrounds = s.EqualizeDisconnectedBackgrounds
+	return options
 }

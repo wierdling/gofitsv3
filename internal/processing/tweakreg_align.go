@@ -35,6 +35,8 @@ type AlignStats struct {
 }
 
 const (
+	// TweakRegCatalogMaxStars is the shared cap for extracted alignment catalogs.
+	TweakRegCatalogMaxStars = 500
 	// tweakRegGlobalTolPx is the radius within which a projected source star is
 	// considered aligned with a reference star when verifying a fit globally.
 	tweakRegGlobalTolPx = 2.0
@@ -78,8 +80,7 @@ func EstimateTweakRegAlignment(
 ) (AffineTransform, AlignStats, error) {
 	debuglog.Log("EstimateTweakRegAlignment: starting")
 	defer debuglog.Log("EstimateTweakRegAlignment: finished")
-	const maxCatalogStars = 200
-	refStars := ExtractAndLimitStars(refPixels, refWidth, refHeight, 4.0, 3, maxCatalogStars)
+	refStars := ExtractAndLimitStars(refPixels, refWidth, refHeight, 4.0, 3, TweakRegCatalogMaxStars)
 	return EstimateTweakRegAlignmentWithRefStars(
 		sourcePixels, sourceWidth, sourceHeight,
 		mapper, refPixels, refStars, refWidth, refHeight, refHeader,
@@ -87,35 +88,26 @@ func EstimateTweakRegAlignment(
 	)
 }
 
-// transformGlobalSupport counts how many of the projected source stars land
-// within tol pixels of some reference star after applying t (which maps a
-// projected source position to reference-pixel space). This validates a
-// candidate transform against the FULL catalogs rather than only the matched
-// pairs, exposing a false consensus that explains its seed matches but nothing
-// else.
+// transformGlobalSupport counts one-to-one projected/reference correspondences
+// within tol pixels after applying t (which maps projected positions to
+// reference-pixel space). This validates a candidate against the FULL catalogs
+// rather than only matched pairs, without counting duplicate detections near a
+// single reference star.
 func transformGlobalSupport(projected, refStars []Star, t AffineTransform, tol float64) int {
-	if len(projected) == 0 || len(refStars) == 0 {
-		return 0
+	return len(pairByTransform(projected, refStars, t, tol))
+}
+
+// preferIdentityTweakRegFit keeps an already-corroborated identity alignment
+// from being replaced by a candidate that explains no more of the full
+// catalogs. A candidate must strictly improve global support; ties go to the
+// identity baseline.
+func preferIdentityTweakRegFit(projected, refStars []Star, candidate AffineTransform, candidateStats AlignStats) (AffineTransform, AlignStats, bool) {
+	identity := AffineTransform{A: 1, E: 1}
+	identityStats := statsForTransform(projected, refStars, identity)
+	if candidateStats.GlobalInliers <= identityStats.GlobalInliers && identityStats.GlobalInliers >= tweakRegMinSupport {
+		return identity, identityStats, true
 	}
-	tolSq := tol * tol
-	count := 0
-	for _, s := range projected {
-		px := t.A*s.X + t.B*s.Y + t.C
-		py := t.D*s.X + t.E*s.Y + t.F
-		best := math.Inf(1)
-		for _, r := range refStars {
-			dx := px - r.X
-			dy := py - r.Y
-			d := dx*dx + dy*dy
-			if d < best {
-				best = d
-			}
-		}
-		if best <= tolSq {
-			count++
-		}
-	}
-	return count
+	return candidate, candidateStats, false
 }
 
 // EstimateTweakRegAlignmentWithRefStars is like EstimateTweakRegAlignment but
@@ -132,8 +124,7 @@ func EstimateTweakRegAlignmentWithRefStars(
 	searchRadiusArcsec float64,
 	fitgeom string,
 ) (AffineTransform, AlignStats, error) {
-	const maxCatalogStars = 200
-	sourceStars := ExtractAndLimitStars(sourcePixels, sourceWidth, sourceHeight, 4.0, 3, maxCatalogStars)
+	sourceStars := ExtractAndLimitStars(sourcePixels, sourceWidth, sourceHeight, 4.0, 3, TweakRegCatalogMaxStars)
 	result, stats, projected, pairs, err := estimateTweakRegFromCatalogs(
 		sourceStars, mapper, refStars, refWidth, refHeight, refHeader, searchRadiusArcsec, fitgeom)
 
@@ -338,6 +329,7 @@ func fitCatalogTransform(projected, refStars []Star, refWidth, refHeight int, se
 				gRMS, gMax := residualStats(pairs, general)
 				debuglog.Log(fmt.Sprintf("fitCatalogTransform: upgrading fitgeom from rscale to general (pairs=%d, rscale rms=%.2f max=%.2f, general rms=%.2f max=%.2f)", len(pairs), rRMS, rMax, gRMS, gMax))
 				result = general
+				effectiveFitgeom = "general"
 			} else {
 				if generalErr != nil {
 					debuglog.Log(fmt.Sprintf("fitCatalogTransform: optional general RANSAC comparison failed (pairs=%d): %v", len(pairs), generalErr))
@@ -357,6 +349,10 @@ func fitCatalogTransform(projected, refStars []Star, refWidth, refHeight int, se
 	rms, maxErr := residualStats(pairs, result)
 	support := transformGlobalSupport(projected, refStars, result, tweakRegGlobalTolPx)
 	stats := AlignStats{MatchedStars: len(pairs), GlobalInliers: support, RMS: rms, MaxError: maxErr}
+	if identity, identityStats, preferred := preferIdentityTweakRegFit(projected, refStars, result, stats); preferred {
+		debuglog.Log(fmt.Sprintf("fitCatalogTransform: candidate support %d does not improve identity support %d; preferring identity", support, identityStats.GlobalInliers))
+		return identity, identityStats, pairs, nil
+	}
 	debuglog.Log(fmt.Sprintf("fitCatalogTransform: solved fitgeom=%s transform=[%.8f %.8f %.3f; %.8f %.8f %.3f] pairs=%d support=%d rms=%.3f max=%.3f", effectiveFitgeom, result.A, result.B, result.C, result.D, result.E, result.F, len(pairs), support, rms, maxErr))
 	if recoveryRScaleErr != nil {
 		debuglog.Log(fmt.Sprintf("fitCatalogTransform: guarded general RANSAC recovery succeeded (pairs=%d, rscale=failed: %v, general=success, selected=general recovery, rms=%.3f max=%.3f, transform=[%.8f %.8f %.3f; %.8f %.8f %.3f])", len(pairs), recoveryRScaleErr, rms, maxErr, result.A, result.B, result.C, result.D, result.E, result.F))
@@ -379,9 +375,13 @@ func fitCatalogTransform(projected, refStars []Star, refWidth, refHeight int, se
 		return AffineTransform{}, stats, pairs, fmt.Errorf("residual shift too large (%.0f px > %.0f): likely false star matches", shift, maxResidualShiftPx)
 	}
 	// Low corroboration floor: require at least a few stars to agree.
-	if support < tweakRegMinSupport {
-		debuglog.Log(fmt.Sprintf("fitCatalogTransform: transform rejected — only %d stars corroborate (need %d), rms=%.2f — likely false matches", support, tweakRegMinSupport, rms))
-		return AffineTransform{}, stats, pairs, fmt.Errorf("fit corroborated by too few stars (%d, need %d)", support, tweakRegMinSupport)
+	minSupport := tweakRegMinSupport
+	if effectiveFitgeom == "general" && len(projected) > tweakRegMinSupport && len(refStars) > tweakRegMinSupport {
+		minSupport++
+	}
+	if support < minSupport {
+		debuglog.Log(fmt.Sprintf("fitCatalogTransform: transform rejected — only %d stars corroborate (need %d), rms=%.2f — likely false matches", support, minSupport, rms))
+		return AffineTransform{}, stats, pairs, fmt.Errorf("fit corroborated by too few stars (%d, need %d)", support, minSupport)
 	}
 	debuglog.Log(fmt.Sprintf("fitCatalogTransform: accepted — %d pairs, %d/%d catalog stars align, shift=%.1f px, rms=%.2f max=%.2f", len(pairs), support, len(projected), maxCornerShift(result, refWidth, refHeight), rms, maxErr))
 	return result, stats, pairs, nil
@@ -409,9 +409,8 @@ func AlignChannelByStars(targetPixels []float32, targetWidth, targetHeight int, 
 	// Spread the alignment catalog across the frame so the global rotation/scale is
 	// well constrained; the brightest-N alone can cluster and leave the fit drifting
 	// toward the edges (see selectSpatiallyDistributedStars).
-	const maxCatalogStars = 200
-	refStars := selectSpatiallyDistributedStars(ExtractStars(refPixels, refWidth, refHeight, 4.0, 3), refWidth, refHeight, maxCatalogStars)
-	targetStars := selectSpatiallyDistributedStars(ExtractStars(aligned, targetWidth, targetHeight, 4.0, 3), targetWidth, targetHeight, maxCatalogStars)
+	refStars := selectSpatiallyDistributedStars(ExtractStars(refPixels, refWidth, refHeight, 4.0, 3), refWidth, refHeight, TweakRegCatalogMaxStars)
+	targetStars := selectSpatiallyDistributedStars(ExtractStars(aligned, targetWidth, targetHeight, 4.0, 3), targetWidth, targetHeight, TweakRegCatalogMaxStars)
 	if len(refStars) < 3 || len(targetStars) < 3 {
 		return nil, AffineTransform{}, AlignStats{}, fmt.Errorf("insufficient stars for alignment (ref %d, target %d)", len(refStars), len(targetStars))
 	}
@@ -477,10 +476,9 @@ func pairByTransform(targetStars, refStars []Star, t AffineTransform, radius flo
 // catalogs: global support within tweakRegGlobalTolPx plus the RMS/max of the
 // stars that land within that tolerance.
 func statsForTransform(targetStars, refStars []Star, t AffineTransform) AlignStats {
-	support := transformGlobalSupport(targetStars, refStars, t, tweakRegGlobalTolPx)
 	pairs := pairByTransform(targetStars, refStars, t, tweakRegGlobalTolPx)
 	rms, maxErr := residualStats(pairs, t)
-	return AlignStats{MatchedStars: len(pairs), GlobalInliers: support, RMS: rms, MaxError: maxErr}
+	return AlignStats{MatchedStars: len(pairs), GlobalInliers: len(pairs), RMS: rms, MaxError: maxErr}
 }
 
 // refineGlobalAffine improves an initial target → ref fit by re-pairing the full
@@ -493,6 +491,7 @@ func statsForTransform(targetStars, refStars []Star, t AffineTransform) AlignSta
 func refineGlobalAffine(targetStars, refStars []Star, init AffineTransform, initStats AlignStats, refWidth, refHeight int) (AffineTransform, AlignStats) {
 	best := init
 	bestStats := initStats
+	identityBaseline := init == (AffineTransform{A: 1, E: 1})
 	if bestStats.GlobalInliers == 0 {
 		bestStats = statsForTransform(targetStars, refStars, init)
 	}
@@ -520,9 +519,10 @@ func refineGlobalAffine(targetStars, refStars []Star, init AffineTransform, init
 			break
 		}
 		st := statsForTransform(targetStars, refStars, cand)
-		// Accept only when more (or equal) stars agree globally; the goal is broader
-		// corroboration, and equal support with a fresh fit is still a safe no-op.
-		if st.GlobalInliers < bestStats.GlobalInliers {
+		// An exact identity baseline is already a safe no-op: only a strict support
+		// increase justifies replacing it. Preserve the historical equal-support
+		// behavior for non-identity starting transforms.
+		if st.GlobalInliers < bestStats.GlobalInliers || (identityBaseline && best == (AffineTransform{A: 1, E: 1}) && st.GlobalInliers <= bestStats.GlobalInliers) {
 			break
 		}
 		best, bestStats, current = cand, st, cand

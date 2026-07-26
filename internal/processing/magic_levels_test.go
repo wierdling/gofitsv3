@@ -69,9 +69,9 @@ func TestMagicLevelsIgnoresPaddingAndNaN(t *testing.T) {
 		px[i] = 50 // uniform real data
 	}
 	// Surround/scatter invalid pixels that must be ignored.
-	px[0] = 0                          // drizzle padding
-	px[1] = float32(math.NaN())        // NaN
-	px[2] = float32(math.Inf(1))       // Inf
+	px[0] = 0                    // drizzle padding
+	px[1] = float32(math.NaN())  // NaN
+	px[2] = float32(math.Inf(1)) // Inf
 	res := MagicLevels(px, w, h, nil, MagicBalanced)
 
 	if res.ValidPixels != w*h-3 {
@@ -97,5 +97,37 @@ func TestMagicPresetWhiteOrdering(t *testing.T) {
 	// point should be at least as high as the nebula (diffuse-protecting) one.
 	if gal.White < neb.White {
 		t.Errorf("galaxy white %.3f < nebula white %.3f", gal.White, neb.White)
+	}
+	if !(gal.Black >= neb.Black) {
+		t.Errorf("galaxy black %.3f < nebula black %.3f; galaxy sky floor should be higher", gal.Black, neb.Black)
+	}
+	if math.IsNaN(gal.Black) || math.IsInf(gal.Black, 0) || gal.ClipLowPercent > 10 {
+		t.Errorf("galaxy black diagnostics are not sensible: black=%.3f clip-low=%.3f%%", gal.Black, gal.ClipLowPercent)
+	}
+}
+
+func TestMagicGalaxyDarkensNormalizedSky(t *testing.T) {
+	const w, h = 200, 1
+	px := make([]float32, w*h)
+	for i := range px {
+		px[i] = float32(100 + 0.5*float64(i))
+	}
+	balanced := MagicLevels(px, w, h, nil, MagicBalanced)
+	galaxy := MagicLevels(px, w, h, nil, MagicGalaxy)
+	if galaxy.Black <= balanced.Black {
+		t.Fatalf("galaxy black %.3f must exceed balanced %.3f", galaxy.Black, balanced.Black)
+	}
+	const sky = 102.0
+	baseNorm := (sky - balanced.Black) / (balanced.White - balanced.Black)
+	galNorm := (sky - galaxy.Black) / (galaxy.White - galaxy.Black)
+	if galNorm >= baseNorm {
+		t.Fatalf("normalized sky %.6f is not darker than baseline %.6f", galNorm, baseNorm)
+	}
+	nebula := MagicLevels(px, w, h, nil, MagicNebula)
+	if nebula.Black != balanced.Black {
+		t.Fatalf("nebula black %.3f changed from balanced %.3f", nebula.Black, balanced.Black)
+	}
+	if galaxy.White <= galaxy.Black {
+		t.Fatalf("galaxy white %.3f must exceed black %.3f", galaxy.White, galaxy.Black)
 	}
 }

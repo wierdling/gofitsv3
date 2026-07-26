@@ -115,6 +115,78 @@ func TestFitCatalogTransformSuccessfulRScaleRemainsUnchanged(t *testing.T) {
 	assertAffineNear(t, got, wantRScale, 1e-9)
 }
 
+func TestPreferIdentityTweakRegFitRequiresStrictSupportImprovement(t *testing.T) {
+	projected := tweakRegTestStars(
+		[2]float64{20, 20}, [2]float64{40, 20}, [2]float64{20, 40},
+		[2]float64{120, 20}, [2]float64{140, 20}, [2]float64{120, 40}, [2]float64{140, 40},
+		[2]float64{220, 20}, [2]float64{240, 20}, [2]float64{220, 40},
+	)
+	refStars := make([]Star, len(projected))
+	for i, star := range projected {
+		shift := 0.0
+		if i >= 3 && i < 7 {
+			shift = 4
+		} else if i >= 7 {
+			shift = 8
+		}
+		refStars[i] = Star{X: star.X + shift, Y: star.Y}
+	}
+	identity := AffineTransform{A: 1, E: 1}
+	fourPixel := AffineTransform{A: 1, C: 4, E: 1}
+	eightPixel := AffineTransform{A: 1, C: 8, E: 1}
+	twentyPixel := AffineTransform{A: 1, C: 20, E: 1}
+	identityStats := statsForTransform(projected, refStars, identity)
+	fourPixelStats := statsForTransform(projected, refStars, fourPixel)
+	eightPixelStats := statsForTransform(projected, refStars, eightPixel)
+	twentyPixelStats := statsForTransform(projected, refStars, twentyPixel)
+	if identityStats.GlobalInliers != 3 || twentyPixelStats.GlobalInliers >= 3 || eightPixelStats.GlobalInliers != 3 || fourPixelStats.GlobalInliers != 4 {
+		t.Fatalf("fixture support = identity %d, +20 %d, +8 %d, +4 %d; want 3, <3, 3, 4", identityStats.GlobalInliers, twentyPixelStats.GlobalInliers, eightPixelStats.GlobalInliers, fourPixelStats.GlobalInliers)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		candidate AffineTransform
+		stats     AlignStats
+	}{
+		{name: "lower", candidate: twentyPixel, stats: twentyPixelStats},
+		{name: "equal", candidate: eightPixel, stats: eightPixelStats},
+	} {
+		got, stats, preferred := preferIdentityTweakRegFit(projected, refStars, tc.candidate, tc.stats)
+		if !preferred {
+			t.Fatalf("%s candidate support %d: expected identity preference", tc.name, tc.stats.GlobalInliers)
+		}
+		if got != identity || stats != identityStats {
+			t.Fatalf("%s candidate support %d: identity result = %+v, stats=%+v; want %+v", tc.name, tc.stats.GlobalInliers, got, stats, identityStats)
+		}
+	}
+
+	got, stats, preferred := preferIdentityTweakRegFit(projected, refStars, fourPixel, fourPixelStats)
+	if preferred || got != fourPixel || stats != fourPixelStats {
+		t.Fatalf("strictly improved candidate = %+v, stats=%+v, preferred=%v", got, stats, preferred)
+	}
+}
+
+func TestRefineGlobalAffinePreservesIdentityOnEqualSupport(t *testing.T) {
+	target := tweakRegTestStars(
+		[2]float64{20, 20}, [2]float64{180, 20}, [2]float64{20, 180},
+		[2]float64{180, 180}, [2]float64{80, 240}, [2]float64{240, 80},
+	)
+	ref := tweakRegTestTransform(AffineTransform{A: 1, C: 1, E: 1}, target)
+	identity := AffineTransform{A: 1, E: 1}
+	got, stats := refineGlobalAffine(target, ref, identity, statsForTransform(target, ref, identity), 300, 300)
+	if got != identity || stats.GlobalInliers != 6 {
+		t.Fatalf("refinement = %+v, stats=%+v; want identity with full support", got, stats)
+	}
+}
+
+func TestTransformGlobalSupportUsesDistinctReferenceStars(t *testing.T) {
+	projected := tweakRegTestStars([2]float64{10, 10}, [2]float64{10.5, 10})
+	refStars := tweakRegTestStars([2]float64{10, 10})
+	if got := transformGlobalSupport(projected, refStars, AffineTransform{A: 1, E: 1}, 2); got != 1 {
+		t.Fatalf("support = %d, want one-to-one support of 1", got)
+	}
+}
+
 func TestFitCatalogTransformRScaleFailureDoesNotRecoverBelowThreePairs(t *testing.T) {
 	projected := tweakRegTestStars([2]float64{50, 50}, [2]float64{50.00000001, 50})
 	refStars := tweakRegTestStars([2]float64{50, 50}, [2]float64{50.00000001, 50})
@@ -128,6 +200,17 @@ func TestFitCatalogTransformRScaleFailureDoesNotRecoverBelowThreePairs(t *testin
 	}
 	if got != (AffineTransform{}) || stats != (AlignStats{}) || len(pairs) != 2 {
 		t.Fatalf("unexpected result for fewer-than-three pairs: transform=%+v stats=%+v pairs=%d", got, stats, len(pairs))
+	}
+}
+
+func TestFitCatalogTransformGeneralNeedsFourthCatalogSupport(t *testing.T) {
+	projected := tweakRegTestStars([2]float64{40, 40}, [2]float64{160, 40}, [2]float64{40, 160}, [2]float64{160, 160})
+	want := AffineTransform{A: 1, B: 0.08, C: 6, D: 0, E: 1, F: -5}
+	refStars := tweakRegTestTransform(want, projected[:3])
+	refStars = append(refStars, Star{X: 500, Y: 500})
+	_, _, pairs, err := fitCatalogTransform(projected, refStars, 300, 300, 30, "general")
+	if err == nil || !strings.Contains(err.Error(), "fit corroborated by too few stars") {
+		t.Fatalf("expected fourth-support rejection, got err=%v pairs=%d", err, len(pairs))
 	}
 }
 

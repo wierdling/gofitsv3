@@ -112,8 +112,12 @@ func Run() error {
 	}
 	win.SetMainMenu(fyne.NewMainMenu(allMenus...))
 
-	win.SetContent(fynetooltip.AddWindowToolTipLayer(tabs, win.Canvas()))
+	memoryLabel := newMemoryUsageLabel()
+	stopMemoryMonitor := monitorMemoryUsage(memoryLabel)
+	content := container.NewBorder(nil, container.NewHBox(memoryLabel), nil, nil, tabs)
+	win.SetContent(fynetooltip.AddWindowToolTipLayer(content, win.Canvas()))
 	win.SetCloseIntercept(func() {
+		stopMemoryMonitor()
 		a.Quit()
 	})
 	win.Show()
