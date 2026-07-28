@@ -18,7 +18,7 @@ This document tracks the current quality of unit tests in this repository using 
 
 | Package | Rating | Priority | Notes |
 | --- | --- | --- | --- |
-| `internal/processing` | well covered | medium | Broad behavior coverage now includes the main `processing.go` helper layer in addition to alignment, masking, compose, cleaning, WCS, and starless processing |
+| `internal/processing` | well covered | medium | Broad behavior coverage now includes the main `processing.go` helper layer, calibration math/background estimation, canonical render paths, and a deterministic save/load/render regression fixture in addition to alignment, masking, compose, cleaning, and WCS |
 | `internal/mosaic` | well covered | medium | Strong scenario coverage for drizzle/input planning, but still worth targeted edge-case additions |
 | `internal/histogram` | well covered | low | Small logic surface and direct branch coverage |
 | `internal/render` | well covered | low | Core rendering helpers are directly tested |
@@ -30,6 +30,7 @@ This document tracks the current quality of unit tests in this repository using 
 | `badpix` | partially covered | medium | Cleaning now covers DQ presence, missing-DQ behavior, bad-bit filtering, and load failures, with only rarer malformed-file edge cases still thin |
 | `internal/fitsio` | partially covered | medium | Synthetic parser/writer tests now cover core branches; a few low-level edge cases still remain |
 | `internal/models` | partially covered | medium | Persistence coverage now includes Compose and Mosaic project/state round-trips, with only backward-compat edge cases still thin |
+| `internal/catalog/gaia` | well covered | medium | Provider/cache tests cover migrations, deduplication, endpoint semantics, retries, cancellation, cache-only misses, and an online-to-cache-only end-to-end fixture |
 | `internal/config` | no direct unit tests | low | Currently small surface; add tests if validation or branching grows |
 | `internal/debuglog` | no direct unit tests | low | Low-risk logging wrapper |
 | `internal/debugtime` | no direct unit tests | low | Low-risk timing helper |
@@ -43,7 +44,6 @@ This document tracks the current quality of unit tests in this repository using 
 ### `internal/processing`
 - Rating: `well covered`
 - Covered behaviors:
-  - starless pipeline settings validation, recombination, mask building, feathering, inpainting, normalization, and detection image construction
   - alignment and WCS behavior across channel alignment, warp, tweakreg, and rotation-center helpers
   - compose and cleaning behavior for RGB composition and mask-based cleaning flows
   - direct helper coverage for autoscaling, auto levels, grayscale/mask rendering, flip helpers, resize interpolation, drizzle-grid matching, pixel-scale parsing, finite sampling, percentile interpolation, and robust sigma fallback behavior
@@ -87,7 +87,6 @@ This document tracks the current quality of unit tests in this repository using 
 ### `internal/models`
 - Rating: `partially covered`
 - Covered behaviors:
-  - `ComposeProject` JSON round-trip preserving channel state plus starless settings zero values
   - `MosaicProject` JSON round-trip preserving nested drizzle, alignment, and skysub settings
   - `MosaicInputState` round-trip preserving affine transform and lock state
   - omitted optional-field behavior for `ReferencePath`, `ReferenceSCIExt`, `SCIExt`, transform fields, and `UseERRWeighting`
@@ -135,8 +134,6 @@ This document tracks the current quality of unit tests in this repository using 
   - viewer coordinate math
   - compose-state clearing helper
   - stretch helper behavior
-  - starless Compose settings defaults and normalization of invalid loaded-project values
-  - starless debug export path builder, default-format fallback, RGB level defaults, and mode-label mapping helpers
   - `channelStateFromImage` and `applyChannelState` behavior for restoring Compose channel state into images, controls, and viewport levels
   - `buildComposePreviewData` behavior for missing channels and optional compose override results
 - Missing or weak areas:
@@ -228,6 +225,25 @@ This document tracks the current quality of unit tests in this repository using 
 4. `internal/ui`: add only targeted regression cases if project-loop wiring or preview application state starts causing bugs.
 5. `internal/models`: add a backward-compat decode test only if legacy project-file compatibility becomes a real concern.
 
+### Color calibration Phase 1 gate
+
+The Phase 1 calibration suite includes direct tests for instrument metadata
+boundaries, robust background estimation, transform fingerprints and staleness,
+canonical render status handling, overlay-mode separation, and a JSON
+save/load/render fixture. The fixture verifies Off behavior, a valid persisted
+instrument/background result, stale non-application, and repeatable preview
+bytes. UI-only dialogs, visual Before/After inspection, and actual file export
+through platform widgets remain manual acceptance checks.
+
+### Color calibration Phase 2 gate
+
+Gaia provider and SQLite cache behavior now have deterministic mocked HTTP and
+cache-only coverage. Manual acceptance is still required for first online use,
+cancellation at each UI stage, insufficient-star messaging, preview/export
+equality, and project save/reload on a representative workstation. The Gaia
+documentation records network/privacy scope, cache growth/deletion, migration
+behavior, passband limits, quality thresholds, and provenance fields.
+
 ## Validation Notes
 - Existing package tests reviewed during this audit passed for:
   - `./internal/processing`
@@ -238,7 +254,6 @@ This document tracks the current quality of unit tests in this repository using 
   - `./internal/ui`
 - `internal/processing` was expanded after the initial audit with direct helper tests for `processing.go`, and the findings above reflect that newer state.
 - `internal/fitsio` was expanded after the initial audit with a synthetic fixture-based suite, and the audit findings above reflect that newer state.
-- `internal/ui` was expanded after the initial audit with direct tests for starless settings normalization, helper defaults, and mode/export helper behavior, and the findings above reflect that newer state.
 - `internal/ui` was expanded again with second-pass tests for channel-state application and preview-data helper behavior, and the findings above reflect that newer state.
 - `internal/models` was expanded after the initial audit with broader project/state persistence round-trip tests, and the findings above reflect that newer state.
 - `internal/badpix` and `badpix` were expanded after the initial audit with fallback, missing-DQ, bad-bit filtering, and load-error coverage, and the findings above reflect that newer state.

@@ -2,137 +2,107 @@ package models
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
 
-func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T) {
-	project := ComposeProject{
-		SharedHistogramScale: true,
-		DisableComposite:     true,
-		MeasureComposite:     true,
-		BlinkFilters:         true,
-		BlinkExcludedFilter:  2,
-		Channels: [3]ChannelState{
-			{
-				Path:       "blue.fits",
-				Mode:       "Linear",
-				Black:      1.1,
-				White:      9.9,
-				Background: 2.2,
-				Peak:       8.8,
-				ScaledPeak: 7.7,
-				ShowClip:   true,
-				OffsetX:    -12.5,
-				OffsetY:    33.25,
-				OffsetRot:  -1.5,
-				Rotation90: 3,
-			},
-		},
-		OrangeLayer: OrangeLayerState{
-			Open: true,
-			Channel: ChannelState{
-				Path:       "ha.fits",
-				Mode:       "Asinh",
-				Black:      0.1,
-				White:      2.5,
-				Background: 0.2,
-				Peak:       1.8,
-				ScaledPeak: 9,
-				ShowClip:   true,
-			},
-			ColorR:  159,
-			ColorG:  140,
-			ColorB:  80,
-			Opacity: 0.65,
-		},
-		StarlessSettings: StarlessComposeSettings{
-			Enabled:                 true,
-			DetectionMode:           "median",
-			DetectionPreprocessMode: "dog",
-			DetectionMergeMode:      "per-channel-merged",
-			ThresholdSigma:          4.5,
-			BackgroundTileSize:      32,
-			UseNoDataFloor:          true,
-			NoDataFloor:             0.02,
-			SeedMinProminence:       0.04,
-			MinDetectedChannels:     2,
-			MinSeedFootprintArea:    5,
-			MinSharedChannels:       2,
-			SuppressionRadius:       5,
-			MaskBaseRadius:          0,
-			MaxRadius:               6,
-			FeatherRadius:           0,
-			InpaintRadius:           5,
-			StarBrightness:          1.0,
-			StarSaturation:          0.4,
-			ExportDebugMasks:        false,
-		},
+func TestLegacyComposeProjectCalibrationDefaults(t *testing.T) {
+	var project ComposeProject
+	if err := json.Unmarshal([]byte(`{"channels":[{"path":"r.fits"}]}`), &project); err != nil {
+		t.Fatal(err)
 	}
+	if project.ColorCalibration != nil {
+		t.Fatal("legacy project unexpectedly has calibration state")
+	}
+	if got := (ColorCalibrationState{}).Effective(); got.PhotometricMode != PhotometricOff || got.Status != CalibrationDisabled {
+		t.Fatalf("defaults = %+v", got)
+	}
+	if got := (OverlayCalibrationState{}); got.Mode != "" {
+		t.Fatal("zero overlay mode should remain omitted for compatibility")
+	}
+	if project.DisableColorCalibration {
+		t.Fatal("legacy project unexpectedly disabled calibration")
+	}
+}
 
+func TestComposeProjectDisableColorCalibrationRoundTrip(t *testing.T) {
+	project := ComposeProject{DisableColorCalibration: true, ColorCalibration: &ColorCalibrationState{Status: CalibrationValid, BaseTransforms: [3]LinearTransform{{Gain: 1}, {Gain: 1}, {Gain: 1}}}}
 	data, err := json.Marshal(project)
 	if err != nil {
-		t.Fatalf("json.Marshal error = %v", err)
+		t.Fatal(err)
 	}
-
 	var decoded ComposeProject
 	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("json.Unmarshal error = %v", err)
+		t.Fatal(err)
 	}
+	if !decoded.DisableColorCalibration || decoded.ColorCalibration == nil || decoded.ColorCalibration.Status != CalibrationValid {
+		t.Fatalf("project round trip lost disable/calibration state: %+v", decoded)
+	}
+}
 
-	if decoded.StarlessSettings.MaskBaseRadius != 0 {
-		t.Fatalf("MaskBaseRadius = %d, want 0", decoded.StarlessSettings.MaskBaseRadius)
+func TestColorCalibrationStateRoundTripAndValidation(t *testing.T) {
+	project := ComposeProject{ColorCalibration: &ColorCalibrationState{
+		Version: 1, PhotometricMode: PhotometricInstrument, NeutralizeBackground: true,
+		BackgroundSelection: BackgroundROI, BackgroundROI: CalibrationROI{X: 2, Y: 3, Width: 8, Height: 9},
+		WhiteReference: WhiteReferenceFlatFlambda,
+		BaseTransforms: [3]LinearTransform{{Offset: -2.5, Gain: 1.2}, {Offset: 0, Gain: 0.8}, {Offset: -0.25, Gain: 2}},
+		Overlays:       []OverlayCalibrationState{{Mode: OverlayCalibratedLinear, Transform: LinearTransform{Offset: -1, Gain: .5}, Strength: -0.75, Status: CalibrationValid}},
+		Status:         CalibrationValid, SourceFingerprint: "source", SettingsFingerprint: "settings",
+	}}
+	data, err := json.Marshal(project)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if decoded.StarlessSettings.FeatherRadius != 0 {
-		t.Fatalf("FeatherRadius = %d, want 0", decoded.StarlessSettings.FeatherRadius)
+	var decoded ComposeProject
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
 	}
-	if decoded.StarlessSettings.NoDataFloor != 0.02 {
-		t.Fatalf("NoDataFloor = %v, want 0.02", decoded.StarlessSettings.NoDataFloor)
+	state := decoded.ColorCalibration
+	if state == nil || state.BaseTransforms[0].Offset != -2.5 || state.BaseTransforms[2].Gain != 2 || state.Overlays[0].Strength != -.75 {
+		t.Fatalf("decoded calibration = %+v", state)
 	}
-	if decoded.StarlessSettings.DetectionMergeMode != "per-channel-merged" {
-		t.Fatalf("DetectionMergeMode = %q, want per-channel-merged", decoded.StarlessSettings.DetectionMergeMode)
+	for _, raw := range []string{
+		`{"status":"valid","baseTransforms":[{"offset":0,"gain":NaN}]}`,
+		`{"status":"valid","baseTransforms":[{"offset":0,"gain":-1}]}`,
+		`{"photometricMode":"bogus"}`,
+		`{"status":"disabled","baseTransforms":[{"offset":0,"gain":-1}]}`,
+	} {
+		var got ColorCalibrationState
+		if err := json.Unmarshal([]byte(raw), &got); err == nil {
+			t.Fatalf("invalid state %s accepted", raw)
+		}
 	}
-	if decoded.StarlessSettings.DetectionPreprocessMode != "dog" {
-		t.Fatalf("DetectionPreprocessMode = %q, want dog", decoded.StarlessSettings.DetectionPreprocessMode)
+	var gaiaState ColorCalibrationState
+	if err := json.Unmarshal([]byte(`{"photometricMode":"gaia"}`), &gaiaState); err != nil || gaiaState.PhotometricMode != PhotometricGaia {
+		t.Fatalf("phase 2 Gaia mode rejected: state=%+v err=%v", gaiaState, err)
 	}
-	if !decoded.StarlessSettings.UseNoDataFloor {
-		t.Fatal("UseNoDataFloor = false, want true")
+	if math.IsNaN(decoded.ColorCalibration.BaseTransforms[1].Gain) {
+		t.Fatal("NaN survived round trip")
 	}
-	if decoded.StarlessSettings.SeedMinProminence != 0.04 {
-		t.Fatalf("SeedMinProminence = %v, want 0.04", decoded.StarlessSettings.SeedMinProminence)
+}
+
+func TestOverlayCalibrationDefaultsNormalizeOnDecode(t *testing.T) {
+	var state ColorCalibrationState
+	if err := json.Unmarshal([]byte(`{"overlays":[{}]}`), &state); err != nil {
+		t.Fatal(err)
 	}
-	if decoded.StarlessSettings.MinSeedFootprintArea != 5 {
-		t.Fatalf("MinSeedFootprintArea = %d, want 5", decoded.StarlessSettings.MinSeedFootprintArea)
+	if state.Overlays[0].Mode != OverlayArtistic || state.Overlays[0].Status != CalibrationDisabled {
+		t.Fatalf("overlay defaults = %+v", state.Overlays[0])
 	}
-	if decoded.StarlessSettings.MinDetectedChannels != 2 {
-		t.Fatalf("MinDetectedChannels = %d, want 2", decoded.StarlessSettings.MinDetectedChannels)
-	}
-	if decoded.StarlessSettings.SuppressionRadius != 5 {
-		t.Fatalf("SuppressionRadius = %d, want 5", decoded.StarlessSettings.SuppressionRadius)
-	}
-	if decoded.StarlessSettings.ExportDebugMasks != false {
-		t.Fatalf("ExportDebugMasks = %v, want false", decoded.StarlessSettings.ExportDebugMasks)
-	}
-	if decoded.Channels[0].Path != "blue.fits" || !decoded.Channels[0].ShowClip {
-		t.Fatalf("Channels[0] = %+v, want preserved compose channel state", decoded.Channels[0])
-	}
-	if decoded.Channels[0].OffsetX != -12.5 || decoded.Channels[0].OffsetY != 33.25 || decoded.Channels[0].OffsetRot != -1.5 {
-		t.Fatalf("Channels[0] offsets = (%v,%v,%v), want (-12.5,33.25,-1.5)", decoded.Channels[0].OffsetX, decoded.Channels[0].OffsetY, decoded.Channels[0].OffsetRot)
-	}
-	if decoded.Channels[0].Rotation90 != 3 {
-		t.Fatalf("Channels[0].Rotation90 = %d, want 3", decoded.Channels[0].Rotation90)
-	}
-	if !decoded.SharedHistogramScale || !decoded.MeasureComposite {
-		t.Fatalf("compose UI settings = shared:%v measure:%v, want both true", decoded.SharedHistogramScale, decoded.MeasureComposite)
-	}
-	if !decoded.DisableComposite {
-		t.Fatal("DisableComposite = false, want true")
-	}
-	if !decoded.BlinkFilters || decoded.BlinkExcludedFilter != 2 {
-		t.Fatalf("blink settings = enabled:%v excluded:%d, want enabled true excluded 2", decoded.BlinkFilters, decoded.BlinkExcludedFilter)
-	}
-	if !decoded.OrangeLayer.Open || decoded.OrangeLayer.Channel.Path != "ha.fits" || decoded.OrangeLayer.ColorR != 159 || decoded.OrangeLayer.Opacity != 0.65 {
-		t.Fatalf("orange layer = %+v, want preserved optional layer state", decoded.OrangeLayer)
+}
+
+func TestExplicitZeroTransformsRejectedForEveryTerminalStatus(t *testing.T) {
+	for _, status := range []string{"disabled", "stale", "cancelled", "failed"} {
+		for _, raw := range []string{
+			`{"status":"` + status + `","baseTransforms":[{"offset":0,"gain":0}]}`,
+			`{"status":"` + status + `","overlays":[{"transform":{"offset":0,"gain":0}}]}`,
+		} {
+			var state ColorCalibrationState
+			if err := json.Unmarshal([]byte(raw), &state); err == nil {
+				t.Fatalf("status %s accepted explicit zero transform: %s", status, raw)
+			}
+		}
 	}
 }
 
@@ -421,6 +391,15 @@ func TestChannelStateAndMosaicInputStateZeroAndNegativeValuesRoundTrip(t *testin
 	}
 	if !decoded.Input.HasTransform || decoded.Input.OffsetX != -12.5 || decoded.Input.TransformB != -0.5 {
 		t.Fatalf("Input = %+v, want preserved transform values", decoded.Input)
+	}
+}
+
+func TestColorCalibrationGaiaSettingsRoundTrip(t *testing.T) {
+	original := ColorCalibrationState{PhotometricMode: PhotometricGaia, Status: CalibrationValid, BaseTransforms: [3]LinearTransform{{Gain: 1}, {Gain: 1}, {Gain: 1}}, Gaia: GaiaCalibrationSettings{AccessMode: "cacheOnly", Endpoint: "https://gaia.test", Release: "DR3", XPRepresentation: "xp-v1", QualitySelector: "clean", MagnitudeLimit: 18, MatchRadiusArcsec: 2, ObservationEpoch: 2024, CachePath: "cache.db", CacheMaxBytes: 1234}, Provenance: CalibrationProvenance{CatalogVersion: "DR3", SourceIDs: []uint64{1, 2}}}
+	var decoded ColorCalibrationState
+	roundTripJSON(t, original, &decoded)
+	if decoded.PhotometricMode != PhotometricGaia || decoded.Gaia.AccessMode != "cacheOnly" || decoded.Gaia.Release != "DR3" || len(decoded.Provenance.SourceIDs) != 2 {
+		t.Fatalf("round trip lost Gaia state: %+v", decoded)
 	}
 }
 

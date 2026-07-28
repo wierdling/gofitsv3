@@ -271,6 +271,9 @@ func ComposeRGB(ctx context.Context, imgs []*models.LoadedImage) ([]byte, int, i
 type OverlayLayer struct {
 	Image    *models.LoadedImage
 	Settings models.OrangeLayerState
+	// Photometry is optional metadata captured for a calibrated overlay. The
+	// persisted overlay transform remains authoritative during rendering.
+	Photometry *InstrumentPhotometry
 }
 
 func ComposeRGBWithOrange(ctx context.Context, imgs []*models.LoadedImage, orange *models.LoadedImage, settings models.OrangeLayerState) ([]byte, int, int, [3]histogram.Stats) {

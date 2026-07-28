@@ -297,7 +297,11 @@ func alignLoadedProject(ctx context.Context, inputs []mosaic.Input, reference *m
 	if reference != nil {
 		resultOffset = 1
 	}
-	var failures []string
+	applyLoadedProjectAlignmentResults(inputs, activeIndices, results, resultOffset)
+	return nil
+}
+
+func applyLoadedProjectAlignmentResults(inputs []mosaic.Input, activeIndices []int, results []mosaic.StarAlignmentResult, resultOffset int) {
 	for resultIndex := resultOffset; resultIndex < len(results); resultIndex++ {
 		activeIndex := resultIndex - resultOffset
 		if activeIndex >= len(activeIndices) {
@@ -309,26 +313,13 @@ func alignLoadedProject(ctx context.Context, inputs []mosaic.Input, reference *m
 		}
 		result := results[resultIndex]
 		if !result.Applied {
-			failures = append(failures, fmt.Sprintf("%s: %s", mosaic.InputLabel(inputs[dstIndex]), result.Error))
 			continue
 		}
 		inputs[dstIndex].OffsetX = result.OffsetX
 		inputs[dstIndex].OffsetY = result.OffsetY
 		inputs[dstIndex].ManualTransform = result.ManualTransform
 		inputs[dstIndex].HasManualTransform = result.HasManualTransform
-		active[resultIndex-resultOffset] = inputs[dstIndex]
 	}
-	if len(failures) > 0 {
-		return fmt.Errorf("alignment failed for %d input(s): %s", len(failures), strings.Join(failures, "; "))
-	}
-	// alignInputs is a copy of the input slice. Copy its updated values back so
-	// the subsequent build uses the job-local transforms.
-	for i, dstIndex := range activeIndices {
-		if i < len(active) {
-			inputs[dstIndex] = active[i]
-		}
-	}
-	return nil
 }
 
 func drizzleQueueOutputPath(projectPath, filter string, when time.Time) (string, error) {

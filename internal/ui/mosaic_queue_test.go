@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
+	"gofitsv3/internal/processing"
 )
 
 func TestDrizzleQueueOutputPath(t *testing.T) {
@@ -114,6 +116,40 @@ func TestDrizzleQueueRunnerCancelCurrentContinues(t *testing.T) {
 	}
 }
 
+func TestAddProjectPathsAddsAllValidSelectionsAndContinuesAfterFailure(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.json")
+	bad := filepath.Join(dir, "bad.json")
+	second := filepath.Join(dir, "second.json")
+	if err := os.WriteFile(first, []byte(`{"activeFilter":"F606W"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bad, []byte(`{`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte(`{"activeFilter":"F814W"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	q := &drizzleQueueWindow{selected: -1}
+
+	added, duplicates, err := q.addProjectPaths([]string{first, bad, second})
+
+	if added != 2 || duplicates != 0 || err == nil || !strings.Contains(err.Error(), "bad.json") {
+		t.Fatalf("addProjectPaths = (%d, %d, %v), want (2, 0, bad.json error)", added, duplicates, err)
+	}
+	if len(q.jobs) != 2 || q.jobs[0].ProjectPath != first || q.jobs[1].ProjectPath != second {
+		t.Fatalf("queued projects = %+v, want first and second in selection order", q.jobs)
+	}
+	if q.jobs[0].Filter != "F606W" || q.jobs[1].Filter != "F814W" || q.jobs[0].RunAlign || q.jobs[1].RunAlign {
+		t.Fatalf("queued project settings = %+v", q.jobs)
+	}
+
+	added, duplicates, err = q.addProjectPaths([]string{first})
+	if added != 0 || duplicates != 1 || err != nil || len(q.jobs) != 2 {
+		t.Fatalf("duplicate add = (%d, %d, %v), jobs=%d; want (0, 1, nil), jobs=2", added, duplicates, err, len(q.jobs))
+	}
+}
+
 func TestApplyInputStateRestoresQueueRelevantFields(t *testing.T) {
 	var input mosaic.Input
 	state := models.MosaicInputState{
@@ -127,5 +163,56 @@ func TestApplyInputStateRestoresQueueRelevantFields(t *testing.T) {
 	}
 	if input.OffsetX != 3.5 || input.OffsetY != -2.25 || !input.HasManualTransform || input.ManualTransform.F != 4 {
 		t.Fatalf("transform state not restored: %+v", input)
+	}
+}
+
+func TestApplyLoadedProjectAlignmentResultsAcceptsPartialSuccess(t *testing.T) {
+	inputs := []mosaic.Input{
+		{Path: "reference.fits"},
+		{Path: "excluded.fits", Excluded: true},
+		{Path: "aligned.fits", OffsetX: 1},
+		{Path: "unaligned.fits", OffsetX: 7, OffsetY: -3},
+	}
+	transform := processing.AffineTransform{A: 1, C: 4, E: 1, F: -2}
+	results := []mosaic.StarAlignmentResult{
+		{Applied: true},
+		{Applied: true, OffsetX: 4, OffsetY: -2, ManualTransform: transform, HasManualTransform: true},
+		{Error: "not enough matching stars"},
+	}
+
+	applyLoadedProjectAlignmentResults(inputs, []int{0, 2, 3}, results, 0)
+
+	if got := inputs[2]; got.OffsetX != 4 || got.OffsetY != -2 || !got.HasManualTransform || got.ManualTransform != transform {
+		t.Fatalf("successful alignment was not applied: %+v", got)
+	}
+	if got := inputs[3]; got.OffsetX != 7 || got.OffsetY != -3 || got.HasManualTransform {
+		t.Fatalf("failed alignment should preserve the existing placement: %+v", got)
+	}
+}
+
+func TestApplyLoadedProjectAlignmentResultsMapsExternalReferenceAndPreservesLockedInput(t *testing.T) {
+	inputs := []mosaic.Input{
+		{Path: "first.fits", OffsetX: 1},
+		{Path: "excluded.fits", Excluded: true},
+		{Path: "locked.fits", OffsetX: 2, OffsetLocked: true},
+		{Path: "last.fits", OffsetX: 3},
+	}
+	results := []mosaic.StarAlignmentResult{
+		{Applied: true, OffsetX: 100},
+		{Applied: true, OffsetX: 10},
+		{Applied: true, OffsetX: 20},
+		{Applied: true, OffsetX: 30},
+	}
+
+	applyLoadedProjectAlignmentResults(inputs, []int{0, 2, 3}, results, 1)
+
+	if got := inputs[0].OffsetX; got != 10 {
+		t.Fatalf("first input offset = %v, want 10", got)
+	}
+	if got := inputs[2].OffsetX; got != 2 {
+		t.Fatalf("locked input offset = %v, want 2", got)
+	}
+	if got := inputs[3].OffsetX; got != 30 {
+		t.Fatalf("last input offset = %v, want 30", got)
 	}
 }
