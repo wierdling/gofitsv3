@@ -39,8 +39,6 @@ import (
 	"gofitsv3/internal/utils"
 )
 
-const starlessComposeTemporarilyDisabled = true
-
 var composeBlinkFilterNames = []string{"Blue", "Green", "Red"}
 
 // globalSendToChannel is registered by newComposeWorkspace and called by the
@@ -118,7 +116,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	headerWins := make([]fyne.Window, 3)
 	levels := defaultRGBLevels()
 	var levelsWin *rgbLevelsWindow
-	starlessSettings := defaultStarlessComposeSettings()
 	var overlayLayers []*overlayLayer
 	colorCalibration := models.ColorCalibrationState{Status: models.CalibrationDisabled}
 	// Any source, alignment, stretch, or overlay edit invalidates a previously
@@ -134,7 +131,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	// Updated to track the new struct
 	var latestRGBStats [3]histogram.Stats
 	suspendRefresh := false
-	var composeRGBWithOptionalStarless func(ctx context.Context, calibrationSnapshot *models.ColorCalibrationState) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, *processing.ComposeRenderResult, error)
+	var composeRGB func(ctx context.Context, calibrationSnapshot *models.ColorCalibrationState) ([]byte, int, int, [3]histogram.Stats, *processing.ComposeRenderResult, error)
 	// renderImages returns an offset-applied view of imgs (Manual Offsets applied
 	// at render time). Forward-declared so refresh/compose can use it; assigned
 	// once controlSets exists.
@@ -264,10 +261,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			start := time.Now()
 			debuglog.Log("compose refresh async: starting preview computation")
 			var renderedResult *processing.ComposeRenderResult
-			data := buildComposePreviewData(ctx, imgSnapshot, sharedHistScale, buildComposite, &levelsSnapshot, func(c context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
-				b, w, h, s, st, rendered, e := composeRGBWithOptionalStarless(c, calibrationSnapshot)
+			data := buildComposePreviewData(ctx, imgSnapshot, sharedHistScale, buildComposite, &levelsSnapshot, func(c context.Context) ([]byte, int, int, [3]histogram.Stats, error) {
+				b, w, h, s, rendered, e := composeRGB(c, calibrationSnapshot)
 				renderedResult = rendered
-				return b, w, h, s, st, e
+				return b, w, h, s, e
 			})
 			data.Rendered = renderedResult
 			if blinkEnabled {
@@ -460,107 +457,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 	}
 
-	composeRGBWithOptionalStarless = func(ctx context.Context, calibrationSnapshot *models.ColorCalibrationState) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, *processing.ComposeRenderResult, error) {
-		// Apply Manual Offsets at render time; imgs stays original.
-		rimgs := renderImages()
-		if starlessComposeTemporarilyDisabled {
-			// Starless/white-star processing is intentionally disabled for now.
-			// The implementation below remains in the codebase so it can be
-			// revisited later, but Compose must not call it from the menu or
-			// from saved project settings.
-			if starlessSettings.Enabled {
-				debuglog.Log("composeRGBWithOptionalStarless: starless temporarily disabled, using normal compose")
-			}
-			rendered, err := composeRenderWithCalibration(ctx, rimgs, calibrationSnapshot)
-			return rendered.Preview, rendered.Width, rendered.Height, rendered.Stats, nil, &rendered, err
-		}
-
-		if !starlessSettings.Enabled {
-			debuglog.Log("composeRGBWithOptionalStarless: starless disabled, using normal compose")
-			rendered, err := composeRenderWithCalibration(ctx, rimgs, calibrationSnapshot)
-			return rendered.Preview, rendered.Width, rendered.Height, rendered.Stats, nil, &rendered, err
-		}
-		if rimgs[0] == nil || rimgs[1] == nil || rimgs[2] == nil {
-			debuglog.Log("composeRGBWithOptionalStarless: missing RGB channels")
-			return nil, 0, 0, [3]histogram.Stats{}, nil, nil, nil
-		}
-		debuglog.Log("composeRGBWithOptionalStarless: building aligned reference-grid channel set")
-		ref := rimgs[1]
-		blueStretched := processing.StretchedImageDataForReferenceGrid(rimgs[0], ref)
-		greenStretched := processing.StretchedImageDataForReferenceGrid(rimgs[1], ref)
-		redStretched := processing.StretchedImageDataForReferenceGrid(rimgs[2], ref)
-
-		maskSettings := processing.DefaultStarMaskSettings()
-		maskSettings.DetectionMode = starlessSettings.DetectionMode
-		maskSettings.DetectionPreprocessMode = starlessSettings.DetectionPreprocessMode
-		maskSettings.DetectionMergeMode = starlessSettings.DetectionMergeMode
-		maskSettings.DetectionSigma = starlessSettings.ThresholdSigma
-		maskSettings.BackgroundTileSize = starlessSettings.BackgroundTileSize
-		maskSettings.UseNoDataFloor = starlessSettings.UseNoDataFloor
-		maskSettings.NoDataFloor = float32(starlessSettings.NoDataFloor)
-		maskSettings.SeedMinProminence = starlessSettings.SeedMinProminence
-		maskSettings.MinDetectedChannels = starlessSettings.MinDetectedChannels
-		maskSettings.MinSeedFootprintArea = starlessSettings.MinSeedFootprintArea
-		maskSettings.MinSharedChannels = starlessSettings.MinSharedChannels
-		maskSettings.SuppressionRadius = starlessSettings.SuppressionRadius
-		maskSettings.MaskGrowRadius = starlessSettings.MaskBaseRadius
-		maskSettings.MaskMaxRadius = starlessSettings.MaxRadius
-		maskSettings.MaskSoftEdgeRadius = starlessSettings.FeatherRadius
-		maskSettings.InpaintRadius = starlessSettings.InpaintRadius
-		debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: pipeline settings mode=%s sigma=%.2f tile=%d base=%d max=%d feather=%d inpaint=%d",
-			maskSettings.DetectionMode,
-			maskSettings.DetectionSigma,
-			maskSettings.BackgroundTileSize,
-			maskSettings.MaskGrowRadius,
-			maskSettings.MaskMaxRadius,
-			maskSettings.MaskSoftEdgeRadius,
-			maskSettings.InpaintRadius,
-		))
-
-		result, err := processing.CreateStarlessChannels([][]float32{
-			redStretched.Pixels,
-			greenStretched.Pixels,
-			blueStretched.Pixels,
-		}, ref.HDU.Data.Width, ref.HDU.Data.Height, maskSettings)
-		if err != nil {
-			debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: pipeline failed: %v", err))
-			return nil, 0, 0, [3]histogram.Stats{}, nil, nil, err
-		}
-		debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: pipeline produced %d components", len(result.Components)))
-		recombined, err := processing.RecombineStarlessRGB(result.Starless, result.Stars, result.AlphaMask, result.Width, result.Height, processing.StarRecombineSettings{
-			StarBrightness: float32(starlessSettings.StarBrightness),
-			StarSaturation: float32(starlessSettings.StarSaturation),
-			ValidMask:      result.RecombineValid,
-		})
-		if err != nil {
-			debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: recombine failed: %v", err))
-			return nil, 0, 0, [3]histogram.Stats{}, nil, nil, err
-		}
-		debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: recombined stars brightness=%.2f saturation=%.2f", starlessSettings.StarBrightness, starlessSettings.StarSaturation))
-
-		makeClone := func(src *models.LoadedImage, pixels []float32) *models.LoadedImage {
-			clone := *src
-			clone.HDU = src.HDU
-			clone.HDU.Header = ref.HDU.Header
-			clone.HDU.Data = fitsio.ImageData{Width: result.Width, Height: result.Height, Pixels: pixels}
-			clone.Mode = stretch.Linear
-			clone.Black = 0
-			clone.White = 1
-			clone.Background = 0
-			clone.Peak = 1
-			clone.ScaledPeak = 1
-			clone.ShowClip = false
-			return &clone
-		}
-		composedImgs := []*models.LoadedImage{
-			makeClone(imgs[0], recombined[2]),
-			makeClone(imgs[1], recombined[1]),
-			makeClone(imgs[2], recombined[0]),
-		}
-		debuglog.Log("composeRGBWithOptionalStarless: composing final RGB preview")
-		rendered, renderErr := composeRenderWithCalibration(ctx, composedImgs, calibrationSnapshot)
-		buf, w, h, stats := rendered.Preview, rendered.Width, rendered.Height, rendered.Stats
-		return buf, w, h, stats, result, &rendered, renderErr
+	composeRGB = func(ctx context.Context, calibrationSnapshot *models.ColorCalibrationState) ([]byte, int, int, [3]histogram.Stats, *processing.ComposeRenderResult, error) {
+		rendered, err := composeRenderWithCalibration(ctx, renderImages(), calibrationSnapshot)
+		return rendered.Preview, rendered.Width, rendered.Height, rendered.Stats, &rendered, err
 	}
 
 	saveChannelGray := func(idx int) {
@@ -1443,7 +1342,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		// Always render from the save-gated snapshot. The cached composite
 		// viewport may have been produced while a temporary Before/After
 		// comparison override was active and must never leak into Export to Edit.
-		buf, w, h, _, _, _, err := composeRGBWithOptionalStarless(context.Background(), cloneCalibration())
+		buf, w, h, _, _, err := composeRGB(context.Background(), cloneCalibration())
 		if err != nil || buf == nil {
 			return nil
 		}
@@ -1631,7 +1530,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			MeasureComposite:     measureEnabled,
 			BlinkFilters:         blinkCheck.Checked,
 			BlinkExcludedFilter:  blinkExcludedIdx,
-			StarlessSettings:     starlessSettings,
 			// New saves use ColorCalibration pointer presence as the canonical
 			// persisted indicator; retain the legacy field only for decoding.
 			DisableColorCalibration: false,
@@ -1904,10 +1802,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						if updateMeasurement != nil {
 							updateMeasurement()
 						}
-						starlessSettings = normalizeStarlessComposeSettings(project.StarlessSettings)
-						// Keep saved starless settings for compatibility, but force the
-						// experimental pipeline off while it is removed from the UI.
-						starlessSettings.Enabled = false
 					})
 					debuglog.Log("load compose project: loaded images applied; refreshing previews asynchronously")
 					for idx := range headerWins {
@@ -2236,7 +2130,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	exportRGB := func() {
-		buf, w, h, _, starlessResult, rendered, err := composeRGBWithOptionalStarless(context.Background(), cloneCalibration())
+		buf, w, h, _, rendered, err := composeRGB(context.Background(), cloneCalibration())
 		if buf == nil {
 			dialog.ShowInformation("Missing", "Load three FITS first", win)
 			return
@@ -2253,13 +2147,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			dialog.ShowError(fmt.Errorf("missing render result"), win)
 			return
 		}
-		if !starlessSettings.Enabled {
-			// Keep the canonical result as the source, then apply the user's
-			// display levels exactly as the preview path does.
-			finalBuf = append([]byte(nil), rendered.Preview...)
-			processing.ApplyRGBLevels(finalBuf, levels)
-			w, h = rendered.Width, rendered.Height
-		}
+		finalBuf = append([]byte(nil), rendered.Preview...)
+		processing.ApplyRGBLevels(finalBuf, levels)
+		w, h = rendered.Width, rendered.Height
 		rF, gF, bF := rendered.R, rendered.G, rendered.B
 		save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
 			if err != nil || uc == nil {
@@ -2283,14 +2173,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					return
 				}
 				debuglog.Log(fmt.Sprintf("exportRGB: wrote composite %s", path))
-				if starlessSettings.Enabled && starlessSettings.ExportDebugMasks && starlessResult != nil {
-					debugSettings := starlessDebugSettingsForRGBExport(path, format, opts)
-					if err := processing.ExportStarlessDebug(starlessResult, debugSettings); err != nil {
-						dialog.ShowError(err, win)
-						return
-					}
-					debuglog.Log(fmt.Sprintf("exportRGB: wrote starless debug images to %s", debugSettings.Dir))
-				}
 			})
 		}, win)
 		save.SetFileName("composite.png")
@@ -3218,9 +3100,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
 	cleanChannelsItem := fyne.NewMenuItem("Cross-Channel Clean", crossChannelClean)
 	resetDataItem := fyne.NewMenuItem("Reset Data (Undo Align & Clean)", resetData)
-	// Starless Settings is intentionally omitted from the Compose menu.
-	// The experimental starless/white-star code remains in the repository for
-	// future investigation, but it should not be reachable from the UI for now.
 
 	openLevels := func() {
 		if levelsWin == nil {
@@ -4035,11 +3914,10 @@ type composeViewportPreview struct {
 }
 
 type composePreviewData struct {
-	Views          [4]composeViewportPreview
-	RGBStats       [3]histogram.Stats
-	StarlessResult *processing.StarlessResult
-	BlinkFrames    []composeBlinkFrame
-	Rendered       *processing.ComposeRenderResult
+	Views       [4]composeViewportPreview
+	RGBStats    [3]histogram.Stats
+	BlinkFrames []composeBlinkFrame
+	Rendered    *processing.ComposeRenderResult
 }
 
 type composeBlinkFrame struct {
@@ -4083,7 +3961,7 @@ func buildComposeBlinkFrames(ctx context.Context, imgs []*models.LoadedImage, so
 	return frames
 }
 
-func buildComposePreviewData(ctx context.Context, imgs []*models.LoadedImage, sharedHistScale bool, buildComposite bool, levels *models.RgbLevels, composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) composePreviewData {
+func buildComposePreviewData(ctx context.Context, imgs []*models.LoadedImage, sharedHistScale bool, buildComposite bool, levels *models.RgbLevels, composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, error)) composePreviewData {
 	start := time.Now()
 	defer func() {
 		debuglog.Log(fmt.Sprintf("buildComposePreviewData: total took %s", time.Since(start)))
@@ -4137,13 +4015,10 @@ func buildComposePreviewData(ctx context.Context, imgs []*models.LoadedImage, sh
 	}
 	buf, w, h, rgbStats := processing.ComposeRGB(ctx, imgs)
 	if composeRGB != nil {
-		starlessStart := time.Now()
-		if altBuf, altW, altH, altStats, starlessResult, err := composeRGB(ctx); err == nil {
+		if altBuf, altW, altH, altStats, err := composeRGB(ctx); err == nil {
 			buf, w, h, rgbStats = altBuf, altW, altH, altStats
-			out.StarlessResult = starlessResult
-			debuglog.Log(fmt.Sprintf("buildComposePreviewData: optional starless compose took %s", time.Since(starlessStart)))
 		} else {
-			debuglog.Log(fmt.Sprintf("buildComposePreviewData: optional starless compose failed after %s: %v", time.Since(starlessStart), err))
+			debuglog.Log(fmt.Sprintf("buildComposePreviewData: compose failed: %v", err))
 		}
 	}
 	if buf == nil {
@@ -4592,7 +4467,7 @@ func applyComposePreviewData(data composePreviewData, views []*viewport, pushHis
 }
 
 // Updated signature to expect an array of histogram.Stats structs
-func updatePreviews(imgs []*models.LoadedImage, views []*viewport, levels *models.RgbLevels, pushHist func([3]histogram.Stats), composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)) {
+func updatePreviews(imgs []*models.LoadedImage, views []*viewport, levels *models.RgbLevels, pushHist func([3]histogram.Stats), composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, error)) {
 	start := time.Now()
 	defer func() {
 		debuglog.Log(fmt.Sprintf("updatePreviews: total took %s", time.Since(start)))
@@ -4653,12 +4528,10 @@ func updatePreviews(imgs []*models.LoadedImage, views []*viewport, levels *model
 	buf, w, h, rgbStats := processing.ComposeRGB(context.Background(), imgs)
 	debuglog.Log(fmt.Sprintf("updatePreviews: ComposeRGB took %s", time.Since(composeStart)))
 	if composeRGB != nil {
-		starlessStart := time.Now()
-		if altBuf, altW, altH, altStats, _, err := composeRGB(context.Background()); err == nil {
+		if altBuf, altW, altH, altStats, err := composeRGB(context.Background()); err == nil {
 			buf, w, h, rgbStats = altBuf, altW, altH, altStats
-			debuglog.Log(fmt.Sprintf("updatePreviews: optional starless compose took %s", time.Since(starlessStart)))
 		} else {
-			debuglog.Log(fmt.Sprintf("updatePreviews: optional starless compose failed after %s: %v", time.Since(starlessStart), err))
+			debuglog.Log(fmt.Sprintf("updatePreviews: compose failed: %v", err))
 		}
 	}
 
@@ -4707,26 +4580,6 @@ func defaultRGBLevels() *models.RgbLevels {
 	return &models.RgbLevels{
 		Min: [3]float64{0, 0, 0},
 		Max: [3]float64{255, 255, 255},
-	}
-}
-
-func starlessDebugSettingsForRGBExport(path string, format export.Format, opts export.Options) processing.StarDebugExportSettings {
-	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	if strings.TrimSpace(base) == "" {
-		base = "composite"
-	}
-	dir := filepath.Dir(path)
-	if strings.TrimSpace(dir) == "" {
-		dir = "."
-	}
-	if format == "" {
-		format = export.PNG
-	}
-	return processing.StarDebugExportSettings{
-		Dir:     filepath.Join(dir, base),
-		Prefix:  "starless",
-		Format:  format,
-		Options: opts,
 	}
 }
 

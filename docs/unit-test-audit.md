@@ -18,7 +18,7 @@ This document tracks the current quality of unit tests in this repository using 
 
 | Package | Rating | Priority | Notes |
 | --- | --- | --- | --- |
-| `internal/processing` | well covered | medium | Broad behavior coverage now includes the main `processing.go` helper layer, calibration math/background estimation, canonical render paths, and a deterministic save/load/render regression fixture in addition to alignment, masking, compose, cleaning, WCS, and starless processing |
+| `internal/processing` | well covered | medium | Broad behavior coverage now includes the main `processing.go` helper layer, calibration math/background estimation, canonical render paths, and a deterministic save/load/render regression fixture in addition to alignment, masking, compose, cleaning, and WCS |
 | `internal/mosaic` | well covered | medium | Strong scenario coverage for drizzle/input planning, but still worth targeted edge-case additions |
 | `internal/histogram` | well covered | low | Small logic surface and direct branch coverage |
 | `internal/render` | well covered | low | Core rendering helpers are directly tested |
@@ -44,7 +44,6 @@ This document tracks the current quality of unit tests in this repository using 
 ### `internal/processing`
 - Rating: `well covered`
 - Covered behaviors:
-  - starless pipeline settings validation, recombination, mask building, feathering, inpainting, normalization, and detection image construction
   - alignment and WCS behavior across channel alignment, warp, tweakreg, and rotation-center helpers
   - compose and cleaning behavior for RGB composition and mask-based cleaning flows
   - direct helper coverage for autoscaling, auto levels, grayscale/mask rendering, flip helpers, resize interpolation, drizzle-grid matching, pixel-scale parsing, finite sampling, percentile interpolation, and robust sigma fallback behavior
@@ -88,7 +87,6 @@ This document tracks the current quality of unit tests in this repository using 
 ### `internal/models`
 - Rating: `partially covered`
 - Covered behaviors:
-  - `ComposeProject` JSON round-trip preserving channel state plus starless settings zero values
   - `MosaicProject` JSON round-trip preserving nested drizzle, alignment, and skysub settings
   - `MosaicInputState` round-trip preserving affine transform and lock state
   - omitted optional-field behavior for `ReferencePath`, `ReferenceSCIExt`, `SCIExt`, transform fields, and `UseERRWeighting`
@@ -136,8 +134,6 @@ This document tracks the current quality of unit tests in this repository using 
   - viewer coordinate math
   - compose-state clearing helper
   - stretch helper behavior
-  - starless Compose settings defaults and normalization of invalid loaded-project values
-  - starless debug export path builder, default-format fallback, RGB level defaults, and mode-label mapping helpers
   - `channelStateFromImage` and `applyChannelState` behavior for restoring Compose channel state into images, controls, and viewport levels
   - `buildComposePreviewData` behavior for missing channels and optional compose override results
 - Missing or weak areas:
@@ -258,7 +254,6 @@ behavior, passband limits, quality thresholds, and provenance fields.
   - `./internal/ui`
 - `internal/processing` was expanded after the initial audit with direct helper tests for `processing.go`, and the findings above reflect that newer state.
 - `internal/fitsio` was expanded after the initial audit with a synthetic fixture-based suite, and the audit findings above reflect that newer state.
-- `internal/ui` was expanded after the initial audit with direct tests for starless settings normalization, helper defaults, and mode/export helper behavior, and the findings above reflect that newer state.
 - `internal/ui` was expanded again with second-pass tests for channel-state application and preview-data helper behavior, and the findings above reflect that newer state.
 - `internal/models` was expanded after the initial audit with broader project/state persistence round-trip tests, and the findings above reflect that newer state.
 - `internal/badpix` and `badpix` were expanded after the initial audit with fallback, missing-DQ, bad-bit filtering, and load-error coverage, and the findings above reflect that newer state.
