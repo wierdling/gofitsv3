@@ -16,6 +16,8 @@ build/
 .gomodcache/
 .gopath/
 TestImages/
+tmp/
+output/
 # --- Go workspace ---
 # Ignore these only if they are local-only
 go.work
