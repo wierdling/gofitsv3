@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"github.com/wierdling/gofiledialog"
 
+	"gofitsv3/internal/catalog/gaia"
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/export"
 	"gofitsv3/internal/fitsio"
@@ -61,12 +63,14 @@ const maxOverlayLayers = 16
 // windows): a grayscale image assigned a tint, screen/additively blended onto the
 // base RGB composite. idx is its stable index into imgs/origPixels.
 type overlayLayer struct {
-	idx      int
-	name     string
-	settings models.OrangeLayerState
-	win      fyne.Window
-	viewport *viewport
-	control  *models.ChannelControl
+	idx                    int
+	name                   string
+	settings               models.OrangeLayerState
+	win                    fyne.Window
+	viewport               *viewport
+	control                *models.ChannelControl
+	calibrationStatus      models.CalibrationStatus
+	calibrationStatusLabel *widget.Label
 }
 
 type composeOverlayPreviewData struct {
@@ -116,11 +120,21 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var levelsWin *rgbLevelsWindow
 	starlessSettings := defaultStarlessComposeSettings()
 	var overlayLayers []*overlayLayer
+	colorCalibration := models.ColorCalibrationState{Status: models.CalibrationDisabled}
+	// Any source, alignment, stretch, or overlay edit invalidates a previously
+	// calculated result. The persisted transforms remain inspectable but are
+	// never silently applied to changed pixels.
+	invalidateCalibration := func() { markComposeCalibrationStale(&colorCalibration) }
+	ensureOverlayCalibration := func(n int) {
+		for len(colorCalibration.Overlays) <= n {
+			colorCalibration.Overlays = append(colorCalibration.Overlays, models.OverlayCalibrationState{Mode: models.OverlayArtistic, Status: models.CalibrationDisabled, Strength: 1})
+		}
+	}
 
 	// Updated to track the new struct
 	var latestRGBStats [3]histogram.Stats
 	suspendRefresh := false
-	var composeRGBWithOptionalStarless func(ctx context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error)
+	var composeRGBWithOptionalStarless func(ctx context.Context, calibrationSnapshot *models.ColorCalibrationState) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, *processing.ComposeRenderResult, error)
 	// renderImages returns an offset-applied view of imgs (Manual Offsets applied
 	// at render time). Forward-declared so refresh/compose can use it; assigned
 	// once controlSets exists.
@@ -128,6 +142,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var previewMu sync.Mutex
 	previewSeq := 0
 	var genCancel context.CancelFunc
+	var calibrationJob composeCalibrationJob
+	var calibrationGeneration uint64
+	// SaveColorCalibration controls the normal render/export gate and whether
+	// calibration is included in the next project save.  The live state is
+	// retained when disabled so it can be compared or re-enabled immediately.
+	saveColorCalibration := true
+	var calibrationPreviewOverride *bool
 	var blinkMu sync.Mutex
 	var blinkPrepared []composeBlinkFrame
 	blinkSeq := 0
@@ -139,6 +160,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	blinkCheck := NewToggle(nil)
 	blinkCheck.SetChecked(false)
 	blinkExcludedIdx := 0
+	composeMagicPreset := widget.NewSelect([]string{"Balanced", "Nebula", "Galaxy"}, nil)
+	composeMagicPreset.SetSelected("Balanced")
 	// nil means no generalized selection was persisted; this preserves legacy
 	// project migration and lets future defaults select all loaded sources.
 	var blinkChannels []int
@@ -173,7 +196,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 	}
 
-	composeRGBCurrent := func(ctx context.Context, composeImgs []*models.LoadedImage) ([]byte, int, int, [3]histogram.Stats) {
+	cloneCalibration := func() *models.ColorCalibrationState {
+		return composeCalibrationSnapshot(colorCalibration, !saveColorCalibration)
+	}
+	cloneCalibrationForPreview := func() *models.ColorCalibrationState {
+		return composeCalibrationPreviewSnapshot(colorCalibration, saveColorCalibration, calibrationPreviewOverride)
+	}
+	composeRenderWithCalibration := func(ctx context.Context, composeImgs []*models.LoadedImage, calibrationSnapshot *models.ColorCalibrationState) (processing.ComposeRenderResult, error) {
 		var overlays []processing.OverlayLayer
 		for _, l := range overlayLayers {
 			if l.win != nil && l.idx < len(imgs) && imgs[l.idx] != nil {
@@ -181,11 +210,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			}
 		}
 		if len(overlays) > 0 {
-			return processing.ComposeRGBWithOverlays(ctx, composeImgs, overlays)
+			rendered, err := processing.ComposeRender(ctx, processing.ComposeRenderRequest{Images: composeImgs, Overlays: overlays, Calibration: calibrationSnapshot})
+			return rendered, err
 		}
-		return processing.ComposeRGB(ctx, composeImgs)
+		return processing.ComposeRender(ctx, processing.ComposeRenderRequest{Images: composeImgs, Calibration: calibrationSnapshot})
 	}
-
 	// startGeneration cancels any in-flight compose generation and starts a
 	// fresh one in the background. Triggering this repeatedly in quick
 	// succession (e.g. dragging a slider) kills the stale generation's work
@@ -227,10 +256,20 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		levelsSnapshot := *levels
 		sharedHistScale := sharedHistCheck.Checked
 		buildComposite := buildCompositeCheck.Checked
+		for i := range overlayLayers {
+			ensureOverlayCalibration(i)
+		}
+		calibrationSnapshot := cloneCalibrationForPreview()
 		go func() {
 			start := time.Now()
 			debuglog.Log("compose refresh async: starting preview computation")
-			data := buildComposePreviewData(ctx, imgSnapshot, sharedHistScale, buildComposite, &levelsSnapshot, composeRGBWithOptionalStarless)
+			var renderedResult *processing.ComposeRenderResult
+			data := buildComposePreviewData(ctx, imgSnapshot, sharedHistScale, buildComposite, &levelsSnapshot, func(c context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+				b, w, h, s, st, rendered, e := composeRGBWithOptionalStarless(c, calibrationSnapshot)
+				renderedResult = rendered
+				return b, w, h, s, st, e
+			})
+			data.Rendered = renderedResult
 			if blinkEnabled {
 				data.BlinkFrames = buildComposeBlinkFrames(ctx, imgSnapshot, blinkSourcesSnapshot, blinkSelectionSnapshot, data.Views)
 			}
@@ -247,6 +286,24 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					return
 				}
 				applyComposePreviewData(data, viewports, pushRGBHist)
+				if data.Rendered != nil {
+					for i, l := range overlayLayers {
+						if i >= len(data.Rendered.OverlayStatus) {
+							continue
+						}
+						l.calibrationStatus = data.Rendered.OverlayStatus[i]
+						if l.calibrationStatusLabel != nil {
+							reason := ""
+							if i < len(data.Rendered.OverlayDiagnostics) {
+								reason = data.Rendered.OverlayDiagnostics[i].Message
+							}
+							if reason != "" {
+								reason = " — " + reason
+							}
+							l.calibrationStatusLabel.SetText("Calibration: " + string(l.calibrationStatus) + reason)
+						}
+					}
+				}
 				blinkMu.Lock()
 				blinkPrepared = append([]composeBlinkFrame(nil), data.BlinkFrames...)
 				blinkMu.Unlock()
@@ -403,7 +460,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 	}
 
-	composeRGBWithOptionalStarless = func(ctx context.Context) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, error) {
+	composeRGBWithOptionalStarless = func(ctx context.Context, calibrationSnapshot *models.ColorCalibrationState) ([]byte, int, int, [3]histogram.Stats, *processing.StarlessResult, *processing.ComposeRenderResult, error) {
 		// Apply Manual Offsets at render time; imgs stays original.
 		rimgs := renderImages()
 		if starlessComposeTemporarilyDisabled {
@@ -414,18 +471,18 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			if starlessSettings.Enabled {
 				debuglog.Log("composeRGBWithOptionalStarless: starless temporarily disabled, using normal compose")
 			}
-			buf, w, h, stats := composeRGBCurrent(ctx, rimgs)
-			return buf, w, h, stats, nil, nil
+			rendered, err := composeRenderWithCalibration(ctx, rimgs, calibrationSnapshot)
+			return rendered.Preview, rendered.Width, rendered.Height, rendered.Stats, nil, &rendered, err
 		}
 
 		if !starlessSettings.Enabled {
 			debuglog.Log("composeRGBWithOptionalStarless: starless disabled, using normal compose")
-			buf, w, h, stats := composeRGBCurrent(ctx, rimgs)
-			return buf, w, h, stats, nil, nil
+			rendered, err := composeRenderWithCalibration(ctx, rimgs, calibrationSnapshot)
+			return rendered.Preview, rendered.Width, rendered.Height, rendered.Stats, nil, &rendered, err
 		}
 		if rimgs[0] == nil || rimgs[1] == nil || rimgs[2] == nil {
 			debuglog.Log("composeRGBWithOptionalStarless: missing RGB channels")
-			return nil, 0, 0, [3]histogram.Stats{}, nil, nil
+			return nil, 0, 0, [3]histogram.Stats{}, nil, nil, nil
 		}
 		debuglog.Log("composeRGBWithOptionalStarless: building aligned reference-grid channel set")
 		ref := rimgs[1]
@@ -467,7 +524,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}, ref.HDU.Data.Width, ref.HDU.Data.Height, maskSettings)
 		if err != nil {
 			debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: pipeline failed: %v", err))
-			return nil, 0, 0, [3]histogram.Stats{}, nil, err
+			return nil, 0, 0, [3]histogram.Stats{}, nil, nil, err
 		}
 		debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: pipeline produced %d components", len(result.Components)))
 		recombined, err := processing.RecombineStarlessRGB(result.Starless, result.Stars, result.AlphaMask, result.Width, result.Height, processing.StarRecombineSettings{
@@ -477,7 +534,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		})
 		if err != nil {
 			debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: recombine failed: %v", err))
-			return nil, 0, 0, [3]histogram.Stats{}, nil, err
+			return nil, 0, 0, [3]histogram.Stats{}, nil, nil, err
 		}
 		debuglog.Log(fmt.Sprintf("composeRGBWithOptionalStarless: recombined stars brightness=%.2f saturation=%.2f", starlessSettings.StarBrightness, starlessSettings.StarSaturation))
 
@@ -501,8 +558,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			makeClone(imgs[2], recombined[0]),
 		}
 		debuglog.Log("composeRGBWithOptionalStarless: composing final RGB preview")
-		buf, w, h, stats := composeRGBCurrent(ctx, composedImgs)
-		return buf, w, h, stats, result, nil
+		rendered, renderErr := composeRenderWithCalibration(ctx, composedImgs, calibrationSnapshot)
+		buf, w, h, stats := rendered.Preview, rendered.Width, rendered.Height, rendered.Stats
+		return buf, w, h, stats, result, &rendered, renderErr
 	}
 
 	saveChannelGray := func(idx int) {
@@ -674,6 +732,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				clearComposeOrigPixels(&origPixels, idx)
 
 				fyne.Do(func() {
+					invalidateCalibration()
 					if controlSets != nil {
 						applyChannelState(idx, channelStateFromImage(img), imgs, viewports, controlSets)
 					}
@@ -946,7 +1005,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 		l.viewport.SetLoadSave(l.name, "L", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255},
 			func() { loadLayer(l) }, func() { saveLayerGray(l) })
-		l.control = channelControls(l.name+" Image", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255}, l.idx, imgs, &origPixels, layerViews(l), func() { refreshLayerPreview(l) }, nil, false)
+		l.control = channelControls(l.name+" Image", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255}, l.idx, imgs, &origPixels, layerViews(l), func() { refreshLayerPreview(l) }, composeMagicPreset, false)
 
 		swatch := canvas.NewRectangle(color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255})
 		swatch.SetMinSize(fyne.NewSize(36, 18))
@@ -979,12 +1038,14 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			slider.OnChanged = func(v float64) {
 				n := uint8(math.Round(v))
 				set(n)
+				invalidateCalibration()
 				valueEntry.SetValue(float64(n))
 				updateSwatch()
 			}
 			valueEntry.OnChanged = func(v float64) {
 				n := uint8(math.Round(v))
 				set(n)
+				invalidateCalibration()
 				slider.Value = float64(n)
 				slider.Refresh()
 				updateSwatch()
@@ -1001,11 +1062,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		opacityValue.SetValue(opacitySlider.Value)
 		opacitySlider.OnChanged = func(v float64) {
 			l.settings.Opacity = v / 100
+			invalidateCalibration()
 			opacityValue.SetValue(v)
 			refresh()
 		}
 		opacityValue.OnChanged = func(v float64) {
 			l.settings.Opacity = v / 100
+			invalidateCalibration()
 			opacitySlider.Value = v
 			opacitySlider.Refresh()
 			refresh()
@@ -1020,11 +1083,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		protectValue.SetValue(protectSlider.Value)
 		protectSlider.OnChanged = func(v float64) {
 			l.settings.HighlightProtect = v / 100
+			invalidateCalibration()
 			protectValue.SetValue(v)
 			refresh()
 		}
 		protectValue.OnChanged = func(v float64) {
 			l.settings.HighlightProtect = v / 100
+			invalidateCalibration()
 			protectSlider.Value = v
 			protectSlider.Refresh()
 			refresh()
@@ -1032,6 +1097,74 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 		if l.idx < len(imgs) && imgs[l.idx] != nil {
 			applyChannelState(l.idx, channelStateFromImage(imgs[l.idx]), imgs, layerViews(l), layerControls(l))
+		}
+		overlayStateIndex := 0
+		for i, candidate := range overlayLayers {
+			if candidate == l {
+				overlayStateIndex = i
+				break
+			}
+		}
+		ensureOverlayCalibration(overlayStateIndex)
+		modeSelect := NewSafeSelect([]string{"Artistic", "Calibrated Linear"}, nil)
+		if colorCalibration.Overlays[overlayStateIndex].Mode == models.OverlayCalibratedLinear {
+			modeSelect.SetSelected("Calibrated Linear")
+		} else {
+			modeSelect.SetSelected("Artistic")
+		}
+		calibratedMode := colorCalibration.Overlays[overlayStateIndex].Mode == models.OverlayCalibratedLinear
+		modeSelect.OnChanged = func(v string) {
+			invalidateCalibration()
+			state := &colorCalibration.Overlays[overlayStateIndex]
+			if v == "Calibrated Linear" {
+				state.Mode = models.OverlayCalibratedLinear
+			} else {
+				state.Mode = models.OverlayArtistic
+			}
+			state.Status = models.CalibrationStale
+			calibratedMode = state.Mode == models.OverlayCalibratedLinear
+			if calibratedMode {
+				opacitySlider.Disable()
+				protectSlider.Disable()
+			} else {
+				opacitySlider.Enable()
+				protectSlider.Enable()
+			}
+			refresh()
+		}
+		neutralizeCheck := NewToggle(nil)
+		neutralizeCheck.SetChecked(colorCalibration.Overlays[overlayStateIndex].NeutralizeBackground)
+		neutralizeCheck.OnChanged = func(v bool) {
+			invalidateCalibration()
+			colorCalibration.Overlays[overlayStateIndex].NeutralizeBackground = v
+			colorCalibration.Overlays[overlayStateIndex].Status = models.CalibrationStale
+			refresh()
+		}
+		strengthSlider := widget.NewSlider(0, 2)
+		strengthSlider.Step = 0.01
+		strengthSlider.Value = colorCalibration.Overlays[overlayStateIndex].Strength
+		strengthValue := NewNumberEntry(2, 0)
+		strengthValue.Min, strengthValue.Max = 0, 2
+		strengthValue.SetValue(strengthSlider.Value)
+		strengthSlider.OnChanged = func(v float64) {
+			invalidateCalibration()
+			colorCalibration.Overlays[overlayStateIndex].Strength = v
+			colorCalibration.Overlays[overlayStateIndex].Status = models.CalibrationStale
+			strengthValue.SetValue(v)
+			refresh()
+		}
+		strengthValue.OnChanged = func(v float64) {
+			invalidateCalibration()
+			colorCalibration.Overlays[overlayStateIndex].Strength = v
+			colorCalibration.Overlays[overlayStateIndex].Status = models.CalibrationStale
+			strengthSlider.Value = v
+			strengthSlider.Refresh()
+			refresh()
+		}
+		l.calibrationStatusLabel = widget.NewLabel("Calibration: " + string(colorCalibration.Overlays[overlayStateIndex].Status))
+		if calibratedMode {
+			opacitySlider.Disable()
+			protectSlider.Disable()
 		}
 		colorControls := container.NewVBox(
 			canvas.NewText("Overlay", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255}),
@@ -1041,6 +1174,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			colorSlider("Blue", l.settings.ColorB, func(v uint8) { l.settings.ColorB = v }),
 			container.NewBorder(nil, nil, widget.NewLabel("Opacity"), container.NewHBox(opacityValue, widget.NewLabel("%")), opacitySlider),
 			container.NewBorder(nil, nil, widget.NewLabel("Highlight protect"), container.NewHBox(protectValue, widget.NewLabel("%")), protectSlider),
+			container.NewBorder(nil, nil, widget.NewLabel("Mix mode"), nil, modeSelect),
+			container.NewHBox(neutralizeCheck, widget.NewLabel("Neutralize background")),
+			container.NewBorder(nil, nil, widget.NewLabel("Linear strength"), strengthValue, strengthSlider),
+			l.calibrationStatusLabel,
 		)
 		controls := container.NewVScroll(container.NewVBox(l.control.Content, colorControls))
 		controls.SetMinSize(fyne.NewSize(300, 200))
@@ -1147,6 +1284,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						return
 					}
 					imgs[l.idx] = img
+					invalidateCalibration()
 					openOverlayLayerWindow(l)
 					if updateMenus != nil {
 						updateMenus()
@@ -1217,11 +1355,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		})
 	}
 
-	magicGroup := &magicPresetGroup{}
 	controlSets = []*models.ChannelControl{
-		channelControls("Channel 1 (Blue)", color.RGBA{R: 100, G: 149, B: 237, A: 255}, 0, imgs, &origPixels, viewports, refresh, magicGroup, true),
-		channelControls("Channel 2 (Green)", color.RGBA{R: 80, G: 200, B: 80, A: 255}, 1, imgs, &origPixels, viewports, refresh, magicGroup, true),
-		channelControls("Channel 3 (Red)", color.RGBA{R: 237, G: 80, B: 80, A: 255}, 2, imgs, &origPixels, viewports, refresh, magicGroup, true),
+		channelControls("Channel 1 (Blue)", color.RGBA{R: 100, G: 149, B: 237, A: 255}, 0, imgs, &origPixels, viewports, refresh, composeMagicPreset, true),
+		channelControls("Channel 2 (Green)", color.RGBA{R: 80, G: 200, B: 80, A: 255}, 1, imgs, &origPixels, viewports, refresh, composeMagicPreset, true),
+		channelControls("Channel 3 (Red)", color.RGBA{R: 237, G: 80, B: 80, A: 255}, 2, imgs, &origPixels, viewports, refresh, composeMagicPreset, true),
 	}
 
 	// The Manual Offset (X/Y/Rot) fields are the source of truth for each channel's
@@ -1303,12 +1440,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	viewports[2].SetLoadSave("Red", "R", color.RGBA{R: 237, G: 80, B: 80, A: 255},
 		func() { loadChannel(2) }, func() { saveChannelGray(2) })
 	compositeImageForEdit := func() *image.RGBA {
-		if buildCompositeCheck.Checked {
-			if img, ok := viewports[3].image.Image.(*image.RGBA); ok && img != nil {
-				return img
-			}
-		}
-		buf, w, h, _, _, err := composeRGBWithOptionalStarless(context.Background())
+		// Always render from the save-gated snapshot. The cached composite
+		// viewport may have been produced while a temporary Before/After
+		// comparison override was active and must never leak into Export to Edit.
+		buf, w, h, _, _, _, err := composeRGBWithOptionalStarless(context.Background(), cloneCalibration())
 		if err != nil || buf == nil {
 			return nil
 		}
@@ -1497,6 +1632,14 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			BlinkFilters:         blinkCheck.Checked,
 			BlinkExcludedFilter:  blinkExcludedIdx,
 			StarlessSettings:     starlessSettings,
+			// New saves use ColorCalibration pointer presence as the canonical
+			// persisted indicator; retain the legacy field only for decoding.
+			DisableColorCalibration: false,
+		}
+		if saveColorCalibration {
+			calibrationCopy := colorCalibration
+			calibrationCopy.Overlays = append([]models.OverlayCalibrationState(nil), colorCalibration.Overlays...)
+			project.ColorCalibration = &calibrationCopy
 		}
 		if blinkChannels != nil {
 			selection := append([]int(nil), blinkChannels...)
@@ -1607,6 +1750,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				dialog.ShowError(err, win)
 				return
 			}
+			if project.ColorCalibration != nil {
+				colorCalibration = *project.ColorCalibration
+				colorCalibration.Overlays = append([]models.OverlayCalibrationState(nil), project.ColorCalibration.Overlays...)
+			} else {
+				colorCalibration = models.ColorCalibrationState{Status: models.CalibrationDisabled}
+			}
+			saveColorCalibration = project.ColorCalibration != nil && !project.DisableColorCalibration
 
 			if globalSelectComposeTab != nil {
 				globalSelectComposeTab()
@@ -1848,6 +1998,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				applyChannelState(i, state, imgs, viewports, controlSets)
 			}
 		})
+		invalidateCalibration()
 
 		if !loaded {
 			dialog.ShowInformation("Reset", "No loaded channels to reset.", win)
@@ -1920,6 +2071,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					// the summary line only.
 					dx, dy, rot = extractManualOffset(back, w, h)
 					setChannelAlignTransform(imgs[idx], back)
+					invalidateCalibration()
 					if idx < len(controlSets) && controlSets[idx] != nil {
 						if controlSets[idx].XOffsetEntry != nil {
 							controlSets[idx].XOffsetEntry.SetValue(0)
@@ -2071,6 +2223,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				imgs[i].HDU.Data.Pixels = out
 				clearComposeOrigPixels(&origPixels, i)
 			}
+			invalidateCalibration()
 
 			fyne.Do(func() {
 				win.Canvas().Refresh(win.Content())
@@ -2083,7 +2236,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	exportRGB := func() {
-		buf, w, h, _, starlessResult, err := composeRGBWithOptionalStarless(context.Background())
+		buf, w, h, _, starlessResult, rendered, err := composeRGBWithOptionalStarless(context.Background(), cloneCalibration())
 		if buf == nil {
 			dialog.ShowInformation("Missing", "Load three FITS first", win)
 			return
@@ -2093,8 +2246,21 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			return
 		}
 		finalBuf := processing.ApplyRGBLevels(buf, levels)
-		// Pre-compute float32 channels for potential 16-bit PNG export.
-		rF, gF, bF, _, _ := processing.ComposeRGBFloat32(imgs)
+		// Use the same immutable render result for high-bit-depth output as for
+		// the preview (including the existing overlay blend).
+		// Reuse the same immutable manual-offset-applied snapshot used by preview.
+		if rendered == nil {
+			dialog.ShowError(fmt.Errorf("missing render result"), win)
+			return
+		}
+		if !starlessSettings.Enabled {
+			// Keep the canonical result as the source, then apply the user's
+			// display levels exactly as the preview path does.
+			finalBuf = append([]byte(nil), rendered.Preview...)
+			processing.ApplyRGBLevels(finalBuf, levels)
+			w, h = rendered.Width, rendered.Height
+		}
+		rF, gF, bF := rendered.R, rendered.G, rendered.B
 		save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
 			if err != nil || uc == nil {
 				return
@@ -2472,7 +2638,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 							renderCache[i] = composeRenderCache{}
 						}
 						renderMu.Unlock()
-						magicGroup.broadcast(batch.Preset)
+						composeMagicPreset.SetSelected(batch.Preset)
 						buildCompositeCheck.SetChecked(true)
 					})
 					finished = true
@@ -2574,9 +2740,479 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}, win)
 	}
 
+	var colorCalibrationWindow fyne.Window
+	var openColorCalibration func()
+	openColorCalibration = func() {
+		if colorCalibrationWindow != nil {
+			colorCalibrationWindow.RequestFocus()
+			return
+		}
+		if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+			dialog.ShowInformation("Color Calibration", "Load all three base channels first.", win)
+			return
+		}
+		mode := NewSafeSelect([]string{"Off", "Instrument", "Gaia"}, nil)
+		mode.SetSelected(map[models.PhotometricMode]string{models.PhotometricInstrument: "Instrument", models.PhotometricGaia: "Gaia"}[colorCalibration.PhotometricMode])
+		if colorCalibration.PhotometricMode == models.PhotometricOff || colorCalibration.PhotometricMode == "" {
+			mode.SetSelected("Off")
+		}
+		gaiaAccess := NewSafeSelect([]string{"Online", "Cache Only"}, nil)
+		if colorCalibration.Gaia.AccessMode == "cacheOnly" {
+			gaiaAccess.SetSelected("Cache Only")
+		} else {
+			gaiaAccess.SetSelected("Online")
+		}
+		gaiaRelease := widget.NewEntry()
+		gaiaRelease.SetText(colorCalibration.Gaia.Release)
+		if gaiaRelease.Text == "" {
+			gaiaRelease.SetText("DR3")
+		}
+		gaiaEndpoint := widget.NewEntry()
+		gaiaEndpoint.SetText(colorCalibration.Gaia.Endpoint)
+		if gaiaEndpoint.Text == "" {
+			gaiaEndpoint.SetText("https://gea.esac.esa.int/tap-server/tap")
+		}
+		gaiaMatchRadius := widget.NewEntry()
+		gaiaMatchRadius.SetText(strconv.FormatFloat(normalizeGaiaMatchRadiusArcsec(colorCalibration.Gaia.MatchRadiusArcsec), 'f', -1, 64))
+		gaiaCachePathEntry := widget.NewEntry()
+		effectiveGaiaSettings := applyGaiaCachePathPreference(colorCalibration.Gaia, app.Preferences().String(gaiaCachePathPreferenceKey))
+		gaiaCachePathEntry.SetText(effectiveGaiaSettings.CachePath)
+		gaiaCacheStatusLabel := widget.NewLabel("")
+		refreshGaiaCacheStatus := func() {
+			path, err := gaiaCachePath(applyGaiaCachePathPreference(colorCalibration.Gaia, app.Preferences().String(gaiaCachePathPreferenceKey)), "")
+			if err != nil {
+				gaiaCacheStatusLabel.SetText("Cache unavailable: " + err.Error())
+				return
+			}
+			exists, bytes, err := gaiaCacheStatus(path)
+			if err != nil {
+				gaiaCacheStatusLabel.SetText("Cache unavailable: " + err.Error())
+				return
+			}
+			if !exists {
+				gaiaCacheStatusLabel.SetText("Cache: not created")
+			} else {
+				gaiaCacheStatusLabel.SetText(fmt.Sprintf("Cache: %s (%d bytes)", path, bytes))
+			}
+		}
+		clearGaiaCacheButton := widget.NewButton("Clear cache", func() {
+			path, err := gaiaCachePath(applyGaiaCachePathPreference(colorCalibration.Gaia, app.Preferences().String(gaiaCachePathPreferenceKey)), "")
+			if err == nil {
+				err = clearGaiaCache(path)
+			}
+			if err != nil {
+				gaiaCacheStatusLabel.SetText("Cache clear failed: " + err.Error())
+			} else {
+				refreshGaiaCacheStatus()
+			}
+		})
+		gaiaInfo := widget.NewLabel("")
+		updateGaiaInfo := func() {
+			gaiaInfo.SetText(fmt.Sprintf("Gaia %s · %s · cache %s", gaiaRelease.Text, map[bool]string{true: "cache-only", false: "online"}[colorCalibration.Gaia.AccessMode == "cacheOnly"], func() string {
+				if effectiveGaiaSettings.CachePath == "" {
+					return "default"
+				}
+				return effectiveGaiaSettings.CachePath
+			}()))
+		}
+		updateGaiaInfo()
+		refreshGaiaCacheStatus()
+		neutral := NewToggle(nil)
+		neutral.SetChecked(colorCalibration.NeutralizeBackground)
+		white := NewSafeSelect([]string{"Flat Fnu", "Flat Flambda", "Average spiral galaxy"}, nil)
+		white.SetSelected(map[models.WhiteReference]string{models.WhiteReferenceFlatFlambda: "Flat Flambda", models.WhiteReferenceAverageSpiralGalaxy: "Average spiral galaxy"}[colorCalibration.WhiteReference])
+		if colorCalibration.WhiteReference == "" || colorCalibration.WhiteReference == models.WhiteReferenceFlatFnu {
+			white.SetSelected("Flat Fnu")
+		}
+		selection := NewSafeSelect([]string{"Automatic", "Aligned reference ROI"}, nil)
+		if colorCalibration.BackgroundSelection == models.BackgroundROI {
+			selection.SetSelected("Aligned reference ROI")
+		} else {
+			selection.SetSelected("Automatic")
+		}
+		roiX, roiY, roiW, roiH := NewNumberEntry(0, 0), NewNumberEntry(0, 0), NewNumberEntry(0, 0), NewNumberEntry(0, 0)
+		roiX.SetValue(float64(colorCalibration.BackgroundROI.X))
+		roiY.SetValue(float64(colorCalibration.BackgroundROI.Y))
+		roiW.SetValue(float64(colorCalibration.BackgroundROI.Width))
+		roiH.SetValue(float64(colorCalibration.BackgroundROI.Height))
+		saveCalibration := NewToggle(nil)
+		saveCalibration.SetChecked(saveColorCalibration)
+		beforePreview := widget.NewButton("Before", func() { v := false; calibrationPreviewOverride = &v; refresh() })
+		afterPreview := widget.NewButton("After", func() { v := true; calibrationPreviewOverride = &v; refresh() })
+		status := widget.NewLabel(composeCalibrationStatusText(colorCalibration))
+		status.Wrapping = fyne.TextWrapWord
+		calculate := widget.NewButton("Calculate", nil)
+		cancelButton := widget.NewButton("Cancel", nil)
+		setStale := func() {
+			markComposeCalibrationStale(&colorCalibration)
+			status.SetText(composeCalibrationStatusText(colorCalibration))
+			refresh()
+		}
+		mode.OnChanged = func(v string) {
+			if v == "Instrument" {
+				colorCalibration.PhotometricMode = models.PhotometricInstrument
+			} else if v == "Gaia" {
+				colorCalibration.PhotometricMode = models.PhotometricGaia
+			} else {
+				colorCalibration.PhotometricMode = models.PhotometricOff
+			}
+			setStale()
+		}
+		gaiaAccess.OnChanged = func(v string) {
+			if v == "Cache Only" {
+				colorCalibration.Gaia.AccessMode = "cacheOnly"
+			} else {
+				colorCalibration.Gaia.AccessMode = "online"
+			}
+			updateGaiaInfo()
+			setStale()
+		}
+		gaiaRelease.OnChanged = func(v string) { colorCalibration.Gaia.Release = v; updateGaiaInfo(); setStale() }
+		gaiaEndpoint.OnChanged = func(v string) { colorCalibration.Gaia.Endpoint = v; setStale() }
+		gaiaMatchRadius.OnChanged = func(v string) {
+			if radius, err := parseGaiaMatchRadiusArcsec(v); err == nil {
+				colorCalibration.Gaia.MatchRadiusArcsec = radius
+				setStale()
+			}
+		}
+		gaiaCachePathEntry.OnChanged = func(v string) {
+			updateComposeGaiaCachePath(&colorCalibration, v)
+			app.Preferences().SetString(gaiaCachePathPreferenceKey, v)
+			effectiveGaiaSettings.CachePath = v
+			refreshGaiaCacheStatus()
+		}
+		neutral.OnChanged = func(v bool) { colorCalibration.NeutralizeBackground = v; setStale() }
+		white.OnChanged = func(v string) {
+			switch v {
+			case "Flat Flambda":
+				colorCalibration.WhiteReference = models.WhiteReferenceFlatFlambda
+			case "Average spiral galaxy":
+				colorCalibration.WhiteReference = models.WhiteReferenceAverageSpiralGalaxy
+			default:
+				colorCalibration.WhiteReference = models.WhiteReferenceFlatFnu
+			}
+			setStale()
+		}
+		selection.OnChanged = func(v string) {
+			if v == "Aligned reference ROI" {
+				colorCalibration.BackgroundSelection = models.BackgroundROI
+			} else {
+				colorCalibration.BackgroundSelection = models.BackgroundAutomatic
+			}
+			setStale()
+		}
+		setROI := func() {
+			colorCalibration.BackgroundROI = models.CalibrationROI{X: int(roiX.Value()), Y: int(roiY.Value()), Width: int(roiW.Value()), Height: int(roiH.Value())}
+			setStale()
+		}
+		roiX.OnChanged, roiY.OnChanged, roiW.OnChanged, roiH.OnChanged = func(float64) { setROI() }, func(float64) { setROI() }, func(float64) { setROI() }, func(float64) { setROI() }
+		saveCalibration.OnChanged = func(v bool) { saveColorCalibration = v; refresh() }
+		prior := colorCalibration
+		cancelButton.Disable()
+		calculate.OnTapped = func() {
+			if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+				return
+			}
+			if colorCalibration.PhotometricMode == models.PhotometricGaia {
+				radius, err := parseGaiaMatchRadiusArcsec(gaiaMatchRadius.Text)
+				if err != nil {
+					status.SetText(err.Error())
+					return
+				}
+				colorCalibration.Gaia.MatchRadiusArcsec = radius
+			}
+			prior = colorCalibration
+			calibrationGeneration++
+			generation := calibrationGeneration
+			ctx, ok := calibrationJob.begin(generation)
+			if !ok {
+				return
+			}
+			calibrationSnapshot := colorCalibration
+			calibrationSnapshot.Overlays = append([]models.OverlayCalibrationState(nil), colorCalibration.Overlays...)
+			for i := range calibrationSnapshot.Overlays {
+				calibrationSnapshot.Overlays[i].Diagnostics.Warnings = append([]string(nil), colorCalibration.Overlays[i].Diagnostics.Warnings...)
+			}
+			priorForJob := prior
+			imageSnapshots := make([]*models.LoadedImage, 3)
+			for i := range imageSnapshots {
+				imageSnapshots[i] = cloneLoadedImageForStretchMatch(imgs[i])
+			}
+			colorCalibration.Status = models.CalibrationCalculating
+			status.SetText(composeCalibrationStatusText(colorCalibration))
+			calculate.Disable()
+			cancelButton.Enable()
+			mode.Disable()
+			neutral.Disable()
+			white.Disable()
+			selection.Disable()
+			gaiaMatchRadius.Disable()
+			inputs := make([]processing.CalibrationInput, 3)
+			var inputErr error
+			for i := range inputs {
+				img := imageSnapshots[i]
+				pixels := append([]float32(nil), img.HDU.Data.Pixels...)
+				inputs[i] = processing.CalibrationInput{SourceIdentity: img.Path, Width: img.HDU.Data.Width, Height: img.HDU.Data.Height, Pixels: pixels, Valid: make([]bool, len(pixels)), Alignment: fmt.Sprintf("channel-%d", i)}
+				for j := range inputs[i].Valid {
+					inputs[i].Valid[j] = true
+				}
+				if settingsMode := calibrationSnapshot.PhotometricMode; settingsMode == models.PhotometricInstrument {
+					ref := processing.ReferenceFnu
+					if calibrationSnapshot.WhiteReference == models.WhiteReferenceFlatFlambda {
+						ref = processing.ReferenceFlambda
+					}
+					headerValue := func(h fitsio.Header, keys ...string) string {
+						for _, key := range keys {
+							if value := fitsio.HeaderString(h, key); value != "" {
+								return value
+							}
+						}
+						return ""
+					}
+					detector := headerValue(img.HDU.Header, "DETECTOR")
+					if strings.HasPrefix(strings.ToUpper(detector), "NRC") {
+						detector = "NRC"
+					}
+					metadata := processing.InstrumentMetadata{Telescope: headerValue(img.Primary, "TELESCOP", "TELESCOPE"), Instrument: headerValue(img.Primary, "INSTRUME", "INSTRUMENT"), Detector: detector, Filter: headerValue(img.HDU.Header, "FILTER", "FILTER1", "FILTER2"), Primary: img.Primary, SCI: img.HDU.Header, Reference: ref}
+					photometry, parseErr := processing.ParseInstrumentPhotometry(metadata)
+					if parseErr != nil {
+						inputErr = parseErr
+						break
+					}
+					inputs[i].Metadata = metadata
+					inputs[i].Photometry = &photometry
+				}
+			}
+			settings := processing.CalibrationSettings{PhotometricMode: calibrationSnapshot.PhotometricMode, NeutralizeBackground: calibrationSnapshot.NeutralizeBackground, BackgroundSelection: calibrationSnapshot.BackgroundSelection, BackgroundROI: calibrationSnapshot.BackgroundROI, WhiteReference: calibrationSnapshot.WhiteReference, LinkedStretch: calibrationSnapshot.LinkedStretch, Overlays: append([]models.OverlayCalibrationState(nil), calibrationSnapshot.Overlays...), AlgorithmVersion: "ui-v1", ReferenceVersion: "local-v1", Gaia: calibrationSnapshot.Gaia}
+			go func() {
+				var result processing.CalibrationResult
+				gaiaDone := false
+				err := inputErr
+				if err == nil && calibrationSnapshot.PhotometricMode == models.PhotometricGaia {
+					debuglog.Log(fmt.Sprintf("Gaia UI calibration start: access=%s release=%s radius=%.3f magnitude=%.2f cache=%s", calibrationSnapshot.Gaia.AccessMode, calibrationSnapshot.Gaia.Release, calibrationSnapshot.Gaia.MatchRadiusArcsec, calibrationSnapshot.Gaia.MagnitudeLimit, calibrationSnapshot.Gaia.CachePath))
+					// Gaia is a staged provider job; construct it from the immutable
+					// image/settings snapshot so cache-only mode never reaches HTTP.
+					calibrationSnapshot.Gaia = applyGaiaCachePathPreference(calibrationSnapshot.Gaia, app.Preferences().String(gaiaCachePathPreferenceKey))
+					cachePath, pathErr := gaiaCachePath(calibrationSnapshot.Gaia, "")
+					if pathErr != nil {
+						err = pathErr
+					} else {
+						calibrationSnapshot.Gaia = resolveGaiaSettings(calibrationSnapshot.Gaia)
+						cache, openErr := composeGaiaCacheOpener(ctx, cachePath)
+						if openErr != nil {
+							err = openErr
+						} else {
+							defer cache.Close()
+							mode := gaia.AccessOnline
+							if calibrationSnapshot.Gaia.AccessMode == "cacheOnly" {
+								mode = gaia.AccessCacheOnly
+							}
+							provider, providerErr := newGaiaProvider(calibrationSnapshot.Gaia.Endpoint, mode, calibrationSnapshot.Gaia.Release, calibrationSnapshot.Gaia.XPRepresentation, cache)
+							if providerErr != nil {
+								err = providerErr
+							} else {
+								query, pixelToSky, queryErr := deriveGaiaFieldQuery(imageSnapshots[1], calibrationSnapshot.Gaia)
+								if queryErr != nil {
+									err = queryErr
+								} else {
+									calibrationSnapshot.Gaia.ObservationEpoch = query.ObservationEpoch
+									alignedPlanes, aw, ah, alignErr := processing.AlignedPlanesForCalibration(ctx, imageSnapshots)
+									if alignErr != nil {
+										err = alignErr
+									} else {
+										stars := processing.ExtractAndLimitStars(alignedPlanes[1].Pixels, aw, ah, 5, 3, 500)
+										debuglog.Log(fmt.Sprintf("Gaia UI alignment/detection: aligned=%dx%d detected_stars=%d", aw, ah, len(stars)))
+										planes := [3]processing.GaiaPlane{}
+										for c := range planes {
+											// UI channels are B,G,R while the canonical planes are R,G,B.
+											p := alignedPlanes[2-c]
+											pixels := append([]float32(nil), p.Pixels...)
+											for i, valid := range p.Valid {
+												if i < len(pixels) && !valid {
+													pixels[i] = float32(math.NaN())
+												}
+											}
+											planes[c] = processing.GaiaPlane{Pixels: pixels, Valid: append([]bool(nil), p.Valid...), Width: aw, Height: ah}
+										}
+										matchRadius := calibrationSnapshot.Gaia.MatchRadiusArcsec
+										if matchRadius <= 0 {
+											matchRadius = 2
+										}
+										epoch := calibrationSnapshot.Gaia.ObservationEpoch
+										if epoch <= 0 {
+											epoch = 2000
+										}
+										magnitude := calibrationSnapshot.Gaia.MagnitudeLimit
+										if magnitude <= 0 {
+											magnitude = 18
+										}
+										greq := processing.GaiaCalibrationRequest{Query: query, Settings: gaiaRequestSettings(calibrationSnapshot.Gaia, matchRadius, epoch, magnitude), DetectedStars: stars, Planes: planes, PixelToSky: pixelToSky}
+										greq.Settings.ObservationEpoch = query.ObservationEpoch
+										gaiaResult, runErr := composeGaiaJobService.Run(ctx, GaiaJobRequest{Provider: provider, Query: query, Settings: greq.Settings, Calibration: greq}, func(p GaiaJobProgress) {
+											debuglog.Log(fmt.Sprintf("Gaia UI stage: %s", p.Stage))
+											fyne.Do(func() { status.SetText(fmt.Sprintf("Calibration: calculating — Gaia %s", p.Stage)) })
+										})
+										if runErr != nil {
+											err = runErr
+											debuglog.Log(fmt.Sprintf("Gaia UI terminal: failed error=%v", runErr))
+										} else {
+											gaiaDone = true
+											result.Base = [3]models.LinearTransform{{Gain: gaiaResult.Diagnostics.Gains[0]}, {Gain: gaiaResult.Diagnostics.Gains[1]}, {Gain: gaiaResult.Diagnostics.Gains[2]}}
+											result.Status = gaiaResult.Status
+											result.Diagnostics.Message = fmt.Sprintf("Gaia: %d matched, %d accepted", gaiaResult.Diagnostics.MatchedStars, gaiaResult.Diagnostics.AcceptedStars)
+											result.Provenance = gaiaResult.Provenance
+											result.SourceFingerprint = gaiaResult.SourceFingerprint
+											result.SettingsFingerprint = gaiaResult.SettingsFingerprint
+											debuglog.Log(fmt.Sprintf("Gaia UI terminal: status=%s matched=%d accepted=%d rejected=%d", gaiaResult.Status, gaiaResult.Diagnostics.MatchedStars, gaiaResult.Diagnostics.AcceptedStars, gaiaResult.Diagnostics.RejectedStars))
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				if err != nil {
+					// Metadata parsing above produced the actionable unsupported reason.
+				} else if ctx.Err() != nil {
+					err = ctx.Err()
+				} else {
+					if calibrationSnapshot.NeutralizeBackground {
+						roi := calibrationSnapshot.BackgroundROI
+						var roiPtr *models.CalibrationROI
+						if calibrationSnapshot.BackgroundSelection == models.BackgroundROI {
+							roiPtr = &roi
+						}
+						alignedPlanes, _, _, alignErr := processing.AlignedPlanesForCalibration(ctx, imageSnapshots)
+						if alignErr != nil {
+							err = alignErr
+						}
+						if err == nil {
+							for i := range inputs {
+								plane := alignedPlanes[2-i]
+								inputs[i].Pixels = append([]float32(nil), plane.Pixels...)
+								inputs[i].Valid = append([]bool(nil), plane.Valid...)
+								inputs[i].Width, inputs[i].Height = plane.Width, plane.Height
+							}
+						}
+						for i := range inputs {
+							if err != nil {
+								break
+							}
+							if ctx.Err() != nil {
+								err = ctx.Err()
+								break
+							}
+							// Compose's canonical plane order is R,G,B while the UI
+							// channel slots are B,G,R.
+							plane := alignedPlanes[2-i]
+							estimate, estimateErr := processing.EstimateBackgroundPlane(ctx, processing.BackgroundPlane{Pixels: plane.Pixels, Width: plane.Width, Height: plane.Height, Valid: plane.Valid, ROI: roiPtr}, processing.DefaultBackgroundConfig())
+							if estimateErr != nil {
+								err = estimateErr
+								break
+							}
+							if estimate.Status != models.CalibrationValid {
+								err = &processing.UnsupportedCalibrationError{Reason: fmt.Sprintf("channel %d background: %s", i+1, estimate.RejectionReason)}
+								break
+							}
+							estimate.Transform.Gain = 1
+							inputs[i].Background = estimate.Transform
+						}
+					}
+				}
+				if err == nil && ctx.Err() != nil {
+					err = ctx.Err()
+				}
+				if err == nil && !gaiaDone {
+					result, err = processing.CalculateCalibration(inputs, settings)
+				}
+				fyne.Do(func() {
+					if ctx.Err() != nil && err == nil {
+						err = ctx.Err()
+					}
+					liveGaiaCachePath := colorCalibration.Gaia.CachePath
+					accepted := composeCalibrationResultForUI(&calibrationJob, generation, calibrationGeneration, &colorCalibration, &priorForJob, result, err)
+					if accepted {
+						if gaiaDone {
+							// Persist only the resolved settings of an accepted Gaia job;
+							// failed or superseded jobs must not alter current settings.
+							liveSettings := colorCalibration.Gaia
+							liveSettings.CachePath = liveGaiaCachePath
+							colorCalibration.Gaia = retainComposeProjectGaiaCachePath(liveSettings, calibrationSnapshot.Gaia)
+						}
+						status.SetText(composeCalibrationStatusText(colorCalibration))
+						refresh()
+					}
+					if accepted && generation == calibrationGeneration {
+						calculate.Enable()
+						cancelButton.Disable()
+						mode.Enable()
+						neutral.Enable()
+						white.Enable()
+						selection.Enable()
+						gaiaMatchRadius.Enable()
+					}
+				})
+			}()
+		}
+		cancelButton.OnTapped = func() {
+			if calibrationJob.cancelJob() {
+				colorCalibration = prior
+				if prior.Status != models.CalibrationValid {
+					colorCalibration.Status = models.CalibrationCancelled
+				}
+				status.SetText(composeCalibrationStatusText(colorCalibration))
+				calculate.Enable()
+				cancelButton.Disable()
+				mode.Enable()
+				neutral.Enable()
+				white.Enable()
+				selection.Enable()
+				gaiaMatchRadius.Enable()
+				refresh()
+			}
+		}
+		var calibrationWindow fyne.Window
+		closeCalibration := widget.NewButton("Close", func() {
+			if calibrationWindow != nil {
+				calibrationWindow.Close()
+			}
+		})
+		content := container.NewVBox(
+			container.NewBorder(nil, nil, widget.NewLabel("Photometric mode"), nil, mode),
+			container.NewHBox(neutral, widget.NewLabel("Neutralize background")),
+			container.NewBorder(nil, nil, widget.NewLabel("White reference"), nil, white),
+			container.NewBorder(nil, nil, widget.NewLabel("Background selection"), nil, selection),
+			container.NewBorder(nil, nil, widget.NewLabel("Gaia access"), nil, gaiaAccess),
+			container.NewGridWithColumns(2, widget.NewLabel("Gaia release"), gaiaRelease, widget.NewLabel("Gaia endpoint"), gaiaEndpoint),
+			container.NewBorder(nil, nil, widget.NewLabel("Gaia match radius (arcsec)"), nil, gaiaMatchRadius),
+			container.NewBorder(nil, nil, widget.NewLabel("Cache path"), clearGaiaCacheButton, gaiaCachePathEntry),
+			gaiaCacheStatusLabel,
+			gaiaInfo,
+			container.NewGridWithColumns(4, roiX, roiY, roiW, roiH), status,
+			container.NewHBox(calculate, cancelButton, saveCalibration, widget.NewLabel("Save Color Calibration"), beforePreview, afterPreview, layout.NewSpacer(), closeCalibration),
+		)
+		calibrationWindow = app.NewWindow("Color Calibration")
+		colorCalibrationWindow = calibrationWindow
+		calibrationWindow.SetContent(container.NewVScroll(content))
+		calibrationWindow.SetOnClosed(func() {
+			if colorCalibrationWindow == calibrationWindow {
+				colorCalibrationWindow = nil
+			}
+			calibrationPreviewOverride = nil
+			refresh()
+		})
+		// A scroll container reports only its first child's minimum height until its
+		// viewport is explicitly sized. Without this, the Color Calibration window
+		// can appear as just the photometric-mode row, hiding the settings and
+		// Calculate controls below it.
+		calibrationWindow.Resize(fyne.NewSize(760, 640))
+		calibrationWindow.Show()
+	}
+
 	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 Settings to 2 & 3", copySettings)
 	matchStretchItem := fyne.NewMenuItem("Match Channel Stretch...", showMatchStretchDialog)
 	addLayerItem := fyne.NewMenuItem("Add Colored Layer...", addColoredLayer)
+	colorCalibrationItem := fyne.NewMenuItem("Color Calibration...", openColorCalibration)
 	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
 	sendToEditItem := fyne.NewMenuItem("Send Composite to Edit", sendToEdit)
 	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
@@ -2617,6 +3253,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		normalizeScaleItem,
 		fyne.NewMenuItemSeparator(),
 		addLayerItem,
+		colorCalibrationItem,
 	)
 	// View: display tuning plus the per-channel FITS header viewers/savers.
 	viewMenu := fyne.NewMenu("View",
@@ -2710,7 +3347,122 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 	updateHistScaleLabel()
 
+	var magicAll *widget.Button
+	magicAll = widget.NewButton("Magic", func() {
+		preset := processing.ParseMagicPreset(composeMagicPreset.Selected)
+		// Snapshot loaded channels; processing runs off the UI thread.
+		type magicTarget struct {
+			idx      int
+			img      *models.LoadedImage
+			before   magicStretchSnapshot
+			prepared models.LoadedImage
+		}
+		targets := make([]magicTarget, 0, len(imgs))
+		for i, img := range imgs {
+			if img != nil {
+				targets = append(targets, magicTarget{idx: i, img: img, before: snapshotMagicStretch(img), prepared: *img})
+			}
+		}
+		if len(targets) == 0 {
+			return
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		finished := false
+		var progressDialog *dialog.CustomDialog
+		progressLabel := widget.NewLabel("Applying Magic + Auto MTF to loaded channels…")
+		cancelButton := widget.NewButton("Cancel", func() {
+			cancel()
+			if progressDialog != nil {
+				progressDialog.Hide()
+			}
+		})
+		progressDialog = dialog.NewCustomWithoutButtons("Magic", container.NewVBox(
+			progressLabel,
+			widget.NewProgressBarInfinite(), cancelButton,
+		), win)
+		progressDialog.SetOnClosed(func() {
+			if !finished {
+				cancel()
+			}
+		})
+		progressDialog.Show()
+		magicAll.Disable()
+		go func() {
+			results := make([]models.LoadedImage, len(targets))
+			for j, target := range targets {
+				if composeMagicCanceled(ctx) != nil {
+					fyne.Do(func() {
+						finished = true
+						if progressDialog != nil {
+							progressDialog.Hide()
+						}
+						magicAll.Enable()
+					})
+					return
+				}
+				clone := target.prepared
+				processing.ApplyMagicLevels(&clone, preset)
+				processing.AutoMTFMidtone(&clone)
+				results[j] = clone
+			}
+			fyne.Do(func() {
+				defer cancel()
+				if ctx.Err() != nil {
+					finished = true
+					if progressDialog != nil {
+						progressDialog.Hide()
+					}
+					magicAll.Enable()
+					return
+				}
+				for _, target := range targets {
+					if target.idx >= len(imgs) || imgs[target.idx] != target.img || !magicStretchUnchanged(target.img, target.before) {
+						finished = true
+						if progressDialog != nil {
+							progressDialog.Hide()
+						}
+						magicAll.Enable()
+						return
+					}
+				}
+				withSuspendedRefresh(func() {
+					for j, target := range targets {
+						installMagicStretch(target.img, results[j])
+						var cc *models.ChannelControl
+						if target.idx < len(controlSets) {
+							cc = controlSets[target.idx]
+						} else {
+							for _, layer := range overlayLayers {
+								if layer != nil && layer.idx == target.idx {
+									cc = layer.control
+									break
+								}
+							}
+						}
+						if cc != nil {
+							cc.BackgroundEntry.SetValue(target.img.Background)
+							cc.PeakEntry.SetValue(target.img.Peak)
+							cc.MTFMidtoneEntry.SetValue(target.img.MTFMidtone)
+							cc.ModeSelect.SetSelected("MTF")
+						}
+					}
+				})
+				finished = true
+				progressLabel.SetText("Refreshing previews…")
+				cancelButton.Disable()
+				refreshAsync(func() {
+					if progressDialog != nil {
+						progressDialog.Hide()
+					}
+					magicAll.Enable()
+				})
+			})
+		}()
+	})
+	magicAll.Importance = widget.HighImportance
+
 	options := container.NewVBox(
+		container.NewHBox(widget.NewLabel("Magic preset"), composeMagicPreset),
 		container.NewHBox(sharedHistCheck, widget.NewLabel("Shared histogram scale")),
 		histScaleStatus,
 		container.NewHBox(blinkCheck, widget.NewLabel("Blink filters")),
@@ -2721,6 +3473,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		resetBtn,
 	)
 	channels := container.NewVBox(
+		magicAll,
 		container.NewHBox(buildCompositeCheck, widget.NewLabel("Build color composite")),
 		widget.NewSeparator(),
 		measureLabel,
@@ -2966,30 +3719,22 @@ func (s *tapShield) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(canvas.NewRectangle(color.Transparent))
 }
 
-// magicPresetGroup keeps the per-channel Magic preset selectors in sync: picking
-// a preset on one channel applies it to all registered channels. A re-entrancy
-// guard prevents SetSelected from triggering a broadcast storm.
-type magicPresetGroup struct {
-	selects []*widget.Select
-	syncing bool
+type magicStretchSnapshot struct {
+	Background, Peak, Black, White, MTFMidtone float64
+	Mode                                       stretch.Mode
 }
 
-func (g *magicPresetGroup) add(s *widget.Select) { g.selects = append(g.selects, s) }
-
-func (g *magicPresetGroup) broadcast(value string) {
-	if g == nil || g.syncing {
-		return
-	}
-	g.syncing = true
-	for _, s := range g.selects {
-		if s.Selected != value {
-			s.SetSelected(value)
-		}
-	}
-	g.syncing = false
+func snapshotMagicStretch(img *models.LoadedImage) magicStretchSnapshot {
+	return magicStretchSnapshot{img.Background, img.Peak, img.Black, img.White, img.MTFMidtone, img.Mode}
+}
+func magicStretchUnchanged(img *models.LoadedImage, s magicStretchSnapshot) bool {
+	return snapshotMagicStretch(img) == s
+}
+func installMagicStretch(dst *models.LoadedImage, src models.LoadedImage) {
+	dst.Background, dst.Peak, dst.Black, dst.White, dst.MTFMidtone, dst.Mode = src.Background, src.Peak, src.Black, src.White, src.MTFMidtone, src.Mode
 }
 
-func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func(), magicGroup *magicPresetGroup, allowRotate bool) *models.ChannelControl {
+func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func(), magicPreset *widget.Select, allowRotate bool) *models.ChannelControl {
 	// Stretch-specific parameter rows. Only the row(s) relevant to the selected
 	// mode are shown; the rest stay hidden to avoid clutter.
 	asinhScaleEntry := NewNumberEntry(0.1, 3)
@@ -3180,12 +3925,6 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		selectBox.SetSelected("MTF") // also reveals the MTF row and triggers refresh
 	})
 
-	magicPreset := widget.NewSelect([]string{"Balanced", "Nebula", "Galaxy"}, nil)
-	magicPreset.SetSelected("Balanced")
-	if magicGroup != nil {
-		magicGroup.add(magicPreset)
-		magicPreset.OnChanged = func(value string) { magicGroup.broadcast(value) }
-	}
 	magic := widget.NewButton("Magic", func() {
 		if imgs[idx] == nil {
 			return
@@ -3252,7 +3991,7 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 			ghsSPRow,
 			container.NewHBox(showClip, widget.NewLabel("Show clipped pixels")),
 			container.NewHBox(outlinedButton(col, auto), outlinedButton(col, autoMTF), outlinedButton(col, apply)),
-			container.NewHBox(outlinedButton(col, magic), magicPreset),
+			outlinedButton(col, magic),
 			func() fyne.CanvasObject {
 				if allowRotate {
 					return outlinedButton(col, rotate)
@@ -3300,6 +4039,7 @@ type composePreviewData struct {
 	RGBStats       [3]histogram.Stats
 	StarlessResult *processing.StarlessResult
 	BlinkFrames    []composeBlinkFrame
+	Rendered       *processing.ComposeRenderResult
 }
 
 type composeBlinkFrame struct {

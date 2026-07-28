@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -9,8 +10,8 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
+	"github.com/wierdling/gofiledialog"
 )
 
 type drizzleQueueWindow struct {
@@ -47,7 +48,7 @@ func (ws *mosaicWorkspace) openDrizzleQueue() {
 	q.stage = widget.NewLabel("Queue is empty.")
 	q.overall = widget.NewLabel("")
 	q.progress = widget.NewProgressBar()
-	q.addBtn = widget.NewButton("Add Project...", q.addProject)
+	q.addBtn = widget.NewButton("Add Projects...", q.addProject)
 	q.generateBtn = widget.NewButton("Create Projects from Directory...", q.openProjectGenerator)
 	q.removeBtn = widget.NewButton("Remove", q.removeSelected)
 	q.upBtn = widget.NewButton("Move Up", func() { q.moveSelected(-1) })
@@ -80,27 +81,55 @@ func (ws *mosaicWorkspace) openDrizzleQueue() {
 }
 
 func (q *drizzleQueueWindow) addProject() {
-	fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-		if err != nil || r == nil {
+	opts := []gofiledialog.Option{
+		gofiledialog.WithTitle("Add Mosaic Projects"),
+		gofiledialog.WithFilters(gofiledialog.Filter{Name: "Mosaic projects", Extensions: []string{".json"}}),
+		gofiledialog.WithMultiSelect(true),
+	}
+	if lastDir := q.ws.app.Preferences().String("lastDir"); lastDir != "" {
+		opts = append(opts, gofiledialog.WithStartDir(lastDir))
+	}
+	if err := gofiledialog.ShowOpen(func(paths []string, err error) {
+		if err != nil {
+			dialog.ShowError(err, q.win)
 			return
 		}
-		path := r.URI().Path()
-		_ = r.Close()
-		project, absPath, readErr := readMosaicProject(path)
-		if readErr != nil {
-			dialog.ShowError(readErr, q.win)
+		if len(paths) == 0 {
 			return
+		}
+		q.ws.app.Preferences().SetString("lastDir", filepath.Dir(paths[0]))
+		added, duplicates, addErr := q.addProjectPaths(paths)
+		if added > 0 {
+			q.refresh()
+		}
+		if addErr != nil {
+			if duplicates > 0 {
+				addErr = fmt.Errorf("%w\n%d selected project(s) were already queued", addErr, duplicates)
+			}
+			dialog.ShowError(addErr, q.win)
+		} else if duplicates > 0 {
+			dialog.ShowInformation("Already Queued", fmt.Sprintf("%d selected project(s) were already in the queue.", duplicates), q.win)
+		}
+	}, q.win, opts...); err != nil {
+		dialog.ShowError(err, q.win)
+	}
+}
+
+func (q *drizzleQueueWindow) addProjectPaths(paths []string) (added, duplicates int, addErr error) {
+	var failures []error
+	for _, path := range paths {
+		project, absPath, err := readMosaicProject(path)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", filepath.Base(path), err))
+			continue
 		}
 		if !q.addGeneratedProject(absPath, project, false) {
-			dialog.ShowInformation("Already Queued", "That Mosaic project is already in the queue.", q.win)
-			return
+			duplicates++
+			continue
 		}
-		q.refresh()
-	}, q.win)
-	fd.SetFilter(storage.NewExtensionFileFilter([]string{".json"}))
-	q.ws.configureLastDir(fd)
-	sizeFileDialog(fd)
-	fd.Show()
+		added++
+	}
+	return added, duplicates, errors.Join(failures...)
 }
 
 func (q *drizzleQueueWindow) removeSelected() {

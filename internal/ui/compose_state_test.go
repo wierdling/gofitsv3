@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"math"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,162 @@ import (
 	"gofitsv3/internal/processing"
 	"gofitsv3/internal/stretch"
 )
+
+func TestComposeCalibrationJobRejectsLateResult(t *testing.T) {
+	var job composeCalibrationJob
+	if _, ok := job.begin(1); !ok {
+		t.Fatal("begin rejected")
+	}
+	state := models.ColorCalibrationState{Status: models.CalibrationCalculating}
+	result := processing.CalibrationResult{Status: models.CalibrationValid, Base: [3]models.LinearTransform{{Gain: 1}, {Gain: 2}, {Gain: 3}}}
+	if composeCalibrationResultForUI(&job, 1, 2, &state, nil, result, nil) {
+		t.Fatal("late result was accepted")
+	}
+	if state.Status != models.CalibrationCalculating {
+		t.Fatalf("late result changed state: %s", state.Status)
+	}
+}
+
+func TestComposeCalibrationJobSuccessAndFailure(t *testing.T) {
+	var job composeCalibrationJob
+	state := models.ColorCalibrationState{Status: models.CalibrationCalculating}
+	ctx, ok := job.begin(3)
+	if !ok || ctx == nil {
+		t.Fatal("begin failed")
+	}
+	result := processing.CalibrationResult{Status: models.CalibrationValid, Base: [3]models.LinearTransform{{Gain: 1}, {Gain: 2}, {Gain: 3}}, SourceFingerprint: "source"}
+	if !composeCalibrationResultForUI(&job, 3, 3, &state, nil, result, nil) || state.Status != models.CalibrationValid || state.SourceFingerprint != "source" {
+		t.Fatalf("success not published: %+v", state)
+	}
+	state.BaseTransforms = [3]models.LinearTransform{}
+	if _, ok := job.begin(4); !ok {
+		t.Fatal("second begin failed")
+	}
+	if !composeCalibrationResultForUI(&job, 4, 4, &state, nil, processing.CalibrationResult{}, errors.New("bad metadata")) || state.Status != models.CalibrationFailed {
+		t.Fatalf("failure not published: %+v", state)
+	}
+	state = models.ColorCalibrationState{Status: models.CalibrationStale, BaseTransforms: [3]models.LinearTransform{{Gain: 1}, {Gain: 1}, {Gain: 1}}}
+	prior := state
+	if _, ok := job.begin(5); !ok {
+		t.Fatal("third begin failed")
+	}
+	if !composeCalibrationResultForUI(&job, 5, 5, &state, &prior, processing.CalibrationResult{}, errors.New("temporary")) || state.Status != models.CalibrationStale {
+		t.Fatalf("prior stale result was not retained after failure: %+v", state)
+	}
+	state = models.ColorCalibrationState{Status: models.CalibrationCalculating, BaseTransforms: prior.BaseTransforms}
+	if _, ok := job.begin(6); !ok {
+		t.Fatal("unsupported begin failed")
+	}
+	if !composeCalibrationResultForUI(&job, 6, 6, &state, &prior, processing.CalibrationResult{}, &processing.UnsupportedPhotometryError{Reason: "missing filter"}) || state.Status != models.CalibrationUnsupported {
+		t.Fatalf("unsupported result did not disable application: %+v", state)
+	}
+	state = models.ColorCalibrationState{Status: models.CalibrationCalculating, BaseTransforms: prior.BaseTransforms}
+	if _, ok := job.begin(7); !ok {
+		t.Fatal("unsupported background begin failed")
+	}
+	if !composeCalibrationResultForUI(&job, 7, 7, &state, &prior, processing.CalibrationResult{}, &processing.UnsupportedCalibrationError{Reason: "invalid ROI"}) || state.Status != models.CalibrationUnsupported {
+		t.Fatalf("unsupported background result did not publish: %+v", state)
+	}
+}
+
+func TestComposeCalibrationResultPersistsGaiaProvenanceAndFingerprints(t *testing.T) {
+	var job composeCalibrationJob
+	if _, ok := job.begin(11); !ok {
+		t.Fatal("begin failed")
+	}
+	prov := models.CalibrationProvenance{CatalogVersion: "custom-release", ProviderVersion: "provider-x", SourceIDs: []uint64{7, 9}}
+	result := processing.CalibrationResult{Status: models.CalibrationValid, Provenance: prov, SourceFingerprint: "src-fp", SettingsFingerprint: "settings-fp"}
+	state := models.ColorCalibrationState{Status: models.CalibrationCalculating}
+	if !composeCalibrationResultForUI(&job, 11, 11, &state, nil, result, nil) {
+		t.Fatal("result rejected")
+	}
+	if state.Provenance.CatalogVersion != prov.CatalogVersion || state.Provenance.ProviderVersion != prov.ProviderVersion || state.SettingsFingerprint != result.SettingsFingerprint || state.SourceFingerprint != result.SourceFingerprint || len(state.Provenance.SourceIDs) != 2 {
+		t.Fatalf("Gaia result was not persisted verbatim: %+v", state)
+	}
+}
+
+func TestComposeCalibrationSnapshotDisablePreservesLiveState(t *testing.T) {
+	state := models.ColorCalibrationState{Status: models.CalibrationValid, BaseTransforms: [3]models.LinearTransform{{Gain: 2}}, Provenance: models.CalibrationProvenance{CatalogVersion: "DR3"}, Overlays: []models.OverlayCalibrationState{{Status: models.CalibrationValid, Transform: models.LinearTransform{Gain: 3}}}}
+	snapshot := composeCalibrationSnapshot(state, true)
+	if snapshot.Status != models.CalibrationDisabled || state.Status != models.CalibrationValid {
+		t.Fatalf("disable changed wrong state: snapshot=%v live=%v", snapshot.Status, state.Status)
+	}
+	if snapshot.BaseTransforms != state.BaseTransforms || snapshot.Provenance.CatalogVersion != state.Provenance.CatalogVersion || snapshot.Overlays[0].Transform != state.Overlays[0].Transform {
+		t.Fatal("snapshot lost calibration transforms or provenance")
+	}
+	snapshot = composeCalibrationSnapshot(state, false)
+	if snapshot.Status != models.CalibrationValid {
+		t.Fatalf("re-enabled snapshot status = %v", snapshot.Status)
+	}
+}
+
+func TestComposeCalibrationPreviewOverrideDoesNotChangeExportGate(t *testing.T) {
+	state := models.ColorCalibrationState{Status: models.CalibrationValid, BaseTransforms: [3]models.LinearTransform{{Gain: 2}, {Gain: 1}, {Gain: 1}}}
+	before := false
+	preview := composeCalibrationPreviewSnapshot(state, true, &before)
+	if preview.Status != models.CalibrationDisabled {
+		t.Fatalf("Before preview status=%v, want disabled", preview.Status)
+	}
+	export := composeCalibrationSnapshot(state, false)
+	if export.Status != models.CalibrationValid {
+		t.Fatalf("export snapshot status=%v, want valid while Save is enabled", export.Status)
+	}
+	export = composeCalibrationSnapshot(state, true)
+	if export.Status != models.CalibrationDisabled {
+		t.Fatalf("export snapshot status=%v, want disabled while Save is disabled", export.Status)
+	}
+}
+
+func TestUpdateComposeGaiaCachePathPreservesValidCalibration(t *testing.T) {
+	state := models.ColorCalibrationState{Status: models.CalibrationValid, BaseTransforms: [3]models.LinearTransform{{Gain: 1}, {Gain: 1}, {Gain: 1}}}
+	updateComposeGaiaCachePath(&state, "cache.db")
+	if state.Status != models.CalibrationValid || state.Gaia.CachePath != "cache.db" {
+		t.Fatalf("cache path edit altered calibration state: %+v", state)
+	}
+}
+
+func TestRetainComposeProjectGaiaCachePathDoesNotPinFallback(t *testing.T) {
+	project := models.GaiaCalibrationSettings{}
+	resolved := models.GaiaCalibrationSettings{CachePath: "A.db", Release: "DR3"}
+	accepted := retainComposeProjectGaiaCachePath(project, resolved)
+	if accepted.CachePath != "" || accepted.Release != "DR3" {
+		t.Fatalf("resolved settings were not separated from project path: %+v", accepted)
+	}
+	project.CachePath = "explicit.db"
+	accepted = retainComposeProjectGaiaCachePath(project, resolved)
+	if accepted.CachePath != "explicit.db" {
+		t.Fatalf("explicit project path was not retained: %q", accepted.CachePath)
+	}
+	project.CachePath = "B.db"
+	accepted = retainComposeProjectGaiaCachePath(project, resolved)
+	if accepted.CachePath != "B.db" {
+		t.Fatalf("live in-flight project path was not retained: %q", accepted.CachePath)
+	}
+}
+
+func TestComposeCalibrationCancelAndStale(t *testing.T) {
+	var job composeCalibrationJob
+	if _, ok := job.begin(1); !ok || !job.cancelJob() || job.cancelJob() {
+		t.Fatal("cancel state transition incorrect")
+	}
+	state := models.ColorCalibrationState{Status: models.CalibrationValid}
+	markComposeCalibrationStale(&state)
+	if state.Status != models.CalibrationStale {
+		t.Fatalf("expected stale, got %s", state.Status)
+	}
+	state.Status = models.CalibrationDisabled
+	markComposeCalibrationStale(&state)
+	if state.Status != models.CalibrationDisabled {
+		t.Fatal("disabled state should remain disabled")
+	}
+}
+
+func TestComposeCalibrationStatusText(t *testing.T) {
+	got := composeCalibrationStatusText(models.ColorCalibrationState{Status: models.CalibrationStale})
+	if got == "" || got == "Calibration: stale" {
+		t.Fatalf("missing actionable status: %q", got)
+	}
+}
 
 func TestClearComposeOrigPixels(t *testing.T) {
 	orig := [][]float32{

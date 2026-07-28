@@ -27,6 +27,7 @@ var (
 type Toggle struct {
 	widget.BaseWidget
 	Checked   bool
+	disabled  bool
 	OnChanged func(bool)
 }
 
@@ -38,12 +39,18 @@ func NewToggle(changed func(bool)) *Toggle {
 }
 
 func (t *Toggle) Tapped(_ *fyne.PointEvent) {
+	if t.disabled {
+		return
+	}
 	t.Checked = !t.Checked
 	t.Refresh()
 	if t.OnChanged != nil {
 		t.OnChanged(t.Checked)
 	}
 }
+
+func (t *Toggle) Disable() { t.disabled = true; t.Refresh() }
+func (t *Toggle) Enable()  { t.disabled = false; t.Refresh() }
 
 func (t *Toggle) TappedSecondary(_ *fyne.PointEvent) {}
 

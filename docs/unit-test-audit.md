@@ -18,7 +18,7 @@ This document tracks the current quality of unit tests in this repository using 
 
 | Package | Rating | Priority | Notes |
 | --- | --- | --- | --- |
-| `internal/processing` | well covered | medium | Broad behavior coverage now includes the main `processing.go` helper layer in addition to alignment, masking, compose, cleaning, WCS, and starless processing |
+| `internal/processing` | well covered | medium | Broad behavior coverage now includes the main `processing.go` helper layer, calibration math/background estimation, canonical render paths, and a deterministic save/load/render regression fixture in addition to alignment, masking, compose, cleaning, WCS, and starless processing |
 | `internal/mosaic` | well covered | medium | Strong scenario coverage for drizzle/input planning, but still worth targeted edge-case additions |
 | `internal/histogram` | well covered | low | Small logic surface and direct branch coverage |
 | `internal/render` | well covered | low | Core rendering helpers are directly tested |
@@ -30,6 +30,7 @@ This document tracks the current quality of unit tests in this repository using 
 | `badpix` | partially covered | medium | Cleaning now covers DQ presence, missing-DQ behavior, bad-bit filtering, and load failures, with only rarer malformed-file edge cases still thin |
 | `internal/fitsio` | partially covered | medium | Synthetic parser/writer tests now cover core branches; a few low-level edge cases still remain |
 | `internal/models` | partially covered | medium | Persistence coverage now includes Compose and Mosaic project/state round-trips, with only backward-compat edge cases still thin |
+| `internal/catalog/gaia` | well covered | medium | Provider/cache tests cover migrations, deduplication, endpoint semantics, retries, cancellation, cache-only misses, and an online-to-cache-only end-to-end fixture |
 | `internal/config` | no direct unit tests | low | Currently small surface; add tests if validation or branching grows |
 | `internal/debuglog` | no direct unit tests | low | Low-risk logging wrapper |
 | `internal/debugtime` | no direct unit tests | low | Low-risk timing helper |
@@ -227,6 +228,25 @@ This document tracks the current quality of unit tests in this repository using 
 3. `internal/mosaic`: add a targeted edge-case pass for malformed headers and bookkeeping/status branches.
 4. `internal/ui`: add only targeted regression cases if project-loop wiring or preview application state starts causing bugs.
 5. `internal/models`: add a backward-compat decode test only if legacy project-file compatibility becomes a real concern.
+
+### Color calibration Phase 1 gate
+
+The Phase 1 calibration suite includes direct tests for instrument metadata
+boundaries, robust background estimation, transform fingerprints and staleness,
+canonical render status handling, overlay-mode separation, and a JSON
+save/load/render fixture. The fixture verifies Off behavior, a valid persisted
+instrument/background result, stale non-application, and repeatable preview
+bytes. UI-only dialogs, visual Before/After inspection, and actual file export
+through platform widgets remain manual acceptance checks.
+
+### Color calibration Phase 2 gate
+
+Gaia provider and SQLite cache behavior now have deterministic mocked HTTP and
+cache-only coverage. Manual acceptance is still required for first online use,
+cancellation at each UI stage, insufficient-star messaging, preview/export
+equality, and project save/reload on a representative workstation. The Gaia
+documentation records network/privacy scope, cache growth/deletion, migration
+behavior, passband limits, quality thresholds, and provenance fields.
 
 ## Validation Notes
 - Existing package tests reviewed during this audit passed for:

@@ -252,6 +252,71 @@ If you have a fourth filter (for example, a narrow-band Hydrogen-Alpha `F656N` i
 * **Cross-Channel Clean**: Click this under the `Compose` menu. It builds a protective star mask and cleans up single-channel cosmic rays or hot pixels that survived the drizzling stage.
 * **Normalize Scale**: Adjusts the scale factor of the channels relative to Channel 2 to ensure a color-balanced starting point.
 
+#### Optional color calibration
+
+Compose color calibration is opt-in. Existing projects and new projects start
+with calibration **Off**, and the established Artistic overlay behavior remains
+the default. Calibration is a non-destructive render transform: it never
+replaces loaded channel pixels and a saved result remains inspectable when its
+inputs later become stale.
+
+The Phase 1 instrument matrix is deliberately explicit:
+
+| Telescope | Instrument / detector | Filters | Accepted input |
+| --- | --- | --- | --- |
+| HST | ACS / WFC | F435W, F606W, F814W | `ELECTRONS/S` or `COUNTS` with positive `PHOTFLAM` or `PHOTFNU`; `COUNTS` also requires positive `EXPTIME` |
+| HST | WFC3 / UVIS | F275W, F336W, F438W, F555W, F606W, F814W | same count/count-rate rules |
+| HST | WFC3 / IR | F105W, F125W, F160W | same count/count-rate rules |
+| JWST | NIRCam / NRC detector | F090W, F150W, F200W, F277W, F356W, F444W | calibrated `Jy`, `MJy`, or `MJy/sr` |
+| JWST | MIRI / MIRIMAGE | F770W, F1000W, F1500W, F1800W, F2100W, F2550W | calibrated `Jy`, `MJy`, or `MJy/sr` |
+
+SCI keywords are authoritative; primary-header keywords are only a fallback.
+Unknown filters, detectors, units, missing or contradictory keywords,
+non-positive exposure or pixel-area values, and unsupported combinations are
+reported as **Unsupported** rather than guessed. JWST detector counts and
+Flambda inputs are not accepted in this phase.
+
+For an HST count-rate image, `F_lambda = countRate * PHOTFLAM`; counts are
+first divided by `EXPTIME`. When Fnu is requested,
+`F_nu[Jy] = F_lambda * pivotAngstrom^2 / cAngstromPerSecond * 1e23`.
+The inverse conversion is used for Flambda output. A calibrated JWST Fnu image
+is used as-is in Jy (`MJy` is multiplied by 1e6); `MJy/sr` is multiplied by
+`PIXAR_SR` before conversion. Supported white references are flat Fnu and flat
+Flambda. The average spiral-galaxy reference is reserved for a future
+reference-data release and is reported unsupported when selected.
+
+Background neutralization is independent of instrument mode. Automatic
+sampling rejects non-finite pixels, detected stars, bright outliers, and
+insufficient samples; a shared ROI can instead be specified in aligned
+reference coordinates. Spatial tiles are checked for uniformity. A gradient or
+extended structure beyond the threshold is refused as **Unsupported**, because
+a scalar offset cannot remove a two-dimensional background. The operation is
+always `y = (x - offset) * gain`.
+
+The optional linked calibrated stretch is applied once to calibrated RGB data
+so channels retain their relative color. Calibration gains are normalized to
+remove arbitrary global luminance scale. A **Calibrated Linear** overlay is
+opt-in and contributes before that shared stretch using its persisted transform,
+tint, and strength. Artistic overlays continue to use the existing post-stretch
+palette path. Even with a physically normalized input, an overlay tint is a
+user-chosen display palette, not a unique scientific color.
+
+Each result records status, diagnostics, algorithm/reference versions,
+provenance, and source/settings fingerprints. **Valid** results are applied;
+**Stale**, **Unsupported**, **Cancelled**, and **Failed** results are not.
+Changing pixels, alignment, metadata, ROI, white reference, stretch, overlay
+order/source/tint/strength/mode, or the algorithm version marks a result stale.
+The same immutable render result supplies preview, Before/After, Edit handoff,
+and 8-bit/16-bit export representations. Cancelling a calculation leaves the
+previous valid result available until a replacement succeeds.
+
+For acceptance testing, verify Off regression, background-only operation, each
+matrix row and reference, unsupported metadata, ROI, cancellation, save/reload,
+Before/After, preview/export equality, and mixed Artistic plus Calibrated Linear
+overlays. The automated processing fixture covers deterministic save/load/render
+and stale/non-application cases; UI dialogs and visual Before/After appearance
+remain manual checks.
+
 When finished, select `File -> Send Composite to Edit`.
 
 ---
@@ -319,6 +384,31 @@ Let's walk through the creation of a color image of the **Whirlpool Galaxy (M51)
 *Congratulations, you have created a professional-grade space photograph!*
 
 ---
+
+### Gaia Photometric Calibration (optional)
+
+Gaia mode is an SPCC-like, reproducible photometric fit—not PixInsight code.
+In **Online** mode GoFitsV3 requests only the selected sky footprint and
+catalog criteria from the configured Gaia service; image pixels and project
+files stay local. The default ESA service uses TAP for DR3 source discovery and
+DataLink to download sampled XP spectra only for stars matched to the image.
+**Cache Only** uses the local SQLite catalog and reports a clear miss when data
+are unavailable. The default cache is stored under the user cache directory
+(`gofitsv3/gaia-cache.sqlite`); overlapping fields reuse deduplicated source and
+XP records. You may delete or relocate it at any time; a saved valid project
+still renders from its persisted transforms and provenance, without network
+access.
+
+Proper motion is propagated from Gaia's reference epoch to the FITS observation
+epoch. The quality selector, magnitude limit, match radius and observation epoch
+are saved as Gaia settings. Compose persists/displays the matched/accepted
+status message; residuals, scatter and per-star rejection details remain
+internal fit data. Persisted provenance retains source IDs, catalog release,
+provider/passband versions, and source and settings fingerprints. Only
+versioned passbands with complete
+XP wavelength coverage are supported (currently G/BP/RP, F435W, F606W and
+F814W); unsupported bands fail rather than extrapolate. Gaia can estimate an
+overlay scalar, but artistic tint and opacity remain your choices.
 
 ## 6. Glossary of Terms
 

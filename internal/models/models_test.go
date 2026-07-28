@@ -2,9 +2,109 @@ package models
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
+
+func TestLegacyComposeProjectCalibrationDefaults(t *testing.T) {
+	var project ComposeProject
+	if err := json.Unmarshal([]byte(`{"channels":[{"path":"r.fits"}]}`), &project); err != nil {
+		t.Fatal(err)
+	}
+	if project.ColorCalibration != nil {
+		t.Fatal("legacy project unexpectedly has calibration state")
+	}
+	if got := (ColorCalibrationState{}).Effective(); got.PhotometricMode != PhotometricOff || got.Status != CalibrationDisabled {
+		t.Fatalf("defaults = %+v", got)
+	}
+	if got := (OverlayCalibrationState{}); got.Mode != "" {
+		t.Fatal("zero overlay mode should remain omitted for compatibility")
+	}
+	if project.DisableColorCalibration {
+		t.Fatal("legacy project unexpectedly disabled calibration")
+	}
+}
+
+func TestComposeProjectDisableColorCalibrationRoundTrip(t *testing.T) {
+	project := ComposeProject{DisableColorCalibration: true, ColorCalibration: &ColorCalibrationState{Status: CalibrationValid, BaseTransforms: [3]LinearTransform{{Gain: 1}, {Gain: 1}, {Gain: 1}}}}
+	data, err := json.Marshal(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ComposeProject
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.DisableColorCalibration || decoded.ColorCalibration == nil || decoded.ColorCalibration.Status != CalibrationValid {
+		t.Fatalf("project round trip lost disable/calibration state: %+v", decoded)
+	}
+}
+
+func TestColorCalibrationStateRoundTripAndValidation(t *testing.T) {
+	project := ComposeProject{ColorCalibration: &ColorCalibrationState{
+		Version: 1, PhotometricMode: PhotometricInstrument, NeutralizeBackground: true,
+		BackgroundSelection: BackgroundROI, BackgroundROI: CalibrationROI{X: 2, Y: 3, Width: 8, Height: 9},
+		WhiteReference: WhiteReferenceFlatFlambda,
+		BaseTransforms: [3]LinearTransform{{Offset: -2.5, Gain: 1.2}, {Offset: 0, Gain: 0.8}, {Offset: -0.25, Gain: 2}},
+		Overlays:       []OverlayCalibrationState{{Mode: OverlayCalibratedLinear, Transform: LinearTransform{Offset: -1, Gain: .5}, Strength: -0.75, Status: CalibrationValid}},
+		Status:         CalibrationValid, SourceFingerprint: "source", SettingsFingerprint: "settings",
+	}}
+	data, err := json.Marshal(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ComposeProject
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	state := decoded.ColorCalibration
+	if state == nil || state.BaseTransforms[0].Offset != -2.5 || state.BaseTransforms[2].Gain != 2 || state.Overlays[0].Strength != -.75 {
+		t.Fatalf("decoded calibration = %+v", state)
+	}
+	for _, raw := range []string{
+		`{"status":"valid","baseTransforms":[{"offset":0,"gain":NaN}]}`,
+		`{"status":"valid","baseTransforms":[{"offset":0,"gain":-1}]}`,
+		`{"photometricMode":"bogus"}`,
+		`{"status":"disabled","baseTransforms":[{"offset":0,"gain":-1}]}`,
+	} {
+		var got ColorCalibrationState
+		if err := json.Unmarshal([]byte(raw), &got); err == nil {
+			t.Fatalf("invalid state %s accepted", raw)
+		}
+	}
+	var gaiaState ColorCalibrationState
+	if err := json.Unmarshal([]byte(`{"photometricMode":"gaia"}`), &gaiaState); err != nil || gaiaState.PhotometricMode != PhotometricGaia {
+		t.Fatalf("phase 2 Gaia mode rejected: state=%+v err=%v", gaiaState, err)
+	}
+	if math.IsNaN(decoded.ColorCalibration.BaseTransforms[1].Gain) {
+		t.Fatal("NaN survived round trip")
+	}
+}
+
+func TestOverlayCalibrationDefaultsNormalizeOnDecode(t *testing.T) {
+	var state ColorCalibrationState
+	if err := json.Unmarshal([]byte(`{"overlays":[{}]}`), &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Overlays[0].Mode != OverlayArtistic || state.Overlays[0].Status != CalibrationDisabled {
+		t.Fatalf("overlay defaults = %+v", state.Overlays[0])
+	}
+}
+
+func TestExplicitZeroTransformsRejectedForEveryTerminalStatus(t *testing.T) {
+	for _, status := range []string{"disabled", "stale", "cancelled", "failed"} {
+		for _, raw := range []string{
+			`{"status":"` + status + `","baseTransforms":[{"offset":0,"gain":0}]}`,
+			`{"status":"` + status + `","overlays":[{"transform":{"offset":0,"gain":0}}]}`,
+		} {
+			var state ColorCalibrationState
+			if err := json.Unmarshal([]byte(raw), &state); err == nil {
+				t.Fatalf("status %s accepted explicit zero transform: %s", status, raw)
+			}
+		}
+	}
+}
 
 func TestComposeProjectStarlessSettingsRoundTripPreservesZeroValues(t *testing.T) {
 	project := ComposeProject{
@@ -421,6 +521,15 @@ func TestChannelStateAndMosaicInputStateZeroAndNegativeValuesRoundTrip(t *testin
 	}
 	if !decoded.Input.HasTransform || decoded.Input.OffsetX != -12.5 || decoded.Input.TransformB != -0.5 {
 		t.Fatalf("Input = %+v, want preserved transform values", decoded.Input)
+	}
+}
+
+func TestColorCalibrationGaiaSettingsRoundTrip(t *testing.T) {
+	original := ColorCalibrationState{PhotometricMode: PhotometricGaia, Status: CalibrationValid, BaseTransforms: [3]LinearTransform{{Gain: 1}, {Gain: 1}, {Gain: 1}}, Gaia: GaiaCalibrationSettings{AccessMode: "cacheOnly", Endpoint: "https://gaia.test", Release: "DR3", XPRepresentation: "xp-v1", QualitySelector: "clean", MagnitudeLimit: 18, MatchRadiusArcsec: 2, ObservationEpoch: 2024, CachePath: "cache.db", CacheMaxBytes: 1234}, Provenance: CalibrationProvenance{CatalogVersion: "DR3", SourceIDs: []uint64{1, 2}}}
+	var decoded ColorCalibrationState
+	roundTripJSON(t, original, &decoded)
+	if decoded.PhotometricMode != PhotometricGaia || decoded.Gaia.AccessMode != "cacheOnly" || decoded.Gaia.Release != "DR3" || len(decoded.Provenance.SourceIDs) != 2 {
+		t.Fatalf("round trip lost Gaia state: %+v", decoded)
 	}
 }
 
