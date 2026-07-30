@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gofitsv3/internal/debuglog"
+	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
 )
 
@@ -110,6 +111,28 @@ type composeAlignmentResult struct {
 	RootIndex int
 	Channels  map[int]composeAlignmentChannelResult
 	Attempts  []composeAlignmentAttempt
+}
+
+// composeLargeAlignmentReferenceCurrent is the commit guard for a catalog
+// alignment job. The reference descriptor must be unchanged before any target
+// affine is installed.
+func composeLargeAlignmentReferenceCurrent(current, expected composeArtifactDescriptor) bool {
+	return expected.Path != "" && current.Path == expected.Path && current.Generation == expected.Generation
+}
+
+func resetComposeAlignmentOffsets(control *models.ChannelControl) {
+	if control == nil {
+		return
+	}
+	if control.XOffsetEntry != nil {
+		control.XOffsetEntry.SetValue(0)
+	}
+	if control.YOffsetEntry != nil {
+		control.YOffsetEntry.SetValue(0)
+	}
+	if control.RotOffsetEntry != nil {
+		control.RotOffsetEntry.SetValue(0)
+	}
 }
 
 func coordinateComposeAlignment(channels []composeAlignmentChannel, rootIndex int, match composeAlignmentMatcher) composeAlignmentResult {

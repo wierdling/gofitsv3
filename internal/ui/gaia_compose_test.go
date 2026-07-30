@@ -13,9 +13,44 @@ import (
 	"gofitsv3/internal/processing"
 )
 
+func TestAlignedArtifactReadWindowSamplesOnlyRequestedSourceRange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.rawf32")
+	a, err := fitsio.CreateFloat32Artifact(path, 100, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for y := 0; y < 4; y++ {
+		row := make([]float32, 100)
+		for x := range row {
+			row[x] = float32(y*100 + x)
+		}
+		if err := a.WriteRow(y, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	inst := &fitsio.ArtifactInstrumentation{}
+	fitsio.SetArtifactInstrumentation(inst)
+	defer fitsio.SetArtifactInstrumentation(nil)
+	r := &alignedArtifactRowReader{path: path, source: models.LoadedImage{}, reference: models.LoadedImage{}, width: 100, height: 4}
+	defer r.Close()
+	dst := make([]float32, 3)
+	if err := r.ReadWindow(1, 20, 23, dst); err != nil {
+		t.Fatal(err)
+	}
+	if got := inst.LargestBuffer.Load(); got >= 100*4 {
+		t.Fatalf("window read used full source row buffer: %d bytes", got)
+	}
+	if math.IsNaN(float64(dst[0])) {
+		t.Fatal("valid window returned NaN")
+	}
+}
+
 func TestGaiaMatchRadiusParsingAndNormalization(t *testing.T) {
-	if got := normalizeGaiaMatchRadiusArcsec(0); got != 2 {
-		t.Fatalf("unset radius = %v, want 2", got)
+	if got := normalizeGaiaMatchRadiusArcsec(0); got != 10 {
+		t.Fatalf("unset radius = %v, want 10", got)
 	}
 	for _, radius := range []float64{-1, math.NaN(), math.Inf(1)} {
 		got := normalizeGaiaMatchRadiusArcsec(radius)
@@ -173,6 +208,44 @@ func TestDeriveGaiaFieldQueryUsesTANProjectionAndGeometricFootprint(t *testing.T
 		if angularSeparationDeg(center, p) > q.Footprint.RadiusDeg+1e-12 {
 			t.Fatalf("corner %+v outside radius %.9f", corner, q.Footprint.RadiusDeg)
 		}
+	}
+}
+
+func TestDeriveGaiaFieldProjectionRoundTripsTAN(t *testing.T) {
+	img := &models.LoadedImage{HDU: fitsio.HDU{Header: fitsio.Header{Cards: map[string]string{
+		"CRVAL1": "116.73101182695", "CRVAL2": "39.025082290628", "CRPIX1": "2028.354937", "CRPIX2": "1226.439365",
+		"CTYPE1": "RA---TAN", "CTYPE2": "DEC--TAN", "CD1_1": "4.79342542333e-06", "CD1_2": "-1.2741944547e-05", "CD2_1": "-1.29854994213e-05", "CD2_2": "-5.73504303172e-06", "DATE-OBS": "2020-11-20",
+	}}, Data: fitsio.ImageData{Width: 4122, Height: 4298}}}
+	_, toSky, toPixel, err := deriveGaiaFieldProjection(img, models.GaiaCalibrationSettings{Release: "DR3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, y := 100.0, 201.0
+	c, err := toSky(x, y)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rx, ry, err := toPixel(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(rx-x) > 1e-6 || math.Abs(ry-y) > 1e-6 {
+		t.Fatalf("round trip=(%v,%v), want (%v,%v)", rx, ry, x, y)
+	}
+}
+
+func TestDeriveGaiaFieldQueryAcceptsRotatedCD(t *testing.T) {
+	img := &models.LoadedImage{HDU: fitsio.HDU{Header: fitsio.Header{Cards: map[string]string{
+		"CRVAL1": "10", "CRVAL2": "20", "CRPIX1": "1", "CRPIX2": "1",
+		"CD1_1": "0", "CD1_2": "0.001", "CD2_1": "-0.001", "CD2_2": "0", "DATE-OBS": "2024-01-01",
+	}}, Data: fitsio.ImageData{Width: 10, Height: 10}}}
+	_, proj, err := deriveGaiaFieldQuery(img, models.GaiaCalibrationSettings{Release: "DR3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := proj(1, 0)
+	if err != nil || math.Abs(got.RA-10) > 1e-12 || math.Abs(got.Dec-19.999) > 1e-12 {
+		t.Fatalf("rotated projection=%+v err=%v", got, err)
 	}
 }
 

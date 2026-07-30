@@ -38,23 +38,29 @@ func OpenCache(ctx context.Context, path string) (*Cache, error) {
 	}
 	dsn := path
 	if path != ":memory:" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, fmt.Errorf("open Gaia cache %q: create parent directory: %w", path, err)
+		}
 		dsn = "file:" + filepath.ToSlash(path) + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open Gaia cache %q: database handle: %w", path, err)
 	}
-	db.SetMaxOpenConns(8)
-	db.SetMaxIdleConns(8)
+	// The cache is a small local SQLite store. A bounded pool avoids opening
+	// eight independent SQLite connections (and their page caches) for a
+	// single picker/calibration job while still allowing one concurrent reader.
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
 	for _, pragma := range []string{"PRAGMA foreign_keys=ON", "PRAGMA journal_mode=WAL", fmt.Sprintf("PRAGMA busy_timeout=%d", cacheBusyTimeoutMS)} {
 		if _, err := db.ExecContext(ctx, pragma); err != nil {
 			db.Close()
-			return nil, err
+			return nil, fmt.Errorf("open Gaia cache %q: %s: %w", path, pragma, err)
 		}
 	}
 	if err := migrate(ctx, db); err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open Gaia cache %q: migrate schema: %w", path, err)
 	}
 	return &Cache{db: db}, nil
 }

@@ -183,6 +183,7 @@ type viewport struct {
 	customZoom    string
 	histColor     [4]uint8 // bar color; if zero, use default white-bg/gray-bar style
 	StatsLabel    *widget.Label
+	renderStatus  *widget.Label
 	FilterLabel   *widget.Label
 	pickerLabel   *widget.Label
 	pickerBox     fyne.CanvasObject
@@ -220,13 +221,16 @@ func newViewport() *viewport {
 	vp.StatsLabel = widget.NewLabel("Sky --  μ --  σ --")
 	vp.StatsLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.StatsLabel.Alignment = fyne.TextAlignCenter
+	vp.renderStatus = widget.NewLabel("Rendering composite…")
+	vp.renderStatus.TextStyle = fyne.TextStyle{Italic: true}
+	vp.renderStatus.Hide()
 	vp.FilterLabel = widget.NewLabel("")
 	vp.FilterLabel.TextStyle = fyne.TextStyle{Italic: true}
 	vp.pickerLabel = widget.NewLabel("Value: --")
 	vp.pickerLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.pickerBox = container.New(layout.NewGridWrapLayout(fyne.NewSize(135, vp.pickerLabel.MinSize().Height)), vp.pickerLabel)
 
-	vp.actionRow = container.NewHBox(layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer())
+	vp.actionRow = container.NewHBox(layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer(), vp.renderStatus)
 
 	histRow := container.NewBorder(nil, nil, container.NewHBox(hpad(6), vp.FilterLabel, hpad(6)), nil, vp.histogram)
 
@@ -255,6 +259,35 @@ func newViewport() *viewport {
 	vp.zoomLabel.SetSelected("fit")
 
 	return vp
+}
+
+// SetCompositeRendering shows a small, modeless status indicator in the
+// viewport header. It deliberately does not cover the image or intercept
+// pointer input, so zooming, picking, and other controls remain interactive
+// while a disk-backed composite is being prepared.
+func (vp *viewport) SetCompositeRendering(rendering bool) {
+	if vp == nil || vp.renderStatus == nil {
+		return
+	}
+	if rendering {
+		vp.renderStatus.Show()
+	} else {
+		vp.renderStatus.Hide()
+	}
+	vp.actionRow.Refresh()
+}
+
+// SetStatsText updates the viewport's status text without changing the image
+// or histogram. Callers that are not already on Fyne's UI thread should wrap
+// this method in fyne.Do.
+func (vp *viewport) SetStatsText(text string) {
+	if vp == nil || vp.StatsLabel == nil {
+		return
+	}
+	if text == "" {
+		text = "Sky --  μ --  σ --"
+	}
+	vp.StatsLabel.SetText(text)
 }
 
 func (vp *viewport) SetLevelPickers(blackFn, whiteFn func()) {

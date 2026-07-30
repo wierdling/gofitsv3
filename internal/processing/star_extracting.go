@@ -1,6 +1,7 @@
 package processing
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"runtime"
@@ -9,6 +10,125 @@ import (
 
 	"gofitsv3/internal/debuglog"
 )
+
+// StarRowReader supplies detector rows without materializing the detector
+// plane. It is used by large-file calibration and alignment paths.
+type StarRowReader interface {
+	ReadRow(row int, dst []float32) error
+}
+
+// ExtractStarsTiledReader detects stars in bounded tiles. A halo keeps blobs
+// crossing tile boundaries visible; duplicate detections are merged by their
+// rounded coordinates. At most one tile (including halo) is resident.
+func ExtractStarsTiledReader(ctx context.Context, r StarRowReader, width, height, tileSize int, thresholdSigma float64, minArea int) ([]Star, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if r == nil || width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("invalid star reader dimensions")
+	}
+	if tileSize <= 0 {
+		tileSize = 256
+	}
+	halo := 8
+	// Keep tiled discovery bounded even when a pathological field contains
+	// millions of detections. Candidates are spatially indexed for O(1)
+	// duplicate checks, then brightness-sorted and capped identically to the
+	// in-memory catalog path.
+	const maxTiledCandidates = TweakRegCatalogMaxStars * 8
+	out := make([]Star, 0, maxTiledCandidates)
+	seen := make(map[[2]int]Star, maxTiledCandidates)
+	for ty := 0; ty < height; ty += tileSize {
+		for tx := 0; tx < width; tx += tileSize {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			x0, y0 := tx-halo, ty-halo
+			if x0 < 0 {
+				x0 = 0
+			}
+			if y0 < 0 {
+				y0 = 0
+			}
+			x1, y1 := tx+tileSize+halo, ty+tileSize+halo
+			if x1 > width {
+				x1 = width
+			}
+			if y1 > height {
+				y1 = height
+			}
+			w, h := x1-x0, y1-y0
+			pixels := make([]float32, w*h)
+			row := make([]float32, width)
+			for y := y0; y < y1; y++ {
+				if err := r.ReadRow(y, row); err != nil {
+					return nil, err
+				}
+				copy(pixels[(y-y0)*w:], row[x0:x1])
+			}
+			for _, s := range ExtractStars(pixels, w, h, thresholdSigma, minArea) {
+				s.X += float64(x0)
+				s.Y += float64(y0)
+				if s.X < float64(tx) || s.X >= float64(min(tx+tileSize, width)) || s.Y < float64(ty) || s.Y >= float64(min(ty+tileSize, height)) {
+					continue
+				}
+				key := [2]int{int(math.Round(s.X)), int(math.Round(s.Y))}
+				dup := false
+				for oy := -1; oy <= 1 && !dup; oy++ {
+					for ox := -1; ox <= 1; ox++ {
+						if prior, ok := seen[[2]int{key[0] + ox, key[1] + oy}]; ok && math.Hypot(prior.X-s.X, prior.Y-s.Y) < 1 {
+							dup = true
+							break
+						}
+					}
+				}
+				if dup {
+					continue
+				}
+				if len(out) < maxTiledCandidates {
+					seen[key] = s
+					out = append(out, s)
+				} else {
+					// Keep a global top-K candidate set so bright stars found in
+					// later tiles are not discarded by scan order.
+					minIdx := 0
+					for i := 1; i < len(out); i++ {
+						if out[i].Peak < out[minIdx].Peak {
+							minIdx = i
+						}
+					}
+					if s.Peak <= out[minIdx].Peak {
+						continue
+					}
+					old := out[minIdx]
+					delete(seen, [2]int{int(math.Round(old.X)), int(math.Round(old.Y))})
+					seen[key] = s
+					out[minIdx] = s
+				}
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Peak != out[j].Peak {
+			return out[i].Peak > out[j].Peak
+		}
+		if out[i].X != out[j].X {
+			return out[i].X < out[j].X
+		}
+		return out[i].Y < out[j].Y
+	})
+	if len(out) > TweakRegCatalogMaxStars {
+		out = out[:TweakRegCatalogMaxStars]
+	}
+	return out, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 type Star struct {
 	X    float64

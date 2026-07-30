@@ -87,6 +87,41 @@ func TestEstimateBackgroundCancellationAndInsufficient(t *testing.T) {
 	}
 }
 
+func TestStreamingCalibrationFingerprintMatchesCanonical(t *testing.T) {
+	p := []float32{1, 2, 3, 4, 5, 6}
+	valid := []bool{true, false, true, true, true, false}
+	row := func(y int, dst []float32) error { copy(dst, p[y*3:(y+1)*3]); return nil }
+	vrow := func(y int, dst []bool) error { copy(dst, valid[y*3:(y+1)*3]); return nil }
+	in := CalibrationInput{SourceIdentity: "x", Width: 3, Height: 2, Pixels: p, Valid: valid, Alignment: "a", Background: models.LinearTransform{Offset: 2, Gain: 1}}
+	settings := CalibrationSettings{NeutralizeBackground: true}
+	want, err := CalculateCalibration([]CalibrationInput{in}, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := CalculateCalibrationStreaming(context.Background(), []CalibrationStreamInput{{SourceIdentity: in.SourceIdentity, Width: 3, Height: 2, ReadRow: row, ReadValidRow: vrow, Alignment: in.Alignment, Background: in.Background}}, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SourceFingerprint != want.SourceFingerprint {
+		t.Fatalf("stream fingerprint %s, canonical %s", got.SourceFingerprint, want.SourceFingerprint)
+	}
+}
+
+func TestEstimateBackgroundStreamHonorsValidAndROI(t *testing.T) {
+	p := []float32{10, 10, 100, 10, 10, 10, 100, 10, 10, 10, 10, 10}
+	valid := make([]bool, len(p))
+	for i := range valid {
+		valid[i] = true
+	}
+	valid[2] = false
+	valid[6] = false
+	in := CalibrationStreamInput{Width: 4, Height: 3, ReadRow: func(y int, dst []float32) error { copy(dst, p[y*4:(y+1)*4]); return nil }, ReadValidRow: func(y int, dst []bool) error { copy(dst, valid[y*4:(y+1)*4]); return nil }}
+	r, err := EstimateBackgroundStream(context.Background(), in, &models.CalibrationROI{X: 0, Y: 0, Width: 4, Height: 3}, BackgroundConfig{MinSamples: 4, TileSize: 2})
+	if err != nil || r.Status != models.CalibrationValid || r.Transform.Offset != 10 {
+		t.Fatalf("estimate=%+v err=%v", r, err)
+	}
+}
+
 func TestEstimateBackgroundUsesAcceptedSamplesForTiles(t *testing.T) {
 	p := make([]float32, 64)
 	for i := range p {

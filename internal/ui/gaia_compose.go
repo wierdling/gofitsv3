@@ -20,7 +20,10 @@ import (
 	"gofitsv3/internal/processing"
 )
 
-const defaultGaiaMatchRadiusArcsec = 2
+// Ten arcseconds accommodates the residual astrometric error commonly present
+// in a newly drizzled mosaic while still being small enough to avoid broad
+// catalog associations. Users can tighten it after the first calibration.
+const defaultGaiaMatchRadiusArcsec = 10
 
 func normalizeGaiaMatchRadiusArcsec(radius float64) float64 {
 	if radius == 0 {
@@ -155,7 +158,7 @@ func deriveGaiaFieldQuery(img *models.LoadedImage, settings models.GaiaCalibrati
 		}
 		a, b, c, d = p11*sx, p12*sx, p21*sy, p22*sy
 	}
-	if a == 0 || d == 0 || !isFinite(a) || !isFinite(b) || !isFinite(c) || !isFinite(d) || math.Abs(dec) > 90 {
+	if !isFinite(a) || !isFinite(b) || !isFinite(c) || !isFinite(d) || math.Abs(dec) > 90 || math.Abs(a*d-b*c) < 1e-18 {
 		return gaia.FieldQuery{}, nil, fmt.Errorf("invalid WCS scale")
 	}
 	crpix1, okx := read("CRPIX1")
@@ -235,6 +238,89 @@ func deriveGaiaFieldQuery(img *models.LoadedImage, settings models.GaiaCalibrati
 	}
 	debuglog.Log(fmt.Sprintf("Gaia WCS setup: center_ra=%.7f center_dec=%.7f footprint=%.5f deg crpix=[%.3f %.3f] size=%dx%d tan=%t scale=[%.6g %.6g %.6g %.6g] epoch=%.3f", q.Footprint.Center.RA, q.Footprint.Center.Dec, q.Footprint.RadiusDeg, crpix1, crpix2, img.HDU.Data.Width, img.HDU.Data.Height, isTAN, a, b, c, d, epoch))
 	return q, pixelToSky, nil
+}
+
+// deriveGaiaFieldProjection exposes the paired inverse used by refinement while
+// retaining deriveGaiaFieldQuery's compatibility for existing callers.
+func deriveGaiaFieldProjection(img *models.LoadedImage, settings models.GaiaCalibrationSettings) (gaia.FieldQuery, func(float64, float64) (gaia.Coordinate, error), func(gaia.Coordinate) (float64, float64, error), error) {
+	q, pixelToSky, err := deriveGaiaFieldQuery(img, settings)
+	if err != nil {
+		return gaia.FieldQuery{}, nil, nil, err
+	}
+	read := func(key string) (float64, bool) {
+		v, ok := fitsio.HeaderFloat(img.HDU.Header, key)
+		return v, ok && isFinite(v)
+	}
+	ra, oka := read("CRVAL1")
+	dec, okd := read("CRVAL2")
+	crpix1, ok1 := read("CRPIX1")
+	crpix2, ok2 := read("CRPIX2")
+	if !ok1 {
+		crpix1 = 1
+	}
+	if !ok2 {
+		crpix2 = 1
+	}
+	var a, b, c, d float64
+	if a, ok1 = read("CD1_1"); ok1 {
+		var ok bool
+		b, ok = read("CD1_2")
+		if !ok {
+			return q, nil, nil, fmt.Errorf("incomplete CD WCS matrix")
+		}
+		c, ok = read("CD2_1")
+		if !ok {
+			return q, nil, nil, fmt.Errorf("incomplete CD WCS matrix")
+		}
+		d, ok = read("CD2_2")
+		if !ok {
+			return q, nil, nil, fmt.Errorf("incomplete CD WCS matrix")
+		}
+	} else {
+		sx, oksx := read("CDELT1")
+		sy, oksy := read("CDELT2")
+		if !oksx || !oksy {
+			return q, nil, nil, fmt.Errorf("Gaia requires verified linear WCS metadata")
+		}
+		p11, p12, p21, p22 := 1.0, 0.0, 0.0, 1.0
+		if v, ok := read("PC1_1"); ok {
+			p11 = v
+		}
+		if v, ok := read("PC1_2"); ok {
+			p12 = v
+		}
+		if v, ok := read("PC2_1"); ok {
+			p21 = v
+		}
+		if v, ok := read("PC2_2"); ok {
+			p22 = v
+		}
+		a, b, c, d = p11*sx, p12*sx, p21*sy, p22*sy
+	}
+	if !oka || !okd || math.Abs(a*d-b*c) < 1e-18 {
+		return q, nil, nil, fmt.Errorf("singular WCS matrix")
+	}
+	tan := strings.HasPrefix(strings.ToUpper(fitsio.HeaderString(img.HDU.Header, "CTYPE1", "")), "RA---TAN") && strings.HasPrefix(strings.ToUpper(fitsio.HeaderString(img.HDU.Header, "CTYPE2", "")), "DEC--TAN")
+	skyToPixel := func(coord gaia.Coordinate) (float64, float64, error) {
+		dra := math.Mod(coord.RA-ra+540, 360) - 180
+		if !tan {
+			dx, dy := dra, coord.Dec-dec
+			det := a*d - b*c
+			return (d*dx-b*dy)/det + crpix1 - 1, (-c*dx+a*dy)/det + crpix2 - 1, nil
+		}
+		dec0 := dec * math.Pi / 180
+		dr := coord.Dec * math.Pi / 180
+		cosc := math.Sin(dec0)*math.Sin(dr) + math.Cos(dec0)*math.Cos(dr)*math.Cos(dra*math.Pi/180)
+		if cosc <= 0 || !isFinite(cosc) {
+			return 0, 0, fmt.Errorf("sky coordinate outside TAN projection")
+		}
+		xi := math.Cos(dr) * math.Sin(dra*math.Pi/180) / cosc
+		eta := (math.Cos(dec0)*math.Sin(dr) - math.Sin(dec0)*math.Cos(dr)*math.Cos(dra*math.Pi/180)) / cosc
+		dx, dy := xi*180/math.Pi, eta*180/math.Pi
+		det := a*d - b*c
+		return (d*dx-b*dy)/det + crpix1 - 1, (-c*dx+a*dy)/det + crpix2 - 1, nil
+	}
+	return q, pixelToSky, skyToPixel, nil
 }
 
 func angularSeparationDeg(a, b gaia.Coordinate) float64 {

@@ -310,6 +310,282 @@ type CalibrationInput struct {
 	Metadata       InstrumentMetadata
 	Background     models.LinearTransform
 	Photometry     *InstrumentPhotometry
+	// PixelDigest is populated by streaming callers; when present it replaces
+	// the pixel loop in the canonical source fingerprint.
+	PixelDigest string
+}
+
+// CalibrationStreamInput describes a channel whose samples remain on disk.
+// ReadRow is called sequentially with a caller-owned row buffer; implementations
+// must not retain the buffer after returning.  It is intentionally separate
+// from CalibrationInput so streaming jobs cannot accidentally construct a full
+// pixel slice.
+type CalibrationStreamInput struct {
+	SourceIdentity string
+	Width, Height  int
+	ReadRow        func(row int, dst []float32) error
+	ReadValidRow   func(row int, dst []bool) error
+	Alignment      string
+	Metadata       InstrumentMetadata
+	Background     models.LinearTransform
+	Photometry     *InstrumentPhotometry
+}
+
+// CalculateCalibrationStreaming computes the same metadata-only calibration
+// transforms as CalculateCalibration while reading each source one row at a
+// time.  Fingerprints are based on the exact streamed float32 values.
+func CalculateCalibrationStreaming(ctx context.Context, inputs []CalibrationStreamInput, settings CalibrationSettings) (CalibrationResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(inputs) == 0 || len(inputs) > 3 {
+		return CalibrationResult{Status: models.CalibrationUnsupported}, fmt.Errorf("at most three calibration channels are supported")
+	}
+	converted := make([]CalibrationInput, len(inputs))
+	for i, in := range inputs {
+		if in.Width <= 0 || in.Height <= 0 || in.ReadRow == nil {
+			return CalibrationResult{Status: models.CalibrationUnsupported}, fmt.Errorf("invalid streamed channel dimensions")
+		}
+		converted[i] = CalibrationInput{SourceIdentity: in.SourceIdentity, Width: in.Width, Height: in.Height, Alignment: in.Alignment, Metadata: in.Metadata, Background: in.Background, Photometry: in.Photometry}
+	}
+	result := CalibrationResult{Status: models.CalibrationValid}
+	var raw, offsets [3]float64
+	for i := range result.Base {
+		result.Base[i] = models.LinearTransform{Gain: 1}
+	}
+	var sourceHash canonicalHash
+	sourceHash.stringValue("color-calibration-source-v1")
+	for i, in := range inputs {
+		if err := streamCanonicalInput(ctx, &sourceHash, in, settings.NeutralizeBackground); err != nil {
+			return CalibrationResult{Status: models.CalibrationCancelled}, err
+		}
+		if settings.NeutralizeBackground && in.Background.Gain != 0 {
+			offsets[i] = in.Background.Offset
+		}
+		if in.Photometry != nil {
+			raw[i] = in.Photometry.Gain
+		} else {
+			raw[i] = 1
+		}
+	}
+	normalized, err := NormalizeCalibrationGains(raw)
+	if err != nil {
+		return result, err
+	}
+	for i := range inputs {
+		if normalized[i] > 0 {
+			result.Base[i] = models.LinearTransform{Offset: offsets[i], Gain: normalized[i]}
+		}
+	}
+	result.SourceFingerprint = sourceHash.sum()
+	_, result.SettingsFingerprint = CalibrationFingerprints(converted, settings)
+	result.Provenance = models.CalibrationProvenance{AlgorithmVersion: settings.AlgorithmVersion, ReferenceVersion: settings.ReferenceVersion, Source: "local"}
+	// Streaming and in-memory calculations must expose identical overlay
+	// calibration state; overlays are metadata-only and carry no pixel planes.
+	result.Overlays = append([]models.OverlayCalibrationState(nil), settings.Overlays...)
+	return result, nil
+}
+
+func streamCalibrationFingerprint(ctx context.Context, in CalibrationStreamInput, out *CalibrationInput) error {
+	var h canonicalHash
+	h.stringValue(in.SourceIdentity)
+	h.h.b.WriteString(fmt.Sprintf("d:%d:%d;", in.Width, in.Height))
+	h.stringValue(in.Alignment)
+	row := make([]float32, in.Width)
+	for y := 0; y < in.Height; y++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := in.ReadRow(y, row); err != nil {
+			return err
+		}
+		for x := 0; x < in.Width; x++ {
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], math.Float32bits(row[x]))
+			h.bytesValue(b[:])
+		}
+	}
+	if in.ReadValidRow == nil {
+		h.h.b.WriteString("valid-mask:0;")
+	} else {
+		h.h.b.WriteString(fmt.Sprintf("valid-mask:%d;", in.Width*in.Height))
+		valid := make([]bool, in.Width)
+		for y := 0; y < in.Height; y++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := in.ReadValidRow(y, valid); err != nil {
+				return err
+			}
+			for x := 0; x < in.Width; x++ {
+				if valid[x] {
+					h.stringValue("1")
+				} else {
+					h.stringValue("0")
+				}
+			}
+		}
+	}
+	// Preserve the canonical source digest without retaining any samples.
+	out.Pixels = nil
+	out.Valid = nil
+	out.PixelDigest = h.sum()
+	return nil
+}
+
+// streamedSourceFingerprint serializes the same canonical fields as
+// CalibrationFingerprints while feeding pixel and validity bytes incrementally.
+// It deliberately avoids retaining either a full plane or a per-channel digest.
+func streamCanonicalInput(ctx context.Context, h *canonicalHash, in CalibrationStreamInput, includeBackground bool) error {
+	h.stringValue(in.SourceIdentity)
+	h.h.b.WriteString(fmt.Sprintf("d:%d:%d;", in.Width, in.Height))
+	h.stringValue(in.Alignment)
+	row := make([]float32, in.Width)
+	for y := 0; y < in.Height; y++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := in.ReadRow(y, row); err != nil {
+			return err
+		}
+		for _, p := range row {
+			var b [4]byte
+			binary.LittleEndian.PutUint32(b[:], math.Float32bits(p))
+			h.bytesValue(b[:])
+		}
+	}
+	if in.ReadValidRow == nil {
+		h.h.b.WriteString("valid-mask:0;")
+	} else {
+		h.h.b.WriteString(fmt.Sprintf("valid-mask:%d;", in.Width*in.Height))
+		valid := make([]bool, in.Width)
+		for y := 0; y < in.Height; y++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := in.ReadValidRow(y, valid); err != nil {
+				return err
+			}
+			for _, ok := range valid {
+				if ok {
+					h.stringValue("1")
+				} else {
+					h.stringValue("0")
+				}
+			}
+		}
+	}
+	h.h.b.WriteString("star-mask:0;")
+	h.jsonValue(in.Metadata)
+	if includeBackground {
+		h.jsonValue(in.Background)
+	}
+	if in.Photometry != nil {
+		h.jsonValue(*in.Photometry)
+	} else {
+		h.stringValue("no-photometry")
+	}
+	return nil
+}
+
+// EstimateBackgroundStream computes a robust scalar offset from bounded,
+// deterministic samples taken from sequential rows. It never retains a full
+// plane and is suitable for automatic and ROI background estimation.
+func EstimateBackgroundStream(ctx context.Context, in CalibrationStreamInput, roi *models.CalibrationROI, cfg BackgroundConfig) (BackgroundEstimate, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if in.Width <= 0 || in.Height <= 0 || in.ReadRow == nil {
+		return BackgroundEstimate{Status: models.CalibrationUnsupported, RejectionReason: "invalid dimensions"}, nil
+	}
+	const maxSamples = 65536
+	values := make([]float32, 0, maxSamples)
+	indices := make([]int, 0, maxSamples)
+	row := make([]float32, in.Width)
+	valid := make([]bool, in.Width)
+	useValid := in.ReadValidRow != nil
+	step := (in.Width*in.Height + maxSamples - 1) / maxSamples
+	if step < 1 {
+		step = 1
+	}
+	for y := 0; y < in.Height; y++ {
+		if err := ctx.Err(); err != nil {
+			return BackgroundEstimate{Status: models.CalibrationCancelled}, err
+		}
+		if err := in.ReadRow(y, row); err != nil {
+			return BackgroundEstimate{}, err
+		}
+		if useValid {
+			if err := in.ReadValidRow(y, valid); err != nil {
+				return BackgroundEstimate{}, err
+			}
+		}
+		for x, v := range row {
+			if (y*in.Width+x)%step != 0 || (useValid && !valid[x]) || !inBackgroundROI(x, y, roi, in.Width, in.Height) || math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+				continue
+			}
+			values = append(values, v)
+			indices = append(indices, y*in.Width+x)
+		}
+	}
+	if len(values) == 0 {
+		return BackgroundEstimate{Status: models.CalibrationUnsupported, RejectionReason: "insufficient samples"}, nil
+	}
+	return estimateBackgroundStreamSamples(ctx, values, indices, in.Width, in.Height, roi, cfg)
+}
+
+func estimateBackgroundStreamSamples(ctx context.Context, values []float32, indices []int, width, height int, roi *models.CalibrationROI, cfg BackgroundConfig) (BackgroundEstimate, error) {
+	// Keep the robust clipping logic and spatial tile medians bounded to the
+	// sampled values. This preserves ROI/valid semantics without synthesizing a
+	// flattened plane whose tile layout would be incorrect.
+	plane := BackgroundPlane{Pixels: values, Width: len(values), Height: 1}
+	r, err := EstimateBackgroundPlane(ctx, plane, cfg)
+	if err != nil || r.Status == models.CalibrationCancelled {
+		return r, err
+	}
+	if cfg.TileSize <= 0 {
+		cfg.TileSize = DefaultBackgroundConfig().TileSize
+	}
+	byTile := map[[2]int][]float64{}
+	for i, v := range values {
+		x, y := indices[i]%width, indices[i]/width
+		key := [2]int{x / cfg.TileSize, y / cfg.TileSize}
+		byTile[key] = append(byTile[key], float64(v))
+	}
+	medians := make([]float64, 0, len(byTile))
+	for _, vs := range byTile {
+		medians = append(medians, calibrationMedianFloat64(ctx, vs))
+	}
+	if len(medians) >= 2 {
+		sort.Float64s(medians)
+		r.TileSpread = medians[len(medians)-1] - medians[0]
+		r.TileCount = len(medians)
+	}
+	r.Samples = len(values)
+	if r.Status != models.CalibrationUnsupported || r.RejectionReason == "background is spatially non-uniform" {
+		all := make([]float64, len(values))
+		for i, v := range values {
+			all[i] = float64(v)
+		}
+		median := calibrationMedianFloat64(ctx, all)
+		r.Transform.Offset = median
+		scale := math.Max(math.Abs(median), r.Dispersion)
+		if scale < 1e-12 {
+			scale = 1
+		}
+		threshold := cfg.TileUniformityThreshold
+		if threshold <= 0 {
+			threshold = DefaultBackgroundConfig().TileUniformityThreshold
+		}
+		if r.TileCount >= 2 && r.TileSpread/scale > threshold {
+			r.Status = models.CalibrationUnsupported
+			r.RejectionReason = "background is spatially non-uniform"
+		} else if r.RejectionReason == "background is spatially non-uniform" {
+			r.Status = models.CalibrationValid
+			r.RejectionReason = ""
+		}
+	}
+	return r, nil
 }
 
 // CalibrationSettings contains only behavior-affecting calculation options.
@@ -419,6 +695,7 @@ func CalculateCalibration(inputs []CalibrationInput, settings CalibrationSetting
 	result.Status = models.CalibrationValid
 	result.SourceFingerprint, result.SettingsFingerprint = CalibrationFingerprints(inputs, settings)
 	result.Provenance = models.CalibrationProvenance{AlgorithmVersion: settings.AlgorithmVersion, ReferenceVersion: settings.ReferenceVersion, Source: "local"}
+	result.Overlays = append([]models.OverlayCalibrationState(nil), settings.Overlays...)
 	return result, nil
 }
 
@@ -529,6 +806,9 @@ func (c *canonicalHash) input(in CalibrationInput, includeBackground bool) {
 		var b [4]byte
 		binary.LittleEndian.PutUint32(b[:], math.Float32bits(p))
 		c.bytesValue(b[:])
+	}
+	if len(in.Pixels) == 0 && in.PixelDigest != "" {
+		c.stringValue("pixel-digest:" + in.PixelDigest)
 	}
 	c.h.b.WriteString(fmt.Sprintf("valid-mask:%d;", len(in.Valid)))
 	for _, v := range in.Valid {

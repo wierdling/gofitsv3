@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -234,5 +236,24 @@ func TestCacheConnectionPragmasAndForeignKeys(t *testing.T) {
 		if _, err := conn.ExecContext(context.Background(), `INSERT INTO xp_spectra(release,source_id,representation_version,calibration_version,wavelengths,flux,flux_errors,wavelength_min,wavelength_max,checksum,fetched_at) VALUES('DR3',999,'x','x','[]','[]','[]',1,2,'x',0)`); err == nil {
 			t.Fatal("foreign-key violation accepted")
 		}
+	}
+}
+
+func TestOpenCacheCreatesParentAndReportsPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "gaia.db")
+	c, err := OpenCache(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenCache nested path: %v", err)
+	}
+	defer c.Close()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("cache file was not created: %v", err)
+	}
+	invalid := filepath.Join(t.TempDir(), "cache-dir")
+	if err := os.Mkdir(invalid, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenCache(context.Background(), invalid); err == nil || !strings.Contains(err.Error(), "open Gaia cache") {
+		t.Fatalf("invalid cache path error=%v, want contextual open error", err)
 	}
 }

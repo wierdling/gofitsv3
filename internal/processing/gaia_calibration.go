@@ -326,9 +326,19 @@ type GaiaCalibrationRequest struct {
 	Measurements  []GaiaChannelMeasurement
 	DetectedStars []Star
 	Planes        [3]GaiaPlane
-	PixelToSky    func(x, y float64) (gaia.Coordinate, error)
-	Aperture      GaiaApertureConfig
+	// Readers is the bounded alternative to Planes. At most the rows touched
+	// by each aperture are requested and no full aligned plane is retained.
+	Readers [3]GaiaPlaneReader
+	// Sources is an optional normalized discovery result. When supplied, the
+	// calibration job reuses it and does not call the provider a second time.
+	Sources    []gaia.Source
+	PixelToSky func(x, y float64) (gaia.Coordinate, error)
+	Aperture   GaiaApertureConfig
 }
+
+// GaiaPlaneDimensions is an optional extension for readers that carry their
+// raster shape. Requests may also provide dimensions in Planes[c].
+type GaiaPlaneDimensions interface{ Dimensions() (int, int) }
 
 type GaiaPlane struct {
 	Pixels        []float32
@@ -629,13 +639,33 @@ func PrepareGaiaCalibration(ctx context.Context, req GaiaCalibrationRequest) (Ga
 		}
 		return GaiaCalibrationResult{Status: models.CalibrationUnsupported}, err
 	}
-	sources, err := req.Provider.DiscoverSources(ctx, q)
-	if err != nil {
-		return GaiaCalibrationResult{Status: gaiaErrorStatus(err)}, err
-	}
-	sources, err = gaia.NormalizeSources(sources, req.Settings.Release)
-	if err != nil {
-		return GaiaCalibrationResult{Status: models.CalibrationUnsupported}, err
+	var sources []gaia.Source
+	if req.Sources != nil {
+		// The caller owns this normalized slice and may hand it to a preceding
+		// refinement pass. Validate in place without rediscovering or copying it.
+		sources = req.Sources
+		for _, source := range sources {
+			if err := source.Validate(req.Settings.Release); err != nil {
+				return GaiaCalibrationResult{Status: models.CalibrationUnsupported}, err
+			}
+		}
+		for i := 1; i < len(sources); i++ {
+			if sources[i-1].SourceID >= sources[i].SourceID {
+				return GaiaCalibrationResult{Status: models.CalibrationUnsupported}, fmt.Errorf("Gaia sources must be normalized and sorted by source ID")
+			}
+			if sources[i-1].SourceID == sources[i].SourceID {
+				return GaiaCalibrationResult{Status: models.CalibrationUnsupported}, fmt.Errorf("duplicate Gaia source ID %d", sources[i].SourceID)
+			}
+		}
+	} else {
+		sources, err = req.Provider.DiscoverSources(ctx, q)
+		if err != nil {
+			return GaiaCalibrationResult{Status: gaiaErrorStatus(err)}, err
+		}
+		sources, err = gaia.NormalizeSources(sources, req.Settings.Release)
+		if err != nil {
+			return GaiaCalibrationResult{Status: models.CalibrationUnsupported}, err
+		}
 	}
 	if len(sources) == 0 {
 		return GaiaCalibrationResult{Status: models.CalibrationUnsupported}, fmt.Errorf("Gaia field contains no usable sources")
@@ -685,11 +715,30 @@ func PrepareGaiaCalibration(ctx context.Context, req GaiaCalibrationRequest) (Ga
 					if err := ctx.Err(); err != nil {
 						return GaiaCalibrationResult{Status: models.CalibrationCancelled}, err
 					}
-					if req.Planes[c].Width <= 0 {
+					width, height := req.Planes[c].Width, req.Planes[c].Height
+					if req.Readers[c] != nil {
+						if width <= 0 || height <= 0 {
+							if sized, ok := req.Readers[c].(GaiaPlaneDimensions); ok {
+								width, height = sized.Dimensions()
+							}
+						}
+						// Reader-backed requests carry dimensions in the aperture
+						// geometry through the companion plane metadata.
+						if width <= 0 || height <= 0 {
+							valid = false
+							break
+						}
+					} else if width <= 0 {
 						valid = false
 						break
 					}
-					ap, aerr := MeasureApertureAnnulus(req.Planes[c].Pixels, req.Planes[c].Width, req.Planes[c].Height, match.Star.X, match.Star.Y, cfg.Radius, cfg.AnnulusInner, cfg.AnnulusOuter, cfg.Saturation)
+					var ap ApertureFlux
+					var aerr error
+					if req.Readers[c] != nil {
+						ap, aerr = MeasureApertureAnnulusReader(req.Readers[c], width, height, match.Star.X, match.Star.Y, cfg.Radius, cfg.AnnulusInner, cfg.AnnulusOuter, cfg.Saturation)
+					} else {
+						ap, aerr = MeasureApertureAnnulus(req.Planes[c].Pixels, width, height, match.Star.X, match.Star.Y, cfg.Radius, cfg.AnnulusInner, cfg.AnnulusOuter, cfg.Saturation)
+					}
 					if aerr != nil || ap.Saturated {
 						apertureRejects++
 						if len(apertureRejectSamples) < cap(apertureRejectSamples) {

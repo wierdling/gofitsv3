@@ -3,6 +3,7 @@ package processing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -80,6 +81,75 @@ func TestMeasureApertureAnnulusSubtractsBackgroundAndFlagsSaturation(t *testing.
 	}
 	if !f.Saturated || f.Background != 10 || f.Flux <= 0 || f.SNR <= 0 {
 		t.Fatalf("bad aperture result: %+v", f)
+	}
+}
+
+type gaiaRowReader struct {
+	p           []float32
+	w, h, reads int
+}
+
+type gaiaWindowReader struct {
+	gaiaRowReader
+}
+
+func (r *gaiaWindowReader) ReadWindow(y, x0, x1 int, dst []float32) error {
+	if y < 0 || y >= r.h || x0 < 0 || x1 > r.w || x1 < x0 || len(dst) < x1-x0 {
+		return fmt.Errorf("window out of range")
+	}
+	for x := x0; x < x1; x++ {
+		dst[x-x0] = r.p[y*r.w+x]
+	}
+	return nil
+}
+
+func (r *gaiaRowReader) ReadRow(y int, dst []float32) error {
+	if y < 0 || y >= r.h || len(dst) < r.w {
+		return fmt.Errorf("row out of range")
+	}
+	r.reads++
+	copy(dst[:r.w], r.p[y*r.w:(y+1)*r.w])
+	return nil
+}
+
+func TestMeasureApertureAnnulusReaderMatchesPlane(t *testing.T) {
+	w, h := 24, 20
+	p := make([]float32, w*h)
+	for i := range p {
+		p[i] = 2
+	}
+	p[10*w+10] = 42
+	a, err := MeasureApertureAnnulus(p, w, h, 10, 10, 2, 4, 6, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &gaiaRowReader{p: p, w: w, h: h}
+	b, err := MeasureApertureAnnulusReader(r, w, h, 10, 10, 2, 4, 6, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(a.Flux-b.Flux) > 1e-6 || a.Samples != b.Samples || a.AnnulusSamples != b.AnnulusSamples || r.reads > 2*int(math.Ceil(10+6)-math.Floor(10-6)+1) {
+		t.Fatalf("plane=%+v stream=%+v reads=%d", a, b, r.reads)
+	}
+}
+
+func TestMeasureApertureAnnulusWindowReaderMatchesPlaneAtNonzeroX(t *testing.T) {
+	const w, h = 32, 24
+	p := make([]float32, w*h)
+	for i := range p {
+		p[i] = float32(i%w) + float32(i/w)*0.25
+	}
+	p[11*w+17] += 30
+	want, err := MeasureApertureAnnulus(p, w, h, 17, 11, 2, 4, 6, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := MeasureApertureAnnulusReader(&gaiaWindowReader{gaiaRowReader: gaiaRowReader{p: p, w: w, h: h}}, w, h, 17, 11, 2, 4, 6, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(got.Flux-want.Flux) > 1e-6 || got.Samples != want.Samples || got.AnnulusSamples != want.AnnulusSamples {
+		t.Fatalf("plane=%+v window=%+v", want, got)
 	}
 }
 

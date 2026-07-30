@@ -84,6 +84,16 @@ func TestPrepareGaiaCalibrationReportsNoDetectedStars(t *testing.T) {
 	}
 }
 
+func TestPrepareGaiaCalibrationRejectsUnsortedHandoffSources(t *testing.T) {
+	sources := []gaia.Source{step12Source(2, 10, 1), step12Source(1, 10, 1)}
+	_, err := PrepareGaiaCalibration(context.Background(), GaiaCalibrationRequest{
+		Provider: fakeGaiaProvider{sourceErr: context.Canceled}, Query: step12Query(), Settings: step12Settings(), Sources: sources,
+	})
+	if err == nil || !strings.Contains(err.Error(), "normalized and sorted") {
+		t.Fatalf("error=%v, want normalized-source rejection without discovery", err)
+	}
+}
+
 func TestPrepareGaiaCalibrationReportsNoGaiaCrossmatches(t *testing.T) {
 	provider := fakeGaiaProvider{sources: []gaia.Source{step12Source(1, 10, 1)}}
 	_, err := PrepareGaiaCalibration(context.Background(), GaiaCalibrationRequest{

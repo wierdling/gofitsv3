@@ -245,6 +245,12 @@ func TestSaveResultFITSRoundTrip(t *testing.T) {
 	if got := fitsio.HeaderString(loaded.HDUs[0].Header, "NCOMBINE"); got != "1" {
 		t.Fatalf("NCOMBINE = %q, want 1", got)
 	}
+	for _, key := range []string{"CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2", "CD1_1", "CD1_2", "CD2_1", "CD2_2", "CTYPE1", "CTYPE2", "DATE-OBS"} {
+		want := fitsio.HeaderString(result.OutputHeader, key)
+		if got := fitsio.HeaderString(loaded.HDUs[0].Header, key); got != want {
+			t.Fatalf("saved %s = %q, want output header value %q", key, got, want)
+		}
+	}
 }
 
 func TestLooksLikeFLC(t *testing.T) {
@@ -372,14 +378,17 @@ func makeInput(path string, width, height int, pixels []float32, header fitsio.H
 
 func headerWithCRPIX(crpix1, crpix2 float64) fitsio.Header {
 	return fitsio.Header{Cards: map[string]string{
-		"CRPIX1": strconv.FormatFloat(crpix1, 'f', -1, 64),
-		"CRPIX2": strconv.FormatFloat(crpix2, 'f', -1, 64),
-		"CRVAL1": "100",
-		"CRVAL2": "22",
-		"CD1_1":  "1",
-		"CD1_2":  "0",
-		"CD2_1":  "0",
-		"CD2_2":  "1",
+		"CRPIX1":   strconv.FormatFloat(crpix1, 'f', -1, 64),
+		"CRPIX2":   strconv.FormatFloat(crpix2, 'f', -1, 64),
+		"CRVAL1":   "100",
+		"CRVAL2":   "22",
+		"CD1_1":    "1",
+		"CD1_2":    "0",
+		"CD2_1":    "0",
+		"CD2_2":    "1",
+		"CTYPE1":   "'RA---TAN'",
+		"CTYPE2":   "'DEC--TAN'",
+		"DATE-OBS": "'2024-01-01T00:00:00Z'",
 	}}
 }
 

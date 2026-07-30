@@ -2,11 +2,13 @@ package ui
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
 	"image/color"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -41,6 +43,8 @@ import (
 
 var composeBlinkFilterNames = []string{"Blue", "Green", "Red"}
 
+const composeLargeFilesPreferenceKey = "compose.largeFiles"
+
 // globalSendToChannel is registered by newComposeWorkspace and called by the
 // preview window to load an image directly into a compose channel with all
 // stretch settings already applied.
@@ -49,6 +53,11 @@ var globalSendToChannel func(channelIdx int, img *models.LoadedImage)
 // globalSelectComposeTab is registered by app.go and called by loadProject in
 // workspace_compose.go to switch to the Compose tab when loading a Compose project.
 var globalSelectComposeTab func()
+
+// globalComposeLargeCleanup is invoked by the application close handler.
+var globalComposeLargeCleanup func()
+var composeLargeModeActive func() bool
+var globalComposeGaiaRefinementInvalidate func()
 
 // maxOverlayLayers bounds how many colored overlay layers can exist at once.
 // imgs/origPixels are pre-allocated with room for the 3 RGB base channels plus
@@ -69,6 +78,175 @@ type overlayLayer struct {
 	control                *models.ChannelControl
 	calibrationStatus      models.CalibrationStatus
 	calibrationStatusLabel *widget.Label
+}
+
+// artifactRowReader adapts a runtime float artifact to the bounded Gaia
+// aperture reader contract. A handle is opened only for the requested row.
+type artifactRowReader struct{ path string }
+
+func (r artifactRowReader) Dimensions() (int, int) {
+	a, err := fitsio.OpenFloat32ArtifactReadOnly(r.path)
+	if err != nil {
+		return 0, 0
+	}
+	defer a.Close()
+	return a.Width, a.Height
+}
+
+func (r artifactRowReader) ReadRow(y int, dst []float32) error {
+	a, err := fitsio.OpenFloat32ArtifactReadOnly(r.path)
+	if err != nil {
+		return err
+	}
+	defer a.Close()
+	return a.ReadRow(y, dst)
+}
+
+// alignedArtifactRowReader presents a source artifact on the reference
+// output grid. It uses the same affine/WCS/manual-offset mapping as the disk
+// compositor and returns NaN for invalid footprints so Gaia aperture
+// photometry excludes fill pixels.
+type alignedArtifactRowReader struct {
+	path         string
+	source       models.LoadedImage
+	reference    models.LoadedImage
+	width        int
+	height       int
+	offsetX      float64
+	offsetY      float64
+	offsetRot    float64
+	a            *fitsio.Float32Artifact
+	rows         map[int][]float32
+	order        []int
+	validScratch []float32
+}
+
+// ReadValidRow reports the same footprint validity as the aligned samples.
+// Invalid affine footprints and non-finite source pixels are excluded from
+// neutral-background statistics rather than being treated as zero-valued data.
+func (r *alignedArtifactRowReader) ReadValidRow(y int, dst []bool) error {
+	if len(dst) < r.width {
+		return fmt.Errorf("invalid aligned validity row %d", y)
+	}
+	if cap(r.validScratch) < r.width {
+		r.validScratch = make([]float32, r.width)
+	} else {
+		r.validScratch = r.validScratch[:r.width]
+	}
+	if err := r.ReadRow(y, r.validScratch); err != nil {
+		return err
+	}
+	for x, v := range r.validScratch {
+		dst[x] = !math.IsNaN(float64(v)) && !math.IsInf(float64(v), 0)
+	}
+	return nil
+}
+
+func (r alignedArtifactRowReader) Dimensions() (int, int) { return r.width, r.height }
+
+func (r *alignedArtifactRowReader) ReadRow(y int, dst []float32) error {
+	if len(dst) < r.width {
+		return fmt.Errorf("invalid aligned artifact row %d", y)
+	}
+	return r.ReadWindow(y, 0, r.width, dst[:r.width])
+}
+
+// ReadWindow maps and samples only the requested output range. Source rows are
+// fetched with ReadRange over the minimum contiguous span needed by the
+// mapped pixels; no full output row (or full source row) is materialized.
+func (r *alignedArtifactRowReader) ReadWindow(y, x0, x1 int, dst []float32) error {
+	if y < 0 || y >= r.height {
+		return fmt.Errorf("invalid aligned artifact row %d", y)
+	}
+	if x0 < 0 {
+		x0 = 0
+	}
+	if x1 > r.width {
+		x1 = r.width
+	}
+	if x1 < x0 || len(dst) < x1-x0 {
+		return fmt.Errorf("invalid aligned artifact window")
+	}
+	if r.a == nil {
+		a, err := fitsio.OpenFloat32ArtifactReadOnly(r.path)
+		if err != nil {
+			return err
+		}
+		r.a = a
+		r.rows = make(map[int][]float32, 8)
+	}
+	a := r.a
+	type mapped struct {
+		fx, fy float64
+		valid  bool
+	}
+	mappedPixels := make([]mapped, x1-x0)
+	rowRanges := make(map[int][2]int, 2)
+	for x := x0; x < x1; x++ {
+		fx, fy := processing.MapDiskCoordinate(r.source, r.reference, r.offsetX, r.offsetY, r.offsetRot, x, y, r.width, r.height, a.Width, a.Height)
+		m := &mappedPixels[x-x0]
+		m.fx, m.fy = fx, fy
+		if fx < 0 || fy < 0 || fx >= float64(a.Width-1) || fy >= float64(a.Height-1) {
+			continue
+		}
+		m.valid = true
+		sx0, sy := int(math.Floor(fx)), int(math.Floor(fy))
+		for _, ry := range []int{sy, sy + 1} {
+			if old, ok := rowRanges[ry]; ok {
+				if sx0 < old[0] {
+					old[0] = sx0
+				}
+				if sx0+2 > old[1] {
+					old[1] = sx0 + 2
+				}
+				rowRanges[ry] = old
+			} else {
+				rowRanges[ry] = [2]int{sx0, sx0 + 2}
+			}
+		}
+	}
+	rows := make(map[int]struct {
+		x0     int
+		values []float32
+	}, len(rowRanges))
+	for ry, span := range rowRanges {
+		vals := make([]float32, span[1]-span[0])
+		if err := a.ReadRange(ry, span[0], span[1], vals); err != nil {
+			return err
+		}
+		rows[ry] = struct {
+			x0     int
+			values []float32
+		}{span[0], vals}
+	}
+	for i, m := range mappedPixels {
+		if !m.valid {
+			dst[i] = float32(math.NaN())
+			continue
+		}
+		sx, sy := int(math.Floor(m.fx)), int(math.Floor(m.fy))
+		r0, r1 := rows[sy], rows[sy+1]
+		v00, v10 := r0.values[sx-r0.x0], r0.values[sx+1-r0.x0]
+		v01, v11 := r1.values[sx-r1.x0], r1.values[sx+1-r1.x0]
+		if math.IsNaN(float64(v00)) || math.IsNaN(float64(v10)) || math.IsNaN(float64(v01)) || math.IsNaN(float64(v11)) || math.IsInf(float64(v00), 0) || math.IsInf(float64(v10), 0) || math.IsInf(float64(v01), 0) || math.IsInf(float64(v11), 0) {
+			dst[i] = float32(math.NaN())
+			continue
+		}
+		wx, wy := m.fx-float64(sx), m.fy-float64(sy)
+		dst[i] = float32(float64(v00)*(1-wx)*(1-wy) + float64(v10)*wx*(1-wy) + float64(v01)*(1-wx)*wy + float64(v11)*wx*wy)
+	}
+	return nil
+}
+
+func (r *alignedArtifactRowReader) Close() error {
+	if r.a == nil {
+		return nil
+	}
+	err := r.a.Close()
+	r.a = nil
+	r.rows = nil
+	r.order = nil
+	return err
 }
 
 type composeOverlayPreviewData struct {
@@ -118,10 +296,19 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var levelsWin *rgbLevelsWindow
 	var overlayLayers []*overlayLayer
 	colorCalibration := models.ColorCalibrationState{Status: models.CalibrationDisabled}
+	var refinedGaiaResidual *processing.AffineTransform
+	var refinedGaiaSources []gaia.Source
+	var gaiaRefinementGeneration uint64
+	clearGaiaRefinement := func() {
+		refinedGaiaResidual = nil
+		refinedGaiaSources = nil
+		gaiaRefinementGeneration++
+	}
+	globalComposeGaiaRefinementInvalidate = clearGaiaRefinement
 	// Any source, alignment, stretch, or overlay edit invalidates a previously
 	// calculated result. The persisted transforms remain inspectable but are
 	// never silently applied to changed pixels.
-	invalidateCalibration := func() { markComposeCalibrationStale(&colorCalibration) }
+	invalidateCalibration := func() { clearGaiaRefinement(); markComposeCalibrationStale(&colorCalibration) }
 	ensureOverlayCalibration := func(n int) {
 		for len(colorCalibration.Overlays) <= n {
 			colorCalibration.Overlays = append(colorCalibration.Overlays, models.OverlayCalibrationState{Mode: models.OverlayArtistic, Status: models.CalibrationDisabled, Strength: 1})
@@ -132,6 +319,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var latestRGBStats [3]histogram.Stats
 	suspendRefresh := false
 	var composeRGB func(ctx context.Context, calibrationSnapshot *models.ColorCalibrationState) ([]byte, int, int, [3]histogram.Stats, *processing.ComposeRenderResult, error)
+	var composeChannelOffsetFields func(int) (float64, float64, float64, bool)
 	// renderImages returns an offset-applied view of imgs (Manual Offsets applied
 	// at render time). Forward-declared so refresh/compose can use it; assigned
 	// once controlSets exists.
@@ -141,6 +329,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var genCancel context.CancelFunc
 	var calibrationJob composeCalibrationJob
 	var calibrationGeneration uint64
+	var editSnapshotCancel context.CancelFunc
+	var editSnapshotMu sync.Mutex
 	// SaveColorCalibration controls the normal render/export gate and whether
 	// calibration is included in the next project save.  The live state is
 	// retained when disabled so it can be compared or re-enabled immediately.
@@ -156,6 +346,59 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	buildCompositeCheck.SetChecked(false)
 	blinkCheck := NewToggle(nil)
 	blinkCheck.SetChecked(false)
+	largeFilesCheck := NewToggle(nil)
+	largeFilesCheck.SetChecked(app.Preferences().Bool(composeLargeFilesPreferenceKey))
+	var largeStore *composeLargeStore
+	largeMode := largeFilesCheck.Checked
+	composeLargeModeActive = func() bool { return largeMode }
+	largePreviews := make(map[int]*image.RGBA)
+	largeArtifacts := make(map[int]composeArtifactDescriptor)
+	var largeMu sync.RWMutex
+	largeRuntime := &largeChannelRuntime{store: nil, artifacts: largeArtifacts, previews: largePreviews, mu: &largeMu, refresh: nil, syncWidgets: make(map[int]func(*models.LoadedImage))}
+	largeLoadGenerations := make(map[string]uint64)
+	largeSessionGeneration := uint64(1)
+	nextLargeLoadGeneration := func(slot string) (uint64, uint64, *composeLargeStore) {
+		largeMu.Lock()
+		defer largeMu.Unlock()
+		largeLoadGenerations[slot]++
+		return largeLoadGenerations[slot], largeSessionGeneration, largeStore
+	}
+	largeLoadStillCurrent := func(slot string, request, session uint64, d composeArtifactDescriptor) bool {
+		largeMu.RLock()
+		defer largeMu.RUnlock()
+		store := largeStore
+		if store == nil || largeSessionGeneration != session || largeLoadGenerations[slot] != request || d.Slot != slot {
+			return false
+		}
+		current, ok := store.Descriptor(slot)
+		return ok && current.Generation == d.Generation && current.Path == d.Path
+	}
+	cleanupLargeArtifactIfCurrent := func(d composeArtifactDescriptor) {
+		largeMu.RLock()
+		store := largeStore
+		largeMu.RUnlock()
+		if d.Slot == "" || store == nil {
+			return
+		}
+		_, _ = store.RemoveSlotIfCurrent(d)
+	}
+	invalidateLargeSlot := func(idx int) {
+		largeMu.Lock()
+		defer largeMu.Unlock()
+		slot := fmt.Sprintf("channel-%d", idx)
+		if idx >= 3 {
+			slot = fmt.Sprintf("overlay-%d", idx)
+		}
+		largeLoadGenerations[slot]++
+	}
+	if largeMode {
+		largeStore, _ = newComposeLargeStore("")
+		if largeStore == nil {
+			largeMode = false
+			largeFilesCheck.SetChecked(false)
+			app.Preferences().SetBool(composeLargeFilesPreferenceKey, false)
+		}
+	}
 	blinkExcludedIdx := 0
 	composeMagicPreset := widget.NewSelect([]string{"Balanced", "Nebula", "Galaxy"}, nil)
 	composeMagicPreset.SetSelected("Balanced")
@@ -168,6 +411,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var startBlink func()
 	var stopBlink func()
 	var refreshBlinkFrame func()
+	var refresh func()
 	var measureEnabled bool
 	var measureCheck *Toggle
 	var measureStart *imagePoint
@@ -240,10 +484,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		blinkPrepared = nil
 		blinkMu.Unlock()
 		previewMu.Unlock()
-		imgSnapshot := renderImages()
+		imgSnapshot := append([]*models.LoadedImage(nil), imgs...)
+		if !largeMode {
+			imgSnapshot = renderImages()
+		}
 		blinkSourcesSnapshot := composeBlinkSources()
 		blinkSelectionSnapshot := append([]int(nil), blinkChannels...)
-		blinkEnabled := blinkCheck.Checked
+		blinkEnabled := blinkCheck.Checked && !largeMode
 		if blinkEnabled && blinkChannels == nil {
 			blinkSelectionSnapshot = resolveComposeBlinkSelection(blinkSourcesSnapshot, nil, true, blinkExcludedIdx)
 		}
@@ -253,6 +500,39 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		levelsSnapshot := *levels
 		sharedHistScale := sharedHistCheck.Checked
 		buildComposite := buildCompositeCheck.Checked
+		compositeRenderActive := largeMode && buildComposite && len(imgSnapshot) >= 3 &&
+			imgSnapshot[0] != nil && imgSnapshot[1] != nil && imgSnapshot[2] != nil
+		priorCompositeImage, _ := viewports[3].image.Image.(*image.RGBA)
+		priorCompositeStats := ""
+		if viewports[3].StatsLabel != nil {
+			priorCompositeStats = viewports[3].StatsLabel.Text
+		}
+		priorCompositeW, priorCompositeH := viewports[3].origW, viewports[3].origH
+		priorCompositeBins, priorCompositeHistMax := viewports[3].bins, viewports[3].histMax
+		priorCompositeBlack, priorCompositeWhite := viewports[3].blackBox.Value(), viewports[3].whiteBox.Value()
+		// Keep the indicator in the viewport header so the image and its
+		// interaction layer remain usable while the disk compositor runs.
+		if largeMode {
+			statusText := composeCompositeDisabledStatus(buildComposite, imgSnapshot)
+			if compositeRenderActive {
+				statusText = "Rendering disk-backed color composite…"
+			}
+			// Publish the in-progress/disabled state before the worker starts. This
+			// deliberately changes only the tile label, retaining the previous
+			// image until a current generation produces a replacement.
+			fyne.Do(func() {
+				viewports[3].SetStatsText(statusText)
+				viewports[3].SetCompositeRendering(compositeRenderActive)
+			})
+		} else {
+			fyne.Do(func() { viewports[3].SetCompositeRendering(false) })
+		}
+		largeMu.RLock()
+		largePreviewSnapshot := make(map[int]*image.RGBA, len(largePreviews))
+		for i, p := range largePreviews {
+			largePreviewSnapshot[i] = p
+		}
+		largeMu.RUnlock()
 		for i := range overlayLayers {
 			ensureOverlayCalibration(i)
 		}
@@ -261,11 +541,50 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			start := time.Now()
 			debuglog.Log("compose refresh async: starting preview computation")
 			var renderedResult *processing.ComposeRenderResult
-			data := buildComposePreviewData(ctx, imgSnapshot, sharedHistScale, buildComposite, &levelsSnapshot, func(c context.Context) ([]byte, int, int, [3]histogram.Stats, error) {
-				b, w, h, s, rendered, e := composeRGB(c, calibrationSnapshot)
-				renderedResult = rendered
-				return b, w, h, s, e
-			})
+			var data composePreviewData
+			if largeMode {
+				for i := range data.Views {
+					data.Views[i] = composeViewportPreview{Image: blankImg(), StatsText: "Disk-backed preview"}
+				}
+				data.Views[3] = composeViewportPreview{Image: priorCompositeImage, Bins: priorCompositeBins, HistMax: priorCompositeHistMax, OrigW: priorCompositeW, OrigH: priorCompositeH, Black: priorCompositeBlack, White: priorCompositeWhite, StatsText: priorCompositeStats}
+				for i := range imgSnapshot {
+					if i >= len(data.Views) {
+						break
+					}
+					if p := largePreviewSnapshot[i]; p != nil {
+						data.Views[i] = composeViewportPreview{Image: p, OrigW: imgSnapshot[i].HDU.Data.Width, OrigH: imgSnapshot[i].HDU.Data.Height, StatsText: "Disk-backed preview"}
+					}
+				}
+				if buildComposite && composeHasAllBaseChannels(imgSnapshot) {
+					b, w, h, s, rendered, e := composeRGB(ctx, calibrationSnapshot)
+					if e == nil && len(b) > 0 {
+						renderedResult = rendered
+						data.RGBStats = s
+						pw, ph := w, h
+						if len(b) != w*h*4 {
+							scale := math.Sqrt(float64(len(b)/4) / float64(w*h))
+							pw, ph = int(math.Max(1, math.Round(float64(w)*scale))), int(math.Max(1, math.Round(float64(h)*scale)))
+						}
+						lumaStats := histogramRGBLuminance(b)
+						data.Views[3] = composeViewportPreview{Image: image.NewRGBA(image.Rect(0, 0, pw, ph)), OrigW: w, OrigH: h, StatsText: fmt.Sprintf("Luma μ %.1f  σ %.1f", lumaStats.Mean, lumaStats.Std)}
+						copy(data.Views[3].Image.Pix, b)
+					} else {
+						if e != nil {
+							data.Views[3].StatsText = fmt.Sprintf("Composite render failed: %v", e)
+						} else {
+							data.Views[3].StatsText = "Composite render failed: empty result"
+						}
+					}
+				} else {
+					data.Views[3] = composeViewportPreview{Image: blankImg(), StatsText: composeCompositeDisabledStatus(buildComposite, imgSnapshot)}
+				}
+			} else {
+				data = buildComposePreviewData(ctx, imgSnapshot, sharedHistScale, buildComposite, &levelsSnapshot, func(c context.Context) ([]byte, int, int, [3]histogram.Stats, error) {
+					b, w, h, s, rendered, e := composeRGB(c, calibrationSnapshot)
+					renderedResult = rendered
+					return b, w, h, s, e
+				})
+			}
 			data.Rendered = renderedResult
 			if blinkEnabled {
 				data.BlinkFrames = buildComposeBlinkFrames(ctx, imgSnapshot, blinkSourcesSnapshot, blinkSelectionSnapshot, data.Views)
@@ -277,11 +596,29 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				previewMu.Unlock()
 				if seq != currentSeq || ctx.Err() != nil {
 					debuglog.Log("compose refresh async: skipped stale/canceled preview result")
+					if seq == currentSeq && ctx.Err() != nil {
+						viewports[3].SetCompositeRendering(false)
+					}
 					if onDone != nil {
 						onDone()
 					}
 					return
 				}
+				// The toggle can change while a disk-backed preview is being
+				// assembled. Do not install a result that was computed for the
+				// previous toggle state; previewSeq normally handles this, but this
+				// additional UI-thread check also covers queued UI refreshes.
+				if buildComposite != buildCompositeCheck.Checked {
+					debuglog.Log("compose refresh async: rerendering after composite toggle change")
+					refresh()
+					if onDone != nil {
+						onDone()
+					}
+					return
+				}
+				// This generation is now either applied or has produced its final
+				// error result; a newer generation, if any, owns the indicator.
+				viewports[3].SetCompositeRendering(false)
 				applyComposePreviewData(data, viewports, pushRGBHist)
 				if data.Rendered != nil {
 					for i, l := range overlayLayers {
@@ -314,7 +651,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			})
 		}()
 	}
-	refresh := func() {
+	refresh = func() {
 		startGeneration(nil)
 	}
 	sharedHistCheck.OnChanged = func(bool) {
@@ -458,11 +795,94 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	composeRGB = func(ctx context.Context, calibrationSnapshot *models.ColorCalibrationState) ([]byte, int, int, [3]histogram.Stats, *processing.ComposeRenderResult, error) {
+		if largeMode {
+			if largeStore == nil || len(imgs) < 3 || imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+				return nil, 0, 0, [3]histogram.Stats{}, nil, errors.New("all three channels are required for disk-backed Compose")
+			}
+			largeMu.RLock()
+			expectedCompositeGeneration := uint64(0)
+			if currentComposite, ok := largeStore.Composite(); ok {
+				expectedCompositeGeneration = currentComposite.Generation
+			}
+			var channels [3]processing.DiskChannel
+			for i := 0; i < 3; i++ {
+				d, ok := largeArtifacts[i]
+				if !ok || d.Path == "" {
+					largeMu.RUnlock()
+					return nil, 0, 0, [3]histogram.Stats{}, nil, fmt.Errorf("missing disk artifact for channel %d", i)
+				}
+				dx, dy, rot, _ := composeChannelOffsetFields(i)
+				channels[i] = processing.DiskChannel{ArtifactPath: d.Path, Image: *imgs[i], OffsetX: dx, OffsetY: dy, OffsetRot: rot}
+			}
+			largeMu.RUnlock()
+			// Every render owns a unique output set. This prevents a cancelled or
+			// superseded job from reopening/overwriting the currently displayed
+			// composite while another job is still preparing its rows.
+			renderID := time.Now().UnixNano()
+			outs := [3]string{
+				filepath.Join(largeStore.root, fmt.Sprintf("composite-r-%d.bin", renderID)),
+				filepath.Join(largeStore.root, fmt.Sprintf("composite-g-%d.bin", renderID)),
+				filepath.Join(largeStore.root, fmt.Sprintf("composite-b-%d.bin", renderID)),
+			}
+			ovs := make([]processing.DiskOverlay, 0, len(overlayLayers))
+			largeMu.RLock()
+			for _, l := range overlayLayers {
+				if l == nil || l.idx >= len(imgs) || imgs[l.idx] == nil {
+					continue
+				}
+				if d, ok := largeArtifacts[l.idx]; ok {
+					ovs = append(ovs, processing.DiskOverlay{Channel: processing.DiskChannel{ArtifactPath: d.Path, Image: *imgs[l.idx]}, Settings: l.settings})
+				}
+			}
+			largeMu.RUnlock()
+			result, err := processing.ComposeDisk(ctx, processing.DiskComposeRequest{Channels: channels, Overlays: ovs, Calibration: calibrationSnapshot, Output: outs, PreviewMax: 1600, RGBLevels: levels})
+			if err != nil {
+				for _, p := range outs {
+					_ = os.Remove(p)
+				}
+				return nil, 0, 0, [3]histogram.Stats{}, nil, err
+			}
+			if _, err := largeStore.PublishCompositeIfCurrent(expectedCompositeGeneration, outs, result.Width, result.Height); err != nil {
+				for _, p := range outs {
+					_ = os.Remove(p)
+				}
+				return nil, 0, 0, [3]histogram.Stats{}, nil, err
+			}
+			rendered := &processing.ComposeRenderResult{Preview: result.Preview, Width: result.Width, Height: result.Height, Stats: result.Stats, Status: result.Status}
+			return result.Preview, result.Width, result.Height, result.Stats, rendered, nil
+		}
 		rendered, err := composeRenderWithCalibration(ctx, renderImages(), calibrationSnapshot)
 		return rendered.Preview, rendered.Width, rendered.Height, rendered.Stats, &rendered, err
 	}
 
 	saveChannelGray := func(idx int) {
+		if largeMode {
+			if imgs[idx] == nil {
+				dialog.ShowInformation("Missing", fmt.Sprintf("Load Channel %d first", idx+1), win)
+				return
+			}
+			d, ok := largeArtifacts[idx]
+			if !ok {
+				dialog.ShowInformation("Missing", "The channel artifact is unavailable.", win)
+				return
+			}
+			save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
+				if err != nil || uc == nil {
+					return
+				}
+				path := uc.URI().Path()
+				_ = uc.Close()
+				format := detectExportFormat(path)
+				showExportOptionsDialog(format, win, func(opts export.Options) {
+					if err := export.FromFloat32Artifact(context.Background(), path, d.Path, d.Width, d.Height, format, opts, imgs[idx]); err != nil {
+						dialog.ShowError(err, win)
+					}
+				})
+			}, win)
+			save.SetFileName(fmt.Sprintf("channel_%d_gray.png", idx+1))
+			save.Show()
+			return
+		}
 		if imgs[idx] == nil {
 			dialog.ShowInformation("Missing", fmt.Sprintf("Load Channel %d first", idx+1), win)
 			return
@@ -490,6 +910,66 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	normalizeScale := func() {
 		if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
 			dialog.ShowInformation("Missing Channels", "Load all three FITS channels before scaling.", win)
+			return
+		}
+		if largeMode && largeStore != nil {
+			linesG := utils.FormatHeadersLines(imgs[1].Primary, imgs[1].HDU.Header)
+			targetScale := processing.GetPixelScale(linesG)
+			progressDialog := dialog.NewCustom("Normalizing", "Resampling arrays to match Channel 2 scale...", widget.NewProgressBarInfinite(), win)
+			progressDialog.Show()
+			go func() {
+				type result struct {
+					idx, width, height int
+					d                  composeArtifactDescriptor
+					preview            *image.RGBA
+					err                error
+				}
+				results := make([]result, 0, 2)
+				for _, idx := range []int{0, 2} {
+					d, ok := largeArtifacts[idx]
+					if !ok {
+						results = append(results, result{idx: idx, err: fmt.Errorf("missing disk artifact for channel %d", idx+1)})
+						continue
+					}
+					lines := utils.FormatHeadersLines(imgs[idx].Primary, imgs[idx].HDU.Header)
+					sourceScale := processing.GetPixelScale(lines)
+					if targetScale == 0 || math.Abs(sourceScale-targetScale)/targetScale < 0.01 {
+						results = append(results, result{idx: idx, width: d.Width, height: d.Height, d: d})
+						continue
+					}
+					ratio := sourceScale / targetScale
+					newW, newH := int(float64(d.Width)*ratio), int(float64(d.Height)*ratio)
+					nd, err := largeStore.ResizeArtifact(d, newW, newH)
+					var preview *image.RGBA
+					if err == nil {
+						preview, _, _, err = composeLargeStretchedPreview(nd.Path, imgs[idx])
+					}
+					results = append(results, result{idx: idx, width: newW, height: newH, d: nd, preview: preview, err: err})
+				}
+				fyne.Do(func() {
+					progressDialog.Hide()
+					count := 0
+					for _, r := range results {
+						if r.err != nil {
+							dialog.ShowError(r.err, win)
+							continue
+						}
+						if r.width == 0 {
+							continue
+						}
+						largeArtifacts[r.idx] = r.d
+						if r.preview != nil {
+							largePreviews[r.idx] = r.preview
+						}
+						imgs[r.idx].HDU.Data.Width, imgs[r.idx].HDU.Data.Height = r.width, r.height
+						imgs[r.idx].HDU.Data.Pixels = nil
+						clearComposeOrigPixels(&origPixels, r.idx)
+						count++
+					}
+					refresh()
+					dialog.ShowInformation("Complete", fmt.Sprintf("Rescaled %d channel(s) to match Channel 2 pixel scale.", count), win)
+				})
+			}()
 			return
 		}
 
@@ -618,8 +1098,27 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			)
 			progressDialog.Show()
 
+			diskLoad := largeMode
 			go func() {
-				img, loadErr := loadImageFromPath(path)
+				slot := fmt.Sprintf("channel-%d", idx)
+				request, session, store := nextLargeLoadGeneration(slot)
+				var img *models.LoadedImage
+				var preview *image.RGBA
+				var artifact composeArtifactDescriptor
+				var loadErr error
+				if diskLoad {
+					if largeStore == nil {
+						loadErr = errors.New("disk-backed Compose store is unavailable")
+					} else {
+						if store == nil {
+							loadErr = errors.New("disk-backed Compose store is unavailable")
+						} else {
+							img, preview, artifact, loadErr = loadLargeComposeImage(path, store, slot)
+						}
+					}
+				} else {
+					img, loadErr = loadImageFromPath(path)
+				}
 
 				if loadErr != nil {
 					progressDialog.Hide()
@@ -627,7 +1126,26 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					return
 				}
 
-				replaceComposeChannelImage(imgs, idx, img)
+				if diskLoad && !largeLoadStillCurrent(slot, request, session, artifact) {
+					cleanupLargeArtifactIfCurrent(artifact)
+					return
+				}
+				if !diskLoad {
+					replaceComposeChannelImage(imgs, idx, img)
+				}
+				if diskLoad {
+					largeMu.Lock()
+					current, currentOK := store.Descriptor(slot)
+					if largeStore != store || largeSessionGeneration != session || largeLoadGenerations[slot] != request || !currentOK || current.Generation != artifact.Generation || current.Path != artifact.Path {
+						largeMu.Unlock()
+						cleanupLargeArtifactIfCurrent(artifact)
+						return
+					}
+					replaceComposeChannelImage(imgs, idx, img)
+					largePreviews[idx] = preview
+					largeArtifacts[idx] = artifact
+					largeMu.Unlock()
+				}
 				clearComposeOrigPixels(&origPixels, idx)
 
 				fyne.Do(func() {
@@ -716,6 +1234,17 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			refresh()
 			return
 		}
+		if composeLargeModeActive != nil && composeLargeModeActive() {
+			largeMu.RLock()
+			p := largePreviews[l.idx]
+			largeMu.RUnlock()
+			if p != nil {
+				l.viewport.image.Image = p
+				l.viewport.image.Refresh()
+			}
+			refresh()
+			return
+		}
 		data, err := buildComposeOverlayPreviewData(context.Background(), imgs[l.idx])
 		if err != nil {
 			return
@@ -725,6 +1254,33 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	saveLayerGray := func(l *overlayLayer) {
+		if largeMode {
+			if l == nil || l.idx >= len(imgs) || imgs[l.idx] == nil {
+				dialog.ShowInformation("Missing", "Load the layer image first", win)
+				return
+			}
+			d, ok := largeArtifacts[l.idx]
+			if !ok {
+				dialog.ShowInformation("Missing", "The layer artifact is unavailable.", win)
+				return
+			}
+			save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
+				if err != nil || uc == nil {
+					return
+				}
+				path := uc.URI().Path()
+				_ = uc.Close()
+				format := detectExportFormat(path)
+				showExportOptionsDialog(format, win, func(opts export.Options) {
+					if err := export.FromFloat32Artifact(context.Background(), path, d.Path, d.Width, d.Height, format, opts, imgs[l.idx]); err != nil {
+						dialog.ShowError(err, win)
+					}
+				})
+			}, win)
+			save.SetFileName("layer_gray.png")
+			save.Show()
+			return
+		}
 		if l.idx >= len(imgs) || imgs[l.idx] == nil {
 			dialog.ShowInformation("Missing", "Load the layer image first", win)
 			return
@@ -757,14 +1313,47 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			app.Preferences().SetString("lastDir", filepath.Dir(path))
 			progressDialog := dialog.NewCustom("Loading Layer Image", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
 			progressDialog.Show()
+			diskLoad := largeMode
 			go func() {
-				img, loadErr := loadImageFromPath(path)
+				slot := fmt.Sprintf("overlay-%d", l.idx)
+				request, session, store := nextLargeLoadGeneration(slot)
+				var img *models.LoadedImage
+				var preview *image.RGBA
+				var artifact composeArtifactDescriptor
+				var loadErr error
+				if diskLoad {
+					if store == nil {
+						loadErr = errors.New("disk-backed Compose store is unavailable")
+					} else {
+						img, preview, artifact, loadErr = loadLargeComposeImage(path, store, slot)
+					}
+				} else {
+					img, loadErr = loadImageFromPath(path)
+				}
 				if loadErr != nil {
 					progressDialog.Hide()
 					dialog.ShowError(loadErr, win)
 					return
 				}
-				imgs[l.idx] = img
+				if diskLoad && !largeLoadStillCurrent(slot, request, session, artifact) {
+					cleanupLargeArtifactIfCurrent(artifact)
+					return
+				}
+				if diskLoad {
+					largeMu.Lock()
+					current, currentOK := store.Descriptor(slot)
+					if largeStore != store || largeSessionGeneration != session || largeLoadGenerations[slot] != request || !currentOK || current.Generation != artifact.Generation || current.Path != artifact.Path {
+						largeMu.Unlock()
+						cleanupLargeArtifactIfCurrent(artifact)
+						return
+					}
+					largePreviews[l.idx] = preview
+					largeArtifacts[l.idx] = artifact
+					imgs[l.idx] = img
+					largeMu.Unlock()
+				} else {
+					imgs[l.idx] = img
+				}
 				clearComposeOrigPixels(&origPixels, l.idx)
 				fyne.Do(func() {
 					if l.control != nil {
@@ -800,6 +1389,18 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 		if l.idx < len(imgs) {
 			imgs[l.idx] = nil
+			if largeMode && largeStore != nil {
+				invalidateLargeSlot(l.idx)
+				largeMu.Lock()
+				store := largeStore
+				d := largeArtifacts[l.idx]
+				delete(largeArtifacts, l.idx)
+				delete(largePreviews, l.idx)
+				largeMu.Unlock()
+				if d.Slot != "" && store != nil {
+					_, _ = store.RemoveSlotIfCurrent(d)
+				}
+			}
 			clearComposeOrigPixels(&origPixels, l.idx)
 		}
 		l.win = nil
@@ -904,7 +1505,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 		l.viewport.SetLoadSave(l.name, "L", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255},
 			func() { loadLayer(l) }, func() { saveLayerGray(l) })
-		l.control = channelControls(l.name+" Image", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255}, l.idx, imgs, &origPixels, layerViews(l), func() { refreshLayerPreview(l) }, composeMagicPreset, false)
+		largeRuntime.store = largeStore
+		l.control = channelControls(l.name+" Image", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255}, l.idx, imgs, &origPixels, layerViews(l), func() { refreshLayerPreview(l) }, composeMagicPreset, false, largeRuntime)
 
 		swatch := canvas.NewRectangle(color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255})
 		swatch.SetMinSize(fyne.NewSize(36, 18))
@@ -1169,20 +1771,58 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			app.Preferences().SetString("lastDir", filepath.Dir(path))
 			progressDialog := dialog.NewCustom("Loading Layer Image", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
 			progressDialog.Show()
+			diskLoad := largeMode
 			go func() {
-				img, loadErr := loadImageFromPath(path)
+				// The staging slot is unique per request and becomes the runtime
+				// descriptor slot once the overlay is created below.
+				slot := fmt.Sprintf("overlay-stage-%d", time.Now().UnixNano())
+				request, session, store := nextLargeLoadGeneration(slot)
+				var img *models.LoadedImage
+				var preview *image.RGBA
+				var artifact composeArtifactDescriptor
+				var loadErr error
+				if diskLoad {
+					// The runtime slot index is assigned only after the load succeeds;
+					// use a unique staging slot and publish it under the assigned index.
+					if store == nil {
+						loadErr = errors.New("disk-backed Compose store is unavailable")
+					} else {
+						img, preview, artifact, loadErr = loadLargeComposeImage(path, store, slot)
+					}
+				} else {
+					img, loadErr = loadImageFromPath(path)
+				}
 				fyne.Do(func() {
 					progressDialog.Hide()
 					if loadErr != nil {
 						dialog.ShowError(loadErr, win)
 						return
 					}
+					if diskLoad && !largeLoadStillCurrent(slot, request, session, artifact) {
+						cleanupLargeArtifactIfCurrent(artifact)
+						return
+					}
 					l, ok := createOverlayLayer(defaultOverlayLayerSettings(len(overlayLayers)))
 					if !ok {
+						if diskLoad {
+							cleanupLargeArtifactIfCurrent(artifact)
+						}
 						dialog.ShowInformation("Layer limit", fmt.Sprintf("A maximum of %d colored layers is supported.", maxOverlayLayers), win)
 						return
 					}
 					imgs[l.idx] = img
+					if diskLoad {
+						largeMu.Lock()
+						current, currentOK := store.Descriptor(artifact.Slot)
+						if largeStore != store || largeSessionGeneration != session || largeLoadGenerations[artifact.Slot] != request || !currentOK || current.Generation != artifact.Generation || current.Path != artifact.Path {
+							largeMu.Unlock()
+							cleanupLargeArtifactIfCurrent(artifact)
+							return
+						}
+						largePreviews[l.idx] = preview
+						largeArtifacts[l.idx] = artifact
+						largeMu.Unlock()
+					}
 					invalidateCalibration()
 					openOverlayLayerWindow(l)
 					if updateMenus != nil {
@@ -1254,10 +1894,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		})
 	}
 
+	largeRuntime.store = largeStore
 	controlSets = []*models.ChannelControl{
-		channelControls("Channel 1 (Blue)", color.RGBA{R: 100, G: 149, B: 237, A: 255}, 0, imgs, &origPixels, viewports, refresh, composeMagicPreset, true),
-		channelControls("Channel 2 (Green)", color.RGBA{R: 80, G: 200, B: 80, A: 255}, 1, imgs, &origPixels, viewports, refresh, composeMagicPreset, true),
-		channelControls("Channel 3 (Red)", color.RGBA{R: 237, G: 80, B: 80, A: 255}, 2, imgs, &origPixels, viewports, refresh, composeMagicPreset, true),
+		channelControls("Channel 1 (Blue)", color.RGBA{R: 100, G: 149, B: 237, A: 255}, 0, imgs, &origPixels, viewports, refresh, composeMagicPreset, true, largeRuntime),
+		channelControls("Channel 2 (Green)", color.RGBA{R: 80, G: 200, B: 80, A: 255}, 1, imgs, &origPixels, viewports, refresh, composeMagicPreset, true, largeRuntime),
+		channelControls("Channel 3 (Red)", color.RGBA{R: 237, G: 80, B: 80, A: 255}, 2, imgs, &origPixels, viewports, refresh, composeMagicPreset, true, largeRuntime),
 	}
 
 	// The Manual Offset (X/Y/Rot) fields are the source of truth for each channel's
@@ -1266,7 +1907,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	// offset-applied view used for the composite (merge) and the per-channel
 	// previews the blink shows. Results are cached so an unchanged offset isn't
 	// re-warped on every refresh.
-	channelOffsetFields := func(idx int) (dx, dy, rot float64, ok bool) {
+	composeChannelOffsetFields = func(idx int) (dx, dy, rot float64, ok bool) {
 		if idx < 0 || idx >= len(controlSets) || controlSets[idx] == nil {
 			return 0, 0, 0, false
 		}
@@ -1290,7 +1931,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		if idx < 0 || idx >= len(imgs) || imgs[idx] == nil {
 			return nil
 		}
-		dx, dy, rot, ok := channelOffsetFields(idx)
+		dx, dy, rot, ok := composeChannelOffsetFields(idx)
 		align, hasAlign := channelAlignTransform(imgs[idx])
 		if (!ok || (dx == 0 && dy == 0 && rot == 0)) && !hasAlign {
 			return imgs[idx]
@@ -1351,9 +1992,75 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		copy(img.Pix, buf)
 		return img
 	}
+	startLargeEditSnapshot := func(d composeCompositeDescriptor, levelSnapshot models.RgbLevels) {
+		// Capture the session owner before starting any asynchronous work. The
+		// Compose session may be cleared or replaced while the copy is running;
+		// the job must continue to use the immutable store pointer it started
+		// with, rather than dereferencing the mutable outer largeStore variable.
+		store := largeStore
+		if store == nil {
+			dialog.ShowInformation("Nothing to send", "The large-file Compose session is no longer available.", win)
+			return
+		}
+		editSnapshotMu.Lock()
+		if editSnapshotCancel != nil {
+			editSnapshotMu.Unlock()
+			dialog.ShowInformation("Send to Edit", "A composite snapshot is already in progress.", win)
+			return
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		editSnapshotCancel = cancel
+		editSnapshotMu.Unlock()
+		cancelButton := widget.NewButton("Cancel", cancel)
+		progressDialog := dialog.NewCustomWithoutButtons("Sending to Edit", container.NewBorder(nil, cancelButton, nil, nil, container.NewVBox(widget.NewLabel("Copying the published composite…"), widget.NewProgressBarInfinite())), win)
+		finished := false
+		progressDialog.SetOnClosed(func() {
+			if !finished {
+				cancel()
+			}
+		})
+		progressDialog.Show()
+		go func() {
+			ed, err := store.SnapshotCompositeForEdit(ctx, d)
+			if err == nil {
+				ed.levels = levelSnapshot
+			}
+			fyne.Do(func() {
+				finished = true
+				progressDialog.Hide()
+				editSnapshotMu.Lock()
+				editSnapshotCancel = nil
+				editSnapshotMu.Unlock()
+				if err != nil {
+					if !errors.Is(err, context.Canceled) {
+						dialog.ShowInformation("Nothing to send", err.Error(), win)
+					}
+					return
+				}
+				if cur, ok := store.Composite(); !ok || cur.Generation != d.Generation {
+					ed.cleanup()
+					dialog.ShowInformation("Nothing to send", "The composite changed before it could be sent to Edit.", win)
+					return
+				}
+				if globalExportToEdit != nil {
+					globalExportToEdit(editImageHandoff{disk: ed})
+				}
+			})
+		}()
+	}
 	viewports[3].SetCenterAction("Composite", "C", color.RGBA{R: 200, G: 110, B: 30, A: 255},
 		"Export to Edit", func() {
 			if globalExportToEdit == nil {
+				return
+			}
+			if largeMode {
+				if largeStore != nil {
+					if d, ok := largeStore.Composite(); ok {
+						startLargeEditSnapshot(d, *levels)
+						return
+					}
+				}
+				dialog.ShowInformation("Build Composite first", "Build the composite before sending it to Edit.", win)
 				return
 			}
 			img := compositeImageForEdit()
@@ -1361,7 +2068,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				dialog.ShowInformation("Nothing to export", "Compose all three channels first.", win)
 				return
 			}
-			globalExportToEdit(img)
+			globalExportToEdit(editImageHandoff{memory: img})
 		})
 
 	copySettings := func() {
@@ -1432,6 +2139,97 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 		if targetCount == 0 {
 			dialog.ShowInformation("No Targets", "Load at least one other channel to match.", win)
+			return
+		}
+		if largeMode && largeStore != nil {
+			progressDialog := dialog.NewCustom("Matching Channel Stretch", "Matching channel levels...", widget.NewProgressBarInfinite(), win)
+			progressDialog.Show()
+			largeMu.RLock()
+			refD, ok := largeArtifacts[refIdx]
+			expectedTargets := make(map[int]composeArtifactDescriptor)
+			for idx := range targetSnapshots {
+				if d, exists := largeArtifacts[idx]; exists {
+					expectedTargets[idx] = d
+				}
+			}
+			largeMu.RUnlock()
+			if !ok {
+				progressDialog.Hide()
+				dialog.ShowError(fmt.Errorf("missing disk artifact for reference channel"), win)
+				return
+			}
+			go func(expected composeArtifactDescriptor) {
+				refSummary, err := largeArtifactStretchSummary(expected.Path, refSnapshot, matchStarCores)
+				type result struct {
+					idx     int
+					state   models.ChannelState
+					preview *image.RGBA
+					err     error
+				}
+				results := make([]result, 0, targetCount)
+				if err == nil {
+					for idx := range targetSnapshots {
+						if targetSnapshots[idx] == nil {
+							continue
+						}
+						largeMu.RLock()
+						d, exists := largeArtifacts[idx]
+						largeMu.RUnlock()
+						if !exists {
+							results = append(results, result{idx: idx, err: fmt.Errorf("missing disk artifact")})
+							continue
+						}
+						anchors := refSummary.coreAnchors
+						if anchors == nil {
+							// A non-nil empty slice marks this as a target pass even
+							// when the reference had too few usable anchors.
+							anchors = []processing.Star{}
+						}
+						targetSummary, e := largeArtifactStretchSummaryWithAnchors(d.Path, targetSnapshots[idx], matchStarCores, anchors, expected.Width, expected.Height)
+						st := channelStateFromImage(targetSnapshots[idx])
+						if e == nil {
+							e = applyLargeStretchMatch(&st, refSnapshot, refSummary, targetSummary)
+						}
+						var p *image.RGBA
+						if e == nil {
+							clone := *targetSnapshots[idx]
+							applyChannelStateToImage(&clone, st)
+							p, _, _, e = composeLargeStretchedPreview(d.Path, &clone)
+						}
+						results = append(results, result{idx: idx, state: st, preview: p, err: e})
+					}
+				}
+				if err != nil {
+					results = append(results, result{err: err})
+				}
+				fyne.Do(func() {
+					progressDialog.Hide()
+					largeMu.RLock()
+					currentRef, refCurrent := largeArtifacts[refIdx]
+					largeMu.RUnlock()
+					if !refCurrent || currentRef.Generation != expected.Generation || currentRef.Path != expected.Path {
+						return
+					}
+					for _, r := range results {
+						if r.err != nil {
+							dialog.ShowError(r.err, win)
+							continue
+						}
+						largeMu.RLock()
+						cur, current := largeArtifacts[r.idx]
+						largeMu.RUnlock()
+						expected, expectedOK := expectedTargets[r.idx]
+						if !expectedOK || !current || cur.Generation != expected.Generation || cur.Path != expected.Path {
+							continue
+						}
+						applyChannelState(r.idx, r.state, imgs, viewports, controlSets)
+						if r.preview != nil {
+							largePreviews[r.idx] = r.preview
+						}
+					}
+					refresh()
+				})
+			}(refD)
 			return
 		}
 
@@ -1558,7 +2356,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				continue
 			}
 			hasChannel = true
-			dx, dy, rot, _ := channelOffsetFields(i)
+			dx, dy, rot, _ := composeChannelOffsetFields(i)
 			project.Channels[i] = models.ChannelState{
 				Path:       imgs[i].Path,
 				Mode:       modeToLabel(imgs[i].Mode),
@@ -1648,6 +2446,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				dialog.ShowError(err, win)
 				return
 			}
+			clearGaiaRefinement()
+			previousCalibration := colorCalibration
+			previousSaveCalibration := saveColorCalibration
 			if project.ColorCalibration != nil {
 				colorCalibration = *project.ColorCalibration
 				colorCalibration.Overlays = append([]models.OverlayCalibrationState(nil), project.ColorCalibration.Overlays...)
@@ -1674,6 +2475,23 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			}
 			if len(layerStates) > maxOverlayLayers {
 				layerStates = layerStates[:maxOverlayLayers]
+			}
+			// Keep a detached snapshot until every incoming source has staged
+			// successfully; large-mode failure restores these runtime references.
+			previousImgs := append([]*models.LoadedImage(nil), imgs...)
+			previousOrig := append([][]float32(nil), origPixels...)
+			previousOverlays := append([]*overlayLayer(nil), overlayLayers...)
+			previousArtifacts := make(map[int]composeArtifactDescriptor)
+			previousPreviews := make(map[int]*image.RGBA)
+			if largeMode {
+				largeMu.RLock()
+				for idx, d := range largeArtifacts {
+					previousArtifacts[idx] = d
+				}
+				for idx, p := range largePreviews {
+					previousPreviews[idx] = p
+				}
+				largeMu.RUnlock()
 			}
 
 			// Tear down existing overlay windows and rebuild imgs/origPixels to hold
@@ -1705,44 +2523,78 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 			go func() {
 				type loadResult struct {
-					idx   int
-					img   *models.LoadedImage
-					state models.ChannelState
-					err   error
+					idx      int
+					img      *models.LoadedImage
+					preview  *image.RGBA
+					artifact composeArtifactDescriptor
+					state    models.ChannelState
+					err      error
 				}
 
 				total := len(imgs)
-				results := make(chan loadResult, total)
-				var wg sync.WaitGroup
-
 				stateForIdx := func(i int) models.ChannelState {
 					if i < 3 {
 						return project.Channels[i]
 					}
 					return layerStates[i-3].Channel
 				}
-
-				for i := 0; i < total; i++ {
-					state := stateForIdx(i)
-					if state.Path == "" {
-						results <- loadResult{idx: i, state: state}
-						continue
-					}
-					wg.Add(1)
-					go func(idx int, state models.ChannelState) {
-						defer wg.Done()
-						img, loadErr := loadImageFromPath(state.Path)
-						results <- loadResult{idx: idx, img: img, state: state, err: loadErr}
-					}(i, state)
-				}
-
-				go func() {
-					wg.Wait()
-					close(results)
-				}()
-
+				results := make([]loadResult, 0, total)
 				errors := make([]string, 0, total)
-				for res := range results {
+				if largeMode {
+					// Large-mode project loads are deliberately sequential. Each source is
+					// staged through the artifact transaction before its bounded preview is
+					// generated; no legacy full-pixel loader is used.
+					for i := 0; i < total; i++ {
+						state := stateForIdx(i)
+						res := loadResult{idx: i, state: state}
+						if state.Path != "" {
+							slot := fmt.Sprintf("project-%d", i)
+							if largeStore == nil {
+								res.err = fmt.Errorf("disk-backed Compose store is unavailable")
+							} else {
+								img, preview, artifact, loadErr := loadLargeComposeImage(state.Path, largeStore, slot)
+								res.img, res.preview, res.artifact, res.err = img, preview, artifact, loadErr
+								if res.err == nil {
+									turns := state.Rotation90 % 4
+									for turns > 0 {
+										artifact, res.err = largeStore.RotateArtifact90CW(artifact)
+										if res.err != nil {
+											break
+										}
+										res.artifact = artifact
+										img.HDU.Data.Width, img.HDU.Data.Height = artifact.Width, artifact.Height
+										turns--
+									}
+									if res.err == nil && state.Rotation90%4 != 0 {
+										res.preview, _, _, res.err = composeLargeStretchedPreview(artifact.Path, img)
+									}
+								}
+							}
+						}
+						results = append(results, res)
+					}
+				} else {
+					resultsCh := make(chan loadResult, total)
+					var wg sync.WaitGroup
+					for i := 0; i < total; i++ {
+						state := stateForIdx(i)
+						if state.Path == "" {
+							results = append(results, loadResult{idx: i, state: state})
+							continue
+						}
+						wg.Add(1)
+						go func(idx int, state models.ChannelState) {
+							defer wg.Done()
+							img, loadErr := loadImageFromPath(state.Path)
+							resultsCh <- loadResult{idx: idx, img: img, state: state, err: loadErr}
+						}(i, state)
+					}
+					go func() { wg.Wait(); close(resultsCh) }()
+					for res := range resultsCh {
+						results = append(results, res)
+					}
+				}
+				for _, res := range results {
 					if res.state.Path == "" {
 						imgs[res.idx] = nil
 						continue
@@ -1756,15 +2608,83 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						continue
 					}
 					imgs[res.idx] = res.img
+					if largeMode {
+						largeMu.Lock()
+						largeArtifacts[res.idx] = res.artifact
+						largePreviews[res.idx] = res.preview
+						largeMu.Unlock()
+					}
 					clearComposeOrigPixels(&origPixels, res.idx)
+				}
+				if largeMode && len(errors) > 0 {
+					// Project replacement is all-or-none in disk mode: discard every
+					// staged artifact when any source fails, including artifacts already
+					// published into the temporary result maps above.
+					for _, res := range results {
+						if res.artifact.Slot != "" {
+							_, _ = largeStore.RemoveSlotIfCurrent(res.artifact)
+						}
+						imgs[res.idx] = nil
+						largeMu.Lock()
+						delete(largeArtifacts, res.idx)
+						delete(largePreviews, res.idx)
+						largeMu.Unlock()
+					}
 				}
 
 				fyne.Do(func() {
+					if largeMode && len(errors) > 0 {
+						// Restore the detached runtime snapshot before reporting failure.
+						restoreComposeLargeProjectSnapshot(&imgs, &origPixels, &overlayLayers, &largeArtifacts, &largePreviews, &colorCalibration, &saveColorCalibration, previousImgs, previousOrig, previousOverlays, previousArtifacts, previousPreviews, previousCalibration, previousSaveCalibration)
+						largeMu.Lock()
+						largeArtifacts = previousArtifacts
+						largePreviews = previousPreviews
+						largeRuntime.artifacts = largeArtifacts
+						largeRuntime.previews = largePreviews
+						largeMu.Unlock()
+						colorCalibration = previousCalibration
+						saveColorCalibration = previousSaveCalibration
+						for _, l := range overlayLayers {
+							if l.win != nil {
+								l.win.SetCloseIntercept(nil)
+								l.win.Close()
+							}
+						}
+						for _, l := range previousOverlays {
+							l.win, l.viewport, l.control = nil, nil, nil
+							openOverlayLayerWindow(l)
+						}
+						blinkChannels = nil
+						blinkCheck.SetChecked(false)
+						if stopBlink != nil {
+							stopBlink()
+						}
+						dialog.ShowError(fmt.Errorf("%s", strings.Join(errors, "\n")), win)
+						progressDialog.Hide()
+						return
+					} else if largeMode {
+						// Commit succeeded; old session slots can now be reclaimed.
+						largeMu.RLock()
+						currentArtifacts := make(map[int]composeArtifactDescriptor, len(largeArtifacts))
+						for idx, d := range largeArtifacts {
+							currentArtifacts[idx] = d
+						}
+						largeMu.RUnlock()
+						for idx, old := range previousArtifacts {
+							if cur, ok := currentArtifacts[idx]; !ok || cur.Path != old.Path {
+								_, _ = largeStore.RemoveSlotIfCurrent(old)
+							}
+						}
+					}
 					debuglog.Log("load compose project: applying loaded project state")
 					withSuspendedRefresh(func() {
 						for i, img := range imgs[:3] {
 							if img != nil {
-								restoreComposeChannelRotation(img, project.Channels[i].Rotation90)
+								if largeMode {
+									img.Rotation90 = project.Channels[i].Rotation90
+								} else {
+									restoreComposeChannelRotation(img, project.Channels[i].Rotation90)
+								}
 								applyChannelState(i, project.Channels[i], imgs, viewports, controlSets)
 							}
 						}
@@ -1784,7 +2704,12 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						} else {
 							blinkChannels = resolveComposeBlinkSelection(composeBlinkSources(), nil, project.BlinkFilters, project.BlinkExcludedFilter)
 						}
-						blinkCheck.SetChecked(project.BlinkFilters)
+						if largeMode {
+							blinkCheck.SetChecked(false)
+							blinkChannels = nil
+						} else {
+							blinkCheck.SetChecked(project.BlinkFilters)
+						}
 						measureEnabled = project.MeasureComposite
 						if measureCheck != nil {
 							measureCheck.SetChecked(measureEnabled)
@@ -1821,7 +2746,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						dialog.ShowError(fmt.Errorf("%s", strings.Join(errors, "\n")), win)
 					}
 					refreshAsync(func() {
-						if blinkCheck.Checked && startBlink != nil {
+						if !largeMode && blinkCheck.Checked && startBlink != nil {
 							startBlink()
 						}
 						progressDialog.Hide()
@@ -1911,6 +2836,95 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	alignChannels := func() {
 		if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
 			dialog.ShowInformation("Missing Channels", "Load all three FITS channels before aligning.", win)
+			return
+		}
+		if largeMode && largeStore != nil {
+			progressDialog := dialog.NewCustom("Aligning", "Extracting star catalogs...", widget.NewProgressBarInfinite(), win)
+			progressDialog.Show()
+			go func() {
+				largeMu.RLock()
+				descs := make(map[int]composeArtifactDescriptor, 3)
+				channels := make([]composeAlignmentChannel, 0, 3)
+				for _, idx := range []int{0, 1, 2} {
+					d, exists := largeArtifacts[idx]
+					if exists {
+						descs[idx] = d
+					}
+				}
+				largeMu.RUnlock()
+				var err error
+				for _, idx := range []int{0, 1, 2} {
+					d, exists := descs[idx]
+					if !exists {
+						err = fmt.Errorf("missing disk artifact for Channel %d", idx+1)
+						break
+					}
+					stars, e := largeArtifactStars(d.Path)
+					if e != nil {
+						err = e
+						break
+					}
+					channels = append(channels, composeAlignmentChannel{Index: idx + 1, Width: d.Width, Height: d.Height, UsableStars: stars, Footprint: composeAlignmentFootprint{MaxX: float64(d.Width), MaxY: float64(d.Height)}})
+				}
+				match := func(target, reference composeAlignmentChannel) (composeAlignmentMatch, error) {
+					if len(target.UsableStars) < 3 || len(reference.UsableStars) < 3 {
+						return composeAlignmentMatch{}, fmt.Errorf("insufficient stars found for alignment")
+					}
+					sx, sy := float64(reference.Width)/float64(target.Width), float64(reference.Height)/float64(target.Height)
+					targetStars := make([]processing.Star, len(target.UsableStars))
+					for i, star := range target.UsableStars {
+						targetStars[i] = star
+						targetStars[i].X *= sx
+						targetStars[i].Y *= sy
+					}
+					// Both catalogs are now expressed in the reference pixel frame;
+					// use the same robust histogram/mutual-neighbour fit and global
+					// refinement as the normal alignment path.
+					forward, stats, e := processing.FitCatalogResidual(targetStars, reference.UsableStars, reference.Width, reference.Height, 30, "general")
+					if e != nil {
+						return composeAlignmentMatch{}, e
+					}
+					// FitCatalogResidual maps the resized target catalog into the
+					// reference frame. Convert that forward transform back to the
+					// target's native frame exactly as the normal pixel path does.
+					return composeAlignmentMatchFromFittedAffine(target, reference, forward, stats), nil
+				}
+				alignment := composeAlignmentResult{}
+				if err == nil {
+					alignment = coordinateComposeAlignmentWithEligibility(channels, 2, match, composeAlignmentFallbackPairEligible)
+				}
+				fyne.Do(func() {
+					progressDialog.Hide()
+					if err != nil {
+						dialog.ShowError(err, win)
+						return
+					}
+					// Channel 2 is the alignment root.  Do not commit either
+					// fitted result if the reference artifact was replaced while
+					// catalogs were being extracted.
+					refCurrent, refOK := largeStore.Descriptor("channel-1")
+					refExpected := descs[1]
+					if !refOK || !composeLargeAlignmentReferenceCurrent(refCurrent, refExpected) {
+						return
+					}
+					for _, idx := range []int{0, 2} {
+						res := alignment.Channels[idx+1]
+						cur, current := largeStore.Descriptor(fmt.Sprintf("channel-%d", idx))
+						expected := descs[idx]
+						if !current || cur.Generation != expected.Generation || cur.Path != expected.Path || !res.Applicable {
+							continue
+						}
+						setChannelAlignTransform(imgs[idx], res.Backward)
+						// The fitted affine supersedes the user nudge, matching the
+						// normal alignment path. Keep controls and metadata in sync.
+						if idx < len(controlSets) {
+							resetComposeAlignmentOffsets(controlSets[idx])
+						}
+						invalidateCalibration()
+					}
+					refresh()
+				})
+			}()
 			return
 		}
 
@@ -2029,6 +3043,708 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 
 		savedStates := captureViewportStates()
+		if largeMode && largeStore != nil {
+			expected := make([]composeArtifactDescriptor, 3)
+			for i := 0; i < 3; i++ {
+				d, ok := largeArtifacts[i]
+				if !ok || d.Path == "" {
+					dialog.ShowInformation("Missing Channels", "Load all three channels before cleaning.", win)
+					return
+				}
+				expected[i] = d
+			}
+			cleanCtx, cancelClean := context.WithCancel(context.Background())
+			cancelButton := widget.NewButton("Cancel", cancelClean)
+			progressLabel := widget.NewLabel("Preparing cleaner…")
+			progressBar := widget.NewProgressBar()
+			progressDialog := dialog.NewCustom("Cleaning", "", container.NewBorder(nil, cancelButton, nil, nil, container.NewVBox(progressLabel, progressBar)), win)
+			progressDialog.Show()
+			go func() {
+				defer cancelClean()
+				lastProgressStage, lastProgressPercent := "", -1
+				updateProgress := func(stage string, completed, total int) {
+					if total <= 0 {
+						return
+					}
+					percent := min(100, completed*100/total)
+					if stage == lastProgressStage && percent == lastProgressPercent {
+						return
+					}
+					lastProgressStage, lastProgressPercent = stage, percent
+					fyne.Do(func() {
+						progressLabel.SetText(fmt.Sprintf("%s — %d%%", stage, percent))
+						progressBar.SetValue(float64(completed) / float64(total))
+					})
+				}
+				widths := []int{expected[0].Width, expected[1].Width, expected[2].Width}
+				heights := []int{expected[0].Height, expected[1].Height, expected[2].Height}
+				sharedW, sharedH := widths[0], heights[0]
+				for i := 1; i < 3; i++ {
+					if widths[i] < sharedW {
+						sharedW = widths[i]
+					}
+					if heights[i] < sharedH {
+						sharedH = heights[i]
+					}
+				}
+				var maskFiles [3]*os.File
+				var maskScratchFiles [3]*os.File
+				var labelFiles [3]*os.File
+				var equivFiles [3]*os.File
+				var memberFiles [3]*os.File
+				var crLabelFiles [3]*os.File
+				var crEquivFiles [3]*os.File
+				var crMemberFiles [3]*os.File
+				var crStatsFiles [3]*os.File
+				var crDecisionFiles [3]*os.File
+				var crDecisionValidFiles [3]*os.File
+				var crReplacementFiles [3]*os.File
+				var crReplacementValidFiles [3]*os.File
+				for i := range maskFiles {
+					f, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-mask-%d-*.bin", i))
+					if e != nil {
+						for _, m := range maskFiles {
+							if m != nil {
+								_ = m.Close()
+							}
+						}
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					maskFiles[i] = f
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(f)
+					sf, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-mask-scratch-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					maskScratchFiles[i] = sf
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(sf)
+					lf, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-label-%d-*.bin", i))
+					if e != nil {
+						for _, m := range maskFiles {
+							if m != nil {
+								_ = m.Close()
+							}
+						}
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					labelFiles[i] = lf
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(lf)
+					ef, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-equiv-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					equivFiles[i] = ef
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(ef)
+					mf, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-member-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					memberFiles[i] = mf
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(mf)
+					clf, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-cr-label-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					crLabelFiles[i] = clf
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(clf)
+					cef, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-cr-equiv-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					crEquivFiles[i] = cef
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(cef)
+					cmf, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-cr-member-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					crMemberFiles[i] = cmf
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(cmf)
+					stf, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-cr-stats-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					crStatsFiles[i] = stf
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(stf)
+					df, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-cr-decision-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					crDecisionFiles[i] = df
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(df)
+					dvf, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-cr-decision-valid-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					crDecisionValidFiles[i] = dvf
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(dvf)
+					rf, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-cr-replacement-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					crReplacementFiles[i] = rf
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(rf)
+					rvf, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-cr-replacement-valid-%d-*.bin", i))
+					if e != nil {
+						fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(e, win) })
+						return
+					}
+					crReplacementValidFiles[i] = rvf
+					defer func(f *os.File) { _ = f.Close(); _ = os.Remove(f.Name()) }(rvf)
+				}
+				var stagedPreviews [3]*image.RGBA
+				next, err := largeStore.ReplaceManyIfCurrentArtifactsPrepared(expected, func(outs [3]*fitsio.Float32Artifact) error {
+					var readers [3]*fitsio.Float32Artifact
+					for i := range readers {
+						var e error
+						readers[i], e = fitsio.OpenFloat32ArtifactReadOnly(expected[i].Path)
+						if e != nil {
+							for _, r := range readers {
+								if r != nil {
+									_ = r.Close()
+								}
+							}
+							return e
+						}
+						defer readers[i].Close()
+					}
+					ro := processing.CrossChannelCleanDiskOptions{Widths: widths, Heights: heights, Passes: 2, TileWidth: 256, TileHeight: 256, Halo: 6, Context: cleanCtx, Progress: func(p processing.CrossChannelCleanProgress) {
+						updateProgress(p.Stage, p.Completed, p.Total)
+					}}
+					var scratch [3][2]*fitsio.Float32Artifact
+					var scratchPaths [3][2]string
+					var scratchActive [3]int
+					for i := 0; i < 3; i++ {
+						for pass := 0; pass < 2; pass++ {
+							sp, e := os.CreateTemp(largeStore.root, fmt.Sprintf("clean-scratch-%d-%d-*.bin", i, pass))
+							if e != nil {
+								return e
+							}
+							scratchPaths[i][pass] = sp.Name()
+							_ = sp.Close()
+							_ = os.Remove(scratchPaths[i][pass])
+							scratch[i][pass], e = fitsio.CreateFloat32Artifact(scratchPaths[i][pass], widths[i], heights[i])
+							if e != nil {
+								return e
+							}
+							defer func(a *fitsio.Float32Artifact, p string) { _ = a.Close(); _ = os.Remove(p) }(scratch[i][pass], scratchPaths[i][pass])
+						}
+						idx := i
+						ro.CosmicScratch[i] = processing.CosmicRayScratch{
+							ReadRow:  func(y int, dst []float32) error { return scratch[idx][scratchActive[idx]].ReadRow(y, dst) },
+							WriteRow: func(y int, src []float32) error { return scratch[idx][1-scratchActive[idx]].WriteRow(y, src) },
+							SeedRow:  func(y int, src []float32) error { return scratch[idx][scratchActive[idx]].WriteRow(y, src) },
+							Swap:     func() error { scratchActive[idx] = 1 - scratchActive[idx]; return nil },
+						}
+					}
+					for i := 0; i < 3; i++ {
+						idx := i
+						ro.MaskReadRow[i] = func(y int, dst []byte) error {
+							buf := dst[:sharedW]
+							n, e := maskFiles[idx].ReadAt(buf, int64(y*sharedW))
+							if n < len(buf) {
+								clear(buf[n:])
+							}
+							if e == io.EOF {
+								return nil
+							}
+							return e
+						}
+						ro.MaskWriteRow[i] = func(y int, src []byte) error {
+							_, e := maskFiles[idx].WriteAt(src[:sharedW], int64(y*sharedW))
+							return e
+						}
+						ro.MaskScratchReadRow[i] = func(y int, dst []byte) error {
+							buf := dst[:sharedW]
+							n, e := maskScratchFiles[idx].ReadAt(buf, int64(y*sharedW))
+							if n < len(buf) {
+								clear(buf[n:])
+							}
+							if e == io.EOF {
+								return nil
+							}
+							return e
+						}
+						ro.MaskScratchWriteRow[i] = func(y int, src []byte) error {
+							_, e := maskScratchFiles[idx].WriteAt(src[:sharedW], int64(y*sharedW))
+							return e
+						}
+						ro.ComponentScratch[i] = processing.CrossChannelComponentScratch{
+							ReadEquivalence: func(label uint32) (uint32, bool, error) {
+								var b [4]byte
+								n, e := equivFiles[idx].ReadAt(b[:], int64(label)*4)
+								if e != nil && e != io.EOF {
+									return 0, false, e
+								}
+								if n != 4 {
+									return 0, false, nil
+								}
+								v := binary.LittleEndian.Uint32(b[:])
+								return v, v != 0 && v != label, nil
+							},
+							WriteEquivalence: func(label, canonical uint32) error {
+								var b [4]byte
+								binary.LittleEndian.PutUint32(b[:], canonical)
+								_, e := equivFiles[idx].WriteAt(b[:], int64(label)*4)
+								return e
+							},
+							LabelReadRow: func(y int, dst []uint32) error {
+								buf := make([]byte, sharedW*4)
+								n, e := labelFiles[idx].ReadAt(buf, int64(y*sharedW*4))
+								if e != nil && e != io.EOF {
+									return e
+								}
+								if n < len(buf) {
+									clear(buf[n:])
+								}
+								for j := 0; j < sharedW && j < len(dst); j++ {
+									dst[j] = binary.LittleEndian.Uint32(buf[j*4:])
+								}
+								return nil
+							},
+							LabelWriteRow: func(y int, src []uint32) error {
+								buf := make([]byte, sharedW*4)
+								for j := 0; j < sharedW && j < len(src); j++ {
+									binary.LittleEndian.PutUint32(buf[j*4:], src[j])
+								}
+								_, e := labelFiles[idx].WriteAt(buf, int64(y*sharedW*4))
+								return e
+							},
+							AppendMember: func(label uint32, pixel int) error {
+								var rec [8]byte
+								binary.LittleEndian.PutUint32(rec[0:4], label)
+								binary.LittleEndian.PutUint32(rec[4:8], uint32(pixel))
+								_, e := memberFiles[idx].Write(rec[:])
+								return e
+							},
+						}
+						ro.CRCandidateScratch[i] = processing.GlobalCRCandidateScratch{
+							ReadEquivalence: func(label uint32) (uint32, bool, error) {
+								var b [4]byte
+								n, e := crEquivFiles[idx].ReadAt(b[:], int64(label)*4)
+								if e != nil && e != io.EOF {
+									return 0, false, e
+								}
+								if n != 4 {
+									return 0, false, nil
+								}
+								v := binary.LittleEndian.Uint32(b[:])
+								return v, v != 0 && v != label, nil
+							},
+							WriteEquivalence: func(label, canonical uint32) error {
+								var b [4]byte
+								binary.LittleEndian.PutUint32(b[:], canonical)
+								_, e := crEquivFiles[idx].WriteAt(b[:], int64(label)*4)
+								return e
+							},
+							LabelReadRow: func(y int, dst []uint32) error {
+								buf := make([]byte, sharedW*4)
+								n, e := crLabelFiles[idx].ReadAt(buf, int64(y*sharedW*4))
+								if e != nil && e != io.EOF {
+									return e
+								}
+								if n < len(buf) {
+									clear(buf[n:])
+								}
+								for j := 0; j < sharedW && j < len(dst); j++ {
+									dst[j] = binary.LittleEndian.Uint32(buf[j*4:])
+								}
+								return nil
+							},
+							LabelWriteRow: func(y int, src []uint32) error {
+								buf := make([]byte, sharedW*4)
+								for j := 0; j < sharedW && j < len(src); j++ {
+									binary.LittleEndian.PutUint32(buf[j*4:], src[j])
+								}
+								_, e := crLabelFiles[idx].WriteAt(buf, int64(y*sharedW*4))
+								return e
+							},
+							AppendMember: func(label uint32, pixel int) error {
+								var rec [8]byte
+								binary.LittleEndian.PutUint32(rec[0:4], label)
+								binary.LittleEndian.PutUint32(rec[4:8], uint32(pixel))
+								_, e := crMemberFiles[idx].Write(rec[:])
+								return e
+							},
+							// Persist compact geometry keyed by canonical label. This keeps
+							// replacement classification O(1) per component instead of
+							// rescanning the entire member stream for every label.
+							AccumulateComponent: func(label uint32, pixel int) error {
+								const recSize = int64(40)
+								var rec [5]int64
+								buf := make([]byte, recSize)
+								n, e := crStatsFiles[idx].ReadAt(buf, int64(label)*recSize)
+								if e != nil && e != io.EOF {
+									return e
+								}
+								if n == int(recSize) {
+									for j := range rec {
+										rec[j] = int64(binary.LittleEndian.Uint64(buf[j*8:]))
+									}
+								} else {
+									rec[1], rec[3] = int64(sharedW), int64(sharedH)
+									rec[2], rec[4] = -1, -1
+								}
+								x, y := pixel%sharedW, pixel/sharedW
+								rec[0]++
+								if int64(x) < rec[1] {
+									rec[1] = int64(x)
+								}
+								if int64(x) > rec[2] {
+									rec[2] = int64(x)
+								}
+								if int64(y) < rec[3] {
+									rec[3] = int64(y)
+								}
+								if int64(y) > rec[4] {
+									rec[4] = int64(y)
+								}
+								for j := range rec {
+									binary.LittleEndian.PutUint64(buf[j*8:], uint64(rec[j]))
+								}
+								_, e = crStatsFiles[idx].WriteAt(buf, int64(label)*recSize)
+								return e
+							},
+							ReadComponentStats: func(label uint32) (int, int, int, int, int, bool, error) {
+								const recSize = int64(40)
+								var buf [40]byte
+								n, e := crStatsFiles[idx].ReadAt(buf[:], int64(label)*recSize)
+								if e != nil && e != io.EOF {
+									return 0, 0, 0, 0, 0, false, e
+								}
+								if n != len(buf) {
+									return 0, 0, 0, 0, 0, false, nil
+								}
+								return int(int64(binary.LittleEndian.Uint64(buf[0:8]))), int(int64(binary.LittleEndian.Uint64(buf[8:16]))), int(int64(binary.LittleEndian.Uint64(buf[16:24]))), int(int64(binary.LittleEndian.Uint64(buf[24:32]))), int(int64(binary.LittleEndian.Uint64(buf[32:40]))), true, nil
+							},
+						}
+						// Persist one replacement value per canonical candidate component.
+						// A missing record is represented by a short ReadAt, so zero is a
+						// valid replacement value as well.
+						decisionFile := crDecisionFiles[idx]
+						decisionValidFile := crDecisionValidFiles[idx]
+						ro.CRCandidateScratch[i].ReadComponentValue = func(label uint32) (float32, bool, error) {
+							var buf [4]byte
+							var valid [1]byte
+							vn, ve := decisionValidFile.ReadAt(valid[:], int64(label))
+							if ve != nil && ve != io.EOF {
+								return 0, false, ve
+							}
+							if vn != 1 || valid[0] == 0 {
+								return 0, false, nil
+							}
+							n, e := decisionFile.ReadAt(buf[:], int64(label)*4)
+							if e != nil && e != io.EOF {
+								return 0, false, e
+							}
+							if n != len(buf) {
+								return 0, false, nil
+							}
+							return math.Float32frombits(binary.LittleEndian.Uint32(buf[:])), true, nil
+						}
+						ro.CRCandidateScratch[i].DecideComponent = func(label uint32, firstMember int) (float32, error) {
+							x, y := firstMember%sharedW, firstMember/sharedW
+							var vals [121]float64
+							n := 0
+							window := make([]float32, 11)
+							for k := 0; k < 11; k++ {
+								yy := y + k - 5
+								if yy < 0 || yy >= sharedH {
+									continue
+								}
+								sx0, sx1 := x-5, x+6
+								if sx0 < 0 {
+									sx0 = 0
+								}
+								if sx1 > sharedW {
+									sx1 = sharedW
+								}
+								if e := readers[idx].ReadRange(yy, sx0, sx1, window[:sx1-sx0]); e != nil {
+									return 0, e
+								}
+								for xx := sx0; xx < sx1; xx++ {
+									v := float64(window[xx-sx0])
+									if !math.IsNaN(v) {
+										vals[n] = v
+										n++
+									}
+								}
+							}
+							if n == 0 {
+								return 0, nil
+							}
+							sort.Float64s(vals[:n])
+							replacement := float32(vals[n/2])
+							var buf [4]byte
+							binary.LittleEndian.PutUint32(buf[:], math.Float32bits(replacement))
+							if _, e := decisionFile.WriteAt(buf[:], int64(label)*4); e != nil {
+								return 0, e
+							}
+							_, e := decisionValidFile.WriteAt([]byte{1}, int64(label))
+							return replacement, e
+						}
+						replacementFile := crReplacementFiles[idx]
+						replacementValidFile := crReplacementValidFiles[idx]
+						ro.CRCandidateScratch[i].WriteMemberValue = func(pixel int, replacement float32) error {
+							if pixel < 0 {
+								return fmt.Errorf("negative replacement member index %d", pixel)
+							}
+							var buf [4]byte
+							binary.LittleEndian.PutUint32(buf[:], math.Float32bits(replacement))
+							if _, err := replacementFile.WriteAt(buf[:], int64(pixel)*4); err != nil {
+								return err
+							}
+							_, err := replacementValidFile.WriteAt([]byte{1}, int64(pixel))
+							return err
+						}
+					}
+					for i := 0; i < 3; i++ {
+						idx := i
+						ro.ReadRow[i] = func(y int, row []float32) error { return readers[idx].ReadRow(y, row) }
+						ro.WriteRow[i] = func(y int, row []float32) error { return outs[idx].WriteRow(y, row) }
+					}
+					if e := processing.CrossChannelCleanDisk(ro); e != nil {
+						return e
+					}
+					// Cosmic-ray scratch output is now final. Replay deferred component
+					// replacements afterward so they cannot be overwritten by the final
+					// scratch-to-output copy above.
+					for c := 0; c < 3; c++ {
+						rowsPerBatch := crossChannelCleanReplayRowsPerBatch(sharedW, sharedH)
+						rows := make([]float32, rowsPerBatch*widths[c])
+						replacements := make([]byte, rowsPerBatch*sharedW*4)
+						valid := make([]byte, rowsPerBatch*sharedW)
+						for y := 0; y < sharedH; y += rowsPerBatch {
+							if e := cleanCtx.Err(); e != nil {
+								return e
+							}
+							rowCount := min(rowsPerBatch, sharedH-y)
+							batchRows := rows[:rowCount*widths[c]]
+							batchReplacements := replacements[:rowCount*sharedW*4]
+							batchValid := valid[:rowCount*sharedW]
+							if e := outs[c].ReadRows(y, rowCount, batchRows); e != nil {
+								return e
+							}
+							validN, e := crReplacementValidFiles[c].ReadAt(batchValid, int64(y*sharedW))
+							if e != nil && e != io.EOF {
+								return e
+							}
+							if validN < len(batchValid) {
+								clear(batchValid[validN:])
+							}
+							replacementN, e := crReplacementFiles[c].ReadAt(batchReplacements, int64(y*sharedW)*4)
+							if e != nil && e != io.EOF {
+								return e
+							}
+							if replacementN < len(batchReplacements) {
+								clear(batchReplacements[replacementN:])
+								// Match the former per-pixel behavior: a valid marker
+								// without all four replacement bytes must not turn into
+								// a zero-valued replacement.
+								if complete := replacementN / 4; complete < len(batchValid) {
+									clear(batchValid[complete:])
+								}
+							}
+							dirty := false
+							for row := 0; row < rowCount; row++ {
+								rowStart := row * widths[c]
+								sharedStart := row * sharedW
+								if applyCrossChannelReplacementRow(batchRows[rowStart:rowStart+sharedW], batchReplacements[sharedStart*4:], batchValid[sharedStart:]) {
+									dirty = true
+								}
+							}
+							if dirty {
+								if e := outs[c].WriteRows(y, rowCount, batchRows); e != nil {
+									return e
+								}
+							}
+							updateProgress(fmt.Sprintf("Applying replacements (channel %d)", c+1), y+rowCount, sharedH)
+						}
+					}
+					return nil
+				}, func(staged []composeArtifactDescriptor) error {
+					for i := range staged {
+						preview, _, _, e := composeLargeStretchedPreview(staged[i].Path, imgs[i])
+						if e != nil {
+							return e
+						}
+						stagedPreviews[i] = preview
+					}
+					return nil
+				})
+				if err == nil {
+					fyne.Do(func() {
+						for i := range next {
+							largeArtifacts[i] = next[i]
+							largePreviews[i] = stagedPreviews[i]
+							imgs[i].HDU.Data.Pixels = nil
+							clearComposeOrigPixels(&origPixels, i)
+						}
+						invalidateCalibration()
+						progressDialog.Hide()
+						refresh()
+						restoreViewportStates(savedStates)
+						dialog.ShowInformation("Complete", "Star masks generated and cosmic rays eradicated in the shared region.", win)
+					})
+				} else {
+					fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(err, win) })
+				}
+				return
+				/* unreachable legacy duplicate implementation
+				writes := make([]func(*fitsio.Float32Artifact) error, 3)
+				for i := 0; i < 3; i++ {
+					idx := i
+					writes[i] = func(out *fitsio.Float32Artifact) error {
+						if err := cleanCtx.Err(); err != nil {
+							return err
+						}
+						src := make([]*fitsio.Float32Artifact, 3)
+						for c := range src {
+							var err error
+							src[c], err = fitsio.OpenFloat32ArtifactReadOnly(expected[c].Path)
+							if err != nil {
+								for _, a := range src {
+									if a != nil {
+										_ = a.Close()
+									}
+								}
+								return err
+							}
+							defer src[c].Close()
+						}
+						sharedW, sharedH := widths[0], heights[0]
+						for c := 1; c < 3; c++ {
+							if widths[c] < sharedW {
+								sharedW = widths[c]
+							}
+							if heights[c] < sharedH {
+								sharedH = heights[c]
+							}
+						}
+						row := make([]float32, widths[idx])
+						for y := 0; y < heights[idx]; y++ {
+							if err := cleanCtx.Err(); err != nil {
+								return err
+							}
+							if err := src[idx].ReadRow(y, row); err != nil {
+								return err
+							}
+							if err := out.WriteRow(y, row); err != nil {
+								return err
+							}
+						}
+						sigmas := make([]float64, 3)
+						sample := make([]float32, 0, 65536)
+						maxWidth := widths[0]
+						for c := 1; c < 3; c++ {
+							if widths[c] > maxWidth {
+								maxWidth = widths[c]
+							}
+						}
+						sampleRow := make([]float32, maxWidth)
+						for c := 0; c < 3; c++ {
+							step := heights[c] / 64
+							if step < 1 {
+								step = 1
+							}
+							for y := 0; y < heights[c] && len(sample) < cap(sample); y += step {
+								if err := src[c].ReadRow(y, sampleRow[:widths[c]]); err != nil {
+									return err
+								}
+								remain := cap(sample) - len(sample)
+								if remain > widths[c] {
+									remain = widths[c]
+								}
+								sample = append(sample, sampleRow[:remain]...)
+							}
+							_, sigmas[c] = processing.EstimateBackground(sample)
+							sample = sample[:0]
+						}
+						for y0 := 0; y0 < sharedH; y0 += 256 {
+							for x0 := 0; x0 < sharedW; x0 += 256 {
+								if err := cleanCtx.Err(); err != nil {
+									return err
+								}
+								x1, y1 := x0+256, y0+256
+								if x1 > sharedW {
+									x1 = sharedW
+								}
+								if y1 > sharedH {
+									y1 = sharedH
+								}
+								sx0, sy0 := x0-6, y0-6
+								if sx0 < 0 {
+									sx0 = 0
+								}
+								if sy0 < 0 {
+									sy0 = 0
+								}
+								sx1, sy1 := x1+6, y1+6
+								if sx1 > sharedW {
+									sx1 = sharedW
+								}
+								if sy1 > sharedH {
+									sy1 = sharedH
+								}
+								tw, th := sx1-sx0, sy1-sy0
+								tile := make([][]float32, 3)
+								for c := 0; c < 3; c++ {
+									tile[c] = make([]float32, tw*th)
+									rr := make([]float32, widths[c])
+									for yy := sy0; yy < sy1; yy++ {
+										if err := src[c].ReadRow(yy, rr); err != nil {
+											return err
+										}
+										copy(tile[c][(yy-sy0)*tw:], rr[sx0:sx1])
+									}
+								}
+								cleaned, err := processing.CrossChannelCleanTile(tile, tw, th, sigmas, 2)
+								if err != nil {
+									return err
+								}
+								for y := y0; y < y1; y++ {
+									if err := out.ReadRow(y, row); err != nil {
+										return err
+									}
+									copy(row[x0:x1], cleaned[idx][(y-sy0)*tw+x0-sx0:(y-sy0)*tw+x1-sx0])
+									if err := out.WriteRow(y, row); err != nil {
+										return err
+									}
+								}
+							}
+						}
+						return nil
+					}
+				}
+				previews := make([]*image.RGBA, 3)
+				next, err := largeStore.ReplaceManyIfCurrentPrepared(expected, writes, func(staged []composeArtifactDescriptor) error {
+					for i := range staged {
+						if cancelErr := cleanCtx.Err(); cancelErr != nil {
+							return cancelErr
+						}
+						var previewErr error
+						previews[i], _, _, previewErr = composeLargeStretchedPreview(staged[i].Path, imgs[i])
+						if previewErr != nil {
+							return previewErr
+						}
+					}
+					return nil
+				})
+				*/
+			}()
+			return
+		}
 
 		sharedWidth := 0
 		sharedHeight := 0
@@ -2139,6 +3855,18 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			dialog.ShowError(err, win)
 			return
 		}
+		var largePaths [3]string
+		if largeMode && largeStore != nil {
+			comp, ok := largeStore.Composite()
+			if !ok {
+				dialog.ShowError(fmt.Errorf("missing disk composite"), win)
+				return
+			}
+			for i := range comp.Planes {
+				largePaths[i] = comp.Planes[i].Path
+			}
+			w, h = comp.Width, comp.Height
+		}
 		finalBuf := processing.ApplyRGBLevels(buf, levels)
 		// Use the same immutable render result for high-bit-depth output as for
 		// the preview (including the existing overlay blend).
@@ -2159,6 +3887,17 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			_ = uc.Close()
 			format := detectExportFormat(path)
 			showExportOptionsDialog(format, win, func(opts export.Options) {
+				if largeMode {
+					if format == export.PNG && opts.BitDepth != 16 {
+						opts.BitDepth = 8
+					}
+					if err := export.FromFloat32ArtifactsWithLevels(context.Background(), path, largePaths, w, h, format, opts, levels); err != nil {
+						dialog.ShowError(err, win)
+						return
+					}
+					debuglog.Log(fmt.Sprintf("exportRGB: wrote disk composite %s", path))
+					return
+				}
 				if format == export.PNG && opts.BitDepth == 16 && rF != nil {
 					rA, gA, bA := processing.ApplyRGBLevelsFloat32(rF, gF, bF, levels)
 					if err := export.FromFloat32Channels(path, rA, gA, bA, w, h, format, opts); err != nil {
@@ -2447,6 +4186,162 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			progressDialog.Show()
 			spec := composeMagicSpec{Preset: preset, Rows: append([]composeMagicRow(nil), rows...)}
 			go func() {
+				if largeMode {
+					// Stage and process one source at a time. All descriptors remain
+					// private until every row succeeds, so cancellation/failure leaves
+					// the live project untouched.
+					if err := validateComposeMagicPlan(spec.Rows); err != nil {
+						fyne.Do(func() { finished = true; progressDialog.Hide(); dialog.ShowError(err, win) })
+						return
+					}
+					magicPresetValue := processing.ParseMagicPreset(spec.Preset)
+					type staged struct {
+						row      composeMagicRow
+						img      *models.LoadedImage
+						preview  *image.RGBA
+						artifact composeArtifactDescriptor
+					}
+					ordered := append([]composeMagicRow(nil), spec.Rows...)
+					sort.SliceStable(ordered, func(i, j int) bool {
+						if ordered[i].File.FilterNumber != ordered[j].File.FilterNumber {
+							return ordered[i].File.FilterNumber < ordered[j].File.FilterNumber
+						}
+						return strings.ToLower(ordered[i].File.Name) < strings.ToLower(ordered[j].File.Name)
+					})
+					stagedRows := make([]staged, 0, len(ordered))
+					cleanup := func() {
+						for _, x := range stagedRows {
+							cleanupLargeArtifactIfCurrent(x.artifact)
+						}
+					}
+					for i, row := range ordered {
+						if ctx.Err() != nil {
+							cleanup()
+							return
+						}
+						slot := fmt.Sprintf("filter-stage-%d-%d", time.Now().UnixNano(), i)
+						img, preview, artifact, loadErr := loadLargeComposeImage(row.File.Path, largeStore, slot)
+						if loadErr != nil {
+							cleanup()
+							fyne.Do(func() {
+								finished = true
+								progressDialog.Hide()
+								dialog.ShowError(fmt.Errorf("load %s: %w", composeMagicFileLabel(row.File), loadErr), win)
+							})
+							return
+						}
+						lease, leaseErr := fitsio.MaterializeFloat32ArtifactLease(artifact.Path)
+						if leaseErr != nil {
+							cleanupLargeArtifactIfCurrent(artifact)
+							cleanup()
+							fyne.Do(func() { finished = true; progressDialog.Hide(); dialog.ShowError(leaseErr, win) })
+							return
+						}
+						clone := *img
+						clone.HDU.Data.Pixels = lease.Pixels
+						magicResult := processing.ApplyMagicLevels(&clone, magicPresetValue)
+						if ctx.Err() != nil {
+							lease.Release()
+							cleanupLargeArtifactIfCurrent(artifact)
+							cleanup()
+							return
+						}
+						processing.AutoMTFMidtone(&clone)
+						lease.Release()
+						if ctx.Err() != nil {
+							cleanupLargeArtifactIfCurrent(artifact)
+							cleanup()
+							return
+						}
+						if magicResult.ValidPixels == 0 {
+							cleanupLargeArtifactIfCurrent(artifact)
+							cleanup()
+							fyne.Do(func() {
+								finished = true
+								progressDialog.Hide()
+								dialog.ShowError(fmt.Errorf("process %s: Magic found no valid image samples", composeMagicFileLabel(row.File)), win)
+							})
+							return
+						}
+						preview, _, _, loadErr = composeLargeStretchedPreview(artifact.Path, &clone)
+						if loadErr != nil {
+							cleanupLargeArtifactIfCurrent(artifact)
+							cleanup()
+							fyne.Do(func() { finished = true; progressDialog.Hide(); dialog.ShowError(loadErr, win) })
+							return
+						}
+						clone.HDU.Data.Pixels = nil
+						stagedRows = append(stagedRows, staged{row: row, img: &clone, preview: preview, artifact: artifact})
+					}
+					if !composeLargeInstallAllowed(ctx) {
+						cleanup()
+						return
+					}
+					fyne.Do(func() {
+						if !composeLargeInstallAllowed(ctx) {
+							cleanup()
+							return
+						}
+						defer func() { finished = true; progressDialog.Hide() }()
+						existingSlots := make([]int, len(overlayLayers))
+						for i, layer := range overlayLayers {
+							existingSlots[i] = layer.idx
+						}
+						planRows := make([]composeMagicRow, len(stagedRows))
+						for i := range stagedRows {
+							planRows[i] = stagedRows[i].row
+						}
+						if installErr := validateComposeMagicCapacity(planRows, len(existingSlots)); installErr != nil {
+							cleanup()
+							dialog.ShowError(installErr, win)
+							return
+						}
+						base := map[composeMagicAssignment]staged{}
+						for _, x := range stagedRows {
+							if x.row.Assignment != composeMagicCustom {
+								base[x.row.Assignment] = x
+							}
+						}
+						for assignment, index := range map[composeMagicAssignment]int{composeMagicBlue: 0, composeMagicGreen: 1, composeMagicRed: 2} {
+							x := base[assignment]
+							if old := largeArtifacts[index]; old.Slot != "" {
+								_, _ = largeStore.RemoveSlotIfCurrent(old)
+							}
+							imgs[index] = x.img
+							largeArtifacts[index] = x.artifact
+							largePreviews[index] = x.preview
+							clearComposeOrigPixels(&origPixels, index)
+							applyChannelState(index, channelStateFromImage(x.img), imgs, viewports, controlSets)
+						}
+						for _, x := range stagedRows {
+							if x.row.Assignment != composeMagicCustom {
+								continue
+							}
+							settings := defaultOverlayLayerSettings(len(overlayLayers))
+							settings.ColorR, settings.ColorG, settings.ColorB = x.row.Color.R, x.row.Color.G, x.row.Color.B
+							settings.Open = true
+							slot, ok := freeOverlaySlot()
+							if !ok {
+								cleanup()
+								dialog.ShowError(errors.New("no free overlay slot"), win)
+								return
+							}
+							layer := createOverlayLayerAt(slot, settings)
+							imgs[layer.idx] = x.img
+							largeArtifacts[layer.idx] = x.artifact
+							largePreviews[layer.idx] = x.preview
+							clearComposeOrigPixels(&origPixels, layer.idx)
+							openOverlayLayerWindowWithPreview(layer, nil)
+						}
+						composeMagicPreset.SetSelected(spec.Preset)
+						buildCompositeCheck.SetChecked(true)
+						if updateMenus != nil {
+							updateMenus()
+						}
+						refresh()
+					})
+					return
+				}
 				batch, prepareErr := prepareComposeMagicBatch(ctx, spec, loadImageFromPath)
 				previews := make(map[*models.LoadedImage]*composeOverlayPreviewData)
 				if prepareErr == nil {
@@ -2550,12 +4445,22 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		if globalExportToEdit == nil {
 			return
 		}
+		if largeMode {
+			if largeStore != nil {
+				if d, ok := largeStore.Composite(); ok {
+					startLargeEditSnapshot(d, *levels)
+					return
+				}
+			}
+			dialog.ShowInformation("Build Composite first", "Build the composite before sending it to Edit.", win)
+			return
+		}
 		img := compositeImageForEdit()
 		if img == nil {
 			dialog.ShowInformation("Nothing to send", "Compose all three channels first.", win)
 			return
 		}
-		globalExportToEdit(img)
+		globalExportToEdit(editImageHandoff{memory: img})
 	}
 
 	clearChannels := func() {
@@ -2566,6 +4471,18 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			oldSources := composeBlinkSources()
 			for i := 0; i < 3; i++ {
 				imgs[i] = nil
+				if largeMode && largeStore != nil {
+					invalidateLargeSlot(i)
+					largeMu.Lock()
+					store := largeStore
+					d := largeArtifacts[i]
+					delete(largeArtifacts, i)
+					delete(largePreviews, i)
+					largeMu.Unlock()
+					if d.Slot != "" && store != nil {
+						_, _ = store.RemoveSlotIfCurrent(d)
+					}
+				}
 				clearComposeOrigPixels(&origPixels, i)
 				viewports[i].image.Image = blankImg()
 			}
@@ -2603,6 +4520,18 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			blinkCheck.SetChecked(false)
 			for i := range imgs {
 				imgs[i] = nil
+				if largeMode && largeStore != nil {
+					invalidateLargeSlot(i)
+					largeMu.Lock()
+					store := largeStore
+					d := largeArtifacts[i]
+					delete(largeArtifacts, i)
+					delete(largePreviews, i)
+					largeMu.Unlock()
+					if d.Slot != "" && store != nil {
+						_, _ = store.RemoveSlotIfCurrent(d)
+					}
+				}
 				clearComposeOrigPixels(&origPixels, i)
 			}
 			imgs = imgs[:3]
@@ -2726,6 +4655,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		calculate := widget.NewButton("Calculate", nil)
 		cancelButton := widget.NewButton("Cancel", nil)
 		setStale := func() {
+			clearGaiaRefinement()
 			markComposeCalibrationStale(&colorCalibration)
 			status.SetText(composeCalibrationStatusText(colorCalibration))
 			refresh()
@@ -2811,14 +4741,21 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				return
 			}
 			calibrationSnapshot := colorCalibration
+			refinedResidualSnapshot := refinedGaiaResidual
+			refinedSourcesSnapshot := append([]gaia.Source(nil), refinedGaiaSources...)
 			calibrationSnapshot.Overlays = append([]models.OverlayCalibrationState(nil), colorCalibration.Overlays...)
 			for i := range calibrationSnapshot.Overlays {
 				calibrationSnapshot.Overlays[i].Diagnostics.Warnings = append([]string(nil), colorCalibration.Overlays[i].Diagnostics.Warnings...)
 			}
 			priorForJob := prior
 			imageSnapshots := make([]*models.LoadedImage, 3)
+			var offsetSnapshots [3][3]float64
 			for i := range imageSnapshots {
 				imageSnapshots[i] = cloneLoadedImageForStretchMatch(imgs[i])
+				if composeChannelOffsetFields != nil {
+					dx, dy, rot, _ := composeChannelOffsetFields(i)
+					offsetSnapshots[i] = [3]float64{dx, dy, rot}
+				}
 			}
 			colorCalibration.Status = models.CalibrationCalculating
 			status.SetText(composeCalibrationStatusText(colorCalibration))
@@ -2830,13 +4767,59 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			selection.Disable()
 			gaiaMatchRadius.Disable()
 			inputs := make([]processing.CalibrationInput, 3)
+			streamInputs := make([]processing.CalibrationStreamInput, 3)
+			largeCalibration := composeLargeModeActive != nil && composeLargeModeActive()
 			var inputErr error
+			var backgroundReaders [3]*alignedArtifactRowReader
+			if largeCalibration && calibrationSnapshot.NeutralizeBackground {
+				ref, ok := largeArtifacts[1]
+				if !ok {
+					inputErr = fmt.Errorf("channel 2 disk artifact is unavailable")
+				} else {
+					for i := range backgroundReaders {
+						d, exists := largeArtifacts[i]
+						if !exists {
+							inputErr = fmt.Errorf("channel %d disk artifact is unavailable", i+1)
+							break
+						}
+						off := offsetSnapshots[i]
+						backgroundReaders[i] = &alignedArtifactRowReader{
+							path: d.Path, source: *imageSnapshots[i], reference: *imageSnapshots[1],
+							width: ref.Width, height: ref.Height, offsetX: off[0], offsetY: off[1], offsetRot: off[2],
+						}
+					}
+				}
+			}
 			for i := range inputs {
 				img := imageSnapshots[i]
-				pixels := append([]float32(nil), img.HDU.Data.Pixels...)
-				inputs[i] = processing.CalibrationInput{SourceIdentity: img.Path, Width: img.HDU.Data.Width, Height: img.HDU.Data.Height, Pixels: pixels, Valid: make([]bool, len(pixels)), Alignment: fmt.Sprintf("channel-%d", i)}
-				for j := range inputs[i].Valid {
-					inputs[i].Valid[j] = true
+				if !largeCalibration {
+					pixels := append([]float32(nil), img.HDU.Data.Pixels...)
+					inputs[i] = processing.CalibrationInput{SourceIdentity: img.Path, Width: img.HDU.Data.Width, Height: img.HDU.Data.Height, Pixels: pixels, Valid: make([]bool, len(pixels)), Alignment: fmt.Sprintf("channel-%d", i)}
+					for j := range inputs[i].Valid {
+						inputs[i].Valid[j] = true
+					}
+				} else {
+					d, ok := largeArtifacts[i]
+					if !ok {
+						inputErr = fmt.Errorf("channel %d disk artifact is unavailable", i+1)
+						break
+					}
+					streamInputs[i] = processing.CalibrationStreamInput{SourceIdentity: img.Path, Width: d.Width, Height: d.Height, Alignment: fmt.Sprintf("channel-%d", i)}
+					path := d.Path
+					streamInputs[i].ReadRow = func(y int, dst []float32) error {
+						a, err := fitsio.OpenFloat32ArtifactReadOnly(path)
+						if err != nil {
+							return err
+						}
+						defer a.Close()
+						return a.ReadRow(y, dst)
+					}
+					streamInputs[i].ReadValidRow = func(y int, dst []bool) error {
+						for j := range dst {
+							dst[j] = true
+						}
+						return nil
+					}
 				}
 				if settingsMode := calibrationSnapshot.PhotometricMode; settingsMode == models.PhotometricInstrument {
 					ref := processing.ReferenceFnu
@@ -2861,8 +4844,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						inputErr = parseErr
 						break
 					}
-					inputs[i].Metadata = metadata
-					inputs[i].Photometry = &photometry
+					if largeCalibration {
+						streamInputs[i].Metadata = metadata
+						streamInputs[i].Photometry = &photometry
+					} else {
+						inputs[i].Metadata = metadata
+						inputs[i].Photometry = &photometry
+					}
 				}
 			}
 			settings := processing.CalibrationSettings{PhotometricMode: calibrationSnapshot.PhotometricMode, NeutralizeBackground: calibrationSnapshot.NeutralizeBackground, BackgroundSelection: calibrationSnapshot.BackgroundSelection, BackgroundROI: calibrationSnapshot.BackgroundROI, WhiteReference: calibrationSnapshot.WhiteReference, LinkedStretch: calibrationSnapshot.LinkedStretch, Overlays: append([]models.OverlayCalibrationState(nil), calibrationSnapshot.Overlays...), AlgorithmVersion: "ui-v1", ReferenceVersion: "local-v1", Gaia: calibrationSnapshot.Gaia}
@@ -2898,14 +4886,70 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 									err = queryErr
 								} else {
 									calibrationSnapshot.Gaia.ObservationEpoch = query.ObservationEpoch
-									alignedPlanes, aw, ah, alignErr := processing.AlignedPlanesForCalibration(ctx, imageSnapshots)
-									if alignErr != nil {
-										err = alignErr
+									query.Release = calibrationSnapshot.Gaia.Release
+									if calibrationSnapshot.Gaia.MagnitudeLimit > 0 {
+										query.MagnitudeLimit = calibrationSnapshot.Gaia.MagnitudeLimit
+									}
+									query.ObservationEpoch = calibrationSnapshot.Gaia.ObservationEpoch
+									// Discover and normalize Gaia sources once. The same immutable
+									// slice is reused by refinement/calibration so refinement never
+									// triggers a second catalog or XP request.
+									sources := refinedSourcesSnapshot
+									discoverErr := error(nil)
+									if len(sources) == 0 {
+										sources, discoverErr = provider.DiscoverSources(ctx, query)
+										if discoverErr == nil {
+											sources, discoverErr = gaia.NormalizeSources(sources, calibrationSnapshot.Gaia.Release)
+										}
+									}
+									if discoverErr != nil {
+										err = discoverErr
+									}
+									var stars []processing.Star
+									var aw, ah int
+									var alignedPlanes [3]processing.AlignedPlane
+									var detectionLease *fitsio.MaterializedPlane
+									if largeCalibration {
+										d, ok := largeArtifacts[1]
+										if !ok {
+											err = fmt.Errorf("channel 2 disk artifact is unavailable")
+										} else {
+											aw, ah = d.Width, d.Height
+											reader := artifactRowReader{path: d.Path}
+											stars, err = processing.ExtractStarsTiledReader(ctx, reader, aw, ah, 256, 5, 3)
+											if len(stars) > processing.TweakRegCatalogMaxStars {
+												stars = stars[:processing.TweakRegCatalogMaxStars]
+											}
+										}
 									} else {
-										stars := processing.ExtractAndLimitStars(alignedPlanes[1].Pixels, aw, ah, 5, 3, 500)
+										aligned, aw0, ah0, alignErr := processing.AlignedPlanesForCalibration(ctx, imageSnapshots)
+										if alignErr != nil {
+											err = alignErr
+										} else {
+											aw, ah = aw0, ah0
+											alignedPlanes = aligned
+											stars = processing.ExtractAndLimitStars(alignedPlanes[1].Pixels, aw, ah, 5, 3, 500)
+										}
+									}
+									if detectionLease != nil {
+										defer detectionLease.Release()
+									}
+									if err == nil {
 										debuglog.Log(fmt.Sprintf("Gaia UI alignment/detection: aligned=%dx%d detected_stars=%d", aw, ah, len(stars)))
 										planes := [3]processing.GaiaPlane{}
+										readers := [3]processing.GaiaPlaneReader{}
 										for c := range planes {
+											if largeCalibration {
+												d, ok := largeArtifacts[2-c]
+												if !ok {
+													err = fmt.Errorf("channel %d disk artifact is unavailable", 3-c)
+													break
+												}
+												off := offsetSnapshots[2-c]
+												readers[c] = &alignedArtifactRowReader{path: d.Path, source: *imageSnapshots[2-c], reference: *imageSnapshots[1], width: aw, height: ah, offsetX: off[0], offsetY: off[1], offsetRot: off[2]}
+												planes[c].Width, planes[c].Height = aw, ah
+												continue
+											}
 											// UI channels are B,G,R while the canonical planes are R,G,B.
 											p := alignedPlanes[2-c]
 											pixels := append([]float32(nil), p.Pixels...)
@@ -2928,12 +4972,20 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 										if magnitude <= 0 {
 											magnitude = 18
 										}
-										greq := processing.GaiaCalibrationRequest{Query: query, Settings: gaiaRequestSettings(calibrationSnapshot.Gaia, matchRadius, epoch, magnitude), DetectedStars: stars, Planes: planes, PixelToSky: pixelToSky}
+										if refinedResidualSnapshot != nil {
+											pixelToSky, err = processing.RefinedPixelToSky(pixelToSky, *refinedResidualSnapshot)
+										}
+										greq := processing.GaiaCalibrationRequest{Query: query, Settings: gaiaRequestSettings(calibrationSnapshot.Gaia, matchRadius, epoch, magnitude), Sources: sources, DetectedStars: stars, Planes: planes, Readers: readers, PixelToSky: pixelToSky}
 										greq.Settings.ObservationEpoch = query.ObservationEpoch
 										gaiaResult, runErr := composeGaiaJobService.Run(ctx, GaiaJobRequest{Provider: provider, Query: query, Settings: greq.Settings, Calibration: greq}, func(p GaiaJobProgress) {
 											debuglog.Log(fmt.Sprintf("Gaia UI stage: %s", p.Stage))
 											fyne.Do(func() { status.SetText(fmt.Sprintf("Calibration: calculating — Gaia %s", p.Stage)) })
 										})
+										for c := range readers {
+											if r, ok := readers[c].(*alignedArtifactRowReader); ok {
+												_ = r.Close()
+											}
+										}
 										if runErr != nil {
 											err = runErr
 											debuglog.Log(fmt.Sprintf("Gaia UI terminal: failed error=%v", runErr))
@@ -2953,11 +5005,63 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						}
 					}
 				}
+				if err == nil && largeCalibration && calibrationSnapshot.PhotometricMode != models.PhotometricGaia {
+					backgroundInputs := append([]processing.CalibrationStreamInput(nil), streamInputs...)
+					calibrationInputs := streamInputs
+					if calibrationSnapshot.NeutralizeBackground {
+						for i, reader := range backgroundReaders {
+							if reader == nil {
+								err = fmt.Errorf("channel %d aligned background reader is unavailable", i+1)
+								break
+							}
+							backgroundInputs[i].Width, backgroundInputs[i].Height = reader.width, reader.height
+							backgroundInputs[i].ReadRow = reader.ReadRow
+							backgroundInputs[i].ReadValidRow = reader.ReadValidRow
+						}
+						// The aligned reference-grid samples are the canonical input
+						// for neutralized calibration. Use them for the final streamed
+						// fingerprint/calculation as well as background estimation;
+						// otherwise the persisted fingerprint would describe a raw,
+						// differently sized raster than normal Compose.
+						calibrationInputs = append([]processing.CalibrationStreamInput(nil), backgroundInputs...)
+						defer func() {
+							for _, reader := range backgroundReaders {
+								if reader != nil {
+									_ = reader.Close()
+								}
+							}
+						}()
+					}
+					if err == nil {
+						for i := range streamInputs {
+							if calibrationSnapshot.NeutralizeBackground {
+								var roi *models.CalibrationROI
+								if calibrationSnapshot.BackgroundSelection == models.BackgroundROI {
+									r := calibrationSnapshot.BackgroundROI
+									roi = &r
+								}
+								e, eerr := processing.EstimateBackgroundStream(ctx, backgroundInputs[i], roi, processing.DefaultBackgroundConfig())
+								if eerr != nil {
+									err = eerr
+									break
+								}
+								if e.Status != models.CalibrationValid {
+									err = &processing.UnsupportedCalibrationError{Reason: fmt.Sprintf("channel %d background: %s", i+1, e.RejectionReason)}
+									break
+								}
+								calibrationInputs[i].Background = e.Transform
+							}
+						}
+						if err == nil {
+							result, err = processing.CalculateCalibrationStreaming(ctx, calibrationInputs, settings)
+						}
+					}
+				}
 				if err != nil {
 					// Metadata parsing above produced the actionable unsupported reason.
 				} else if ctx.Err() != nil {
 					err = ctx.Err()
-				} else {
+				} else if !largeCalibration {
 					if calibrationSnapshot.NeutralizeBackground {
 						roi := calibrationSnapshot.BackgroundROI
 						var roiPtr *models.CalibrationROI
@@ -3004,7 +5108,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				if err == nil && ctx.Err() != nil {
 					err = ctx.Err()
 				}
-				if err == nil && !gaiaDone {
+				if err == nil && !gaiaDone && !largeCalibration {
 					result, err = processing.CalculateCalibration(inputs, settings)
 				}
 				fyne.Do(func() {
@@ -3075,7 +5179,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		)
 		calibrationWindow = app.NewWindow("Color Calibration")
 		colorCalibrationWindow = calibrationWindow
-		calibrationWindow.SetContent(container.NewVScroll(content))
+		// Keep the controls clear of every edge of the scroll viewport. The
+		// explicit spacers make this a stable 20 px margin regardless of theme.
+		calibrationWindow.SetContent(container.NewVScroll(container.NewBorder(vpad(20), vpad(20), hpad(20), hpad(20), content)))
 		calibrationWindow.SetOnClosed(func() {
 			if colorCalibrationWindow == calibrationWindow {
 				colorCalibrationWindow = nil
@@ -3093,6 +5199,28 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 Settings to 2 & 3", copySettings)
 	matchStretchItem := fyne.NewMenuItem("Match Channel Stretch...", showMatchStretchDialog)
+	showGaiaPicker := func() {
+		if imgs[1] == nil {
+			dialog.ShowInformation("Missing Channel 2", "Load Channel 2 before selecting Gaia reference stars.", win)
+			return
+		}
+		preview, _ := viewports[1].image.Image.(image.Image)
+		snapshot := cloneLoadedImageForStretchMatch(imgs[1])
+		pickerGeneration := gaiaRefinementGeneration
+		sourcePath, sourceWidth, sourceHeight := snapshot.Path, snapshot.HDU.Data.Width, snapshot.HDU.Data.Height
+		showComposeGaiaPicker(app, win, snapshot, preview, composeGaiaResidualRunnerForImage(snapshot, colorCalibration.Gaia), func(result composeGaiaResidualResult) bool {
+			if pickerGeneration != gaiaRefinementGeneration || imgs[1] == nil || imgs[1].Path != sourcePath || imgs[1].HDU.Data.Width != sourceWidth || imgs[1].HDU.Data.Height != sourceHeight || imgs[1].Rotation90 != 0 || imgs[1].HasAlignTransform {
+				return false
+			}
+			residual := result.Transform
+			refinedGaiaResidual = &residual
+			refinedGaiaSources = append([]gaia.Source(nil), result.Sources...)
+			markComposeCalibrationStale(&colorCalibration)
+			refresh()
+			return true
+		})
+	}
+	gaiaPickerItem := fyne.NewMenuItem("Pick Channel 2 Gaia Stars...", showGaiaPicker)
 	addLayerItem := fyne.NewMenuItem("Add Colored Layer...", addColoredLayer)
 	colorCalibrationItem := fyne.NewMenuItem("Color Calibration...", openColorCalibration)
 	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
@@ -3124,6 +5252,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	// former Channels and Process menus).
 	composeMenu := fyne.NewMenu("Compose",
 		alignChannelsItem,
+		gaiaPickerItem,
 		cleanChannelsItem,
 		resetDataItem,
 		fyne.NewMenuItemSeparator(),
@@ -3156,6 +5285,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 		copySettingsItem.Disabled = imgs[0] == nil
 		matchStretchItem.Disabled = imgs[0] == nil && imgs[1] == nil && imgs[2] == nil
+		gaiaPickerItem.Disabled = imgs[1] == nil
 
 		allLoaded := imgs[0] != nil && imgs[1] != nil && imgs[2] != nil
 
@@ -3164,7 +5294,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		cleanChannelsItem.Disabled = !allLoaded
 		resetDataItem.Disabled = !allLoaded
 		exportRGBItem.Disabled = !allLoaded
-		sendToEditItem.Disabled = !allLoaded
+		sendToEditItem.Disabled = !allLoaded || (largeMode && largeStore != nil && func() bool { _, ok := largeStore.Composite(); return !ok }())
+		colorCalibrationItem.Disabled = !allLoaded
 
 		// if allLoaded {
 		// 	alignBtn.Enable()
@@ -3181,17 +5312,166 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				break
 			}
 		}
+		anyChannelLoaded := imgs[0] != nil || imgs[1] != nil || imgs[2] != nil || anyOverlayLoaded
+		if anyChannelLoaded {
+			largeFilesCheck.Disable()
+		} else {
+			largeFilesCheck.Enable()
+		}
+		if largeFilesCheck.Checked {
+			blinkCheck.SetChecked(false)
+			blinkCheck.Disable()
+		} else {
+			blinkCheck.Enable()
+		}
 		saveProjectItem.Disabled = imgs[0] == nil && imgs[1] == nil && imgs[2] == nil && !anyOverlayLoaded
 		if m := win.MainMenu(); m != nil {
 			m.Refresh()
 		}
 	}
 	updateMenus()
+	largeFilesCheck.OnChanged = func(enabled bool) {
+		hasOverlayImage := false
+		for _, layer := range overlayLayers {
+			if layer != nil && layer.idx >= 0 && layer.idx < len(imgs) && imgs[layer.idx] != nil {
+				hasOverlayImage = true
+				break
+			}
+		}
+		if enabled && (imgs[0] != nil || imgs[1] != nil || imgs[2] != nil || hasOverlayImage) {
+			largeFilesCheck.SetChecked(false)
+			return
+		}
+		if enabled {
+			store, err := newComposeLargeStore("")
+			if err != nil {
+				largeFilesCheck.SetChecked(false)
+				dialog.ShowError(err, win)
+				return
+			}
+			largeStore = store
+			largeRuntime.store = store
+			largeMode = true
+			blinkCheck.SetChecked(false)
+			blinkCheck.Disable()
+			app.Preferences().SetBool(composeLargeFilesPreferenceKey, true)
+		} else {
+			largeMode = false
+			app.Preferences().SetBool(composeLargeFilesPreferenceKey, false)
+			largeMu.Lock()
+			largeSessionGeneration++
+			store := largeStore
+			largeStore = nil
+			largeMu.Unlock()
+			if store != nil {
+				_ = store.Close()
+			}
+			largeMu.Lock()
+			largePreviews = make(map[int]*image.RGBA)
+			largeArtifacts = make(map[int]composeArtifactDescriptor)
+			largeRuntime.previews = largePreviews
+			largeRuntime.artifacts = largeArtifacts
+			largeMu.Unlock()
+		}
+		updateMenus()
+	}
+	globalComposeLargeCleanup = func() {
+		largeMu.Lock()
+		largeSessionGeneration++
+		store := largeStore
+		largeStore = nil
+		largeMu.Unlock()
+		if store != nil {
+			editSnapshotMu.Lock()
+			if editSnapshotCancel != nil {
+				editSnapshotCancel()
+			}
+			editSnapshotMu.Unlock()
+			_ = store.Close()
+		}
+	}
 
 	// Register package-level callback so the preview window can inject an image
 	// into any channel with its current stretch settings.
 	globalSendToChannel = func(channelIdx int, img *models.LoadedImage) {
 		if channelIdx < 0 || channelIdx >= 3 {
+			return
+		}
+		if composeLargeModeActive != nil && composeLargeModeActive() {
+			if img == nil || img.HDU.Data.Width <= 0 || img.HDU.Data.Height <= 0 || len(img.HDU.Data.Pixels) < img.HDU.Data.Width*img.HDU.Data.Height || largeStore == nil {
+				debuglog.Log("Compose large mode: Send to Channel requires a materialized incoming image")
+				return
+			}
+			incoming := *img
+			pixels := img.HDU.Data.Pixels
+			w, h := img.HDU.Data.Width, img.HDU.Data.Height
+			slot := fmt.Sprintf("channel-%d", channelIdx)
+			request, session, store := nextLargeLoadGeneration(slot)
+			stageSlot := fmt.Sprintf("send-channel-%d-%d", channelIdx, time.Now().UnixNano())
+			largeMu.RLock()
+			oldDescriptor := largeArtifacts[channelIdx]
+			largeMu.RUnlock()
+			go func() {
+				if store == nil {
+					fyne.Do(func() { dialog.ShowError(fmt.Errorf("disk-backed Compose store is unavailable"), win) })
+					return
+				}
+				d, err := store.Replace(stageSlot, w, h, func(out *fitsio.Float32Artifact) error {
+					row := make([]float32, w)
+					for y := 0; y < h; y++ {
+						copy(row, pixels[y*w:(y+1)*w])
+						if err := out.WriteRow(y, row); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+				if err == nil {
+					incoming.HDU.Data.Pixels = nil
+					preview, _, _, pErr := composeLargeStretchedPreview(d.Path, &incoming)
+					err = pErr
+					if err != nil {
+						_, _ = store.RemoveSlotIfCurrent(d)
+					} else {
+						largeMu.Lock()
+						currentSession := largeSessionGeneration == session && largeLoadGenerations[slot] == request && largeStore == store
+						if !currentSession {
+							largeMu.Unlock()
+							_, _ = store.RemoveSlotIfCurrent(d)
+							err = errors.New("stale Compose channel generation")
+							return
+						}
+						largeArtifacts[channelIdx] = d
+						largePreviews[channelIdx] = preview
+						largeMu.Unlock()
+						if oldDescriptor.Slot != "" {
+							_, _ = store.RemoveSlotIfCurrent(oldDescriptor)
+						}
+					}
+				}
+				fyne.Do(func() {
+					if err != nil {
+						dialog.ShowError(err, win)
+						return
+					}
+					largeMu.Lock()
+					current, currentOK := largeArtifacts[channelIdx]
+					currentSession := largeStore == store && composeLargeSendCommitAllowed(session, largeSessionGeneration, request, largeLoadGenerations[slot], currentOK, current, d)
+					largeMu.Unlock()
+					if !currentSession {
+						_, _ = store.RemoveSlotIfCurrent(d)
+						return
+					}
+					replaceComposeChannelImage(imgs, channelIdx, &incoming)
+					clearComposeOrigPixels(&origPixels, channelIdx)
+					applyChannelState(channelIdx, channelStateFromImage(&incoming), imgs, viewports, controlSets)
+					invalidateCalibration()
+					refresh()
+					if updateMenus != nil {
+						updateMenus()
+					}
+				})
+			}()
 			return
 		}
 		replaceComposeChannelImage(imgs, channelIdx, img)
@@ -3228,6 +5508,67 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 	var magicAll *widget.Button
 	magicAll = widget.NewButton("Magic", func() {
+		if composeLargeModeActive != nil && composeLargeModeActive() {
+			preset := processing.ParseMagicPreset(composeMagicPreset.Selected)
+			go func() {
+				largeRuntime.jobMu.Lock()
+				defer largeRuntime.jobMu.Unlock()
+				type result struct {
+					idx     int
+					img     models.LoadedImage
+					preview *image.RGBA
+					d       composeArtifactDescriptor
+				}
+				results := make([]result, 0, 3)
+				for i, img := range imgs {
+					if img == nil {
+						continue
+					}
+					largeRuntime.mu.RLock()
+					d, ok := largeRuntime.artifacts[i]
+					largeRuntime.mu.RUnlock()
+					if !ok {
+						continue
+					}
+					lease, err := fitsio.MaterializeFloat32ArtifactLease(d.Path)
+					if err != nil {
+						return
+					}
+					clone := *img
+					clone.HDU.Data.Pixels = lease.Pixels
+					processing.ApplyMagicLevels(&clone, preset)
+					processing.AutoMTFMidtone(&clone)
+					lease.Release()
+					preview, _, _, err := composeLargeStretchedPreview(d.Path, &clone)
+					if err != nil {
+						return
+					}
+					results = append(results, result{i, clone, preview, d})
+				}
+				fyne.Do(func() {
+					for _, r := range results {
+						largeRuntime.mu.RLock()
+						cur, ok := largeRuntime.artifacts[r.idx]
+						largeRuntime.mu.RUnlock()
+						if !ok || cur.Generation != r.d.Generation || cur.Path != r.d.Path {
+							return
+						}
+					}
+					for _, r := range results {
+						r.img.HDU.Data.Pixels = nil
+						imgs[r.idx] = &r.img
+						largeRuntime.mu.Lock()
+						largeRuntime.previews[r.idx] = r.preview
+						largeRuntime.mu.Unlock()
+						if syncFn := largeRuntime.syncWidgets[r.idx]; syncFn != nil {
+							syncFn(imgs[r.idx])
+						}
+					}
+					refresh()
+				})
+			}()
+			return
+		}
 		preset := processing.ParseMagicPreset(composeMagicPreset.Selected)
 		// Snapshot loaded channels; processing runs off the UI thread.
 		type magicTarget struct {
@@ -3307,22 +5648,15 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				withSuspendedRefresh(func() {
 					for j, target := range targets {
 						installMagicStretch(target.img, results[j])
-						var cc *models.ChannelControl
 						if target.idx < len(controlSets) {
-							cc = controlSets[target.idx]
-						} else {
-							for _, layer := range overlayLayers {
-								if layer != nil && layer.idx == target.idx {
-									cc = layer.control
-									break
-								}
-							}
+							applyChannelState(target.idx, channelStateFromImage(target.img), imgs, viewports, controlSets)
+							continue
 						}
-						if cc != nil {
-							cc.BackgroundEntry.SetValue(target.img.Background)
-							cc.PeakEntry.SetValue(target.img.Peak)
-							cc.MTFMidtoneEntry.SetValue(target.img.MTFMidtone)
-							cc.ModeSelect.SetSelected("MTF")
+						for _, layer := range overlayLayers {
+							if layer != nil && layer.idx == target.idx && layer.control != nil && layer.viewport != nil {
+								applyChannelState(target.idx, channelStateFromImage(target.img), imgs, layerViews(layer), layerControls(layer))
+								break
+							}
 						}
 					}
 				})
@@ -3344,6 +5678,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		container.NewHBox(widget.NewLabel("Magic preset"), composeMagicPreset),
 		container.NewHBox(sharedHistCheck, widget.NewLabel("Shared histogram scale")),
 		histScaleStatus,
+		container.NewHBox(largeFilesCheck, widget.NewLabel("Disk-backed large files (slow)")),
 		container.NewHBox(blinkCheck, widget.NewLabel("Blink filters")),
 		widget.NewButton("Choose channels...", chooseBlinkChannels),
 		blinkStatus,
@@ -3502,6 +5837,30 @@ func loadImageFromPath(path string) (*models.LoadedImage, error) {
 	return imgs[0], nil
 }
 
+func loadLargeComposeImage(path string, store *composeLargeStore, slot string) (*models.LoadedImage, *image.RGBA, composeArtifactDescriptor, error) {
+	name, extver := "SCI", ""
+	primary, hdu, err := fitsio.InspectSelectedHDU(path, name, extver)
+	if err != nil {
+		name = ""
+		primary, hdu, err = fitsio.InspectSelectedHDU(path, name, extver)
+	}
+	if err != nil {
+		return nil, nil, composeArtifactDescriptor{}, err
+	}
+	d, err := store.ReplaceFromFITS(slot, path, name, extver)
+	if err != nil {
+		return nil, nil, composeArtifactDescriptor{}, err
+	}
+	preview, minV, maxV, err := composeLargePreview(d.Path)
+	if err != nil {
+		_, _ = store.RemoveSlotIfCurrent(d)
+		return nil, nil, composeArtifactDescriptor{}, err
+	}
+	img := &models.LoadedImage{Path: path, Primary: primary, HDU: hdu, Mode: stretch.Linear, Black: float64(minV), White: float64(maxV), Peak: float64(maxV), ScaledPeak: 10, ShowClip: true}
+	img.HDU.Data.Pixels = nil
+	return img, preview, d, nil
+}
+
 func channelStateFromImage(img *models.LoadedImage) models.ChannelState {
 	return models.ChannelState{
 		Path:       img.Path,
@@ -3613,7 +5972,405 @@ func installMagicStretch(dst *models.LoadedImage, src models.LoadedImage) {
 	dst.Background, dst.Peak, dst.Black, dst.White, dst.MTFMidtone, dst.Mode = src.Background, src.Peak, src.Black, src.White, src.MTFMidtone, src.Mode
 }
 
-func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func(), magicPreset *widget.Select, allowRotate bool) *models.ChannelControl {
+type largeChannelRuntime struct {
+	store       *composeLargeStore
+	artifacts   map[int]composeArtifactDescriptor
+	previews    map[int]*image.RGBA
+	mu          *sync.RWMutex
+	jobMu       sync.Mutex
+	syncWidgets map[int]func(*models.LoadedImage)
+	refresh     func()
+}
+
+func composeLargeStretchedPreview(path string, img *models.LoadedImage) (*image.RGBA, float32, float32, error) {
+	a, err := fitsio.OpenFloat32ArtifactReadOnly(path)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	defer a.Close()
+	step := 1
+	if a.Width > 1600 || a.Height > 1600 {
+		if a.Width > a.Height {
+			step = (a.Width + 1599) / 1600
+		} else {
+			step = (a.Height + 1599) / 1600
+		}
+	}
+	pw, ph := (a.Width+step-1)/step, (a.Height+step-1)/step
+	out := image.NewRGBA(image.Rect(0, 0, pw, ph))
+	var eqVals []float32
+	if img.Mode == stretch.HistEq {
+		eqVals = make([]float32, pw*ph)
+	}
+	eqHist := make([]int, 256)
+	row := make([]float32, a.Width)
+	var min, max float32
+	first := true
+	for y := 0; y < a.Height; y++ {
+		if err := a.ReadRow(y, row); err != nil {
+			return nil, 0, 0, err
+		}
+		for _, v := range row {
+			if !isFiniteLarge(v) {
+				continue
+			}
+			if first || v < min {
+				min = v
+			}
+			if first || v > max {
+				max = v
+			}
+			first = false
+		}
+		if y%step != 0 {
+			continue
+		}
+		py := y / step
+		for x := 0; x < a.Width; x += step {
+			v := row[x]
+			q := float64(processing.DiskStretchPreviewValue(v, *img))
+			if eqVals != nil {
+				eqVals[py*pw+x/step] = float32(q)
+			} else {
+				c := uint8(q*255 + 0.5)
+				out.SetRGBA(x/step, py, color.RGBA{c, c, c, 255})
+			}
+		}
+	}
+	if eqVals != nil {
+		for _, v := range eqVals {
+			eqHist[int(v*255)]++
+		}
+		total := 0
+		for _, n := range eqHist {
+			total += n
+		}
+		sum := 0
+		cdf := make([]float32, 256)
+		for i, n := range eqHist {
+			sum += n
+			if total > 0 {
+				cdf[i] = float32(float64(sum) / float64(total))
+			}
+		}
+		for i, v := range eqVals {
+			c := uint8(cdf[int(v*255)]*255 + 0.5)
+			out.SetRGBA(i%pw, i/pw, color.RGBA{c, c, c, 255})
+		}
+	}
+	if first {
+		min, max = 0, 1
+	}
+	return out, min, max, nil
+}
+
+func largeArtifactRange(path string) (float32, float32, error) {
+	a, err := fitsio.OpenFloat32ArtifactReadOnly(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer a.Close()
+	row := make([]float32, a.Width)
+	var min, max float32
+	first := true
+	for y := 0; y < a.Height; y++ {
+		if err := a.ReadRow(y, row); err != nil {
+			return 0, 0, err
+		}
+		for _, v := range row {
+			if !isFiniteLarge(v) {
+				continue
+			}
+			if first || v < min {
+				min = v
+			}
+			if first || v > max {
+				max = v
+			}
+			first = false
+		}
+	}
+	if first {
+		return 0, 1, nil
+	}
+	return min, max, nil
+}
+
+type largeStretchSummary struct {
+	median, high                   float64
+	black, white, background, peak float64
+	cores                          []float64
+	// coreAnchors are retained as a compact catalog so target channels can
+	// locate the corresponding star before sampling its core value.  Keeping
+	// coordinates (rather than a second pixel plane) preserves the one-plane
+	// large-file invariant.
+	coreAnchors []processing.Star
+}
+
+// largeArtifactStretchSummary deliberately materializes only the channel being
+// summarized. It mirrors the normal helper's finite-value percentiles and
+// SmartLevels exactly, then releases the plane before the next channel pass.
+func largeArtifactStretchSummary(path string, img *models.LoadedImage, starCores bool) (largeStretchSummary, error) {
+	return largeArtifactStretchSummaryWithAnchors(path, img, starCores, nil, 0, 0)
+}
+
+func largeArtifactStretchSummaryWithAnchors(path string, img *models.LoadedImage, starCores bool, refAnchors []processing.Star, refWidth, refHeight int) (largeStretchSummary, error) {
+	lease, err := fitsio.MaterializeFloat32ArtifactLease(path)
+	if err != nil {
+		return largeStretchSummary{}, err
+	}
+	defer lease.Release()
+	s := largeStretchSummary{}
+	var ok bool
+	if s.median, ok = composePercentile(lease.Pixels, 50); !ok {
+		return s, fmt.Errorf("channel has no finite pixels")
+	}
+	if s.high, ok = composePercentile(lease.Pixels, 99.8); !ok {
+		return s, fmt.Errorf("channel high anchor unavailable")
+	}
+	s.black, s.white, s.background, s.peak = processing.SmartLevels(lease.Pixels)
+	if starCores && img != nil {
+		white := img.White
+		if white <= img.Black {
+			white = img.Peak
+		}
+		stars := processing.ExtractAndLimitStars(lease.Pixels, lease.Width, lease.Height, 4, 5, 64)
+		if refAnchors == nil {
+			// Reference pass: retain only compact coordinates and the sampled
+			// finite core values. The source plane is released on return.
+			for _, star := range stars {
+				x, y := int(math.Round(star.X)), int(math.Round(star.Y))
+				if x < 0 || y < 0 || x >= lease.Width || y >= lease.Height {
+					continue
+				}
+				v := float64(lease.Pixels[y*lease.Width+x])
+				if !isFinite64(v) || (white > img.Black && v >= white*0.98) {
+					continue
+				}
+				s.cores = append(s.cores, v)
+				star.Flux = v
+				s.coreAnchors = append(s.coreAnchors, star)
+			}
+		} else {
+			// Target pass: map target detections into reference coordinates and
+			// use the shared catalog matcher. This avoids assuming the two
+			// channels have identical dimensions or perfectly coincident stars.
+			sx, sy := 1.0, 1.0
+			if refWidth > 0 && refHeight > 0 {
+				sx = float64(refWidth) / float64(lease.Width)
+				sy = float64(refHeight) / float64(lease.Height)
+			}
+			targetRef := make([]processing.Star, 0, len(stars))
+			for _, star := range stars {
+				star.X *= sx
+				star.Y *= sy
+				targetRef = append(targetRef, star)
+			}
+			pairs := processing.MatchStars(refAnchors, targetRef, 40, 0.02)
+			for _, pair := range pairs {
+				if len(s.cores) >= 64 {
+					break
+				}
+				x, y := int(math.Round(pair.TargetX/sx)), int(math.Round(pair.TargetY/sy))
+				if x < 0 || y < 0 || x >= lease.Width || y >= lease.Height {
+					continue
+				}
+				v := float64(lease.Pixels[y*lease.Width+x])
+				if !isFinite64(v) || (white > img.Black && v >= white*0.98) {
+					continue
+				}
+				s.cores = append(s.cores, v)
+			}
+		}
+	}
+	sort.Float64s(s.cores)
+	return s, nil
+}
+
+func applyLargeStretchMatch(dst *models.ChannelState, ref *models.LoadedImage, rs, ts largeStretchSummary) error {
+	if dst == nil || ref == nil {
+		return fmt.Errorf("missing channel state")
+	}
+	rh, th := rs.high, ts.high
+	if len(rs.cores) >= 5 && len(ts.cores) >= 5 {
+		rh, th = composePercentileSorted(rs.cores, 75), composePercentileSorted(ts.cores, 75)
+	}
+	sp := ref.ScaledPeak
+	if !isFinite64(sp) || sp <= 0 {
+		sp = 10
+	}
+	a := composeScaledInput(rs.median, ref.Background, ref.Peak, sp) / sp
+	b := composeScaledInput(rh, ref.Background, ref.Peak, sp) / sp
+	if !isFinite64(a) || !isFinite64(b) || math.Abs(b-a) < 1e-9 || th <= ts.median {
+		dst.Black, dst.White, dst.Background, dst.Peak = ts.black, ts.white, ts.background, ts.peak
+	} else {
+		denom := (th - ts.median) / (b - a)
+		bg, peak := ts.median-a*denom, ts.median-a*denom+denom
+		if !isFinite64(bg) || !isFinite64(peak) || peak <= bg {
+			dst.Black, dst.White, dst.Background, dst.Peak = ts.black, ts.white, ts.background, ts.peak
+		} else {
+			dst.Black, dst.White, dst.Background, dst.Peak = bg, peak, bg, peak
+		}
+	}
+	dst.Mode, dst.ScaledPeak, dst.ShowClip = modeToLabel(ref.Mode), sp, ref.ShowClip
+	return nil
+}
+
+func applyChannelStateToImage(img *models.LoadedImage, st models.ChannelState) {
+	if img == nil {
+		return
+	}
+	img.Mode = labelToMode(st.Mode)
+	img.Black, img.White = st.Black, st.White
+	img.Background, img.Peak, img.ScaledPeak, img.ShowClip = st.Background, st.Peak, st.ScaledPeak, st.ShowClip
+	img.AsinhScale, img.MTFMidtone = st.AsinhScale, st.MTFMidtone
+	img.GHSStretch, img.GHSLocal, img.GHSSymmetry = st.GHSStretch, st.GHSLocal, st.GHSSymmetry
+}
+
+// largeArtifactStars extracts a bounded catalog while materializing only this
+// one channel. The catalog is retained; source pixels are released before the
+// next channel is opened.
+func largeArtifactStars(path string) ([]processing.Star, error) {
+	lease, err := fitsio.MaterializeFloat32ArtifactLease(path)
+	if err != nil {
+		return nil, err
+	}
+	stars := processing.ExtractAndLimitStars(lease.Pixels, lease.Width, lease.Height, 4.0, 3, 30)
+	lease.Release()
+	return stars, nil
+}
+
+func largeRotateChannel(rt *largeChannelRuntime, idx int, imgs []*models.LoadedImage, refresh func(), onCommit func()) {
+	rt.mu.RLock()
+	d, ok := rt.artifacts[idx]
+	rt.mu.RUnlock()
+	if !ok || rt.store == nil {
+		return
+	}
+	go func() {
+		rt.jobMu.Lock()
+		defer rt.jobMu.Unlock()
+		rt.mu.RLock()
+		cur, current := rt.artifacts[idx]
+		rt.mu.RUnlock()
+		if !current || cur.Generation != d.Generation || cur.Path != d.Path {
+			fyne.Do(refresh)
+			return
+		}
+		src, err := fitsio.OpenFloat32ArtifactReadOnly(d.Path)
+		if err != nil {
+			fyne.Do(refresh)
+			return
+		}
+		w, h := src.Width, src.Height
+		nd, err := rt.store.ReplaceIfCurrent(d, h, w, func(out *fitsio.Float32Artifact) error {
+			row := make([]float32, w)
+			dst := make([]float32, h)
+			for y := 0; y < w; y++ {
+				for x := 0; x < h; x++ {
+					if err := src.ReadRow(h-1-x, row); err != nil {
+						return err
+					}
+					dst[x] = row[y]
+				}
+				if err := out.WriteRow(y, dst); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		src.Close()
+		if err == nil {
+			preview, _, _, pErr := composeLargeStretchedPreview(nd.Path, imgs[idx])
+			err = pErr
+			if err == nil {
+				rt.mu.Lock()
+				cur, current := rt.artifacts[idx]
+				if current && cur.Generation == d.Generation {
+					rt.artifacts[idx] = nd
+					rt.previews[idx] = preview
+					imgs[idx].HDU.Data.Width, imgs[idx].HDU.Data.Height = h, w
+					imgs[idx].HDU.Data.Pixels = nil
+					imgs[idx].Rotation90 = (imgs[idx].Rotation90 + 1) % 4
+					clearComposeChannelAlignment(imgs[idx])
+				}
+				rt.mu.Unlock()
+			}
+		}
+		fyne.Do(func() {
+			if err == nil && onCommit != nil {
+				onCommit()
+			}
+			refresh()
+		})
+	}()
+}
+
+func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func(), magicPreset *widget.Select, allowRotate bool, large ...*largeChannelRuntime) *models.ChannelControl {
+	invalidateChannelRefinement := func() {
+		if idx == 1 && globalComposeGaiaRefinementInvalidate != nil {
+			globalComposeGaiaRefinementInvalidate()
+		}
+	}
+	var disk *largeChannelRuntime
+	if len(large) > 0 {
+		disk = large[0]
+	}
+	largeJob := func(op string, mutate func(*models.LoadedImage) error) {
+		if disk == nil || disk.store == nil || !composeLargeModeActive() || idx < 0 || idx >= len(imgs) || imgs[idx] == nil {
+			return
+		}
+		disk.mu.RLock()
+		d, ok := disk.artifacts[idx]
+		disk.mu.RUnlock()
+		if !ok {
+			return
+		}
+		if idx == 1 && globalComposeGaiaRefinementInvalidate != nil {
+			globalComposeGaiaRefinementInvalidate()
+		}
+		go func() {
+			disk.jobMu.Lock()
+			defer disk.jobMu.Unlock()
+			lease, err := fitsio.MaterializeFloat32ArtifactLease(d.Path)
+			if err == nil {
+				img := *imgs[idx]
+				img.HDU.Data.Pixels = lease.Pixels
+				err = mutate(&img)
+				lease.Release()
+				if err == nil {
+					preview, _, _, pErr := composeLargeStretchedPreview(d.Path, &img)
+					err = pErr
+					if err == nil {
+						disk.mu.Lock()
+						cur, current := disk.artifacts[idx]
+						if current && cur.Generation == d.Generation && cur.Path == d.Path {
+							*imgs[idx] = img
+							imgs[idx].HDU.Data.Pixels = nil
+							disk.previews[idx] = preview
+						} else {
+							err = errors.New("stale Compose artifact generation")
+						}
+						disk.mu.Unlock()
+					}
+				}
+			}
+			fyne.Do(func() {
+				if err != nil {
+					debuglog.Log(fmt.Sprintf("large channel %s: %v", op, err))
+				} else if idx < len(views) && views[idx] != nil {
+					views[idx].blackBox.SetValue(imgs[idx].Black)
+					views[idx].whiteBox.SetValue(imgs[idx].White)
+				}
+				if err == nil && disk.syncWidgets != nil {
+					if syncFn := disk.syncWidgets[idx]; syncFn != nil {
+						syncFn(imgs[idx])
+					}
+				}
+				refresh()
+			})
+		}()
+	}
 	// Stretch-specific parameter rows. Only the row(s) relevant to the selected
 	// mode are shown; the rest stay hidden to avoid clutter.
 	asinhScaleEntry := NewNumberEntry(0.1, 3)
@@ -3655,13 +6412,29 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		}
 	}
 
+	var syncingWidgets bool
 	selectBox := widget.NewSelect([]string{"Linear", "Log", "Asinh", "Sqrt", "HistEq", "MTF", "GHS"}, func(value string) {
+		if syncingWidgets {
+			updateStretchParams(labelToMode(value))
+			return
+		}
 		if imgs[idx] == nil {
 			updateStretchParams(labelToMode(value))
 			return
 		}
+		invalidateChannelRefinement()
+		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+			mode := labelToMode(value)
+			updateStretchParams(mode)
+			largeJob("mode", func(img *models.LoadedImage) error { img.Mode = mode; return nil })
+			return
+		}
 		imgs[idx].Mode = labelToMode(value)
 		updateStretchParams(imgs[idx].Mode)
+		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+			largeJob("mode", func(_ *models.LoadedImage) error { return nil })
+			return
+		}
 		refresh()
 	})
 	initialMode := stretch.Linear
@@ -3746,6 +6519,11 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		if imgs[idx] == nil {
 			return
 		}
+		invalidateChannelRefinement()
+		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+			largeJob("show-clip", func(img *models.LoadedImage) error { img.ShowClip = v; return nil })
+			return
+		}
 		imgs[idx].ShowClip = v
 		refresh()
 	})
@@ -3754,6 +6532,17 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 	var apply *widget.Button
 	apply = widget.NewButton("Apply", func() {
 		if imgs[idx] == nil {
+			return
+		}
+		invalidateChannelRefinement()
+		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+			background, peak, scaled, black, white := backgroundEntry.Value(), peakEntry.Value(), scaledPeakEntry.Value(), views[idx].blackBox.Value(), views[idx].whiteBox.Value()
+			asinh, mtfm, ghsd, ghsb, ghssp := asinhScaleEntry.Value(), mtfMidtoneEntry.Value(), ghsStretchEntry.Value(), ghsLocalEntry.Value(), ghsSymmetryEntry.Value()
+			largeJob("apply", func(img *models.LoadedImage) error {
+				img.Background, img.Peak, img.ScaledPeak, img.Black, img.White = background, peak, scaled, black, white
+				img.AsinhScale, img.MTFMidtone, img.GHSStretch, img.GHSLocal, img.GHSSymmetry = asinh, mtfm, ghsd, ghsb, ghssp
+				return nil
+			})
 			return
 		}
 		imgs[idx].Background = backgroundEntry.Value()
@@ -3783,6 +6572,11 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		if imgs[idx] == nil {
 			return
 		}
+		invalidateChannelRefinement()
+		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+			largeJob("auto scaling", func(img *models.LoadedImage) error { processing.AutoScaleLikeFitsLiberator(img); return nil })
+			return
+		}
 		processing.AutoScaleLikeFitsLiberator(imgs[idx])
 		views[idx].blackBox.SetValue(imgs[idx].Black)
 		views[idx].whiteBox.SetValue(imgs[idx].White)
@@ -3796,6 +6590,11 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		if imgs[idx] == nil {
 			return
 		}
+		invalidateChannelRefinement()
+		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+			largeJob("auto MTF", func(img *models.LoadedImage) error { processing.AutoMTFMidtone(img); return nil })
+			return
+		}
 		processing.AutoMTFMidtone(imgs[idx])
 		backgroundEntry.SetValue(imgs[idx].Background)
 		peakEntry.SetValue(imgs[idx].Peak)
@@ -3806,6 +6605,16 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 
 	magic := widget.NewButton("Magic", func() {
 		if imgs[idx] == nil {
+			return
+		}
+		invalidateChannelRefinement()
+		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+			preset := processing.ParseMagicPreset(magicPreset.Selected)
+			largeJob("magic", func(img *models.LoadedImage) error {
+				processing.ApplyMagicLevels(img, preset)
+				processing.AutoMTFMidtone(img)
+				return nil
+			})
 			return
 		}
 		res := processing.ApplyMagicLevels(imgs[idx], processing.ParseMagicPreset(magicPreset.Selected))
@@ -3835,10 +6644,29 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		if imgs[idx] == nil {
 			return
 		}
+		if idx == 1 && globalComposeGaiaRefinementInvalidate != nil {
+			globalComposeGaiaRefinementInvalidate()
+		}
+		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+			largeJob("offset", func(_ *models.LoadedImage) error { return nil })
+			return
+		}
 		refresh()
 	})
 	rotate := widget.NewButton("Rotate 90°", func() {
 		if imgs[idx] == nil {
+			return
+		}
+		if idx == 1 && globalComposeGaiaRefinementInvalidate != nil {
+			globalComposeGaiaRefinementInvalidate()
+		}
+		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+			largeRotateChannel(disk, idx, imgs, refresh, func() {
+				xOffsetEntry.SetValue(0)
+				yOffsetEntry.SetValue(0)
+				rotOffsetEntry.SetValue(0)
+				clearComposeOrigPixels(origPixels, idx)
+			})
 			return
 		}
 		rotateComposeChannel90CW(imgs[idx])
@@ -3849,6 +6677,22 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		clearComposeOrigPixels(origPixels, idx)
 		refresh()
 	})
+	if disk != nil && disk.syncWidgets != nil {
+		disk.syncWidgets[idx] = func(img *models.LoadedImage) {
+			if syncingWidgets || img == nil {
+				return
+			}
+			syncingWidgets = true
+			backgroundEntry.SetValue(img.Background)
+			peakEntry.SetValue(img.Peak)
+			scaledPeakEntry.SetValue(img.ScaledPeak)
+			views[idx].blackBox.SetValue(img.Black)
+			views[idx].whiteBox.SetValue(img.White)
+			mtfMidtoneEntry.SetValue(img.MTFMidtone)
+			selectBox.SetSelected(modeToLabel(img.Mode))
+			syncingWidgets = false
+		}
+	}
 
 	return &models.ChannelControl{
 		Content: container.NewVBox(
@@ -4581,6 +7425,57 @@ func defaultRGBLevels() *models.RgbLevels {
 		Min: [3]float64{0, 0, 0},
 		Max: [3]float64{255, 255, 255},
 	}
+}
+
+func composeHasAllBaseChannels(imgs []*models.LoadedImage) bool {
+	return len(imgs) >= 3 && imgs[0] != nil && imgs[1] != nil && imgs[2] != nil
+}
+
+func composeCompositeDisabledStatus(buildComposite bool, imgs []*models.LoadedImage) string {
+	if !buildComposite {
+		return "Composite disabled — enable Build color composite"
+	}
+	if !composeHasAllBaseChannels(imgs) {
+		return "Composite disabled until all channels are loaded"
+	}
+	return "Composite disabled"
+}
+
+// applyCrossChannelReplacementRow replays the sparse cosmic-ray replacements
+// from one disk row. replacement is little-endian float32 data and valid marks
+// the pixels that have a replacement; both are bounded to the shared region.
+func applyCrossChannelReplacementRow(row []float32, replacement, valid []byte) bool {
+	limit := len(row)
+	if len(valid) < limit {
+		limit = len(valid)
+	}
+	if len(replacement)/4 < limit {
+		limit = len(replacement) / 4
+	}
+	dirty := false
+	for x := 0; x < limit; x++ {
+		if valid[x] == 0 {
+			continue
+		}
+		row[x] = math.Float32frombits(binary.LittleEndian.Uint32(replacement[x*4:]))
+		dirty = true
+	}
+	return dirty
+}
+
+const crossChannelCleanReplayBatchBytes = 100 * 1024 * 1024
+
+// crossChannelCleanReplayRowsPerBatch keeps the deferred replacement replay at
+// about 100 MiB of pixel data while ensuring narrow images still make progress.
+func crossChannelCleanReplayRowsPerBatch(width, height int) int {
+	if width <= 0 || height <= 0 {
+		return 1
+	}
+	rows := int(int64(crossChannelCleanReplayBatchBytes) / (int64(width) * 4))
+	if rows < 1 {
+		rows = 1
+	}
+	return min(rows, height)
 }
 
 // channelBorder wraps a canvas object with a colored rectangular border.
