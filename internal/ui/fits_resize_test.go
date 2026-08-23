@@ -1,6 +1,19 @@
 package ui
 
-import "testing"
+import (
+	"testing"
+
+	"gofitsv3/internal/fitsio"
+)
+
+func TestCleanHDUWithDQMatchesEXTVERThroughHeaderString(t *testing.T) {
+	sci := fitsio.HDU{ExtName: "SCI", Header: fitsio.Header{Cards: map[string]string{"EXTVER": "2 / detector"}}, Data: fitsio.ImageData{Width: 1, Height: 1, Pixels: []float32{3}}}
+	dq := fitsio.HDU{ExtName: "DQ", Header: fitsio.Header{Cards: map[string]string{"EXTVER": "2 / detector"}}, Data: fitsio.ImageData{Width: 1, Height: 1, Int32Pixels: []int32{0}}}
+	file := &fitsio.File{HDUs: []fitsio.HDU{{Header: fitsio.Header{}}, sci, dq}}
+	if _, err := cleanHDUWithDQ(sci, file); err != nil {
+		t.Fatalf("cleanHDUWithDQ returned error for matching EXTVER: %v", err)
+	}
+}
 
 func TestDeduplicatePathsPreservesOrder(t *testing.T) {
 	got := deduplicatePaths([]string{"first.fits", "second.fit", "first.fits", "third.fts", "second.fit"})

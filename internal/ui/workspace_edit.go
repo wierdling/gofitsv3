@@ -45,15 +45,19 @@ type editImageHandoff struct {
 
 func (h editImageHandoff) valid() bool { return (h.memory != nil) != (h.disk != nil) }
 
-var globalExportToEdit func(editImageHandoff)
+var globalExportToEdit func(editImageHandoff) error
 var globalEditCleanup func()
 
 var editZoomPresets = []string{"fit", "10%", "25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%"}
 
 // editWorkspaceState holds all mutable state for the edit tab.
 type editWorkspaceState struct {
-	win        fyne.Window
-	source     *image.RGBA
+	win fyne.Window
+	// base is the last loaded or saved image. working is the mutable image
+	// displayed in Edit. Keeping them separate makes Reset a memory copy rather
+	// than a reload, and prevents adjustments from being applied cumulatively.
+	base       *image.RGBA
+	working    *image.RGBA
 	diskSource *editDiskSource
 	origW      int
 	origH      int
@@ -110,6 +114,7 @@ type editWorkspaceState struct {
 	cropMin         image.Point // selection in image pixels (top-left)
 	cropMax         image.Point // selection in image pixels (bottom-right)
 	cropHasSel      bool
+	jobGeneration   uint64
 }
 
 func (es *editWorkspaceState) applyEdits() {
@@ -119,9 +124,12 @@ func (es *editWorkspaceState) applyEdits() {
 		}
 		return
 	}
-	if es.source == nil {
+	if es.base == nil {
 		return
 	}
+	es.jobGeneration++
+	generation := es.jobGeneration
+	base := es.base
 	prog := dialog.NewCustom("Applying", "Please wait…", widget.NewProgressBarInfinite(), es.win)
 	prog.Show()
 
@@ -133,12 +141,17 @@ func (es *editWorkspaceState) applyEdits() {
 	strength, radius := es.sharpSlider.Value, es.sharpRadiusSlider.Value
 
 	go func() {
-		img := processing.ApplyEditLevels(es.source, rMin, rMax, gMin, gMax, bMin, bMax)
+		img := processing.ApplyEditLevels(base, rMin, rMax, gMin, gMax, bMin, bMax)
 		img = processing.ApplyCurvesRGBA(img, rLUT, gLUT, bLUT)
 		img = processing.SharpenRGBA(img, strength, radius)
 
 		fyne.Do(func() {
 			prog.Hide()
+			if es.jobGeneration != generation || es.base != base || es.diskSource != nil {
+				return
+			}
+			es.working = img
+			es.healUndo = nil
 			es.canvasImg.Image = img
 			es.canvasImg.Refresh()
 		})
@@ -200,12 +213,66 @@ func toRGBA(img image.Image) *image.RGBA {
 	return r
 }
 
+func cloneEditRGBA(src *image.RGBA) *image.RGBA {
+	if src == nil {
+		return nil
+	}
+	dst := image.NewRGBA(src.Bounds())
+	copy(dst.Pix, src.Pix)
+	return dst
+}
+
+func (es *editWorkspaceState) resetWorkingToBase() bool {
+	if es.base == nil {
+		return false
+	}
+	es.working = cloneEditRGBA(es.base)
+	es.healUndo = nil
+	es.jobGeneration++
+	return true
+}
+
+func (es *editWorkspaceState) commitWorkingToBase() {
+	if es.working != nil {
+		es.base = cloneEditRGBA(es.working)
+	}
+}
+
+func (es *editWorkspaceState) resetAdjustmentControls() {
+	for _, slider := range []*widget.Slider{es.rMinSlider, es.rMaxSlider, es.gMinSlider, es.gMaxSlider, es.bMinSlider, es.bMaxSlider} {
+		if slider != nil {
+			slider.SetValue(0)
+		}
+	}
+	if es.rMaxSlider != nil {
+		es.rMaxSlider.SetValue(255)
+	}
+	if es.gMaxSlider != nil {
+		es.gMaxSlider.SetValue(255)
+	}
+	if es.bMaxSlider != nil {
+		es.bMaxSlider.SetValue(255)
+	}
+	if es.curves != nil {
+		es.curves.Reset()
+	}
+	if es.curvesChannel != nil {
+		es.curvesChannel.SetSelected("All")
+	}
+	if es.sharpSlider != nil {
+		es.sharpSlider.SetValue(0)
+	}
+	if es.sharpRadiusSlider != nil {
+		es.sharpRadiusSlider.SetValue(1.0)
+	}
+}
+
 // doHealStroke performs the heal for the full destination stroke.
 func (es *editWorkspaceState) doHealStroke(srcScreen fyne.Position, dstScreens []fyne.Position) {
 	if es.diskSource != nil {
 		return
 	}
-	rgba := toRGBA(es.canvasImg.Image)
+	rgba := es.working
 	if rgba == nil {
 		return
 	}
@@ -234,6 +301,10 @@ func (es *editWorkspaceState) doHealStroke(srcScreen fyne.Position, dstScreens [
 	es.healUndo = undo
 
 	healed := applyHealStroke(rgba, srcPt, dstPts, radius)
+	es.working = healed
+	es.commitWorkingToBase()
+	es.resetAdjustmentControls()
+	es.jobGeneration++
 	es.canvasImg.Image = healed
 	es.canvasImg.Refresh()
 }
@@ -247,7 +318,11 @@ func (es *editWorkspaceState) undoHeal() {
 		return
 	}
 	es.canvasImg.Image = es.healUndo
+	es.working = es.healUndo
+	es.commitWorkingToBase()
+	es.resetAdjustmentControls()
 	es.healUndo = nil
+	es.jobGeneration++
 	es.canvasImg.Refresh()
 }
 
@@ -286,7 +361,7 @@ func (es *editWorkspaceState) applyCrop() {
 		dialog.ShowInformation("No selection", "Drag a rectangle on the image first.", es.win)
 		return
 	}
-	rgba := toRGBA(es.canvasImg.Image)
+	rgba := es.working
 	if rgba == nil {
 		return
 	}
@@ -302,9 +377,10 @@ func (es *editWorkspaceState) applyCrop() {
 	if es.cropOverlay != nil {
 		es.cropOverlay.Reset()
 	}
-	// setImage makes the cropped result the new edit base (resets sliders,
-	// re-fits zoom, rebuilds histograms).
-	es.setImage(cropped)
+	// Crop works on the current working image, then bakes that operation into
+	// the base before clearing the non-destructive adjustment controls.
+	es.setImageOpts(cropped, false, false)
+	es.commitWorkingToBase()
 }
 
 func (es *editWorkspaceState) refreshHistograms(img *image.RGBA) {
@@ -327,7 +403,7 @@ func (es *editWorkspaceState) refreshHistograms(img *image.RGBA) {
 }
 
 func (es *editWorkspaceState) setImage(img image.Image) {
-	es.setImageOpts(img, false)
+	es.setImageOpts(img, false, true)
 }
 
 func (d *editDiskSource) cleanup() {
@@ -341,30 +417,34 @@ func (d *editDiskSource) cleanup() {
 	})
 }
 
-func (es *editWorkspaceState) installHandoff(h editImageHandoff) {
+func (es *editWorkspaceState) installHandoff(h editImageHandoff) error {
 	if !h.valid() {
-		return
+		return fmt.Errorf("invalid Edit image handoff")
 	}
 	if h.disk != nil {
-		es.setDiskSource(h.disk)
-		return
+		return es.setDiskSource(h.disk)
 	}
 	if h.memory != nil {
 		es.setImage(h.memory)
 	}
+	return nil
 }
 
-func (es *editWorkspaceState) setDiskSource(d *editDiskSource) {
+func (es *editWorkspaceState) setDiskSource(d *editDiskSource) error {
 	if d == nil || d.width <= 0 || d.height <= 0 {
-		return
+		if d != nil && d != es.diskSource {
+			d.cleanup()
+		}
+		return fmt.Errorf("invalid disk-backed Edit dimensions")
 	}
-	old := es.diskSource
-	es.diskSource = d
-	es.source = nil
-	if old != nil && old != d {
-		old.cleanup()
+	// Prepare and validate the incoming source completely before touching the
+	// currently installed source. This keeps replacement atomic on malformed or
+	// truncated artifacts.
+	cleanupIncoming := func() {
+		if d != es.diskSource {
+			d.cleanup()
+		}
 	}
-	es.origW, es.origH = d.width, d.height
 	maxDim := 1600
 	scale := math.Min(1, math.Min(float64(maxDim)/float64(d.width), float64(maxDim)/float64(d.height)))
 	pw, ph := maxInt(1, int(math.Round(float64(d.width)*scale))), maxInt(1, int(math.Round(float64(d.height)*scale)))
@@ -373,9 +453,23 @@ func (es *editWorkspaceState) setDiskSource(d *editDiskSource) {
 	for i, p := range d.planes {
 		a, err := fitsio.OpenFloat32ArtifactReadOnly(p)
 		if err != nil {
-			d.cleanup()
-			es.diskSource = nil
-			return
+			for _, opened := range arts {
+				if opened != nil {
+					_ = opened.Close()
+				}
+			}
+			cleanupIncoming()
+			return fmt.Errorf("open Edit plane %d: %w", i+1, err)
+		}
+		if a.Width != d.width || a.Height != d.height {
+			_ = a.Close()
+			for _, opened := range arts {
+				if opened != nil {
+					_ = opened.Close()
+				}
+			}
+			cleanupIncoming()
+			return fmt.Errorf("Edit plane %d dimensions do not match source", i+1)
 		}
 		arts[i] = a
 	}
@@ -386,7 +480,15 @@ func (es *editWorkspaceState) setDiskSource(d *editDiskSource) {
 	for y := 0; y < ph; y++ {
 		sy := minEditInt(d.height-1, int(float64(y)/scale))
 		for c := range arts {
-			_ = arts[c].ReadRow(sy, rows[c])
+			if err := arts[c].ReadRow(sy, rows[c]); err != nil {
+				for _, a := range arts {
+					if a != nil {
+						_ = a.Close()
+					}
+				}
+				cleanupIncoming()
+				return fmt.Errorf("read Edit plane %d row %d: %w", c+1, sy, err)
+			}
 		}
 		for x := 0; x < pw; x++ {
 			sx := minEditInt(d.width-1, int(float64(x)/scale))
@@ -396,6 +498,15 @@ func (es *editWorkspaceState) setDiskSource(d *editDiskSource) {
 	for _, a := range arts {
 		_ = a.Close()
 	}
+	old := es.diskSource
+	es.diskSource = d
+	es.base = nil
+	es.working = nil
+	es.jobGeneration++
+	if old != nil && old != d {
+		old.cleanup()
+	}
+	es.origW, es.origH = d.width, d.height
 	es.rMinSlider.SetValue(d.levels.Min[0])
 	es.rMaxSlider.SetValue(d.levels.Max[0])
 	es.gMinSlider.SetValue(d.levels.Min[1])
@@ -427,6 +538,7 @@ func (es *editWorkspaceState) setDiskSource(d *editDiskSource) {
 	if es.editTabs != nil {
 		es.editTabs.SelectIndex(0)
 	}
+	return nil
 }
 
 func toByte(v float32) uint8 {
@@ -460,7 +572,9 @@ func levelByte(v float32, min, max float64) uint8 {
 	return uint8(x + 0.5)
 }
 
-func (es *editWorkspaceState) setImageOpts(img image.Image, keepZoomAndScroll bool) {
+// setImageOpts installs img as the working image. When replaceBase is true,
+// such as for a new load or Compose handoff, it also becomes the reset target.
+func (es *editWorkspaceState) setImageOpts(img image.Image, keepZoomAndScroll, replaceBase bool) {
 	if img == nil {
 		return
 	}
@@ -478,7 +592,11 @@ func (es *editWorkspaceState) setImageOpts(img image.Image, keepZoomAndScroll bo
 		es.diskSource.cleanup()
 		es.diskSource = nil
 	}
-	es.source = rgba
+	if replaceBase {
+		es.base = cloneEditRGBA(rgba)
+	}
+	es.working = rgba
+	es.jobGeneration++
 	if es.editTabs != nil {
 		for i := range es.editTabs.Items {
 			es.editTabs.EnableIndex(i)
@@ -546,24 +664,26 @@ func (es *editWorkspaceState) runColorSpeckClean() {
 		}
 		return
 	}
-	rgba := toRGBA(es.canvasImg.Image)
+	rgba := es.working
 	if rgba == nil {
 		dialog.ShowInformation("Nothing to clean", "Load or compose an image first.", es.win)
 		return
 	}
+	es.jobGeneration++
+	generation := es.jobGeneration
+	source := rgba
+	blobSize := es.cleanBlobSlider.Value
+	intensity := es.cleanIntensitySlider.Value
 
 	prog := dialog.NewCustom("Cleaning", "Removing tiny RGB specks...", widget.NewProgressBarInfinite(), es.win)
 	prog.Show()
 
 	go func() {
-		cfg := processing.ColorSpeckCleanConfigFromSettings(
-			int(math.Round(es.cleanBlobSlider.Value)),
-			es.cleanIntensitySlider.Value,
-		)
-		cleaned, repaired := processing.CleanColorSpecksRGBA(rgba, cfg)
+		cfg := processing.ColorSpeckCleanConfigFromSettings(int(math.Round(blobSize)), intensity)
+		cleaned, repaired := processing.CleanColorSpecksRGBA(source, cfg)
 		fyne.Do(func() {
 			prog.Hide()
-			if cleaned == nil {
+			if cleaned == nil || es.jobGeneration != generation || es.working != source || es.diskSource != nil {
 				return
 			}
 
@@ -578,7 +698,8 @@ func (es *editWorkspaceState) runColorSpeckClean() {
 				savedOffset = es.imgScroll.Offset
 			}
 
-			es.setImageOpts(cleaned, true)
+			es.setImageOpts(cleaned, true, false)
+			es.commitWorkingToBase()
 
 			// Restore the captured zoom and scroll position. setImageOpts(...,true)
 			// leaves them untouched, but the image swap + SetMinSize queues a layout
@@ -608,7 +729,7 @@ func (es *editWorkspaceState) runColorSpeckClean() {
 				es.cleanStatusLabel.SetText("No tiny pure-color specks were detected.")
 				return
 			}
-			es.cleanStatusLabel.SetText(fmt.Sprintf("Removed %d speck pixels. The cleaned image is now the new edit base.", repaired))
+			es.cleanStatusLabel.SetText(fmt.Sprintf("Removed %d speck pixels; the result is now the edit base.", repaired))
 		})
 	}()
 }
@@ -776,7 +897,7 @@ func editHistRaster(es *editWorkspaceState, ch int, col [3]uint8, getMin, getMax
 	return r
 }
 
-func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(editImageHandoff)) {
+func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(editImageHandoff) error) {
 	es := &editWorkspaceState{zoom: 1.0, win: win}
 
 	// Canvas image
@@ -885,7 +1006,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 	es.applyButton = applyBtn
 	es.curves.onDragEnd = func() { es.applyEdits() }
 	resetBtn := widget.NewButton("Reset", func() {
-		if es.source == nil {
+		if es.base == nil {
 			return
 		}
 		es.rMinSlider.SetValue(0)
@@ -898,13 +1019,15 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 		es.curvesChannel.SetSelected("All")
 		es.sharpSlider.SetValue(0)
 		es.sharpRadiusSlider.SetValue(1.0)
-		es.canvasImg.Image = es.source
+		es.resetWorkingToBase()
+		es.refreshHistograms(es.working)
+		es.canvasImg.Image = es.working
 		es.canvasImg.Refresh()
 	})
 	es.resetButton = resetBtn
 
 	saveBtn := widget.NewButton("Save Image...", func() {
-		if es.canvasImg.Image == nil {
+		if es.working == nil && es.diskSource == nil {
 			dialog.ShowInformation("Nothing to save", "Load or compose an image first.", win)
 			return
 		}
@@ -915,16 +1038,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 			path := uc.URI().Path()
 			_ = uc.Close()
 
-			rgba, ok := es.canvasImg.Image.(*image.RGBA)
-			if !ok {
-				bounds := es.canvasImg.Image.Bounds()
-				rgba = image.NewRGBA(bounds)
-				for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-					for x := bounds.Min.X; x < bounds.Max.X; x++ {
-						rgba.Set(x, y, es.canvasImg.Image.At(x, y))
-					}
-				}
-			}
+			rgba := es.working
 			format := export.PNG
 			lower := strings.ToLower(path)
 			switch {
@@ -944,6 +1058,11 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 				}
 				if err != nil {
 					dialog.ShowError(err, win)
+					return
+				}
+				if es.diskSource == nil && rgba != nil && es.working == rgba {
+					es.commitWorkingToBase()
+					es.resetAdjustmentControls()
 				}
 			})
 		}, win)
@@ -1123,8 +1242,8 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 	split := container.NewHSplit(controlsScroll, rightPanel)
 	split.SetOffset(0.28)
 
-	setter := func(h editImageHandoff) {
-		es.installHandoff(h)
+	setter := func(h editImageHandoff) error {
+		return es.installHandoff(h)
 	}
 	globalEditCleanup = func() {
 		if es.diskSource != nil {

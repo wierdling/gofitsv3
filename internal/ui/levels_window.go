@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"image"
+	"math"
 
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
@@ -116,14 +117,27 @@ func (w *rgbLevelsWindow) applyLevels(onApply func()) {
 	for i := 0; i < 3; i++ {
 		minVal := w.levels.Min[i]
 		maxVal := w.levels.Max[i]
-		if v, err := utils.ParseFloat(w.minEntries[i].Text); err == nil {
+		if !isFiniteLevel(minVal) {
+			minVal = 0
+		}
+		if !isFiniteLevel(maxVal) {
+			maxVal = 255
+		}
+		if v, err := utils.ParseFloat(w.minEntries[i].Text); err == nil && isFiniteLevel(v) {
 			minVal = utils.ClampLevel(v)
 		}
-		if v, err := utils.ParseFloat(w.maxEntries[i].Text); err == nil {
+		if v, err := utils.ParseFloat(w.maxEntries[i].Text); err == nil && isFiniteLevel(v) {
 			maxVal = utils.ClampLevel(v)
 		}
 		if maxVal <= minVal {
-			maxVal = minVal + 1
+			if minVal >= 255 {
+				minVal, maxVal = 254, 255
+			} else {
+				maxVal = minVal + 1
+				if maxVal > 255 {
+					minVal, maxVal = 254, 255
+				}
+			}
 		}
 		if minVal != w.levels.Min[i] || maxVal != w.levels.Max[i] {
 			changed = true
@@ -135,4 +149,8 @@ func (w *rgbLevelsWindow) applyLevels(onApply func()) {
 	if changed && onApply != nil {
 		onApply()
 	}
+}
+
+func isFiniteLevel(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }

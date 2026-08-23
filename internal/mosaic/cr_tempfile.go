@@ -22,6 +22,23 @@ import (
 // is a var (not const) so tests can shrink it to force multi-band processing.
 var crModelMemBudget int64 = 256 << 20 // 256 MB
 
+type firstError struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (f *firstError) Store(err error) {
+	if err == nil {
+		return
+	}
+	f.mu.Lock()
+	if f.err == nil {
+		f.err = err
+	}
+	f.mu.Unlock()
+}
+func (f *firstError) Load() error { f.mu.Lock(); defer f.mu.Unlock(); return f.err }
+
 // buildCRMasksDrizzle implements the AstroDrizzle-style separate-drizzle cosmic
 // ray pipeline without holding every per-frame drizzled image in memory at once.
 //
@@ -72,7 +89,7 @@ func buildCRMasksDrizzle(
 	debuglog.Log(fmt.Sprintf("buildCRMasksDrizzle: sep pass, %d frames, %d workers", n, sepWorkers))
 	var sepWG sync.WaitGroup
 	sepSem := make(chan struct{}, sepWorkers)
-	var sepErr atomic.Value // error
+	var sepErr firstError
 	var sepDone int32
 	for slot, pi := range dataPlanned {
 		if err := opts.cancelled(); err != nil {
@@ -103,8 +120,9 @@ func buildCRMasksDrizzle(
 		}(slot, pi)
 	}
 	sepWG.Wait()
-	if e := sepErr.Load(); e != nil {
-		return nil, e.(error)
+	e := sepErr.Load()
+	if e != nil {
+		return nil, e
 	}
 	if err := opts.cancelled(); err != nil {
 		return nil, err
@@ -136,7 +154,7 @@ func buildCRMasksDrizzle(
 	masks := make([]BitMask, n)
 	var maskWG sync.WaitGroup
 	maskSem := make(chan struct{}, maskConcurrency())
-	var maskErr atomic.Value
+	var maskErr firstError
 	for slot, pi := range dataPlanned {
 		if err := opts.cancelled(); err != nil {
 			maskErr.Store(err)
@@ -193,8 +211,9 @@ func buildCRMasksDrizzle(
 		}(slot, pi)
 	}
 	maskWG.Wait()
-	if e := maskErr.Load(); e != nil {
-		return nil, e.(error)
+	e = maskErr.Load()
+	if e != nil {
+		return nil, e
 	}
 	if err := opts.cancelled(); err != nil {
 		return nil, err

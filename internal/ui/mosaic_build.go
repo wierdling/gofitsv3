@@ -13,6 +13,7 @@ import (
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
+	"gofitsv3/internal/stretch"
 )
 
 func drizzleOptionsFromSettings(s models.DrizzleSettings, sky models.SkysubSettings, debugDir string, progress func(string, int, int), ctx context.Context) mosaic.Options {
@@ -88,29 +89,75 @@ func (ws *mosaicWorkspace) autoAlignToReferenceBaseline() {
 // buildDrizzlePreview runs a drizzle build and updates the preview UI.
 // It must only be called from a goroutine (it shows a progress dialog and blocks).
 func (ws *mosaicWorkspace) buildDrizzlePreview() {
-	// Release previous result before building the new one so the old pixel
-	// arrays can be collected before the new ones are allocated.
-	ws.state.result = nil
-	ws.state.resultName = ""
-	markMosaicArtifactMaskDocumentsStale(ws.state.artifactMasks)
-
+	buildCtx, buildGeneration, started := ws.beginMosaicBuild()
+	if !started {
+		return
+	}
 	pt := newProgressTracker("Processing", "Aligning, cleaning, and drizzling selected inputs...", ws.win)
+	queued := false
+	defer func() {
+		pt.hide()
+		if !queued {
+			ws.finishMosaicBuild(buildGeneration)
+		}
+	}()
+	go func() {
+		select {
+		case <-pt.ctx.Done():
+			ws.cancelMosaicBuild()
+		case <-buildCtx.Done():
+		}
+	}()
 
 	// Temporarily disabled while checking whether baseline auto-alignment causes the chip-edge regression.
 	// ws.autoAlignToReferenceBaseline()
 
-	s := ws.state.drizzleSettings
+	// Capture settings and level state on the Fyne thread before doing any
+	// background work. Widgets and mutable workspace fields must not be read
+	// concurrently with callbacks that edit them.
+	var s models.DrizzleSettings
+	var buildSkysubSettings models.SkysubSettings
+	var debugDir, projectPath string
+	var levelsSet bool
+	var black, white, bg, peak, scaledPeak float64
+	var mode stretch.Mode
+	var mtf float64
+	var buildInputs []mosaic.Input
+	var savePreview bool
+	var previewFilter, previewDir string
+	var previewDestinationOK bool
+	fyne.DoAndWait(func() {
+		s = ws.state.drizzleSettings
+		buildSkysubSettings = ws.state.skysubSettings
+		debugDir, projectPath = s.DebugOutputDir, ws.currentProjectPath
+		levelsSet = ws.levelsSet
+		black, white, bg, peak, scaledPeak = ws.parseLevelEntries()
+		mode, mtf = ws.stretchMode, ws.mtfMidtone
+		inputs := append([]mosaic.Input(nil), ws.state.inputs...)
+		var ref *mosaic.Input
+		if ws.state.referenceInput != nil {
+			r := *ws.state.referenceInput
+			ref = &r
+		}
+		buildInputs = inputsWithRefFor(inputs, ref)
+		for i := range buildInputs {
+			buildInputs[i].HDU.Data.Pixels = nil
+			buildInputs[i].ERRPixels = nil
+			buildInputs[i].WeightPixels = nil
+		}
+		savePreview = ws.state.savePreview
+		if savePreview {
+			previewFilter, previewDir, previewDestinationOK = ws.currentFilterAndDir()
+		}
+	})
 
 	// Drop the full-resolution input arrays before drizzling. Build streams each
 	// frame's pixels back from disk one at a time, so peak memory stays near
 	// "one input + output" instead of holding all inputs at once. inputsWithRef
 	// is captured after freeing, so it carries metadata only (nil pixels), which
 	// triggers Build's on-demand disk loader.
-	ws.freeInputPixels()
-	buildInputs := ws.inputsWithRef()
-
-	buildSkysubSettings := resolveSkysubSettingsForProject(ws.state.skysubSettings, ws.currentProjectPath)
-	options := drizzleOptionsFromSettings(s, buildSkysubSettings, s.DebugOutputDir, pt.progress, pt.ctx)
+	buildSkysubSettings = resolveSkysubSettingsForProject(buildSkysubSettings, projectPath)
+	options := drizzleOptionsFromSettings(s, buildSkysubSettings, debugDir, pt.progress, buildCtx)
 	options.Skysub = skysubOptionsFromSettings(buildSkysubSettings)
 	result, err := mosaic.Build(buildInputs, options)
 
@@ -118,29 +165,46 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 
 	if err != nil {
 		if errors.Is(err, mosaic.ErrCancelled) {
+			ws.finishMosaicBuild(buildGeneration)
 			debuglog.Log("buildDrizzlePreview: cancelled by user")
 			return
 		}
+		ws.finishMosaicBuild(buildGeneration)
 		fyne.Do(func() { dialog.ShowError(err, ws.win) })
 		return
 	}
 
 	debuglog.Log(fmt.Sprintf("buildDrizzlePreview: Build done, result %dx%d (%d pixels)", result.Width, result.Height, len(result.Pixels)))
-	ws.state.result = result
-
 	// Do CPU-heavy work off the main thread before touching any UI.
-	if !ws.levelsSet {
+	var auto *models.LoadedImage
+	if !levelsSet {
 		debuglog.Log("buildDrizzlePreview: autoLevels (off main thread)")
-		ws.autoLevels(result.Pixels)
+		v := autoLevelsForPixels(result.Pixels)
+		auto = &v
+		black, white, bg, peak, scaledPeak = v.Black, v.White, v.Background, v.Peak, v.ScaledPeak
 	}
 	debuglog.Log("buildDrizzlePreview: buildMosaicPreviewImageWithLevels (off main thread)")
-	black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
-	previewImg := buildMosaicPreviewImageWithLevels(result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
+	previewImg := buildMosaicPreviewImageWithLevels(result, black, white, bg, peak, scaledPeak, mode, mtf)
 	debuglog.Log("buildDrizzlePreview: histogram.Compute (off main thread)")
 	stats := histogram.Compute(result.Pixels)
 
 	debuglog.Log("buildDrizzlePreview: submitting UI update to main thread")
+	queued = true
 	fyne.Do(func() {
+		if buildCtx.Err() != nil || !ws.finishMosaicBuild(buildGeneration) {
+			return
+		}
+		ws.state.result = result
+		ws.state.resultName = ""
+		markMosaicArtifactMaskDocumentsStale(ws.state.artifactMasks)
+		if auto != nil {
+			ws.blackEntry.SetValue(auto.Black)
+			ws.whiteEntry.SetValue(auto.White)
+			ws.bgEntry.SetValue(auto.Background)
+			ws.peakEntry.SetValue(auto.Peak)
+			ws.scaledPeakEntry.SetValue(auto.ScaledPeak)
+			ws.levelsSet = true
+		}
 		debuglog.Log("buildDrizzlePreview: UI update start (on main thread)")
 		ws.state.statuses = result.Inputs
 		ws.saveBtn.Enable()
@@ -160,16 +224,15 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 		debuglog.Log("buildDrizzlePreview: UI update done")
 	})
 
-	if ws.state.savePreview {
+	if savePreview {
 		debuglog.Log("buildDrizzlePreview: saving preview FITS")
-		filter, dir, ok := ws.currentFilterAndDir()
-		if !ok {
+		if !previewDestinationOK {
 			fyne.Do(func() {
 				dialog.ShowInformation("Preview Save Skipped", "Automatic preview save requires the loaded files to come from one directory and one filter.", ws.win)
 			})
 			return
 		}
-		previewPath := filepath.Join(dir, filter+"_preview.fits")
+		previewPath := filepath.Join(previewDir, previewFilter+"_preview.fits")
 		if err := mosaic.SaveResultFITS(previewPath, result); err != nil {
 			fyne.Do(func() { dialog.ShowError(err, ws.win) })
 			return

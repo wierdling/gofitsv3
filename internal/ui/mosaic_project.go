@@ -139,20 +139,20 @@ func (ws *mosaicWorkspace) saveMosaicProject() {
 			dialog.ShowError(absErr, ws.win)
 			return
 		}
-		proj.SkysubSettings.RowDestripeMaskDir = encodeProjectRelativePath(absPath, proj.SkysubSettings.RowDestripeMaskDir)
-		proj.SkysubSettings.MIRIArtifactMaskDir = encodeProjectRelativePath(absPath, proj.SkysubSettings.MIRIArtifactMaskDir)
-		data, jsonErr := json.MarshalIndent(proj, "", "  ")
+		// Serialize a copy with portable paths; keep the live settings absolute.
+		serialized := proj
+		serialized.SkysubSettings.RowDestripeMaskDir = encodeProjectRelativePath(absPath, serialized.SkysubSettings.RowDestripeMaskDir)
+		serialized.SkysubSettings.MIRIArtifactMaskDir = encodeProjectRelativePath(absPath, serialized.SkysubSettings.MIRIArtifactMaskDir)
+		data, jsonErr := json.MarshalIndent(serialized, "", "  ")
 		if jsonErr != nil {
 			dialog.ShowError(jsonErr, ws.win)
 			return
 		}
-		if writeErr := os.WriteFile(path, data, 0644); writeErr != nil {
+		if writeErr := writeProjectJSON(path, data, true); writeErr != nil {
 			dialog.ShowError(writeErr, ws.win)
 			return
 		}
 		ws.currentProjectPath = absPath
-		ws.state.skysubSettings.RowDestripeMaskDir = proj.SkysubSettings.RowDestripeMaskDir
-		ws.state.skysubSettings.MIRIArtifactMaskDir = proj.SkysubSettings.MIRIArtifactMaskDir
 		ws.lastProjectName = filepath.Base(path)
 		ws.app.Preferences().SetString("lastDir", filepath.Dir(path))
 		dialog.ShowInformation("Saved", "Mosaic project saved.", ws.win)
@@ -185,9 +185,6 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 			dialog.ShowError(absErr, ws.win)
 			return
 		}
-		ws.currentProjectPath = absPath
-		ws.lastProjectName = filepath.Base(path)
-		ws.app.Preferences().SetString("lastDir", filepath.Dir(path))
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
 			dialog.ShowError(readErr, ws.win)
@@ -199,20 +196,7 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 			return
 		}
 
-		ws.state.drizzleSettings = proj.DrizzleSettings
-		ws.state.drizzleSettingsSet = proj.DrizzleSettingsSet
-		ws.state.alignmentSettings = proj.AlignmentSettings
-		ws.state.alignmentSettingsSet = proj.AlignmentSettingsSet
-		ws.state.skysubSettings = proj.SkysubSettings
-		ws.state.skysubSettingsSet = proj.SkysubSettingsSet
-		ws.state.artifactMasks = proj.ArtifactMasks
-		ws.state.exposureNormMode = mosaic.NormalizationMode(proj.ExposureNormMode)
-		ws.activeFilter = proj.ActiveFilter
-		ws.resetMTFMidtone()
-		if proj.ActiveFilter != "" {
-			ws.activeFilter = proj.ActiveFilter
-			ws.loadLevelPrefsAndMode(ws.activeFilter)
-		}
+		// Keep the live workspace untouched until every staged input has loaded.
 
 		// Reload input FITS files, combining multi-chip exposures on the way in.
 		go func() {
@@ -224,6 +208,7 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 			var order []string
 			groups := map[string][]models.MosaicInputState{}
 			for _, mis := range proj.Inputs {
+				mis.Path = resolveProjectRelativePath(absPath, mis.Path)
 				if _, ok := groups[mis.Path]; !ok {
 					order = append(order, mis.Path)
 				}
@@ -233,6 +218,7 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 			var newInputs []mosaic.Input
 			var newStatuses []mosaic.InputStatus
 			var newRef *mosaic.Input
+			var loadFailure error
 			refLabelText := "Reference: none"
 			migratedExposures := 0
 			cancelled := false
@@ -253,12 +239,12 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 						cancelled = true
 						break
 					}
-					newStatuses = append(newStatuses, mosaic.InputStatus{Path: path, Status: "failed", Error: err.Error()})
-					continue
+					loadFailure = fmt.Errorf("load %s: %w", filepath.Base(path), err)
+					break
 				}
 				if len(inputs) == 0 {
-					newStatuses = append(newStatuses, mosaic.InputStatus{Path: path, Status: "failed", Error: fmt.Sprintf("no inputs loaded from %s", filepath.Base(path))})
-					continue
+					loadFailure = fmt.Errorf("load %s: no inputs loaded", filepath.Base(path))
+					break
 				}
 
 				if len(inputs) == 1 {
@@ -281,11 +267,14 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 				}
 			}
 
-			if !cancelled && proj.ReferencePath != "" {
-				refInputs, refCombined, _, refErr := mosaic.LoadInputsForPipeline(proj.ReferencePath, mosaic.CombineOptions{Ctx: pt.ctx})
+			if !cancelled && loadFailure == nil && proj.ReferencePath != "" {
+				refPath := resolveProjectRelativePath(absPath, proj.ReferencePath)
+				refInputs, refCombined, _, refErr := mosaic.LoadInputsForPipeline(refPath, mosaic.CombineOptions{Ctx: pt.ctx})
 				if refErr == mosaic.ErrCancelled {
 					cancelled = true
-				} else if refErr == nil && len(refInputs) > 0 {
+				} else if refErr != nil {
+					loadFailure = fmt.Errorf("load reference: %w", refErr)
+				} else if len(refInputs) > 0 {
 					chosen := refInputs[0]
 					if !refCombined && proj.ReferenceSCIExt != 0 {
 						for _, r := range refInputs {
@@ -301,10 +290,14 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 				}
 			}
 
-			if cancelled {
+			if cancelled || loadFailure != nil {
 				fyne.Do(func() {
 					pt.hide()
-					dialog.ShowInformation("Loading Project", "Project load was cancelled.", ws.win)
+					if cancelled {
+						dialog.ShowInformation("Loading Project", "Project load was cancelled; the current workspace was preserved.", ws.win)
+					} else {
+						dialog.ShowError(loadFailure, ws.win)
+					}
 				})
 				return
 			}
@@ -314,8 +307,35 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 			sidecars := loadMosaicAlignmentSidecars(newInputs, newStatuses, newRef)
 
 			fyne.Do(func() {
+				// A project replacement invalidates any picker bound to the old
+				// reference result before swapping inputs and previews.
+				if ws.activePicker != nil {
+					ws.exitStarMode()
+				}
+				ws.inputMu.Lock()
+				defer ws.inputMu.Unlock()
 				pt.hide()
+				ws.state.drizzleSettings = proj.DrizzleSettings
+				ws.state.drizzleSettingsSet = proj.DrizzleSettingsSet
+				ws.state.alignmentSettings = proj.AlignmentSettings
+				ws.state.alignmentSettingsSet = proj.AlignmentSettingsSet
+				ws.state.skysubSettings = proj.SkysubSettings
+				ws.state.skysubSettings = resolveSkysubSettingsForProject(ws.state.skysubSettings, absPath)
+				ws.state.skysubSettingsSet = proj.SkysubSettingsSet
+				ws.state.artifactMasks = proj.ArtifactMasks
+				ws.state.exposureNormMode = mosaic.NormalizationMode(proj.ExposureNormMode)
+				ws.activeFilter = proj.ActiveFilter
+				ws.resetMTFMidtone()
+				if proj.ActiveFilter != "" {
+					ws.loadLevelPrefsAndMode(ws.activeFilter)
+				}
 				ws.state.inputs = newInputs
+				for _, input := range newInputs {
+					ws.advanceInputGenerationLocked(input)
+				}
+				ws.currentProjectPath = absPath
+				ws.lastProjectName = filepath.Base(path)
+				ws.app.Preferences().SetString("lastDir", filepath.Dir(path))
 				ws.state.statuses = newStatuses
 				ws.state.referenceInput = newRef
 				ws.refLabel.SetText(refLabelText)

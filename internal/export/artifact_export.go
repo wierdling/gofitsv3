@@ -52,25 +52,7 @@ func FromFloat32Artifact(ctx context.Context, path, artifact string, width, heig
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	backup := path + ".export-backup"
-	_ = os.Remove(backup)
-	hadOld := false
-	if _, err := os.Stat(path); err == nil {
-		if err := os.Rename(path, backup); err != nil {
-			return err
-		}
-		hadOld = true
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		if hadOld {
-			_ = os.Rename(backup, path)
-		}
-		return err
-	}
-	if hadOld {
-		_ = os.Remove(backup)
-	}
-	return nil
+	return replaceExportFile(tmpPath, path)
 }
 
 type grayArtifactImage struct {
@@ -265,18 +247,44 @@ func FromFloat32ArtifactsWithLevels(ctx context.Context, path string, artifacts 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	backup := path + ".export-backup"
-	_ = os.Remove(backup)
-	hadOld := false
-	if _, err := os.Stat(path); err == nil {
+	return replaceExportFile(tmpPath, path)
+}
+
+// replaceExportFile installs tmpPath while preserving an existing regular
+// destination until the replacement succeeds. A unique backup avoids
+// clobbering unrelated files left by another export.
+func replaceExportFile(tmpPath, path string) error {
+	info, err := os.Lstat(path)
+	hadOld := err == nil
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if hadOld && !info.Mode().IsRegular() {
+		return fmt.Errorf("export destination is not a regular file")
+	}
+	backup := ""
+	if hadOld {
+		f, err := os.CreateTemp(filepath.Dir(path), ".export-backup-*")
+		if err != nil {
+			return err
+		}
+		backup = f.Name()
+		if err := f.Close(); err != nil {
+			_ = os.Remove(backup)
+			return err
+		}
+		if err := os.Remove(backup); err != nil {
+			return err
+		}
 		if err := os.Rename(path, backup); err != nil {
 			return err
 		}
-		hadOld = true
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		if hadOld {
-			_ = os.Rename(backup, path)
+			if rollbackErr := os.Rename(backup, path); rollbackErr != nil {
+				return fmt.Errorf("install export: %w (rollback: %v)", err, rollbackErr)
+			}
 		}
 		return err
 	}

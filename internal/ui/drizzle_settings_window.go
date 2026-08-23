@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,9 @@ import (
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
 )
+
+func finitePositive(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0 }
+func finiteUnit(v float64) bool     { return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0 && v <= 1 }
 
 func defaultDrizzleSettings() models.DrizzleSettings {
 	return models.DrizzleSettings{
@@ -252,7 +256,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		fsText := strings.TrimSpace(finalScaleEntry.Text)
 		if fsText != "" {
 			v, err := strconv.ParseFloat(fsText, 64)
-			if err != nil || v <= 0 {
+			if err != nil || !finitePositive(v) {
 				dialog.ShowInformation("Invalid Value", "Output Scale must be a positive number in arcsec/pixel.", win)
 				return
 			}
@@ -260,25 +264,25 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		}
 
 		scale, errS := strconv.ParseFloat(strings.TrimSpace(scaleEntry.Text), 64)
-		if errS != nil || scale <= 0 {
+		if errS != nil || !finitePositive(scale) {
 			dialog.ShowInformation("Invalid Value", "Scale Multiplier must be a positive number.", win)
 			return
 		}
 
 		pixFrac, errP := strconv.ParseFloat(strings.TrimSpace(pixFracEntry.Text), 64)
-		if errP != nil || pixFrac <= 0 || pixFrac > 1 {
+		if errP != nil || !finiteUnit(pixFrac) {
 			dialog.ShowInformation("Invalid Value", "PixFrac must be between 0 (exclusive) and 1.", win)
 			return
 		}
 
 		crSNRVal, errCSNR := strconv.ParseFloat(strings.TrimSpace(crSeedSNREntry.Text), 64)
-		if errCSNR != nil || crSNRVal <= 0 {
+		if errCSNR != nil || !finitePositive(crSNRVal) {
 			dialog.ShowInformation("Invalid Value", "CR Seed SNR must be a positive number.", win)
 			return
 		}
 
 		crDSVal, errCDS := strconv.ParseFloat(strings.TrimSpace(crDerivScaleEntry.Text), 64)
-		if errCDS != nil || crDSVal <= 0 {
+		if errCDS != nil || !finitePositive(crDSVal) {
 			dialog.ShowInformation("Invalid Value", "CR Deriv Scale must be a positive number.", win)
 			return
 		}

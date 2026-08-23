@@ -15,13 +15,13 @@ import (
 
 // triangle SVGs — solid filled triangles, white fill.
 var chevronUpResource = fyne.NewStaticResource("tri-up.svg", []byte(
-	`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 8">` +
-		`<path d="M5 0 L10 8 L0 8 Z" fill="#ffffff"/>` +
+	`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 8">`+
+		`<path d="M5 0 L10 8 L0 8 Z" fill="#ffffff"/>`+
 		`</svg>`))
 
 var chevronDownResource = fyne.NewStaticResource("tri-down.svg", []byte(
-	`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 8">` +
-		`<path d="M5 8 L10 0 L0 0 Z" fill="#ffffff"/>` +
+	`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 8">`+
+		`<path d="M5 8 L10 0 L0 0 Z" fill="#ffffff"/>`+
 		`</svg>`))
 
 // chevronBtn is a minimal tappable icon — no button chrome, sized explicitly.
@@ -48,27 +48,6 @@ func (b *chevronBtn) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(img)
 }
 
-// selectAllEntry is a widget.Entry that selects all text when it gains focus.
-type selectAllEntry struct {
-	widget.Entry
-}
-
-func newSelectAllEntry() *selectAllEntry {
-	e := &selectAllEntry{}
-	e.ExtendBaseWidget(e)
-	return e
-}
-
-func (e *selectAllEntry) FocusGained() {
-	e.Entry.FocusGained()
-	e.TypedShortcut(&fyne.ShortcutSelectAll{})
-}
-
-func (e *selectAllEntry) Tapped(ev *fyne.PointEvent) {
-	e.Entry.Tapped(ev)
-	e.TypedShortcut(&fyne.ShortcutSelectAll{})
-}
-
 // NumberEntry is a compact numeric input with chevron step buttons and a clear
 // button that resets the value to zero.
 type NumberEntry struct {
@@ -90,7 +69,7 @@ type NumberEntry struct {
 	Max float64
 
 	value    float64
-	entry    *selectAllEntry
+	entry    *widget.Entry
 	upBtn    *chevronBtn
 	downBtn  *chevronBtn
 	clearBtn *widget.Button
@@ -107,21 +86,13 @@ func NewNumberEntry(step float64, decimals int) *NumberEntry {
 	}
 	n.ExtendBaseWidget(n)
 
-	n.entry = newSelectAllEntry()
+	n.entry = widget.NewEntry()
 	n.entry.OnChanged = func(s string) {
 		v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-		if err != nil {
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 			return
 		}
-		if v < n.Min {
-			v = n.Min
-		} else if v > n.Max {
-			v = n.Max
-		}
-		n.value = v
-		if n.OnChanged != nil {
-			n.OnChanged(v)
-		}
+		n.setValue(v, true)
 	}
 
 	// Chevron size: 45% of entry height each, width proportional to the SVG aspect (12:8).
@@ -156,14 +127,37 @@ func (n *NumberEntry) Value() float64 { return n.value }
 
 // SetValue updates the value, refreshes the text, and fires OnChanged.
 func (n *NumberEntry) SetValue(v float64) {
+	n.setValue(v, true)
+}
+
+func (n *NumberEntry) setValue(v float64, notify bool) {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return
+	}
 	if v < n.Min {
 		v = n.Min
 	} else if v > n.Max {
 		v = n.Max
 	}
+	if n.Decimals >= 0 {
+		factor := math.Pow10(n.Decimals)
+		if factor > 0 && !math.IsInf(factor, 0) {
+			scaled := v * factor
+			if !math.IsInf(scaled, 0) {
+				v = math.Round(scaled) / factor
+			}
+		}
+	}
+	if v == 0 { // canonicalize negative zero for stable state and callbacks.
+		v = 0
+	}
+	if n.value == v {
+		n.syncText()
+		return
+	}
 	n.value = v
 	n.syncText()
-	if n.OnChanged != nil {
+	if notify && n.OnChanged != nil {
 		n.OnChanged(v)
 	}
 }

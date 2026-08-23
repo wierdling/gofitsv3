@@ -247,18 +247,21 @@ func BuildCRMasksFromModel(frames []FrameInfo, model []float32, outW, outH int, 
 	debuglog.Log("BuildCRMasksFromModel: starting")
 	defer debuglog.Log("BuildCRMasksFromModel: finished")
 	n := len(frames)
+	modelOK := outW > 1 && outH > 1 && outW <= int(^uint(0)>>1)/outH && len(model) >= outW*outH && !math.IsNaN(scale) && !math.IsInf(scale, 0) && scale > 0
 	dirs4 := [4][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
 	masks := make([][]bool, n)
 
 	for fi := range frames {
 		f := &frames[fi]
 		debuglog.Log(fmt.Sprintf("BuildCRMasksFromModel: frame %d/%d (%dx%d)", fi+1, n, f.Width, f.Height))
-		if f.Sigma <= 0 {
-			masks[fi] = make([]bool, f.Width*f.Height)
+		npix := 0
+		if f.Width > 0 && f.Height > 0 && f.Width <= int(^uint(0)>>1)/f.Height {
+			npix = f.Width * f.Height
+		}
+		if f.Sigma <= 0 || !modelOK || npix == 0 || len(f.Pixels) < npix {
+			masks[fi] = make([]bool, npix)
 			continue
 		}
-
-		npix := f.Width * f.Height
 		mask := make([]bool, npix)
 
 		// noiseAt returns the per-pixel 1-sigma used for thresholding. It prefers

@@ -33,6 +33,9 @@ func applyNIRCamWispCorrection(p plannedInput, sci []float32, opts SkysubOptions
 	if err != nil {
 		return fmt.Errorf("NIRCam wisp template %s for %s: %w", path, InputKey(p.input), err)
 	}
+	if len(sci) != len(template) {
+		return fmt.Errorf("NIRCam wisp SCI/template length mismatch: %d vs %d", len(sci), len(template))
+	}
 
 	scale := opts.NIRCamWispScale
 	valid, rejected := 0, 0

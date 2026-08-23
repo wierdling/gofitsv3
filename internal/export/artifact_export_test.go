@@ -175,3 +175,56 @@ func TestFromFloat32ArtifactsCancellationLeavesNoOutput(t *testing.T) {
 		t.Fatalf("output exists after cancellation: %v", err)
 	}
 }
+
+func TestFromFloat32ArtifactsPreservesExistingBackup(t *testing.T) {
+	d := t.TempDir()
+	artifact := filepath.Join(d, "source.bin")
+	a, err := fitsio.CreateFloat32Artifact(artifact, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WriteRow(0, []float32{0.5}); err != nil {
+		t.Fatal(err)
+	}
+	_ = a.Close()
+	out := filepath.Join(d, "out.png")
+	if err := os.WriteFile(out, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	legacyBackup := out + ".export-backup"
+	if err := os.WriteFile(legacyBackup, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := FromFloat32Artifacts(context.Background(), out, [3]string{artifact, artifact, artifact}, 1, 1, PNG, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(legacyBackup); err != nil || string(got) != "keep" {
+		t.Fatalf("legacy backup changed: %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(out); err != nil || string(got) == "old" {
+		t.Fatalf("destination was not replaced: %q, %v", got, err)
+	}
+}
+
+func TestFromFloat32ArtifactsRejectsNonRegularDestination(t *testing.T) {
+	d := t.TempDir()
+	artifact := filepath.Join(d, "source.bin")
+	a, err := fitsio.CreateFloat32Artifact(artifact, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WriteRow(0, []float32{0.5}); err != nil {
+		t.Fatal(err)
+	}
+	_ = a.Close()
+	out := filepath.Join(d, "out.png")
+	if err := os.Mkdir(out, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := FromFloat32Artifacts(context.Background(), out, [3]string{artifact, artifact, artifact}, 1, 1, PNG, Options{}); err == nil {
+		t.Fatal("expected non-regular destination error")
+	}
+	if info, err := os.Stat(out); err != nil || !info.IsDir() {
+		t.Fatalf("destination changed: info=%v err=%v", info, err)
+	}
+}

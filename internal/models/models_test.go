@@ -82,6 +82,27 @@ func TestColorCalibrationStateRoundTripAndValidation(t *testing.T) {
 	}
 }
 
+func TestValidCalibrationRejectsZeroBaseTransformRegression(t *testing.T) {
+	state := ColorCalibrationState{Status: CalibrationValid, BaseTransforms: [3]LinearTransform{{Gain: 1}, {}, {Gain: 1}}}
+	if _, err := json.Marshal(state); err == nil || !strings.Contains(err.Error(), "missing base transform 1") {
+		t.Fatalf("marshal error = %v, want missing base transform 1", err)
+	}
+}
+
+func TestValidOverlayRequiresIndexedTransform(t *testing.T) {
+	state := ColorCalibrationState{Status: CalibrationDisabled, Overlays: []OverlayCalibrationState{{Status: CalibrationValid}}}
+	if err := state.Validate(); err == nil || !strings.Contains(err.Error(), "overlay transform 0") {
+		t.Fatalf("Validate error = %v, want indexed overlay transform error", err)
+	}
+}
+
+func TestValidOverlayMarshalRejectsMissingTransformWhenParentDisabled(t *testing.T) {
+	state := ColorCalibrationState{Status: CalibrationDisabled, Overlays: []OverlayCalibrationState{{Status: CalibrationValid}}}
+	if _, err := json.Marshal(state); err == nil || !strings.Contains(err.Error(), "missing overlay transform 0") {
+		t.Fatalf("marshal error = %v, want indexed overlay transform error", err)
+	}
+}
+
 func TestOverlayCalibrationDefaultsNormalizeOnDecode(t *testing.T) {
 	var state ColorCalibrationState
 	if err := json.Unmarshal([]byte(`{"overlays":[{}]}`), &state); err != nil {

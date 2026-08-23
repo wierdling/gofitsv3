@@ -27,6 +27,15 @@ type progressTracker struct {
 // work completes.
 func newProgressTracker(title, initialMessage string, win fyne.Window) *progressTracker {
 	ctx, cancel := context.WithCancel(context.Background())
+	return newProgressTrackerWithContext(title, initialMessage, win, ctx, cancel)
+}
+
+// newProgressTrackerWithContext binds the Cancel button to an already-owned
+// operation context (for example a workspace generation coordinator).
+func newProgressTrackerWithContext(title, initialMessage string, win fyne.Window, ctx context.Context, cancel context.CancelFunc) *progressTracker {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	pt := &progressTracker{
 		bar:    widget.NewProgressBar(),
 		label:  widget.NewLabel(initialMessage),

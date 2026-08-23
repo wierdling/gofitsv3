@@ -167,6 +167,25 @@ func TestApplyNIRCamWispCorrectionTemplateDimensionMismatchErrors(t *testing.T) 
 	}
 }
 
+func TestApplyNIRCamWispCorrectionRejectsSCIShorterOrLongerTemplate(t *testing.T) {
+	width, height := 8, 8
+	dir := t.TempDir()
+	template := syntheticWispTemplate(width, height)
+	writeWispTemplate(t, dir, "nrcb4", "f200w", width, height, template)
+	for _, sci := range [][]float32{filledPixels(width, height, 1)[:width*height-1], append(filledPixels(width, height, 1), 1)} {
+		before := append([]float32(nil), sci...)
+		p := wispPlannedInput(width, height, sci, "NRCB4", "F200W", false)
+		if err := applyNIRCamWispCorrection(p, sci, SkysubOptions{NIRCamWisp: true, NIRCamWispTemplateDir: dir, NIRCamWispScale: 1}); err == nil {
+			t.Fatal("applyNIRCamWispCorrection error = nil, want SCI/template length mismatch")
+		}
+		for i := range sci {
+			if sci[i] != before[i] {
+				t.Fatalf("SCI pixel %d mutated on length mismatch", i)
+			}
+		}
+	}
+}
+
 func wispPlannedInput(width, height int, pixels []float32, detector, filter string, referenceOnly bool) plannedInput {
 	return plannedInput{input: Input{
 		PrimaryHeader: fitsio.Header{Cards: map[string]string{

@@ -79,6 +79,22 @@ func TestAlignmentSidecarRejectsChangedTargetOrReference(t *testing.T) {
 	}
 }
 
+func TestAlignmentSidecarRequiresExactTargetPathForSCIEntry(t *testing.T) {
+	dir := t.TempDir()
+	targetPath := writeAlignmentTestFile(t, dir, "target.fits", "target")
+	refPath := writeAlignmentTestFile(t, dir, "reference.fits", "reference")
+	target := Input{Path: targetPath, SCIExt: 2, HDU: testAlignmentHDU(10, 10)}
+	ref := Input{Path: refPath, HDU: testAlignmentHDU(10, 10)}
+	path := AlignmentSidecarPath(target)
+	data := []byte(`{"version":1,"entries":[{"target":{"path":"other.fits","sciExt":2},"reference":{"path":"reference.fits"}}]}`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := LoadValidatedAlignmentSidecar(target, ref); got.Status != AlignmentSidecarNotFound {
+		t.Fatalf("status = %v, want not found for mismatched target path", got.Status)
+	}
+}
+
 func TestDeleteAlignmentEntriesForReference(t *testing.T) {
 	dir := t.TempDir()
 	refPath := writeAlignmentTestFile(t, dir, "reference.fits", "reference")

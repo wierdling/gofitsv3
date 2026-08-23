@@ -56,6 +56,7 @@ type DiskComposeResult struct {
 }
 
 var diskComposeSem = make(chan struct{}, 1)
+var diskCompositePreviewForCompose = diskCompositePreview
 
 // ComposeDisk streams channels and overlays without creating a full RGB image
 // or retaining source pixels. A source is opened only for its preparation
@@ -210,11 +211,26 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 		}
 		_ = os.Remove(ov.path)
 	}
-	if err := combineDiskChannels(ctx, prepared, req.Output, w, h); err != nil {
+	// Keep the existing destinations untouched until the complete render,
+	// including preview generation, has succeeded. The first combine publishes
+	// only to staging paths; the second combine performs the final atomic swap.
+	staged := [3]string{}
+	for i := range staged {
+		staged[i] = req.Output[i] + fmt.Sprintf(".compose-staged-%d", i)
+		_ = os.Remove(staged[i])
+		intermediates = append(intermediates, staged[i])
+	}
+	if err := combineDiskChannels(ctx, prepared, staged, w, h); err != nil {
 		return DiskComposeResult{}, err
 	}
-	preview, stats, err := diskCompositePreview(ctx, req.Output, w, h, req.PreviewMax, req.RGBLevels)
+	preview, stats, err := diskCompositePreviewForCompose(ctx, staged, w, h, req.PreviewMax, req.RGBLevels)
 	if err != nil {
+		return DiskComposeResult{}, err
+	}
+	// combineDiskChannels consumes historical B,G,R source ordering. Staged
+	// artifacts are already in output R,G,B order, so reverse the source tuple
+	// for this final transactional copy.
+	if err := combineDiskChannels(ctx, [3]string{staged[2], staged[1], staged[0]}, req.Output, w, h); err != nil {
 		return DiskComposeResult{}, err
 	}
 	status := models.CalibrationDisabled
@@ -403,15 +419,28 @@ func diskHistEqCDF(ctx context.Context, path string, meta models.LoadedImage) ([
 }
 
 func mapDiskCoordinate(img, ref models.LoadedImage, offsetX, offsetY, offsetRot float64, x, y, dw, dh, sw, sh int) (float64, float64) {
+	if img.HasAlignTransform {
+		// Stored alignment transforms are backward (reference/output -> source)
+		// mappings. Apply them directly in the reference grid; composing them
+		// after resize/WCS mapping would interpret the affine in the wrong frame.
+		fx := img.AlignA*float64(x) + img.AlignB*float64(y) + img.AlignC
+		fy := img.AlignD*float64(x) + img.AlignE*float64(y) + img.AlignF
+		fx -= offsetX
+		fy -= offsetY
+		if offsetRot != 0 {
+			cx, cy := float64(sw)/2, float64(sh)/2
+			rad := -offsetRot * math.Pi / 180
+			xc, yc := fx-cx, fy-cy
+			fx, fy = math.Cos(rad)*xc-math.Sin(rad)*yc+cx, math.Sin(rad)*xc+math.Cos(rad)*yc+cy
+		}
+		return fx, fy
+	}
 	fx := (float64(x)+0.5)*float64(sw)/float64(dw) - 0.5
 	fy := (float64(y)+0.5)*float64(sh)/float64(dh) - 0.5
 	if img.Rotation90 == 0 && ref.Rotation90 == 0 && !sharedDrizzleGrid(&img, &ref) {
 		if tr, err := ComputeWCSTransform(img.HDU.Header, ref.HDU.Header); err == nil {
 			fx, fy = ApplyAffineTransform(tr, float64(x), float64(y))
 		}
-	}
-	if img.HasAlignTransform {
-		fx, fy = img.AlignA*fx+img.AlignB*fy+img.AlignC, img.AlignD*fx+img.AlignE*fy+img.AlignF
 	}
 	fx -= offsetX
 	fy -= offsetY
@@ -445,25 +474,34 @@ func newArtifactSampler(a *fitsio.Float32Artifact) *artifactSampler {
 }
 func (s *artifactSampler) sample(x, y float64) float32 {
 	a := s.a
-	if a == nil || x < 0 || y < 0 || x >= float64(a.Width-1) || y >= float64(a.Height-1) {
+	if a == nil || a.Width <= 0 || a.Height <= 0 || x < 0 || y < 0 || x > float64(a.Width-1) || y > float64(a.Height-1) {
 		return 0
 	}
 	x0, y0 := int(math.Floor(x)), int(math.Floor(y))
 	wx, wy := x-float64(x0), y-float64(y0)
+	x1, y1 := x0+1, y0+1
+	if x1 >= a.Width {
+		x1 = x0
+		wx = 0
+	}
+	if y1 >= a.Height {
+		y1 = y0
+		wy = 0
+	}
 	if s.y0 != y0 {
 		if a.ReadRow(y0, s.r0) != nil {
 			return 0
 		}
 		s.y0 = y0
 	}
-	if s.y1 != y0+1 {
-		if a.ReadRow(y0+1, s.r1) != nil {
+	if s.y1 != y1 {
+		if a.ReadRow(y1, s.r1) != nil {
 			return 0
 		}
-		s.y1 = y0 + 1
+		s.y1 = y1
 	}
 	r0, r1 := s.r0, s.r1
-	v00, v10, v01, v11 := r0[x0], r0[x0+1], r1[x0], r1[x0+1]
+	v00, v10, v01, v11 := r0[x0], r0[x1], r1[x0], r1[x1]
 	if !finite(float64(v00)) || !finite(float64(v10)) || !finite(float64(v01)) || !finite(float64(v11)) {
 		return 0
 	}

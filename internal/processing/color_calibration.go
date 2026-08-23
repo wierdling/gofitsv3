@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -338,7 +339,10 @@ func CalculateCalibrationStreaming(ctx context.Context, inputs []CalibrationStre
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if len(inputs) == 0 || len(inputs) > 3 {
+	if len(inputs) == 0 {
+		return CalibrationResult{Status: models.CalibrationUnsupported}, fmt.Errorf("no calibration inputs")
+	}
+	if len(inputs) > 3 {
 		return CalibrationResult{Status: models.CalibrationUnsupported}, fmt.Errorf("at most three calibration channels are supported")
 	}
 	converted := make([]CalibrationInput, len(inputs))
@@ -347,6 +351,9 @@ func CalculateCalibrationStreaming(ctx context.Context, inputs []CalibrationStre
 			return CalibrationResult{Status: models.CalibrationUnsupported}, fmt.Errorf("invalid streamed channel dimensions")
 		}
 		converted[i] = CalibrationInput{SourceIdentity: in.SourceIdentity, Width: in.Width, Height: in.Height, Alignment: in.Alignment, Metadata: in.Metadata, Background: in.Background, Photometry: in.Photometry}
+	}
+	if err := validateCalibrationFingerprintInputs(converted, settings); err != nil {
+		return CalibrationResult{Status: models.CalibrationUnsupported}, err
 	}
 	result := CalibrationResult{Status: models.CalibrationValid}
 	var raw, offsets [3]float64
@@ -357,7 +364,11 @@ func CalculateCalibrationStreaming(ctx context.Context, inputs []CalibrationStre
 	sourceHash.stringValue("color-calibration-source-v1")
 	for i, in := range inputs {
 		if err := streamCanonicalInput(ctx, &sourceHash, in, settings.NeutralizeBackground); err != nil {
-			return CalibrationResult{Status: models.CalibrationCancelled}, err
+			status := models.CalibrationUnsupported
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				status = models.CalibrationCancelled
+			}
+			return CalibrationResult{Status: status}, err
 		}
 		if settings.NeutralizeBackground && in.Background.Gain != 0 {
 			offsets[i] = in.Background.Offset
@@ -449,6 +460,9 @@ func streamCanonicalInput(ctx context.Context, h *canonicalHash, in CalibrationS
 			return err
 		}
 		for _, p := range row {
+			if math.IsNaN(float64(p)) || math.IsInf(float64(p), 0) {
+				return fmt.Errorf("non-finite streamed pixel at row %d", y)
+			}
 			var b [4]byte
 			binary.LittleEndian.PutUint32(b[:], math.Float32bits(p))
 			h.bytesValue(b[:])
@@ -546,8 +560,52 @@ func estimateBackgroundStreamSamples(ctx context.Context, values []float32, indi
 	if cfg.TileSize <= 0 {
 		cfg.TileSize = DefaultBackgroundConfig().TileSize
 	}
+	// Reproduce the robust clipping decision so spatial statistics describe the
+	// accepted sample set, rather than allowing rejected cosmic rays to widen a
+	// tile's spread.
+	d := DefaultBackgroundConfig()
+	if cfg.SigmaClip > 0 {
+		d.SigmaClip = cfg.SigmaClip
+	}
+	if cfg.MaxIterations > 0 {
+		d.MaxIterations = cfg.MaxIterations
+	}
+	work := make([]float64, len(values))
+	for i, v := range values {
+		work[i] = float64(v)
+	}
+	median := calibrationMedianFloat64(ctx, work)
+	for iter := 0; iter < d.MaxIterations; iter++ {
+		mad := calibrationMedianAbs(ctx, work, median)
+		sigma := 1.4826 * mad
+		keep := make([]float64, 0, len(work))
+		for _, v := range work {
+			if (sigma == 0 && v == median) || (sigma > 0 && math.Abs(v-median) <= d.SigmaClip*sigma) {
+				keep = append(keep, v)
+			}
+		}
+		if len(keep) == len(work) {
+			break
+		}
+		work = keep
+		median = calibrationMedianFloat64(ctx, work)
+	}
+	// Map clipped values back by value and source index deterministically. In
+	// the usual case values are unique; duplicate values are consumed in order.
+	used := make([]bool, len(work))
 	byTile := map[[2]int][]float64{}
 	for i, v := range values {
+		found := -1
+		for j, w := range work {
+			if !used[j] && w == float64(v) {
+				found = j
+				break
+			}
+		}
+		if found < 0 {
+			continue
+		}
+		used[found] = true
 		x, y := indices[i]%width, indices[i]/width
 		key := [2]int{x / cfg.TileSize, y / cfg.TileSize}
 		byTile[key] = append(byTile[key], float64(v))
@@ -561,13 +619,13 @@ func estimateBackgroundStreamSamples(ctx context.Context, values []float32, indi
 		r.TileSpread = medians[len(medians)-1] - medians[0]
 		r.TileCount = len(medians)
 	}
+	if len(work) > 0 {
+		r.Accepted = len(work)
+		r.Rejected = len(values) - len(work)
+		r.Transform.Offset = median
+	}
 	r.Samples = len(values)
 	if r.Status != models.CalibrationUnsupported || r.RejectionReason == "background is spatially non-uniform" {
-		all := make([]float64, len(values))
-		for i, v := range values {
-			all[i] = float64(v)
-		}
-		median := calibrationMedianFloat64(ctx, all)
 		r.Transform.Offset = median
 		scale := math.Max(math.Abs(median), r.Dispersion)
 		if scale < 1e-12 {
@@ -659,6 +717,11 @@ func CalculateCalibration(inputs []CalibrationInput, settings CalibrationSetting
 		in := inputs[i]
 		if in.Width < 0 || in.Height < 0 || len(in.Pixels) < in.Width*in.Height {
 			return CalibrationResult{Status: models.CalibrationUnsupported}, fmt.Errorf("invalid channel dimensions")
+		}
+		for _, p := range in.Pixels[:in.Width*in.Height] {
+			if math.IsNaN(float64(p)) || math.IsInf(float64(p), 0) {
+				return CalibrationResult{Status: models.CalibrationUnsupported}, fmt.Errorf("non-finite calibration pixel")
+			}
 		}
 		gain := 1.0
 		if in.Photometry != nil {

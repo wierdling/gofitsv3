@@ -258,6 +258,7 @@ func decodeRow(dst []float32, raw []byte, bitpix int) {
 }
 
 const artifactHeaderSize int64 = 16
+const maxArtifactRowBytes uint64 = 64 << 20
 
 var artifactMagic = [8]byte{'G', 'F', '3', '2', 'A', 'R', 'T', '1'}
 
@@ -308,8 +309,8 @@ func recordBuffer(n int) {
 }
 
 func CreateFloat32Artifact(path string, width, height int) (*Float32Artifact, error) {
-	if width <= 0 || height <= 0 {
-		return nil, fmt.Errorf("invalid artifact dimensions %dx%d", width, height)
+	if _, err := artifactByteSize(width, height); err != nil {
+		return nil, err
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o600)
 	if err != nil {
@@ -323,6 +324,22 @@ func CreateFloat32Artifact(path string, width, height int) (*Float32Artifact, er
 	a.buf = make([]byte, width*4)
 	recordArtifactOpen(1)
 	return a, nil
+}
+
+func artifactByteSize(width, height int) (int64, error) {
+	const maxUint32 = uint64(^uint32(0))
+	if width <= 0 || height <= 0 || uint64(width) > maxUint32 || uint64(height) > maxUint32 {
+		return 0, fmt.Errorf("invalid artifact dimensions %dx%d", width, height)
+	}
+	w, h := uint64(width), uint64(height)
+	if w > maxArtifactRowBytes/4 {
+		return 0, errors.New("artifact row is too large")
+	}
+	const maxInt64 = uint64(^uint64(0) >> 1)
+	if w > (maxInt64-uint64(artifactHeaderSize))/4/h {
+		return 0, errors.New("artifact dimensions are too large")
+	}
+	return artifactHeaderSize + int64(w*h*4), nil
 }
 
 func OpenFloat32Artifact(path string) (*Float32Artifact, error) {
@@ -353,12 +370,13 @@ func openFloat32Artifact(path string, readOnly bool) (*Float32Artifact, error) {
 		return nil, errors.New("invalid float32 artifact header")
 	}
 	w, height := int(binary.LittleEndian.Uint32(h[8:12])), int(binary.LittleEndian.Uint32(h[12:16]))
-	if w <= 0 || height <= 0 {
+	size, sizeErr := artifactByteSize(w, height)
+	if sizeErr != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("invalid artifact dimensions %dx%d", w, height)
+		return nil, sizeErr
 	}
 	info, err := f.Stat()
-	if err != nil || info.Size() < artifactHeaderSize+int64(w)*int64(height)*4 {
+	if err != nil || info.Size() < size {
 		_ = f.Close()
 		if err != nil {
 			return nil, err
@@ -556,8 +574,8 @@ type Float32ArtifactTransaction struct {
 }
 
 func BeginFloat32ArtifactTransaction(finalPath string, width, height int) (*Float32ArtifactTransaction, error) {
-	if width <= 0 || height <= 0 {
-		return nil, fmt.Errorf("invalid artifact dimensions %dx%d", width, height)
+	if _, err := artifactByteSize(width, height); err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o700); err != nil {
 		return nil, err
@@ -606,6 +624,12 @@ func (t *Float32ArtifactTransaction) Abort() error {
 func (t *Float32ArtifactTransaction) Commit() error {
 	if t == nil || t.done {
 		return errors.New("artifact transaction is closed")
+	}
+	if err := t.artifact.Sync(); err != nil {
+		_ = t.artifact.Close()
+		_ = os.Remove(t.tmpPath)
+		t.done = true
+		return err
 	}
 	if err := t.artifact.Close(); err != nil {
 		_ = os.Remove(t.tmpPath)

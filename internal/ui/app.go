@@ -82,9 +82,12 @@ func Run() error {
 		editTab,
 	)
 
-	globalExportToEdit = func(h editImageHandoff) {
-		setEditImage(h)
+	globalExportToEdit = func(h editImageHandoff) error {
+		if err := setEditImage(h); err != nil {
+			return err
+		}
 		tabs.Select(editTab)
+		return nil
 	}
 
 	globalSelectComposeTab = func() {

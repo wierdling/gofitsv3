@@ -2,6 +2,7 @@ package mosaic
 
 import (
 	"math"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -11,10 +12,11 @@ import (
 // file is absent so CI without the (large) image still passes.
 func TestLoadRealMIRICalFile(t *testing.T) {
 	path := filepath.Join("..", "..", "TestImages", "jw09224001001_02101_00001_mirimage_cal.fits")
-	if _, err := DiscoverFilters(filepath.Dir(path)); err != nil {
-		// DiscoverFilters errors only when the directory has no calibrated
-		// inputs at all; treat a missing fixture as a skip.
-		t.Skipf("no MIRI _cal test image available: %v", err)
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			t.Skipf("no MIRI _cal test image available: %v", err)
+		}
+		t.Fatalf("stat MIRI _cal test image: %v", err)
 	}
 
 	inputs, err := LoadInputsFromPath(path)

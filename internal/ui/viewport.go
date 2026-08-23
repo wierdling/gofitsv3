@@ -335,6 +335,7 @@ func (vp *viewport) SetLoadSave(chanLabel, letter string, col color.Color, loadF
 		)
 	}
 	objects = append(objects, hpad(6), newCompactBtn("Load", loadFn), newCompactBtn("Save", saveFn), hpad(6))
+	objects = append(objects, layout.NewSpacer(), vp.renderStatus)
 	vp.actionRow.Objects = objects
 	vp.actionRow.Refresh()
 }
@@ -348,6 +349,7 @@ func (vp *viewport) SetCenterAction(chanLabel, letter string, col color.Color, a
 		hpad(6), badge, hpad(4), nameText,
 		layout.NewSpacer(),
 		vp.StatsLabel, hpad(6), newCompactBtn(actionLabel, fn), hpad(6),
+		layout.NewSpacer(), vp.renderStatus,
 	}
 	vp.actionRow.Refresh()
 }
@@ -502,25 +504,27 @@ func blankImg() *image.RGBA {
 
 func (vp *viewport) imagePointAtPosition(pos fyne.Position, flipped bool) (imagePoint, bool) {
 	adj := pos
-	if vp.overlay != nil && vp.zoom > 0 && vp.origW > 0 && vp.origH > 0 {
-		// img/overlay sit in a NewMax container, which stretches both to fill
-		// the scroll viewport whenever the zoomed image is smaller than it.
-		// ImageFillContain then centers the actual pixels with a letterbox
-		// margin, so that margin must be backed out before mapping (mirrors
-		// screenToImagePt in workspace_edit.go).
-		dispW := float32(vp.origW) * float32(vp.zoom)
-		dispH := float32(vp.origH) * float32(vp.zoom)
-		sz := vp.overlay.Size()
-		var offX, offY float32
-		if sz.Width > dispW {
-			offX = (sz.Width - dispW) / 2
-		}
-		if sz.Height > dispH {
-			offY = (sz.Height - dispH) / 2
-		}
+	if offX, offY, ok := vp.imageLetterboxOffset(); ok {
 		adj = fyne.NewPos(pos.X-offX, pos.Y-offY)
 	}
 	return mapViewportPositionToImage(adj, fyne.NewPos(0, 0), vp.zoom, vp.origW, vp.origH, flipped)
+}
+
+func (vp *viewport) imageLetterboxOffset() (float32, float32, bool) {
+	if vp == nil || vp.overlay == nil || vp.zoom <= 0 || vp.origW <= 0 || vp.origH <= 0 {
+		return 0, 0, false
+	}
+	dispW := float32(vp.origW) * float32(vp.zoom)
+	dispH := float32(vp.origH) * float32(vp.zoom)
+	sz := vp.overlay.Size()
+	var offX, offY float32
+	if sz.Width > dispW {
+		offX = (sz.Width - dispW) / 2
+	}
+	if sz.Height > dispH {
+		offY = (sz.Height - dispH) / 2
+	}
+	return offX, offY, true
 }
 
 func (vp *viewport) setMeasurementOverlay(first *imagePoint, second *imagePoint, flipped bool) {
@@ -531,10 +535,16 @@ func (vp *viewport) setMeasurementOverlay(first *imagePoint, second *imagePoint,
 	var end *fyne.Position
 	if first != nil {
 		pos := imagePointToCanvasPosition(*first, vp.zoom, vp.origH, flipped)
+		if offX, offY, ok := vp.imageLetterboxOffset(); ok {
+			pos = fyne.NewPos(pos.X+offX, pos.Y+offY)
+		}
 		start = &pos
 	}
 	if second != nil {
 		pos := imagePointToCanvasPosition(*second, vp.zoom, vp.origH, flipped)
+		if offX, offY, ok := vp.imageLetterboxOffset(); ok {
+			pos = fyne.NewPos(pos.X+offX, pos.Y+offY)
+		}
 		end = &pos
 	}
 	vp.overlay.setMeasurement(start, end)

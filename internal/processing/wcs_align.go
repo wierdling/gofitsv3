@@ -27,8 +27,11 @@ type D2ITable struct {
 
 // ParseD2ITableFromHDU constructs a D2ITable from a D2IMARR HDU.
 func ParseD2ITableFromHDU(hdu fitsio.HDU) (*D2ITable, error) {
-	if hdu.Data.Width == 0 || hdu.Data.Height == 0 {
+	if hdu.Data.Width <= 0 || hdu.Data.Height <= 0 {
 		return nil, fmt.Errorf("D2IMARR HDU has no data")
+	}
+	if n, ok := rasterSize(hdu.Data.Width, hdu.Data.Height); !ok || len(hdu.Data.Pixels) < n {
+		return nil, fmt.Errorf("D2IMARR HDU data dimensions are invalid")
 	}
 	crpix1, ok1 := tryHeaderFloat(hdu.Header, "CRPIX1")
 	crpix2, ok2 := tryHeaderFloat(hdu.Header, "CRPIX2")
@@ -39,8 +42,13 @@ func ParseD2ITableFromHDU(hdu fitsio.HDU) (*D2ITable, error) {
 	if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 {
 		return nil, fmt.Errorf("D2IMARR HDU missing coordinate keywords")
 	}
-	if math.Abs(cdelt1) < 1e-15 || math.Abs(cdelt2) < 1e-15 {
+	if !isFinite64(crpix1) || !isFinite64(crpix2) || !isFinite64(crval1) || !isFinite64(crval2) || !isFinite64(cdelt1) || !isFinite64(cdelt2) || math.Abs(cdelt1) < 1e-15 || math.Abs(cdelt2) < 1e-15 {
 		return nil, fmt.Errorf("D2IMARR HDU has zero CDELT")
+	}
+	for _, v := range hdu.Data.Pixels[:hdu.Data.Width*hdu.Data.Height] {
+		if !isFinite64(float64(v)) {
+			return nil, fmt.Errorf("D2IMARR HDU contains non-finite data")
+		}
 	}
 	t := &D2ITable{
 		crpix1: crpix1, crpix2: crpix2,
@@ -64,6 +72,9 @@ func (t *D2ITable) interpolate(imgX, imgY float64) float64 {
 }
 
 func bilinearSampleD2I(data []float32, w, h int, x, y float64) float64 {
+	if w <= 0 || h <= 0 || len(data) < w*h || !isFinite64(x) || !isFinite64(y) {
+		return math.NaN()
+	}
 	x0 := int(math.Floor(x))
 	y0 := int(math.Floor(y))
 	x1 := x0 + 1
@@ -78,6 +89,9 @@ func bilinearSampleD2I(data []float32, w, h int, x, y float64) float64 {
 	p10 := float64(data[y0*w+x1])
 	p01 := float64(data[y1*w+x0])
 	p11 := float64(data[y1*w+x1])
+	if !isFinite64(p00) || !isFinite64(p10) || !isFinite64(p01) || !isFinite64(p11) {
+		return math.NaN()
+	}
 	return p00*(1-wx)*(1-wy) + p10*wx*(1-wy) + p01*(1-wx)*wy + p11*wx*wy
 }
 
@@ -269,7 +283,11 @@ func AlignChannelUsingWCSCtx(ctx context.Context, targetPixels []float32, target
 // before the WCS map to fold in a star-based residual correction; pass
 // IdentityTransform() when there is none.
 func WarpImageThroughWCS(srcPixels []float32, srcWidth, srcHeight, outWidth, outHeight int, reverseMapper *WCSMapper, residualInv AffineTransform) []float32 {
-	out := make([]float32, outWidth*outHeight)
+	n, ok := rasterSize(outWidth, outHeight)
+	if !ok {
+		return []float32{}
+	}
+	out := make([]float32, n)
 	if srcWidth <= 0 || srcHeight <= 0 || outWidth <= 0 || outHeight <= 0 || len(srcPixels) == 0 || reverseMapper == nil {
 		return out
 	}
@@ -309,12 +327,18 @@ func WarpImageThroughWCS(srcPixels []float32, srcWidth, srcHeight, outWidth, out
 // outside the source bounds and NaN when any contributing pixel is NaN. It
 // mirrors the sampling used by WarpImageToSize.
 func bilinearSampleImage(pix []float32, w, h int, sx, sy float64) float32 {
+	if w <= 0 || h <= 0 || len(pix) < w*h || !isFinite64(sx) || !isFinite64(sy) || sx < 0 || sy < 0 || sx > float64(w-1) || sy > float64(h-1) {
+		return 0
+	}
 	x0 := int(math.Floor(sx))
 	y0 := int(math.Floor(sy))
 	x1 := x0 + 1
 	y1 := y0 + 1
-	if x0 < 0 || x1 >= w || y0 < 0 || y1 >= h {
-		return 0
+	if x1 >= w {
+		x1 = w - 1
+	}
+	if y1 >= h {
+		y1 = h - 1
 	}
 	wx := sx - float64(x0)
 	wy := sy - float64(y0)
@@ -322,7 +346,7 @@ func bilinearSampleImage(pix []float32, w, h int, sx, sy float64) float32 {
 	p10 := float64(pix[y0*w+x1])
 	p01 := float64(pix[y1*w+x0])
 	p11 := float64(pix[y1*w+x1])
-	if math.IsNaN(p00) || math.IsNaN(p10) || math.IsNaN(p01) || math.IsNaN(p11) {
+	if !isFinite64(p00) || !isFinite64(p10) || !isFinite64(p01) || !isFinite64(p11) {
 		return float32(math.NaN())
 	}
 	return float32(p00*(1-wx)*(1-wy) + p10*wx*(1-wy) + p01*(1-wx)*wy + p11*wx*wy)
@@ -386,6 +410,9 @@ func parseLinearWCS(header fitsio.Header) (linearWCS, error) {
 	cd21, ok21 := tryHeaderFloat(header, "CD2_1")
 	cd22, ok22 := tryHeaderFloat(header, "CD2_2")
 	if ok11 && ok12 && ok21 && ok22 {
+		if !isFinite64(cd11) || !isFinite64(cd12) || !isFinite64(cd21) || !isFinite64(cd22) || math.Abs(cd11*cd22-cd12*cd21) < 1e-18 {
+			return linearWCS{}, fmt.Errorf("invalid WCS matrix")
+		}
 		w := linearWCS{crpix1: crpix1, crpix2: crpix2, crval1: crval1, crval2: crval2, cd11: cd11, cd12: cd12, cd21: cd21, cd22: cd22}
 		parseSIP(header, &w)
 		return w, nil
@@ -413,11 +440,17 @@ func parseLinearWCS(header fitsio.Header) (linearWCS, error) {
 			cd21:   pc21 * cdelt2,
 			cd22:   pc22 * cdelt2,
 		}
+		if !isFinite64(w.cd11) || !isFinite64(w.cd12) || !isFinite64(w.cd21) || !isFinite64(w.cd22) || math.Abs(w.cd11*w.cd22-w.cd12*w.cd21) < 1e-18 {
+			return linearWCS{}, fmt.Errorf("invalid WCS matrix")
+		}
 		parseSIP(header, &w)
 		return w, nil
 	}
 
 	w := linearWCS{crpix1: crpix1, crpix2: crpix2, crval1: crval1, crval2: crval2, cd11: cdelt1, cd12: 0, cd21: 0, cd22: cdelt2}
+	if !isFinite64(cdelt1) || !isFinite64(cdelt2) || math.Abs(cdelt1*cdelt2) < 1e-18 {
+		return linearWCS{}, fmt.Errorf("invalid WCS matrix")
+	}
 	parseSIP(header, &w)
 	return w, nil
 }
@@ -500,7 +533,7 @@ func parseSIP(header fitsio.Header, w *linearWCS) {
 
 func parseSIPPoly(header fitsio.Header, prefix string) sipPoly {
 	order, ok := tryHeaderFloat(header, prefix+"_ORDER")
-	if !ok || order < 0 {
+	if !ok || !isFinite64(order) || order < 0 || order > 15 || order != math.Trunc(order) {
 		return sipPoly{}
 	}
 	maxOrder := int(order)
@@ -509,7 +542,7 @@ func parseSIPPoly(header fitsio.Header, prefix string) sipPoly {
 	for p := 0; p <= maxOrder; p++ {
 		for q := 0; q <= maxOrder; q++ {
 			key := fmt.Sprintf("%s_%d_%d", prefix, p, q)
-			if v, ok := tryHeaderFloat(header, key); ok {
+			if v, ok := tryHeaderFloat(header, key); ok && isFinite64(v) {
 				coeffs = append(coeffs, sipCoeff{p: p, q: q, coeff: v})
 				if p > maxP {
 					maxP = p
@@ -617,10 +650,16 @@ func tryHeaderFloat(header fitsio.Header, key string) (float64, bool) {
 	if err != nil {
 		return 0, false
 	}
+	if !isFinite64(parsed) {
+		return 0, false
+	}
 	return parsed, true
 }
 
 func normalizeAngleDelta(delta float64) float64 {
+	if !isFinite64(delta) {
+		return 0
+	}
 	for delta > 180 {
 		delta -= 360
 	}

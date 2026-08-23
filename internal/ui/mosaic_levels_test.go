@@ -96,7 +96,7 @@ func TestLevelPrefsRoundTripMTFMidtone(t *testing.T) {
 	}
 }
 
-func TestLoadLevelPrefsAndModeDefaultsMissingMTFMidtone(t *testing.T) {
+func TestLoadLevelPrefsAndModePreservesMissingMTFMidtone(t *testing.T) {
 	ws := newTestMosaicWorkspaceForLevels(t)
 	ws.mtfMidtone = 0.4444
 	ws.mtfMidtoneEntry.SetValue(0.4444)
@@ -105,15 +105,15 @@ func TestLoadLevelPrefsAndModeDefaultsMissingMTFMidtone(t *testing.T) {
 	if !ws.loadLevelPrefsAndMode("F814W") {
 		t.Fatal("loadLevelPrefsAndMode returned false")
 	}
-	if ws.mtfMidtone != stretch.DefaultMTFMidtone {
-		t.Fatalf("mtfMidtone = %v, want default %v", ws.mtfMidtone, stretch.DefaultMTFMidtone)
+	if ws.mtfMidtone != 0.4444 {
+		t.Fatalf("mtfMidtone = %v, want preserved 0.4444", ws.mtfMidtone)
 	}
-	if got := ws.mtfMidtoneEntry.Value(); got != stretch.DefaultMTFMidtone {
-		t.Fatalf("mtfMidtoneEntry = %v, want default %v", got, stretch.DefaultMTFMidtone)
+	if got := ws.mtfMidtoneEntry.Value(); got != 0.444 {
+		t.Fatalf("mtfMidtoneEntry = %v, want preserved 0.444", got)
 	}
 }
 
-func TestLoadLevelPrefsAndModeRejectsInvalidMTFMidtone(t *testing.T) {
+func TestLoadLevelPrefsAndModePreservesInvalidMTFMidtone(t *testing.T) {
 	ws := newTestMosaicWorkspaceForLevels(t)
 	ws.mtfMidtone = 0.5555
 	ws.mtfMidtoneEntry.SetValue(0.5555)
@@ -122,13 +122,31 @@ func TestLoadLevelPrefsAndModeRejectsInvalidMTFMidtone(t *testing.T) {
 	if !ws.loadLevelPrefsAndMode("F555W") {
 		t.Fatal("loadLevelPrefsAndMode returned false")
 	}
-	if ws.mtfMidtone != stretch.DefaultMTFMidtone {
-		t.Fatalf("mtfMidtone = %v, want default %v", ws.mtfMidtone, stretch.DefaultMTFMidtone)
+	if ws.mtfMidtone != 0.5555 {
+		t.Fatalf("mtfMidtone = %v, want preserved 0.5555", ws.mtfMidtone)
 	}
-	if got := ws.mtfMidtoneEntry.Value(); got != stretch.DefaultMTFMidtone {
-		t.Fatalf("mtfMidtoneEntry = %v, want default %v", got, stretch.DefaultMTFMidtone)
+	if got := ws.mtfMidtoneEntry.Value(); got != 0.556 {
+		t.Fatalf("mtfMidtoneEntry = %v, want preserved 0.556", got)
 	}
 	if ws.stretchMode != stretch.MTF {
 		t.Fatalf("stretchMode = %v, want MTF", ws.stretchMode)
+	}
+}
+
+func TestLoadLevelPrefsAndModeMalformedPreservesAllControls(t *testing.T) {
+	ws := newTestMosaicWorkspaceForLevels(t)
+	ws.blackEntry.SetValue(0.11)
+	ws.whiteEntry.SetValue(0.88)
+	ws.bgEntry.SetValue(0.22)
+	ws.peakEntry.SetValue(0.77)
+	ws.scaledPeakEntry.SetValue(1234)
+	ws.mtfMidtone = 0.42
+	ws.mtfMidtoneEntry.SetValue(0.42)
+	ws.app.Preferences().SetString(ws.prefKey("BAD"), `{"black":"not-a-number","white":"0.9","background":"0.2","peak":"0.8","scaledPeak":"1000","mode":"MTF","mtfMidtone":"0.1"}`)
+	if ws.loadLevelPrefsAndMode("BAD") {
+		t.Fatal("malformed prefs accepted")
+	}
+	if ws.blackEntry.Value() != 0.11 || ws.whiteEntry.Value() != 0.88 || ws.bgEntry.Value() != 0.22 || ws.peakEntry.Value() != 0.8 || ws.scaledPeakEntry.Value() != 1234 || ws.mtfMidtone != 0.42 {
+		t.Fatalf("malformed prefs partially mutated controls: %.4f %.4f %.4f %.4f %.4f mtf %.4f", ws.blackEntry.Value(), ws.whiteEntry.Value(), ws.bgEntry.Value(), ws.peakEntry.Value(), ws.scaledPeakEntry.Value(), ws.mtfMidtone)
 	}
 }

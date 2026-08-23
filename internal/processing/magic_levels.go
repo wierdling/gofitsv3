@@ -294,7 +294,7 @@ func MagicLevels(pixels []float32, width, height int, valid []bool, preset Magic
 
 	// Clip diagnostics over the sampled valid pixels (sample is sorted).
 	res.ClipLowPercent = 100 * float64(countBelow(sample, black)) / float64(len(sample))
-	res.ClipHighPercent = 100 * float64(len(sample)-countBelow(sample, white)) / float64(len(sample))
+	res.ClipHighPercent = 100 * float64(len(sample)-countAtMost(sample, white)) / float64(len(sample))
 
 	return res
 }
@@ -370,13 +370,16 @@ func detectStarMask(pixels []float32, width, height int, valid []bool, bg, sigma
 					if dx == 0 && dy == 0 {
 						continue
 					}
+					if !pixOK(i + dy*width + dx) {
+						continue
+					}
 					if float64(pixels[i+dy*width+dx]) > v {
 						isPeak = false
 						break
 					}
 				}
 			}
-			if isPeak && isCompactPeak(pixels, width, height, x, y, v, bg) {
+			if isPeak && isCompactPeak(pixels, width, height, x, y, v, bg, valid) {
 				peaks = append(peaks, pt{x, y})
 			}
 		}
@@ -420,7 +423,7 @@ func detectStarMask(pixels []float32, width, height int, valid []bool, bg, sigma
 // isCompactPeak reports whether the peak at (x,y) with value v falls off toward
 // background within starCompactnessRadius. It samples 8 points on a ring at that
 // radius; a compact star drops sharply, extended nebulosity stays bright.
-func isCompactPeak(pixels []float32, width, height, x, y int, v, bg float64) bool {
+func isCompactPeak(pixels []float32, width, height, x, y int, v, bg float64, valid []bool) bool {
 	r := starCompactnessRadius
 	offsets := [8][2]int{
 		{r, 0}, {-r, 0}, {0, r}, {0, -r},
@@ -434,7 +437,8 @@ func isCompactPeak(pixels []float32, width, height, x, y int, v, bg float64) boo
 			continue
 		}
 		rv := float64(pixels[ny*width+nx])
-		if math.IsNaN(rv) || math.IsInf(rv, 0) {
+		ri := ny*width + nx
+		if (valid != nil && !valid[ri]) || pixels[ri] == 0 || math.IsNaN(rv) || math.IsInf(rv, 0) {
 			continue
 		}
 		sum += rv
@@ -454,4 +458,8 @@ func isCompactPeak(pixels []float32, width, height, x, y int, v, bg float64) boo
 // countBelow returns the number of values in a sorted slice strictly below v.
 func countBelow(sorted []float64, v float64) int {
 	return sort.SearchFloat64s(sorted, v)
+}
+
+func countAtMost(sorted []float64, v float64) int {
+	return sort.Search(len(sorted), func(i int) bool { return sorted[i] > v })
 }

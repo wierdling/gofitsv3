@@ -21,6 +21,51 @@ func remoteSpectrum(id uint64) XPSpectrum {
 	return XPSpectrum{Release: "DR3", SourceID: id, RepresentationVersion: "xp-v1", CalibrationVersion: "c1", Wavelengths: []float64{400, 500}, Flux: []float64{1, 2}, FluxErrors: []float64{.1, .1}}
 }
 
+func TestRemoteProviderRejectsMixedKnownAndUnknownSpectraIDs(t *testing.T) {
+	p, err := NewRemoteProvider(RemoteConfig{Endpoint: "http://example.test", Release: "DR3", XPRepresentation: "xp-v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.known[1] = true
+	p.cell = QueryCell{Signature: "sig", SpatialCell: "cell", Release: "DR3"}
+	if _, err := p.RetrieveXPSpectra(context.Background(), "DR3", "xp-v1", []uint64{1, 2}); !errors.Is(err, ErrUnknownSource) {
+		t.Fatalf("mixed IDs err=%v", err)
+	}
+}
+
+func TestRemoteProviderFetchSpectraRequiresExactRequestedIDs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(spectrumEnvelope{Spectra: []XPSpectrum{remoteSpectrum(1)}})
+	}))
+	defer srv.Close()
+	p, err := NewRemoteProvider(RemoteConfig{Endpoint: srv.URL, Release: "DR3", XPRepresentation: "xp-v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.fetchSpectra(context.Background(), "DR3", "xp-v1", []uint64{1, 2}); err == nil {
+		t.Fatal("incomplete spectra response accepted")
+	}
+}
+
+func TestRemoteProviderOversizedJSONReturnsLimitWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"spectra":"` + strings.Repeat("x", 128) + `"}`))
+	}))
+	defer srv.Close()
+	p, err := NewRemoteProvider(RemoteConfig{Endpoint: srv.URL, Release: "DR3", XPRepresentation: "xp-v1", MaxResponseBytes: 16, Retries: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.fetchSpectra(context.Background(), "DR3", "xp-v1", []uint64{1}); !errors.Is(err, ErrRemoteLimit) {
+		t.Fatalf("oversized response err=%v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("oversized response retried %d times", calls.Load())
+	}
+}
+
 func TestRemoteProviderCacheThroughAndBatching(t *testing.T) {
 	var sourceCalls, spectrumCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

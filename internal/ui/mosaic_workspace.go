@@ -1,12 +1,14 @@
 package ui
 
 import (
+	"context"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
 	"gofitsv3/internal/mosaic"
 	"gofitsv3/internal/stretch"
+	"sync"
 )
 
 // mosaicWorkspace holds the shared state and widget references for the mosaic
@@ -23,19 +25,33 @@ type mosaicWorkspace struct {
 	state *mosaicState
 
 	// --- mutable value state (reassigned during the session) ---
-	activeFilter       string
-	lastProjectName    string
-	currentProjectPath string
-	queueRunning       bool
-	queueWindow        fyne.Window
-	zoomLevel          float64
-	zoomFitMode        bool
-	levelsSet          bool
-	stretchMode        stretch.Mode
-	mtfMidtone         float64
-	mosaicBins         [256]int
-	zoomCustomOption   string
-	zoomSelectSyncing  bool
+	activeFilter        string
+	lastProjectName     string
+	currentProjectPath  string
+	queueRunning        bool
+	alignmentMu         sync.Mutex
+	alignmentGeneration uint64
+	alignmentCancel     context.CancelFunc
+	buildMu             sync.Mutex
+	buildGeneration     uint64
+	buildCancel         context.CancelFunc
+	// inputMu guards replacement/reload of inputs and the generation map. Long
+	// running exports take short read snapshots so a project reload cannot race
+	// their validation or final publication.
+	inputMu sync.RWMutex
+	// inputGenerations advances whenever an input is reloaded/replaced. It is
+	// keyed by the stable source identity so an editor cannot export a mask for
+	// a same-path, same-dimensions replacement.
+	inputGenerations  map[string]uint64
+	queueWindow       fyne.Window
+	zoomLevel         float64
+	zoomFitMode       bool
+	levelsSet         bool
+	stretchMode       stretch.Mode
+	mtfMidtone        float64
+	mosaicBins        [256]int
+	zoomCustomOption  string
+	zoomSelectSyncing bool
 
 	// --- mode pointers (non-nil only while in star/measure mode) ---
 	activePicker      *starPickerWidget
@@ -92,4 +108,68 @@ type mosaicWorkspace struct {
 	zoomSelect      *SafeSelect
 	zoomCustomEntry *widget.Entry
 	zoomPresets     []string
+}
+
+func (ws *mosaicWorkspace) beginMosaicBuild() (context.Context, uint64, bool) {
+	ws.buildMu.Lock()
+	defer ws.buildMu.Unlock()
+	if ws.buildCancel != nil {
+		return nil, 0, false
+	}
+	ws.buildGeneration++
+	ctx, cancel := context.WithCancel(context.Background())
+	ws.buildCancel = cancel
+	return ctx, ws.buildGeneration, true
+}
+
+func (ws *mosaicWorkspace) finishMosaicBuild(generation uint64) bool {
+	ws.buildMu.Lock()
+	defer ws.buildMu.Unlock()
+	if generation != ws.buildGeneration {
+		return false
+	}
+	ws.buildCancel = nil
+	return true
+}
+
+func (ws *mosaicWorkspace) cancelMosaicBuild() {
+	ws.buildMu.Lock()
+	if ws.buildCancel != nil {
+		ws.buildCancel()
+		ws.buildCancel = nil
+	}
+	ws.buildGeneration++
+	ws.buildMu.Unlock()
+}
+
+func (ws *mosaicWorkspace) beginMosaicAlignment() (context.Context, uint64, bool) {
+	ws.alignmentMu.Lock()
+	defer ws.alignmentMu.Unlock()
+	if ws.alignmentCancel != nil {
+		return nil, 0, false
+	}
+	ws.alignmentGeneration++
+	ctx, cancel := context.WithCancel(context.Background())
+	ws.alignmentCancel = cancel
+	return ctx, ws.alignmentGeneration, true
+}
+
+func (ws *mosaicWorkspace) finishMosaicAlignment(generation uint64) bool {
+	ws.alignmentMu.Lock()
+	defer ws.alignmentMu.Unlock()
+	if generation != ws.alignmentGeneration {
+		return false
+	}
+	ws.alignmentCancel = nil
+	return true
+}
+
+func (ws *mosaicWorkspace) cancelMosaicAlignment() {
+	ws.alignmentMu.Lock()
+	if ws.alignmentCancel != nil {
+		ws.alignmentCancel()
+		ws.alignmentCancel = nil
+	}
+	ws.alignmentGeneration++
+	ws.alignmentMu.Unlock()
 }

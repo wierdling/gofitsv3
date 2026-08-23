@@ -169,6 +169,12 @@ func (q *drizzleQueueWindow) start() {
 			fyne.Do(func() {
 				if event.Index >= 0 && event.Index < len(q.jobs) {
 					q.jobs[event.Index].Status = event.Status
+					if event.OutputPath != "" {
+						q.jobs[event.Index].OutputPath = event.OutputPath
+					}
+					if event.Err != "" {
+						q.jobs[event.Index].Err = event.Err
+					}
 					q.overall.SetText(fmt.Sprintf("Job %d of %d: %s", event.Index+1, len(q.jobs), filepath.Base(q.jobs[event.Index].ProjectPath)))
 				}
 				q.stage.SetText(event.Stage)
@@ -190,7 +196,8 @@ func (q *drizzleQueueWindow) start() {
 		},
 	}
 	q.refresh()
-	go q.runner.Run(context.Background(), q.jobs)
+	jobs := append([]drizzleQueueJob(nil), q.jobs...)
+	go q.runner.Run(context.Background(), jobs)
 }
 
 func (q *drizzleQueueWindow) refresh() {

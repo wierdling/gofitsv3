@@ -178,6 +178,24 @@ func TestMaskFromDQWithBitFilterSelectsMatchingBits(t *testing.T) {
 	}
 }
 
+func TestMaskFromDQUsesExactInt32BitsAndRejectsShortPixels(t *testing.T) {
+	sci := fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 1, Pixels: []float32{1, 2}}}
+	dq := fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 1, Pixels: []float32{0, 0}, Int32Pixels: []int32{1, math.MinInt32}}}
+	mask, err := MaskFromDQ(sci, dq, 0x80000000)
+	if err != nil {
+		t.Fatalf("MaskFromDQ error = %v", err)
+	}
+	if !mask[1] || mask[0] {
+		t.Fatalf("high-bit mask = %v, want [false true]", mask)
+	}
+	if _, err := MaskFromDQ(sci, fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 1, Pixels: []float32{1}}}, 0); err == nil {
+		t.Fatal("expected malformed DQ length error")
+	}
+	if _, err := MaskFromDQ(fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 1, Pixels: []float32{1}}}, dq, 0); err == nil {
+		t.Fatal("expected malformed SCI length error")
+	}
+}
+
 func contains(arr []int, v int) bool {
 	for _, x := range arr {
 		if x == v {

@@ -43,6 +43,27 @@ func IntegrateXPSpectrum(s gaia.XPSpectrum, p GaiaPassband) (float64, error) {
 	if len(s.Wavelengths) < 2 || len(s.Wavelengths) != len(s.Flux) {
 		return 0, fmt.Errorf("invalid XP samples")
 	}
+	if !finiteFloat(p.MinWavelengthNm) || !finiteFloat(p.MaxWavelengthNm) || p.MaxWavelengthNm <= p.MinWavelengthNm {
+		return 0, fmt.Errorf("invalid passband range")
+	}
+	for i, wavelength := range s.Wavelengths {
+		if !finiteFloat(wavelength) || !finiteFloat(s.Flux[i]) || (i > 0 && wavelength <= s.Wavelengths[i-1]) {
+			return 0, fmt.Errorf("invalid XP wavelength grid")
+		}
+	}
+	if len(p.ThroughputWavelengths) > 0 && len(p.ThroughputWavelengths) != len(p.Throughput) {
+		return 0, fmt.Errorf("invalid passband grid")
+	}
+	for _, throughput := range p.Throughput {
+		if !finiteFloat(throughput) || throughput < 0 {
+			return 0, fmt.Errorf("invalid passband throughput")
+		}
+	}
+	for i, wavelength := range p.ThroughputWavelengths {
+		if !finiteFloat(wavelength) || (i > 0 && wavelength <= p.ThroughputWavelengths[i-1]) {
+			return 0, fmt.Errorf("invalid passband wavelength grid")
+		}
+	}
 	var num, den float64
 	for i := 1; i < len(s.Wavelengths); i++ {
 		a, b := s.Wavelengths[i-1], s.Wavelengths[i]
@@ -266,7 +287,7 @@ func (s GaiaCalibrationSettings) Validate() error {
 	if s.Release == "" || s.XPRepresentation == "" || s.AlgorithmVersion == "" {
 		return fmt.Errorf("Gaia release, XP representation, and algorithm version are required")
 	}
-	if len(s.Passbands) == 0 || !finiteFloat(s.MagnitudeLimit) || s.MagnitudeLimit <= 0 || !finiteFloat(s.MatchRadiusArcsec) || s.MatchRadiusArcsec <= 0 || !finiteFloat(s.ObservationEpoch) {
+	if len(s.Passbands) == 0 || len(s.Passbands) > 3 || !finiteFloat(s.MagnitudeLimit) || s.MagnitudeLimit <= 0 || !finiteFloat(s.MatchRadiusArcsec) || s.MatchRadiusArcsec <= 0 || !finiteFloat(s.ObservationEpoch) {
 		return fmt.Errorf("invalid Gaia calibration settings")
 	}
 	seen := make(map[string]bool, len(s.Passbands))

@@ -108,3 +108,51 @@ func TestComputeWCSTransformPreservesTranslationWithMatchingSIP(t *testing.T) {
 		t.Fatalf("expected near-identity linear terms, got %+v", transform)
 	}
 }
+
+func TestParseLinearWCSRejectsNonFiniteAndSingularMatrices(t *testing.T) {
+	base := fitsio.Header{Cards: map[string]string{"CRPIX1": "1", "CRPIX2": "1", "CRVAL1": "0", "CRVAL2": "0", "CD1_1": "1", "CD1_2": "0", "CD2_1": "0", "CD2_2": "1"}}
+	if _, err := parseLinearWCS(base); err != nil {
+		t.Fatal(err)
+	}
+	base.Cards["CD2_2"] = "NaN"
+	if _, err := parseLinearWCS(base); err == nil {
+		t.Fatal("expected non-finite WCS rejection")
+	}
+	base.Cards["CD2_2"] = "0"
+	if _, err := parseLinearWCS(base); err == nil {
+		t.Fatal("expected singular WCS rejection")
+	}
+}
+
+func TestBilinearSampleD2IClampsRightBottomEdge(t *testing.T) {
+	got := bilinearSampleD2I([]float32{1, 2, 3, 4}, 2, 2, 1, 1)
+	if got != 4 {
+		t.Fatalf("edge sample = %v, want 4", got)
+	}
+}
+
+func TestParseD2ITableRejectsMalformedAndNonFinite(t *testing.T) {
+	h := fitsio.Header{Cards: map[string]string{"CRPIX1": "1", "CRPIX2": "1", "CRVAL1": "0", "CRVAL2": "0", "CDELT1": "1", "CDELT2": "1"}}
+	if _, err := ParseD2ITableFromHDU(fitsio.HDU{Header: h, Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{1}}}); err == nil {
+		t.Fatal("expected short raster rejection")
+	}
+	if _, err := ParseD2ITableFromHDU(fitsio.HDU{Header: h, Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{1, 2, 3, float32(math.Inf(1))}}}); err == nil {
+		t.Fatal("expected non-finite raster rejection")
+	}
+	h.Cards["CRPIX1"] = "NaN"
+	if _, err := ParseD2ITableFromHDU(fitsio.HDU{Header: h, Data: fitsio.ImageData{Width: 1, Height: 1, Pixels: []float32{1}}}); err == nil {
+		t.Fatal("expected non-finite header rejection")
+	}
+}
+
+func TestParseSIPPolyBoundsInvalidOrderAndCoefficients(t *testing.T) {
+	h := fitsio.Header{Cards: map[string]string{"A_ORDER": "99", "A_0_0": "1"}}
+	if p := parseSIPPoly(h, "A"); !p.empty() {
+		t.Fatal("out-of-range order should be ignored")
+	}
+	h.Cards["A_ORDER"] = "2"
+	h.Cards["A_1_0"] = "Inf"
+	if p := parseSIPPoly(h, "A"); len(p.coeffs) != 1 {
+		t.Fatalf("non-finite coefficient should be skipped, got %d", len(p.coeffs))
+	}
+}

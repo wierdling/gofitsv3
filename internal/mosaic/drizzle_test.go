@@ -1,6 +1,8 @@
 package mosaic
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -12,6 +14,57 @@ import (
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/processing"
 )
+
+func TestAlignInputsBySelectedStarsWithModeCtxHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := AlignInputsBySelectedStarsWithModeCtx(ctx, nil, []processing.Star{{X: 1, Y: 1}}, 1, AlignmentModeRScale, 0)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestBuildCancellationDuringOnlyDrizzleReturnsNoResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	progress := func(stage string, done, total int) {
+		if stage == "Drizzling" && done == 0 {
+			cancel()
+		}
+	}
+	result, err := Build([]Input{
+		makeInput("ref_flc.fits", 2, 2, []float32{1, 2, 3, 4}, headerWithCRPIX(10, 10)),
+	}, Options{Scale: 1, Ctx: ctx, Progress: progress})
+	if !errors.Is(err, ErrCancelled) {
+		t.Fatalf("Build error = %v, want ErrCancelled", err)
+	}
+	if result != nil {
+		t.Fatal("cancelled Build returned a partial result")
+	}
+}
+
+func TestPlanInputsMalformedWCSBookkeeping(t *testing.T) {
+	refBad := makeInput("ref_bad.fits", 2, 2, filledPixels(2, 2, 1), headerWithCRPIX(10, 10))
+	refBad.HDU.Header.Cards["CRPIX1"] = "not-a-number"
+	_, statuses, _, _, _, _, err := planInputs([]Input{refBad}, 1)
+	if err == nil || statuses[0].Status != "failed" || statuses[0].Error == "" {
+		t.Fatalf("malformed reference: err=%v status=%+v, want failure diagnostics", err, statuses[0])
+	}
+
+	ref := makeInput("ref.fits", 2, 2, filledPixels(2, 2, 1), headerWithCRPIX(10, 10))
+	targetBad := makeInput("target_bad.fits", 2, 2, filledPixels(2, 2, 2), headerWithCRPIX(10, 10))
+	targetBad.HDU.Header.Cards["CRPIX2"] = "not-a-number"
+	planned, statuses, _, _, _, _, err := planInputs([]Input{ref, targetBad}, 1)
+	if err != nil {
+		t.Fatalf("malformed non-reference should retain reference: %v", err)
+	}
+	if len(planned) != 1 || !statuses[0].Included {
+		t.Fatalf("planned=%d reference included=%v, want only reference planned", len(planned), statuses[0].Included)
+	}
+	if statuses[1].Status != "failed" || statuses[1].Included || statuses[1].Error == "" {
+		t.Fatalf("malformed target status=%+v, want failed/excluded diagnostics", statuses[1])
+	}
+}
 
 func TestBuildSingleImageIdentity(t *testing.T) {
 	inputs := []Input{

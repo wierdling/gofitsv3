@@ -133,8 +133,17 @@ func ParseInstrumentPhotometry(m InstrumentMetadata) (InstrumentPhotometry, erro
 	}
 	gain := 1.0
 	fnuInputScaleJy := 1.0
-	if kind == InputFnu && strings.HasPrefix(strings.ToUpper(strings.ReplaceAll(bunit, " ", "")), "MJY") {
-		fnuInputScaleJy = 1e6
+	if kind == InputFnu {
+		// SI prefixes are case-sensitive: mJy is milli-Jansky while MJy is
+		// mega-Jansky. Preserve that distinction even though classification is
+		// otherwise case-insensitive.
+		u := strings.ReplaceAll(strings.TrimSpace(bunit), " ", "")
+		switch u {
+		case "mJy", "mjy":
+			fnuInputScaleJy = 1e-3
+		case "MJy", "MJY":
+			fnuInputScaleJy = 1e6
+		}
 	}
 	if kind == InputCounts {
 		gain /= exptime

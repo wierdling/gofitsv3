@@ -30,6 +30,10 @@ type blinkFrame struct {
 	Checked bool
 }
 
+func blinkLoadIsCurrent(closed bool, windowGen, currentWindowGen, frameGen, currentFrameGen uint64, checked bool) bool {
+	return !closed && windowGen == currentWindowGen && frameGen == currentFrameGen && checked
+}
+
 func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, scaledPeak float64, stretchMode stretch.Mode) {
 	if blinkerWin != nil {
 		blinkerWin.RequestFocus()
@@ -71,6 +75,9 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 	blinkIntervalMs := int64(500)
 	isPaused := false
 	stopCh := make(chan struct{})
+	loadGen := make([]uint64, len(frames))
+	windowGen := uint64(0)
+	closed := false
 
 	// cimgs[i] mirrors frames[i].ci so the blink/zoom loops can iterate cheaply.
 	// Entries are nil until the corresponding frame is loaded.
@@ -82,6 +89,14 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 	zoomFactor := float32(1)
 
 	blinkerWin.SetCloseIntercept(func() {
+		mu.Lock()
+		if closed {
+			mu.Unlock()
+			return
+		}
+		closed = true
+		windowGen++
+		mu.Unlock()
 		close(stopCh)
 		blinkerWin.SetCloseIntercept(nil)
 		blinkerWin.Close()
@@ -98,6 +113,10 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 	// advanceFrame shows the next selected+loaded frame, hiding the rest.
 	advanceFrame := func() {
 		mu.Lock()
+		if closed {
+			mu.Unlock()
+			return
+		}
 		var disp []int
 		for i, fr := range frames {
 			if fr.Checked && fr.ci != nil {
@@ -122,6 +141,10 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 		}
 		fyne.Do(func() {
 			mu.Lock()
+			if closed {
+				mu.Unlock()
+				return
+			}
 			defer mu.Unlock()
 			for i, ci := range cimgs {
 				if ci == nil {
@@ -143,6 +166,14 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 	// loadFrame reads + stretches a frame's FITS and installs its canvas image.
 	// Runs on a background goroutine; UI mutations are marshalled onto the main thread.
 	loadFrame := func(i int) {
+		mu.Lock()
+		if closed || !frames[i].Checked {
+			mu.Unlock()
+			return
+		}
+		gen := loadGen[i]
+		window := windowGen
+		mu.Unlock()
 		fr := frames[i]
 		fitsFile, err := fitsio.LoadFile(fr.Path)
 		if err != nil || len(fitsFile.HDUs) == 0 {
@@ -166,7 +197,7 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 
 		fyne.Do(func() {
 			mu.Lock()
-			if !fr.Checked {
+			if !blinkLoadIsCurrent(closed, window, windowGen, gen, loadGen[i], fr.Checked) {
 				// Deselected while loading; discard.
 				mu.Unlock()
 				return
@@ -187,8 +218,8 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 			imgLayer.Add(ci)
 			mu.Unlock()
 			imgLayer.Refresh()
+			advanceFrame()
 		})
-		advanceFrame()
 	}
 
 	// unloadFrame drops a frame's image and removes its canvas image, freeing memory.
@@ -202,6 +233,12 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 		mu.Unlock()
 		if ci != nil {
 			fyne.Do(func() {
+				mu.Lock()
+				if closed {
+					mu.Unlock()
+					return
+				}
+				mu.Unlock()
 				imgLayer.Remove(ci)
 				imgLayer.Refresh()
 			})
@@ -215,6 +252,7 @@ func showBlinkerWindow(app fyne.App, debugDir string, black, white, bg, peak, sc
 		check := widget.NewCheck(fr.Name, func(v bool) {
 			mu.Lock()
 			fr.Checked = v
+			loadGen[i]++
 			mu.Unlock()
 			if v {
 				go loadFrame(i)

@@ -54,7 +54,11 @@ func showAlignmentSettingsDialog(win fyne.Window, current models.AlignmentSettin
 	numRefsEntry.SetText(fmt.Sprintf("%d", numRefs))
 
 	debugCheck := widget.NewCheck("Show alignment debug after each image", nil)
-	debugCheck.SetChecked(current.DebugAlignment)
+	// The current catalog alignment pipeline has no diagnostics renderer. Keep
+	// the persisted field for compatibility, but never expose a switch that
+	// would silently change the pixel-loading path.
+	debugCheck.SetChecked(false)
+	debugCheck.Disable()
 
 	notes := widget.NewLabel(
 		"Alignment Mode: TweakReg modes use catalog matching via full WCS (recommended).\n" +
@@ -97,7 +101,7 @@ func showAlignmentSettingsDialog(win fyne.Window, current models.AlignmentSettin
 			AlignmentMode:      alignmentMode,
 			SearchRadiusArcsec: srVal,
 			NumRefs:            nrVal,
-			DebugAlignment:     debugCheck.Checked,
+			DebugAlignment:     false,
 		})
 	}, win)
 	d.Resize(fyne.NewSize(700, 380))

@@ -186,22 +186,32 @@ func (r *alignedArtifactRowReader) ReadWindow(y, x0, x1 int, dst []float32) erro
 		fx, fy := processing.MapDiskCoordinate(r.source, r.reference, r.offsetX, r.offsetY, r.offsetRot, x, y, r.width, r.height, a.Width, a.Height)
 		m := &mappedPixels[x-x0]
 		m.fx, m.fy = fx, fy
-		if fx < 0 || fy < 0 || fx >= float64(a.Width-1) || fy >= float64(a.Height-1) {
+		if fx < 0 || fy < 0 || fx > float64(a.Width-1) || fy > float64(a.Height-1) {
 			continue
 		}
 		m.valid = true
 		sx0, sy := int(math.Floor(fx)), int(math.Floor(fy))
+		sx1, sy1 := sx0+1, sy+1
+		if sx1 >= a.Width {
+			sx1 = sx0
+		}
+		if sy1 >= a.Height {
+			sy1 = sy
+		}
 		for _, ry := range []int{sy, sy + 1} {
+			if ry >= a.Height {
+				ry = sy1
+			}
 			if old, ok := rowRanges[ry]; ok {
 				if sx0 < old[0] {
 					old[0] = sx0
 				}
-				if sx0+2 > old[1] {
-					old[1] = sx0 + 2
+				if sx1+1 > old[1] {
+					old[1] = sx1 + 1
 				}
 				rowRanges[ry] = old
 			} else {
-				rowRanges[ry] = [2]int{sx0, sx0 + 2}
+				rowRanges[ry] = [2]int{sx0, sx1 + 1}
 			}
 		}
 	}
@@ -225,14 +235,21 @@ func (r *alignedArtifactRowReader) ReadWindow(y, x0, x1 int, dst []float32) erro
 			continue
 		}
 		sx, sy := int(math.Floor(m.fx)), int(math.Floor(m.fy))
-		r0, r1 := rows[sy], rows[sy+1]
-		v00, v10 := r0.values[sx-r0.x0], r0.values[sx+1-r0.x0]
-		v01, v11 := r1.values[sx-r1.x0], r1.values[sx+1-r1.x0]
+		sx1, sy1 := sx+1, sy+1
+		wx, wy := m.fx-float64(sx), m.fy-float64(sy)
+		if sx1 >= a.Width {
+			sx1, wx = sx, 0
+		}
+		if sy1 >= a.Height {
+			sy1, wy = sy, 0
+		}
+		r0, r1 := rows[sy], rows[sy1]
+		v00, v10 := r0.values[sx-r0.x0], r0.values[sx1-r0.x0]
+		v01, v11 := r1.values[sx-r1.x0], r1.values[sx1-r1.x0]
 		if math.IsNaN(float64(v00)) || math.IsNaN(float64(v10)) || math.IsNaN(float64(v01)) || math.IsNaN(float64(v11)) || math.IsInf(float64(v00), 0) || math.IsInf(float64(v10), 0) || math.IsInf(float64(v01), 0) || math.IsInf(float64(v11), 0) {
 			dst[i] = float32(math.NaN())
 			continue
 		}
-		wx, wy := m.fx-float64(sx), m.fy-float64(sy)
 		dst[i] = float32(float64(v00)*(1-wx)*(1-wy) + float64(v10)*wx*(1-wy) + float64(v01)*(1-wx)*wy + float64(v11)*wx*wy)
 	}
 	return nil
@@ -2043,7 +2060,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					return
 				}
 				if globalExportToEdit != nil {
-					globalExportToEdit(editImageHandoff{disk: ed})
+					if installErr := globalExportToEdit(editImageHandoff{disk: ed}); installErr != nil {
+						ed.cleanup()
+						dialog.ShowError(installErr, win)
+					}
 				}
 			})
 		}()
@@ -2068,7 +2088,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				dialog.ShowInformation("Nothing to export", "Compose all three channels first.", win)
 				return
 			}
-			globalExportToEdit(editImageHandoff{memory: img})
+			if err := globalExportToEdit(editImageHandoff{memory: img}); err != nil {
+				dialog.ShowError(err, win)
+			}
 		})
 
 	copySettings := func() {
@@ -2794,6 +2816,139 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	resetData := func() {
+		largeMu.RLock()
+		store := largeStore
+		largeMu.RUnlock()
+		if largeMode && store != nil {
+			savedStates := captureViewportStates()
+			expected := make([]composeArtifactDescriptor, 0, 3)
+			selected := make([]*models.LoadedImage, 0, 3)
+			identities := make([]*models.LoadedImage, 0, 3)
+			indices := make([]int, 0, 3)
+			requests := make(map[int]uint64)
+			var session uint64
+			largeMu.RLock()
+			session = largeSessionGeneration
+			store = largeStore
+			if store == nil {
+				largeMu.RUnlock()
+				dialog.ShowInformation("Reset", "The large-file Compose session is no longer available.", win)
+				return
+			}
+			for i := 0; i < 3; i++ {
+				if imgs[i] == nil {
+					continue
+				}
+				d, ok := largeArtifacts[i]
+				if !ok {
+					largeMu.RUnlock()
+					dialog.ShowError(fmt.Errorf("missing disk artifact for Channel %d", i+1), win)
+					return
+				}
+				expected = append(expected, d)
+				identities = append(identities, imgs[i])
+				// Copy the complete small channel state while holding the same lock
+				// used by large-mode writers. Reset staging must never read a live
+				// LoadedImage while a channel job is committing metadata.
+				snapshot := *imgs[i]
+				snapshot.HDU = imgs[i].HDU
+				snapshot.HDU.Header.Cards = make(map[string]string, len(imgs[i].HDU.Header.Cards))
+				for key, value := range imgs[i].HDU.Header.Cards {
+					snapshot.HDU.Header.Cards[key] = value
+				}
+				snapshot.HDU.Data.Pixels = nil
+				snapshot.HDU.Data.Int32Pixels = nil
+				selected = append(selected, &snapshot)
+				indices = append(indices, i)
+				slot := fmt.Sprintf("channel-%d", i)
+				requests[i] = largeLoadGenerations[slot]
+			}
+			largeMu.RUnlock()
+			if len(selected) == 0 {
+				dialog.ShowInformation("Reset", "No loaded channels to reset.", win)
+				return
+			}
+			progressDialog := dialog.NewCustom("Reset", "Restoring channels from disk…", widget.NewProgressBarInfinite(), win)
+			progressDialog.Show()
+			go func() {
+				// Never hold largeMu across FITS I/O. Clear Channels and other UI
+				// invalidation paths must be able to advance the generation while
+				// this reset is staging its transactional replacements.
+				resetStillCurrent := func() bool {
+					largeMu.RLock()
+					defer largeMu.RUnlock()
+					if largeStore != store || largeSessionGeneration != session {
+						return false
+					}
+					for j, idx := range indices {
+						slot := fmt.Sprintf("channel-%d", idx)
+						if imgs[idx] != identities[j] || largeLoadGenerations[slot] != requests[idx] {
+							return false
+						}
+						current, ok := largeArtifacts[idx]
+						if !ok || current.Generation != expected[j].Generation || current.Path != expected[j].Path {
+							return false
+						}
+						stored, ok := store.Descriptor(slot)
+						if !ok || stored.Generation != expected[j].Generation || stored.Path != expected[j].Path {
+							return false
+						}
+					}
+					return true
+				}
+				if !resetStillCurrent() {
+					fyne.Do(func() {
+						progressDialog.Hide()
+						dialog.ShowInformation("Reset", "Channels changed before reset started.", win)
+					})
+					return
+				}
+				descs, previews, hdus, primaries, err := stageComposeLargeReset(context.Background(), store, selected, expected)
+				if err != nil {
+					fyne.Do(func() {
+						progressDialog.Hide()
+						dialog.ShowError(err, win)
+					})
+					return
+				}
+				fyne.Do(func() {
+					progressDialog.Hide()
+					// Revalidate image identity and artifact generations under the
+					// short publish lock immediately before mutating live state.
+					largeMu.Lock()
+					publishCurrent := largeStore == store && largeSessionGeneration == session
+					for j, idx := range indices {
+						slot := fmt.Sprintf("channel-%d", idx)
+						current, ok := largeArtifacts[idx]
+						stored, storedOK := store.Descriptor(slot)
+						if !publishCurrent || imgs[idx] != identities[j] || largeLoadGenerations[slot] != requests[idx] || !ok || current.Generation != expected[j].Generation || current.Path != expected[j].Path || !storedOK || stored.Generation != descs[j].Generation || stored.Path != descs[j].Path {
+							publishCurrent = false
+							break
+						}
+					}
+					if !publishCurrent {
+						largeMu.Unlock()
+						for _, d := range descs {
+							_, _ = store.RemoveSlotIfCurrent(d)
+						}
+						dialog.ShowInformation("Reset", "Channels changed while reset was running.", win)
+						return
+					}
+					for j, idx := range indices {
+						imgs[idx].HDU, imgs[idx].Primary = hdus[j], primaries[j]
+						imgs[idx].HDU.Data.Width, imgs[idx].HDU.Data.Height = descs[j].Width, descs[j].Height
+						imgs[idx].HDU.Data.Pixels = nil
+						largeArtifacts[idx], largePreviews[idx] = descs[j], previews[j]
+					}
+					largeMu.Unlock()
+					invalidateCalibration()
+					refresh()
+					restoreViewportStates(savedStates)
+					dialog.ShowInformation("Reset Complete", "Channels restored from disk.", win)
+				})
+			}()
+			return
+		}
 		loaded := false
 		errors := make([]string, 0, 3)
 
@@ -2902,15 +3057,15 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					// Channel 2 is the alignment root.  Do not commit either
 					// fitted result if the reference artifact was replaced while
 					// catalogs were being extracted.
-					refCurrent, refOK := largeStore.Descriptor("channel-1")
 					refExpected := descs[1]
+					refCurrent, refOK := largeStore.Descriptor(refExpected.Slot)
 					if !refOK || !composeLargeAlignmentReferenceCurrent(refCurrent, refExpected) {
 						return
 					}
 					for _, idx := range []int{0, 2} {
 						res := alignment.Channels[idx+1]
-						cur, current := largeStore.Descriptor(fmt.Sprintf("channel-%d", idx))
 						expected := descs[idx]
+						cur, current := largeStore.Descriptor(expected.Slot)
 						if !current || cur.Generation != expected.Generation || cur.Path != expected.Path || !res.Applicable {
 							continue
 						}
@@ -4460,7 +4615,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			dialog.ShowInformation("Nothing to send", "Compose all three channels first.", win)
 			return
 		}
-		globalExportToEdit(editImageHandoff{memory: img})
+		if err := globalExportToEdit(editImageHandoff{memory: img}); err != nil {
+			dialog.ShowError(err, win)
+		}
 	}
 
 	clearChannels := func() {
@@ -4470,7 +4627,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			}
 			oldSources := composeBlinkSources()
 			for i := 0; i < 3; i++ {
-				imgs[i] = nil
 				if largeMode && largeStore != nil {
 					invalidateLargeSlot(i)
 					largeMu.Lock()
@@ -4478,10 +4634,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					d := largeArtifacts[i]
 					delete(largeArtifacts, i)
 					delete(largePreviews, i)
+					imgs[i] = nil
 					largeMu.Unlock()
 					if d.Slot != "" && store != nil {
 						_, _ = store.RemoveSlotIfCurrent(d)
 					}
+				} else {
+					imgs[i] = nil
 				}
 				clearComposeOrigPixels(&origPixels, i)
 				viewports[i].image.Image = blankImg()
@@ -4519,7 +4678,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			}
 			blinkCheck.SetChecked(false)
 			for i := range imgs {
-				imgs[i] = nil
 				if largeMode && largeStore != nil {
 					invalidateLargeSlot(i)
 					largeMu.Lock()
@@ -4527,10 +4685,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					d := largeArtifacts[i]
 					delete(largeArtifacts, i)
 					delete(largePreviews, i)
+					imgs[i] = nil
 					largeMu.Unlock()
 					if d.Slot != "" && store != nil {
 						_, _ = store.RemoveSlotIfCurrent(d)
 					}
+				} else {
+					imgs[i] = nil
 				}
 				clearComposeOrigPixels(&origPixels, i)
 			}
@@ -5462,7 +5623,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						_, _ = store.RemoveSlotIfCurrent(d)
 						return
 					}
+					largeMu.Lock()
 					replaceComposeChannelImage(imgs, channelIdx, &incoming)
+					largeMu.Unlock()
 					clearComposeOrigPixels(&origPixels, channelIdx)
 					applyChannelState(channelIdx, channelStateFromImage(&incoming), imgs, viewports, controlSets)
 					invalidateCalibration()
@@ -5510,31 +5673,43 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	magicAll = widget.NewButton("Magic", func() {
 		if composeLargeModeActive != nil && composeLargeModeActive() {
 			preset := processing.ParseMagicPreset(composeMagicPreset.Selected)
+			type target struct {
+				idx      int
+				identity *models.LoadedImage
+				image    models.LoadedImage
+				d        composeArtifactDescriptor
+			}
+			largeRuntime.mu.RLock()
+			targets := make([]target, 0, len(imgs))
+			for i, img := range imgs {
+				if img == nil {
+					continue
+				}
+				d, ok := largeRuntime.artifacts[i]
+				if !ok {
+					continue
+				}
+				targets = append(targets, target{idx: i, identity: img, image: snapshotLargeLoadedImage(img), d: d})
+			}
+			largeRuntime.mu.RUnlock()
 			go func() {
 				largeRuntime.jobMu.Lock()
 				defer largeRuntime.jobMu.Unlock()
 				type result struct {
-					idx     int
-					img     models.LoadedImage
-					preview *image.RGBA
-					d       composeArtifactDescriptor
+					idx      int
+					identity *models.LoadedImage
+					img      models.LoadedImage
+					preview  *image.RGBA
+					d        composeArtifactDescriptor
 				}
-				results := make([]result, 0, 3)
-				for i, img := range imgs {
-					if img == nil {
-						continue
-					}
-					largeRuntime.mu.RLock()
-					d, ok := largeRuntime.artifacts[i]
-					largeRuntime.mu.RUnlock()
-					if !ok {
-						continue
-					}
+				results := make([]result, 0, len(targets))
+				for _, target := range targets {
+					d := target.d
 					lease, err := fitsio.MaterializeFloat32ArtifactLease(d.Path)
 					if err != nil {
 						return
 					}
-					clone := *img
+					clone := target.image
 					clone.HDU.Data.Pixels = lease.Pixels
 					processing.ApplyMagicLevels(&clone, preset)
 					processing.AutoMTFMidtone(&clone)
@@ -5543,26 +5718,39 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					if err != nil {
 						return
 					}
-					results = append(results, result{i, clone, preview, d})
+					results = append(results, result{target.idx, target.identity, clone, preview, d})
 				}
 				fyne.Do(func() {
+					largeRuntime.mu.Lock()
 					for _, r := range results {
-						largeRuntime.mu.RLock()
 						cur, ok := largeRuntime.artifacts[r.idx]
-						largeRuntime.mu.RUnlock()
-						if !ok || cur.Generation != r.d.Generation || cur.Path != r.d.Path {
+						var storeCur composeArtifactDescriptor
+						storeOK := largeRuntime.store != nil
+						if storeOK {
+							storeCur, storeOK = largeRuntime.store.Descriptor(r.d.Slot)
+						}
+						identityOK := r.idx < len(imgs) && imgs[r.idx] == r.identity
+						if !ok || !storeOK || !identityOK || cur.Generation != r.d.Generation || cur.Path != r.d.Path || storeCur.Generation != r.d.Generation || storeCur.Path != r.d.Path {
+							largeRuntime.mu.Unlock()
 							return
 						}
 					}
+					type syncItem struct {
+						fn  func(*models.LoadedImage)
+						img *models.LoadedImage
+					}
+					syncFns := make([]syncItem, 0, len(results))
 					for _, r := range results {
 						r.img.HDU.Data.Pixels = nil
 						imgs[r.idx] = &r.img
-						largeRuntime.mu.Lock()
 						largeRuntime.previews[r.idx] = r.preview
-						largeRuntime.mu.Unlock()
 						if syncFn := largeRuntime.syncWidgets[r.idx]; syncFn != nil {
-							syncFn(imgs[r.idx])
+							syncFns = append(syncFns, syncItem{fn: syncFn, img: imgs[r.idx]})
 						}
+					}
+					largeRuntime.mu.Unlock()
+					for _, item := range syncFns {
+						item.fn(item.img)
 					}
 					refresh()
 				})
@@ -5861,6 +6049,137 @@ func loadLargeComposeImage(path string, store *composeLargeStore, slot string) (
 	return img, preview, d, nil
 }
 
+// stageComposeLargeReset restores source pixels while retaining the current
+// stretch/alignment state. Every source and preview is prepared before the
+// store publishes any replacement.
+func stageComposeLargeReset(ctx context.Context, store *composeLargeStore, imgs []*models.LoadedImage, expected []composeArtifactDescriptor) ([]composeArtifactDescriptor, []*image.RGBA, []fitsio.HDU, []fitsio.Header, error) {
+	if len(expected) != len(imgs) {
+		return nil, nil, nil, nil, errors.New("reset channel count mismatch")
+	}
+	sizes := make([][2]int, len(imgs))
+	hdus := make([]fitsio.HDU, len(imgs))
+	primaries := make([]fitsio.Header, len(imgs))
+	writes := make([]func(*fitsio.Float32Artifact) error, len(imgs))
+	for i, img := range imgs {
+		if img == nil {
+			return nil, nil, nil, nil, fmt.Errorf("missing channel %d", i+1)
+		}
+		name := img.HDU.ExtName
+		extver := fitsio.HeaderString(img.HDU.Header, "EXTVER")
+		primary, hdu, err := fitsio.InspectSelectedHDU(img.Path, name, extver)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		turns := ((img.Rotation90 % 4) + 4) % 4
+		w, h := hdu.Data.Width, hdu.Data.Height
+		if turns%2 != 0 {
+			w, h = h, w
+		}
+		sizes[i] = [2]int{w, h}
+		hdus[i], primaries[i] = hdu, primary
+		slot := expected[i].Slot
+		writes[i] = func(out *fitsio.Float32Artifact) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			raw := filepath.Join(store.root, fmt.Sprintf("%s-reset-source.tmp", slot))
+			defer os.Remove(raw)
+			if err := fitsio.CopySelectedHDUToRawFloat32Artifact(img.Path, name, extver, raw); err != nil {
+				return err
+			}
+			src, err := fitsio.OpenFloat32ArtifactReadOnly(raw)
+			if err != nil {
+				return err
+			}
+			defer src.Close()
+			current := src
+			var intermediates []*fitsio.Float32Artifact
+			var intermediatePaths []string
+			defer func() {
+				for _, a := range intermediates {
+					_ = a.Close()
+				}
+				for _, p := range intermediatePaths {
+					_ = os.Remove(p)
+				}
+			}()
+			for turn := 0; turn < turns; turn++ {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				last := turn == turns-1
+				if last {
+					row := make([]float32, current.Height)
+					for y := 0; y < current.Width; y++ {
+						if err := current.ReadRowRotatedCW(y, row); err != nil {
+							return err
+						}
+						if err := out.WriteRow(y, row); err != nil {
+							return err
+						}
+					}
+					continue
+				}
+				p := filepath.Join(store.root, fmt.Sprintf("%s-reset-turn-%d.tmp", slot, turn))
+				_ = os.Remove(p)
+				intermediatePaths = append(intermediatePaths, p)
+				next, err := fitsio.CreateFloat32Artifact(p, current.Height, current.Width)
+				if err != nil {
+					return err
+				}
+				intermediates = append(intermediates, next)
+				row := make([]float32, current.Height)
+				for y := 0; y < current.Width; y++ {
+					if err := current.ReadRowRotatedCW(y, row); err != nil {
+						return err
+					}
+					if err := next.WriteRow(y, row); err != nil {
+						return err
+					}
+				}
+				if err := next.Sync(); err != nil {
+					return err
+				}
+				current = next
+			}
+			if turns == 0 {
+				row := make([]float32, current.Width)
+				for y := 0; y < current.Height; y++ {
+					if err := current.ReadRow(y, row); err != nil {
+						return err
+					}
+					if err := out.WriteRow(y, row); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+	}
+	var previews []*image.RGBA
+	descs, err := store.ReplaceManyIfCurrentSized(expected, sizes, writes, func(staged []composeArtifactDescriptor) error {
+		previews = make([]*image.RGBA, len(staged))
+		for i, d := range staged {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			clone := *imgs[i]
+			clone.HDU.Data.Width, clone.HDU.Data.Height = d.Width, d.Height
+			clone.HDU.Data.Pixels = nil
+			var e error
+			previews[i], _, _, e = composeLargeStretchedPreview(d.Path, &clone)
+			if e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return descs, previews, hdus, primaries, nil
+}
+
 func channelStateFromImage(img *models.LoadedImage) models.ChannelState {
 	return models.ChannelState{
 		Path:       img.Path,
@@ -5960,6 +6279,33 @@ func (s *tapShield) CreateRenderer() fyne.WidgetRenderer {
 type magicStretchSnapshot struct {
 	Background, Peak, Black, White, MTFMidtone float64
 	Mode                                       stretch.Mode
+}
+
+// snapshotLargeLoadedImage copies the small, immutable channel state needed by
+// a background large-file job. Pixel buffers are deliberately detached because
+// the artifact is materialized separately by the worker.
+func snapshotLargeLoadedImage(img *models.LoadedImage) models.LoadedImage {
+	if img == nil {
+		return models.LoadedImage{}
+	}
+	snapshot := *img
+	snapshot.HDU = img.HDU
+	snapshot.HDU.Header.Cards = cloneHeaderCards(img.HDU.Header.Cards)
+	snapshot.HDU.Data.Pixels = nil
+	snapshot.HDU.Data.Int32Pixels = nil
+	snapshot.Primary.Cards = cloneHeaderCards(img.Primary.Cards)
+	return snapshot
+}
+
+func cloneHeaderCards(cards map[string]string) map[string]string {
+	if cards == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(cards))
+	for key, value := range cards {
+		clone[key] = value
+	}
+	return clone
 }
 
 func snapshotMagicStretch(img *models.LoadedImage) magicStretchSnapshot {
@@ -6243,6 +6589,17 @@ func largeArtifactStars(path string) ([]processing.Star, error) {
 func largeRotateChannel(rt *largeChannelRuntime, idx int, imgs []*models.LoadedImage, refresh func(), onCommit func()) {
 	rt.mu.RLock()
 	d, ok := rt.artifacts[idx]
+	var previewImg models.LoadedImage
+	if idx >= 0 && idx < len(imgs) && imgs[idx] != nil {
+		previewImg = *imgs[idx]
+		previewImg.HDU = imgs[idx].HDU
+		previewImg.HDU.Header.Cards = make(map[string]string, len(imgs[idx].HDU.Header.Cards))
+		for key, value := range imgs[idx].HDU.Header.Cards {
+			previewImg.HDU.Header.Cards[key] = value
+		}
+		previewImg.HDU.Data.Pixels = nil
+		previewImg.HDU.Data.Int32Pixels = nil
+	}
 	rt.mu.RUnlock()
 	if !ok || rt.store == nil {
 		return
@@ -6281,7 +6638,8 @@ func largeRotateChannel(rt *largeChannelRuntime, idx int, imgs []*models.LoadedI
 		})
 		src.Close()
 		if err == nil {
-			preview, _, _, pErr := composeLargeStretchedPreview(nd.Path, imgs[idx])
+			previewImg.HDU.Data.Width, previewImg.HDU.Data.Height = h, w
+			preview, _, _, pErr := composeLargeStretchedPreview(nd.Path, &previewImg)
 			err = pErr
 			if err == nil {
 				rt.mu.Lock()
@@ -6317,11 +6675,19 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		disk = large[0]
 	}
 	largeJob := func(op string, mutate func(*models.LoadedImage) error) {
-		if disk == nil || disk.store == nil || !composeLargeModeActive() || idx < 0 || idx >= len(imgs) || imgs[idx] == nil {
+		if disk == nil || disk.store == nil || !composeLargeModeActive() || idx < 0 || idx >= len(imgs) {
 			return
 		}
 		disk.mu.RLock()
 		d, ok := disk.artifacts[idx]
+		identity := (*models.LoadedImage)(nil)
+		var snapshot models.LoadedImage
+		if ok && idx < len(imgs) && imgs[idx] != nil {
+			identity = imgs[idx]
+			snapshot = snapshotLargeLoadedImage(identity)
+		} else {
+			ok = false
+		}
 		disk.mu.RUnlock()
 		if !ok {
 			return
@@ -6334,7 +6700,7 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 			defer disk.jobMu.Unlock()
 			lease, err := fitsio.MaterializeFloat32ArtifactLease(d.Path)
 			if err == nil {
-				img := *imgs[idx]
+				img := snapshot
 				img.HDU.Data.Pixels = lease.Pixels
 				err = mutate(&img)
 				lease.Release()
@@ -6344,7 +6710,8 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 					if err == nil {
 						disk.mu.Lock()
 						cur, current := disk.artifacts[idx]
-						if current && cur.Generation == d.Generation && cur.Path == d.Path {
+						storeCur, storeCurrent := disk.store.Descriptor(d.Slot)
+						if current && storeCurrent && imgs[idx] == identity && cur.Generation == d.Generation && cur.Path == d.Path && storeCur.Generation == d.Generation && storeCur.Path == d.Path {
 							*imgs[idx] = img
 							imgs[idx].HDU.Data.Pixels = nil
 							disk.previews[idx] = preview

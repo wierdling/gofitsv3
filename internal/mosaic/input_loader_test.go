@@ -425,6 +425,27 @@ func TestDQEdgeNoDataMaskMarksHeavilyFlaggedRowsAndColumns(t *testing.T) {
 	}
 }
 
+func TestAuxMatchingRequiresSCIEXTVERUnlessSCIUnversioned(t *testing.T) {
+	sci := fitsio.HDU{ExtName: "SCI", Header: fitsio.Header{Cards: map[string]string{"EXTVER": "2"}}, Data: fitsio.ImageData{Width: 2, Height: 2}}
+	dqWrong := fitsio.HDU{ExtName: "DQ", Header: fitsio.Header{Cards: map[string]string{"EXTVER": "1"}}, Data: fitsio.ImageData{Width: 2, Height: 2}}
+	file := &fitsio.File{HDUs: []fitsio.HDU{dqWrong}}
+	if got := matchingDQHDU(file, sci); got != nil {
+		t.Fatal("matched DQ with wrong EXTVER")
+	}
+	sci.Header.Cards = map[string]string{}
+	if got := matchingDQHDU(file, sci); got == nil {
+		t.Fatal("unversioned SCI did not use size fallback")
+	}
+	err := fitsio.HDU{ExtName: "ERR", Header: fitsio.Header{Cards: map[string]string{"EXTVER": "1"}}, Data: fitsio.ImageData{Pixels: []float32{1}}}
+	file.HDUs = []fitsio.HDU{err}
+	if got := loadERRPixels(file, 2); got != nil {
+		t.Fatal("versioned SCI used unversioned ERR fallback")
+	}
+	if got := loadERRPixels(file, 2, true); len(got) != 1 {
+		t.Fatal("unversioned SCI did not use ERR fallback")
+	}
+}
+
 func writeSyntheticDQMEF(t *testing.T, name string, primaryCards map[string]string, sciPixels, dqPixels []float32) string {
 	t.Helper()
 	if len(sciPixels) != len(dqPixels) {

@@ -69,7 +69,11 @@ func ProjectAuthoringMaskToDetector(input, reference Input, geom MaskOutputGeome
 	}
 	width := input.HDU.Data.Width
 	height := input.HDU.Data.Height
-	out := make([]bool, width*height)
+	n, err := checkedPixelCount(width, height)
+	if err != nil {
+		return nil, fmt.Errorf("detector output %w", err)
+	}
+	out := make([]bool, n)
 	radius := options.ConservativeRadius
 	if radius == 0 {
 		radius = 0.5
@@ -158,7 +162,11 @@ func RasterizePolygonMask(width, height int, points []MaskPoint) ([]bool, error)
 }
 
 func RasterizeThresholdMask(pixels []float32, width, height int, x0, y0, x1, y1 int, minValue, maxValue float32) ([]bool, error) {
-	if len(pixels) != width*height {
+	n, err := checkedPixelCount(width, height)
+	if err != nil {
+		return nil, fmt.Errorf("threshold %w", err)
+	}
+	if len(pixels) != n {
 		return nil, fmt.Errorf("threshold pixels len=%d vs dimensions %dx%d", len(pixels), width, height)
 	}
 	mask, err := NewZeroArtifactMask(width, height)
@@ -232,7 +240,11 @@ func validateAuthoringMask(mask []bool, width, height int) error {
 	if width <= 0 || height <= 0 {
 		return fmt.Errorf("authoring mask dimensions must be positive: %dx%d", width, height)
 	}
-	if len(mask) != width*height {
+	n, err := checkedPixelCount(width, height)
+	if err != nil {
+		return fmt.Errorf("authoring mask %w", err)
+	}
+	if len(mask) != n {
 		return fmt.Errorf("authoring mask dimension mismatch: mask len=%d vs grid %dx%d", len(mask), width, height)
 	}
 	return nil

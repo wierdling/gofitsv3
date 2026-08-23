@@ -326,6 +326,9 @@ type Options struct {
 	// their FITS file via LoadInputsFromPath. Inputs that already carry pixels are
 	// used directly regardless of this field.
 	FrameLoader func(in Input) (sci []float32, errPix []float32, err error)
+	// FrameLoaderCtx is the cancellation-aware variant of FrameLoader. When set,
+	// it is preferred for streamed loads and receives Options.Ctx directly.
+	FrameLoaderCtx func(ctx context.Context, in Input) (sci []float32, errPix []float32, err error)
 }
 
 // ErrCancelled is returned by Build (or AlignInputsByStarsWithMode) when its
@@ -731,6 +734,9 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		dropSize := inputDropSize(planned[i], options.Scale, options.PixFrac)
 		drizzlePlannedInput(planned[i], sums, weights, width, height, minX, minY,
 			options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY)
+		if err := options.cancelled(); err != nil {
+			return nil, err
+		}
 		debuglog.Log(fmt.Sprintf("Build: frame %d done", finalSlot))
 
 		if options.DebugOutputDir != "" {
@@ -738,6 +744,9 @@ func Build(inputs []Input, options Options) (*Result, error) {
 			dbgWeights := make([]float32, width*height)
 			drizzlePlannedInput(planned[i], dbgSums, dbgWeights, width, height, minX, minY,
 				options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY)
+			if err := options.cancelled(); err != nil {
+				return nil, err
+			}
 			normalizeAccumulatedImage(dbgSums, dbgWeights)
 
 			safeName := strings.ReplaceAll(InputLabel(planned[i].input), "[", "_")
@@ -763,7 +772,13 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 	}
 
+	if err := options.cancelled(); err != nil {
+		return nil, err
+	}
 	options.reportProgress("Finalizing", len(dataPlanned), len(dataPlanned))
+	if err := options.cancelled(); err != nil {
+		return nil, err
+	}
 	debuglog.Log("Build: normalizing accumulated image")
 	normalizeAccumulatedImage(sums, weights)
 	logMemStats("finalized")
@@ -1657,6 +1672,20 @@ func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]S
 // linear WCS when needed.  The returned ManualTransform for every aligned image
 // is always expressed in inputs[0] pixel space.
 func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.Star, numRefs int, mode AlignmentMode, searchRadiusArcsec float64) ([]StarAlignmentResult, error) {
+	return AlignInputsBySelectedStarsWithModeCtx(context.Background(), inputs, refStars, numRefs, mode, searchRadiusArcsec)
+}
+
+// AlignInputsBySelectedStarsWithModeCtx is the cancellable selected-star
+// alignment entry point. Cancellation is checked between catalog extraction,
+// reference setup, and each target/reference fit so a superseded UI job cannot
+// continue expensive work or publish stale results.
+func AlignInputsBySelectedStarsWithModeCtx(ctx context.Context, inputs []Input, refStars []processing.Star, numRefs int, mode AlignmentMode, searchRadiusArcsec float64) ([]StarAlignmentResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: starting files=[%s]", alignmentInputFiles(inputs)))
 	defer debuglog.Log("AlignInputsBySelectedStarsWithMode: finished")
 	if len(inputs) == 0 {
@@ -1681,6 +1710,9 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 
 	results := make([]StarAlignmentResult, len(inputs))
 	for i := range inputs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if inputs[i].Excluded {
 			results[i] = StarAlignmentResult{
 				OffsetX:            inputs[i].OffsetX,
@@ -1693,6 +1725,9 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 		}
 	}
 	for r := 0; r < numRefs; r++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if inputs[r].Excluded {
 			continue
 		}
@@ -1721,6 +1756,9 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 	refs := make([]refEntry, numRefs)
 	refs[0] = refEntry{input: inputs[0], stars: refStars, hasWCS: true}
 	for r := 1; r < numRefs; r++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if inputs[r].Excluded {
 			refs[r] = refEntry{input: inputs[r]}
 			continue
@@ -1749,10 +1787,16 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 	// dataset is never resident at once. The reference catalogs come from the
 	// user-picked refStars (and their WCS projections), so only the non-reference
 	// targets are extracted here.
-	catalogs := extractStarCatalogsForAlignment(inputs, processing.TweakRegCatalogMaxStars)
+	catalogs, err := extractStarCatalogsForAlignmentCtx(ctx, inputs, processing.TweakRegCatalogMaxStars)
+	if err != nil {
+		return nil, err
+	}
 
 	// Align closest images first so results are more stable across runs.
 	for _, i := range sortedByDistFromRef(inputs) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if i < numRefs || inputs[i].Excluded {
 			continue
 		}
@@ -1761,6 +1805,9 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 		aligned := false
 
 		for r := 0; r < numRefs && !aligned; r++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			ref := refs[r]
 			if !ref.hasWCS {
 				continue

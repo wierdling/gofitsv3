@@ -25,10 +25,11 @@ type RasterMaskOperation struct {
 }
 
 func NewZeroArtifactMask(width, height int) ([]bool, error) {
-	if width <= 0 || height <= 0 {
-		return nil, fmt.Errorf("artifact mask dimensions must be positive: %dx%d", width, height)
+	n, err := checkedPixelCount(width, height)
+	if err != nil {
+		return nil, fmt.Errorf("artifact mask %w", err)
 	}
-	return make([]bool, width*height), nil
+	return make([]bool, n), nil
 }
 
 func ApplyRasterMaskOperations(width, height int, ops []RasterMaskOperation) ([]bool, error) {
@@ -37,7 +38,11 @@ func ApplyRasterMaskOperations(width, height int, ops []RasterMaskOperation) ([]
 		return nil, err
 	}
 	for i, op := range ops {
-		if op.Width != width || op.Height != height || len(op.Pixels) != width*height {
+		n, err := checkedPixelCount(width, height)
+		if err != nil {
+			return nil, fmt.Errorf("mask operation %d: %w", i, err)
+		}
+		if op.Width != width || op.Height != height || len(op.Pixels) != n {
 			return nil, fmt.Errorf("mask operation %d dimensions mismatch: operation %dx%d len=%d target %dx%d", i, op.Width, op.Height, len(op.Pixels), width, height)
 		}
 		switch op.Mode {
@@ -274,13 +279,24 @@ func ExportRowDestripeMaskAtomic(input Input, dir string, mask []bool, overwrite
 }
 
 func validateArtifactMaskDimensions(mask []bool, width, height int) error {
-	if width <= 0 || height <= 0 {
-		return fmt.Errorf("artifact mask dimensions must be positive: %dx%d", width, height)
+	n, err := checkedPixelCount(width, height)
+	if err != nil {
+		return fmt.Errorf("artifact mask %w", err)
 	}
-	if len(mask) != width*height {
+	if len(mask) != n {
 		return fmt.Errorf("artifact mask dimension mismatch: mask len=%d vs target %dx%d", len(mask), width, height)
 	}
 	return nil
+}
+
+func checkedPixelCount(width, height int) (int, error) {
+	if width <= 0 || height <= 0 {
+		return 0, fmt.Errorf("dimensions must be positive: %dx%d", width, height)
+	}
+	if width > int(^uint(0)>>1)/height {
+		return 0, fmt.Errorf("dimensions overflow: %dx%d", width, height)
+	}
+	return width * height, nil
 }
 
 func replaceFileAtomically(tempPath, path string, overwrite bool) error {

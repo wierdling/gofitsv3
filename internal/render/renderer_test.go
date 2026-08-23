@@ -1,6 +1,7 @@
 package render
 
 import (
+	"math"
 	"testing"
 
 	"gofitsv3/internal/stretch"
@@ -85,5 +86,29 @@ func TestToByteClampsInput(t *testing.T) {
 		if got := toByte(tt.input); got != tt.want {
 			t.Fatalf("toByte(%v) = %d, want %d", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestComposeRGBRejectsInvalidDimensions(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		width, height int
+	}{
+		{name: "negative width", width: -1, height: 1},
+		{name: "zero height", width: 1, height: 0},
+		{name: "multiply overflow", width: int(^uint(0) >> 1), height: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ComposeRGB(nil, nil, nil, tc.width, tc.height, stretch.Linear, stretch.Linear, stretch.Linear); got != nil {
+				t.Fatalf("ComposeRGB returned %d bytes for invalid dimensions", len(got))
+			}
+		})
+	}
+}
+
+func TestComposeRGBMapsNaNToBlack(t *testing.T) {
+	buf := ComposeRGB([]float32{float32(math.NaN())}, nil, nil, 1, 1, stretch.Linear, stretch.Linear, stretch.Linear)
+	if got := buf[:4]; got[0] != 0 || got[1] != 0 || got[2] != 0 || got[3] != 255 {
+		t.Fatalf("NaN pixel = %v, want black opaque", got)
 	}
 }

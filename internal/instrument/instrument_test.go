@@ -26,6 +26,31 @@ func TestFromHeaderRecognizesMIRIImager(t *testing.T) {
 	}
 }
 
+func TestScalePresetsAreAscending(t *testing.T) {
+	presets := ScalePresets()
+	if len(presets) == 0 {
+		t.Fatal("ScalePresets returned no presets")
+	}
+	for i := 1; i < len(presets); i++ {
+		if presets[i].PixelScale < presets[i-1].PixelScale {
+			t.Fatalf("presets not ascending at %d: %#v then %#v", i, presets[i-1], presets[i])
+		}
+	}
+}
+
+func TestFromHeaderUnknownFallsBackToDefault(t *testing.T) {
+	info, ok := FromHeader(fitsio.Header{Cards: map[string]string{"INSTRUME": "'unknown'", "DETECTOR": "'mystery'"}})
+	if ok || info != Default {
+		t.Fatalf("unknown header = %#v, ok=%t; want Default,false", info, ok)
+	}
+}
+
+func TestFromHeaderNormalizesWhitespaceAndCase(t *testing.T) {
+	if _, ok := FromHeader(fitsio.Header{Cards: map[string]string{"INSTRUME": "' miri '", "DETECTOR": "'mirimage'"}}); !ok {
+		t.Fatal("normalized MIRI header was not recognized")
+	}
+}
+
 func TestFromHeaderRecognizesNIRCam(t *testing.T) {
 	cases := []struct {
 		detector  string

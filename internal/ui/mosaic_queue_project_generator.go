@@ -3,7 +3,6 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -97,16 +96,7 @@ func writeGeneratedMosaicProject(path string, project models.MosaicProject) erro
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return err
-	}
-	return f.Close()
+	return writeProjectJSON(path, data, false)
 }
 
 func (q *drizzleQueueWindow) addGeneratedProject(path string, project models.MosaicProject, runAlign bool) bool {

@@ -54,7 +54,7 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 			BUnit:         loadBUnit(hdu.Header, primary),
 			D2IX:          d2iX,
 			D2IY:          d2iY,
-			ERRPixels:     loadERRPixels(file, extver),
+			ERRPixels:     loadERRPixels(file, extver, fitsio.HeaderString(hdu.Header, "EXTVER") == ""),
 		})
 	}
 	return inputs, nil
@@ -189,7 +189,7 @@ func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w,
 	}
 	hdu := cleanSCIWithMatchingDQ(target, file, inst)
 	if needAux {
-		errPix = loadERRPixels(file, in.SCIExt)
+		errPix = loadERRPixels(file, in.SCIExt, fitsio.HeaderString(target.Header, "EXTVER") == "")
 	}
 	return hdu.Data.Pixels, errPix, whtPix, hdu.Data.Width, hdu.Data.Height, nil
 }
@@ -280,10 +280,11 @@ func loadDateObs(headers ...fitsio.Header) string {
 	return ""
 }
 
-func loadERRPixels(file *fitsio.File, sciExtver int) []float32 {
+func loadERRPixels(file *fitsio.File, sciExtver int, unversioned ...bool) []float32 {
+	sciUnversioned := len(unversioned) > 0 && unversioned[0]
 	extver := fmt.Sprintf("%d", sciExtver)
 	hdu := file.GetHDUByExtVer("ERR", extver)
-	if hdu == nil {
+	if hdu == nil && sciUnversioned {
 		hdu = file.GetHDU("ERR")
 	}
 	if hdu == nil || len(hdu.Data.Pixels) == 0 {
@@ -414,7 +415,7 @@ func matchingDQHDU(file *fitsio.File, sci fitsio.HDU) *fitsio.HDU {
 				return hdu
 			}
 		}
-		if sizeMatch == nil && hdu.Data.Width == sci.Data.Width && hdu.Data.Height == sci.Data.Height {
+		if sciExtver == "" && sizeMatch == nil && hdu.Data.Width == sci.Data.Width && hdu.Data.Height == sci.Data.Height {
 			sizeMatch = hdu
 		}
 	}

@@ -265,6 +265,15 @@ type ColorCalibrationState struct {
 
 func (s ColorCalibrationState) MarshalJSON() ([]byte, error) {
 	type alias ColorCalibrationState
+	validateForMarshal := s.Status == CalibrationValid
+	for _, overlay := range s.Overlays {
+		validateForMarshal = validateForMarshal || overlay.Status == CalibrationValid
+	}
+	if validateForMarshal {
+		if err := s.Validate(); err != nil {
+			return nil, err
+		}
+	}
 	allZero := true
 	for _, t := range s.BaseTransforms {
 		if t.Offset != 0 || t.Gain != 0 {

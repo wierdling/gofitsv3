@@ -19,6 +19,7 @@ func TestParseInstrumentPhotometrySupportedCases(t *testing.T) {
 		{"hst count rate flambda", "HST", "ACS", "WFC", "F606W", "ELECTRONS/S", ReferenceFlambda, InputCountRate, 1.5e-19},
 		{"hst counts fnu", "HST", "WFC3", "IR", "F160W", "COUNTS", ReferenceFnu, InputCounts, 1e-19 * 1.6e4 * 1.6e4 / speedOfLightAngstrom * 1e23 / 10},
 		{"jwst mJy sr", "JWST", "NIRCAM", "NRCA1", "F200W", "MJy/sr", ReferenceFnu, InputSurfaceBrightness, 5e5},
+		{"jwst lowercase mJy", "JWST", "NIRCAM", "NRCA1", "F200W", "mJy", ReferenceFnu, InputFnu, 1e-3},
 		{"calibrated fnu", "JWST", "MIRI", "MIRIMAGE", "F770W", "Jy", ReferenceFlambda, InputFnu, speedOfLightAngstrom / (7700 * 7700) * 1e-23},
 	}
 	for _, tc := range tests {

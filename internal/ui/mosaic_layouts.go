@@ -65,7 +65,15 @@ type sidePaddedLayout struct{ pad float32 }
 func (l *sidePaddedLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
 	for _, o := range objects {
 		o.Move(fyne.NewPos(l.pad, 0))
-		o.Resize(fyne.NewSize(size.Width-2*l.pad, size.Height))
+		w := size.Width - 2*l.pad
+		if w < 0 {
+			w = 0
+		}
+		h := size.Height
+		if h < 0 {
+			h = 0
+		}
+		o.Resize(fyne.NewSize(w, h))
 	}
 }
 

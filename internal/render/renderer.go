@@ -1,9 +1,19 @@
 package render
 
-import "gofitsv3/internal/stretch"
+import (
+	"math"
+
+	"gofitsv3/internal/stretch"
+)
 
 func ComposeRGB(r, g, b []float32, width, height int, modeR, modeG, modeB stretch.Mode) []byte {
+	if width <= 0 || height <= 0 || width > int(^uint(0)>>1)/height {
+		return nil
+	}
 	total := width * height
+	if total > int(^uint(0)>>1)/4 {
+		return nil
+	}
 	buf := make([]byte, total*4)
 	for i := 0; i < total; i++ {
 		pr := apply(r, i)
@@ -18,11 +28,11 @@ func ComposeRGB(r, g, b []float32, width, height int, modeR, modeG, modeB stretc
 }
 
 func apply(arr []float32, idx int) float32 {
-	if idx >= len(arr) {
+	if idx < 0 || idx >= len(arr) {
 		return 0
 	}
 	v := arr[idx]
-	if v < 0 {
+	if math.IsNaN(float64(v)) || v < 0 {
 		return 0
 	}
 	if v > 1 {

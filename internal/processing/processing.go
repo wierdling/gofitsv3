@@ -241,7 +241,7 @@ func ApplyStretchParallel(img *models.LoadedImage) (fitsio.ImageData, []byte) {
 }
 
 func ComposeRGB(ctx context.Context, imgs []*models.LoadedImage) ([]byte, int, int, [3]histogram.Stats) {
-	if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+	if len(imgs) < 3 || imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
 		return nil, 0, 0, [3]histogram.Stats{}
 	}
 
@@ -356,7 +356,7 @@ func blendOverlayCtx(ctx context.Context, buf []byte, overlay, ref *models.Loade
 // the three loaded images, aligned and stretched to the green reference grid.
 // Channel order: r, g, b matching imgs[2], imgs[1], imgs[0].
 func ComposeRGBFloat32(imgs []*models.LoadedImage) (r, g, b []float32, width, height int) {
-	if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+	if len(imgs) < 3 || imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
 		return nil, nil, nil, 0, 0
 	}
 	ref := imgs[1]
@@ -828,6 +828,9 @@ func RotateImageData90CW(data fitsio.ImageData) fitsio.ImageData {
 }
 
 func ResizeChannel(pixels []float32, oldW, oldH, newW, newH int) []float32 {
+	if oldW <= 0 || oldH <= 0 || newW <= 0 || newH <= 0 || oldW > len(pixels)/oldH || newW > int(^uint(0)>>1)/newH {
+		return nil
+	}
 	out := make([]float32, newW*newH)
 	xRatio := float64(oldW) / float64(newW)
 	yRatio := float64(oldH) / float64(newH)
@@ -841,15 +844,23 @@ func ResizeChannel(pixels []float32, oldW, oldH, newW, newH int) []float32 {
 			yDiff := py - float64(yBase)
 			idx := yBase*oldW + xBase
 			if xBase >= oldW-1 || yBase >= oldH-1 {
-				out[y*newW+x] = pixels[idx]
+				if finite(float64(pixels[idx])) {
+					out[y*newW+x] = pixels[idx]
+				} else {
+					out[y*newW+x] = float32(math.NaN())
+				}
 				continue
 			}
 			a := float64(pixels[idx])
 			b := float64(pixels[idx+1])
 			c := float64(pixels[(yBase+1)*oldW+xBase])
 			d := float64(pixels[(yBase+1)*oldW+xBase+1])
-			if math.IsNaN(a) || math.IsNaN(b) || math.IsNaN(c) || math.IsNaN(d) {
-				out[y*newW+x] = float32(a)
+			if !finite(a) || !finite(b) || !finite(c) || !finite(d) {
+				if !finite(a) {
+					out[y*newW+x] = float32(math.NaN())
+				} else {
+					out[y*newW+x] = float32(a)
+				}
 				continue
 			}
 			out[y*newW+x] = float32(a*(1-xDiff)*(1-yDiff) + b*xDiff*(1-yDiff) + c*(1-xDiff)*yDiff + d*xDiff*yDiff)

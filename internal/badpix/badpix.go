@@ -10,12 +10,31 @@ func MaskFromDQ(sci fitsio.HDU, dq fitsio.HDU, badBits uint32) ([]bool, error) {
 	if sci.Data.Width != dq.Data.Width || sci.Data.Height != dq.Data.Height {
 		return nil, fmt.Errorf("dimension mismatch: sci %dx%d vs dq %dx%d", sci.Data.Width, sci.Data.Height, dq.Data.Width, dq.Data.Height)
 	}
-	total := len(sci.Data.Pixels)
+	if sci.Data.Width <= 0 || sci.Data.Height <= 0 {
+		return nil, fmt.Errorf("invalid image dimensions: %dx%d", sci.Data.Width, sci.Data.Height)
+	}
+	if sci.Data.Width > int(^uint(0)>>1)/sci.Data.Height {
+		return nil, fmt.Errorf("image dimensions overflow: %dx%d", sci.Data.Width, sci.Data.Height)
+	}
+	total := sci.Data.Width * sci.Data.Height
+	if len(sci.Data.Pixels) != total {
+		return nil, fmt.Errorf("malformed SCI pixel count %d, want %d", len(sci.Data.Pixels), total)
+	}
+	var dqValues []int32
+	if len(dq.Data.Int32Pixels) == total {
+		dqValues = dq.Data.Int32Pixels
+	} else if len(dq.Data.Pixels) == total {
+		dqValues = make([]int32, total)
+		for i, v := range dq.Data.Pixels {
+			dqValues[i] = int32(v)
+		}
+	} else {
+		return nil, fmt.Errorf("malformed DQ pixel count: int32=%d float=%d, want %d", len(dq.Data.Int32Pixels), len(dq.Data.Pixels), total)
+	}
 	mask := make([]bool, total)
 	useBits := badBits != 0
 	for i := 0; i < total; i++ {
-		v := dq.Data.Pixels[i]
-		bits := uint32(int64(v))
+		bits := uint32(dqValues[i])
 		if (!useBits && bits != 0) || (useBits && (bits&badBits) != 0) {
 			mask[i] = true
 		}

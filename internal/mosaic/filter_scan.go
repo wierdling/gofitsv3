@@ -349,6 +349,9 @@ func parseDateObs(raw string) string {
 	if len(date) != 10 || date[4] != '-' || date[7] != '-' {
 		return ""
 	}
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		return ""
+	}
 	return date
 }
 

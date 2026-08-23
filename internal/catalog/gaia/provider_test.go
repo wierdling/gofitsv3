@@ -21,6 +21,13 @@ func TestSourceAndSpectrumValidation(t *testing.T) {
 	}
 }
 
+func TestSourceValidationAcceptsNegativeFiniteMagnitudes(t *testing.T) {
+	s := Source{Release: "DR3", SourceID: 1, RA: 10, Dec: -2, ReferenceEpoch: 2016, PositionError: .1, ProperMotionErrorRA: .1, ProperMotionErrorDec: .1, G: -1, BP: -2, RP: -3, GError: .01, BPError: .02, RPError: .02}
+	if err := s.Validate("DR3"); err != nil {
+		t.Fatalf("negative finite magnitudes rejected: %v", err)
+	}
+}
+
 func TestNormalizeSourcesSortsAndRejectsDuplicates(t *testing.T) {
 	base := func(id uint64) Source {
 		return Source{Release: "DR3", SourceID: id, RA: 10, Dec: 1, ReferenceEpoch: 2016, PositionError: .1, ProperMotionErrorRA: .1, ProperMotionErrorDec: .1, G: 12, BP: 12, RP: 12, GError: .1, BPError: .1, RPError: .1}

@@ -156,6 +156,28 @@ func TestGlobalBundleAdjustReducesResidual(t *testing.T) {
 	}
 }
 
+func TestGlobalBundleAdjustShortFixedReturnsNoUpdates(t *testing.T) {
+	updates, ok := GlobalBundleAdjust([][]Star{{{X: 1, Y: 1}}, {{X: 1, Y: 1}}}, []bool{false}, func(a, b int) bool { return true }, "general", 10, 10, 1)
+	if ok || len(updates) != 2 {
+		t.Fatalf("got updates=%d ok=%v", len(updates), ok)
+	}
+	for i, u := range updates {
+		if u != IdentityTransform() {
+			t.Fatalf("update %d = %+v, want identity", i, u)
+		}
+	}
+}
+
+func TestCatalogMatchingExcludesNonFiniteStars(t *testing.T) {
+	bad := Star{X: math.NaN(), Y: 1, Flux: 1}
+	if got := matchIndicesByProximity([]Star{bad}, []Star{{X: 1, Y: 1, Flux: 1}}, 3); len(got) != 0 {
+		t.Fatal("non-finite catalog coordinate matched")
+	}
+	if got := matchStarsByMutualProximity([]Star{{X: 1, Y: 1, Flux: math.Inf(1)}}, []Star{{X: 1, Y: 1, Flux: 1}}, 0, 3, .85); len(got) != 0 {
+		t.Fatal("non-finite catalog flux matched")
+	}
+}
+
 func TestTransformGlobalSupport(t *testing.T) {
 	stars := []Star{
 		{X: 10, Y: 12}, {X: 120, Y: 30}, {X: 200, Y: 80}, {X: 60, Y: 150},

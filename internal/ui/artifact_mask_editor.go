@@ -23,23 +23,28 @@ import (
 )
 
 type artifactMaskEditorWindow struct {
-	ws            *mosaicWorkspace
-	win           fyne.Window
-	ctrl          *artifactMaskEditorController
-	preview       *canvas.Image
-	layer         *artifactMaskLayer
-	stack         *fyne.Container
-	scroll        *container.Scroll
-	status        *widget.Label
-	previewStatus *widget.Label
-	undoBtn       *widget.Button
-	redoBtn       *widget.Button
-	radius        *NumberEntry
-	erase         *widget.Check
-	tool          artifactMaskEditorTool
-	zoom          float64
-	polyInfo      *widget.Label
-	targets       []artifactMaskExportTarget
+	ws               *mosaicWorkspace
+	win              fyne.Window
+	ctrl             *artifactMaskEditorController
+	preview          *canvas.Image
+	layer            *artifactMaskLayer
+	stack            *fyne.Container
+	scroll           *container.Scroll
+	status           *widget.Label
+	previewStatus    *widget.Label
+	undoBtn          *widget.Button
+	redoBtn          *widget.Button
+	radius           *NumberEntry
+	erase            *widget.Check
+	tool             artifactMaskEditorTool
+	zoom             float64
+	polyInfo         *widget.Label
+	targets          []artifactMaskExportTarget
+	sourceKey        string
+	sourceWidth      int
+	sourceHeight     int
+	sourceGeneration uint64
+	sourceResult     *mosaic.Result
 }
 
 const (
@@ -48,7 +53,8 @@ const (
 )
 
 func (ws *mosaicWorkspace) openArtifactMaskEditor() {
-	options, indices := ws.artifactMaskInputOptions()
+	options := ws.artifactMaskInputOptions()
+	optionLabels := artifactMaskInputOptionLabels(options)
 	if len(options) == 0 && ws.state.result == nil {
 		dialog.ShowInformation("Artifact Masks", "Load at least one Mosaic input before creating masks.", ws.win)
 		return
@@ -62,9 +68,9 @@ func (ws *mosaicWorkspace) openArtifactMaskEditor() {
 	sourceSelect.SetSelected(sourceOptions[0])
 	purposeSelect := NewSafeSelect([]string{artifactMaskPurposeLabelMIRIArtifact, artifactMaskPurposeLabelRowDestripe}, nil)
 	purposeSelect.SetSelected(artifactMaskPurposeLabelMIRIArtifact)
-	chooser := NewSafeSelect(options, nil)
-	if len(options) > 0 {
-		chooser.SetSelected(options[0])
+	chooser := NewSafeSelect(optionLabels, nil)
+	if len(optionLabels) > 0 {
+		chooser.SetSelected(optionLabels[0])
 	}
 	dialog.NewCustomConfirm("Create Artifact Mask", "Open", "Cancel", container.NewVBox(
 		widget.NewLabel("Choose the mask purpose and source. MIRI masks exclude pixels from drizzle; NIRCam row masks only exclude pixels from row median estimation."),
@@ -81,42 +87,77 @@ func (ws *mosaicWorkspace) openArtifactMaskEditor() {
 			ws.openArtifactMaskEditorForMosaic()
 			return
 		}
-		if len(indices) == 0 {
+		if len(options) == 0 {
 			dialog.ShowInformation("Artifact Masks", "No input frames are available to edit.", ws.win)
 			return
 		}
-		sel := chooser.Selected
-		idx := indices[0]
-		for i, label := range options {
-			if label == sel {
-				idx = indices[i]
-				break
-			}
+		option, ok := artifactMaskInputOptionByLabel(options, chooser.Selected)
+		if !ok {
+			dialog.ShowInformation("Artifact Masks", "The selected input is no longer available. Reopen the dialog.", ws.win)
+			return
 		}
 		purpose := artifactMaskPurposeFromLabel(purposeSelect.Selected)
-		ws.openArtifactMaskEditorForInput(idx, purpose)
+		ws.openArtifactMaskEditorForInput(option.Index, option.Key, purpose)
 	}, ws.win).Show()
 }
 
-func (ws *mosaicWorkspace) artifactMaskInputOptions() ([]string, []int) {
-	var options []string
-	var indices []int
-	for i, input := range ws.state.inputs {
+type artifactMaskInputOption struct {
+	Label string
+	Index int
+	Key   string
+}
+
+func (ws *mosaicWorkspace) artifactMaskInputOptions() []artifactMaskInputOption {
+	var options []artifactMaskInputOption
+	for i, input := range ws.inputsSnapshot() {
 		if input.Excluded || input.ReferenceOnly {
 			continue
 		}
-		options = append(options, mosaic.InputLabel(input))
-		indices = append(indices, i)
+		options = append(options, artifactMaskInputOption{Label: mosaic.InputLabel(input), Index: i, Key: artifactMaskTargetKey(input)})
 	}
-	return options, indices
+	return options
 }
 
-func (ws *mosaicWorkspace) openArtifactMaskEditorForInput(idx int, purpose models.ArtifactMaskPurpose) {
-	if idx < 0 || idx >= len(ws.state.inputs) {
+func artifactMaskInputOptionLabels(options []artifactMaskInputOption) []string {
+	labels := make([]string, len(options))
+	seen := make(map[string]int, len(options))
+	for i, option := range options {
+		label := option.Label
+		if seen[label] > 0 {
+			base := label
+			label = fmt.Sprintf("%s (input %d)", base, option.Index+1)
+			for seen[label] > 0 {
+				label += " *"
+			}
+		}
+		seen[option.Label]++
+		labels[i] = label
+	}
+	return labels
+}
+
+func artifactMaskInputOptionByLabel(options []artifactMaskInputOption, label string) (artifactMaskInputOption, bool) {
+	labels := artifactMaskInputOptionLabels(options)
+	for i, optionLabel := range labels {
+		if optionLabel == label {
+			return options[i], true
+		}
+	}
+	return artifactMaskInputOption{}, false
+}
+
+func (ws *mosaicWorkspace) openArtifactMaskEditorForInput(idx int, expectedKey string, purpose models.ArtifactMaskPurpose) {
+	input, ok := ws.inputSnapshot(idx)
+	if !ok {
 		dialog.ShowError(fmt.Errorf("input index %d out of range", idx), ws.win)
 		return
 	}
-	input := ws.state.inputs[idx]
+	// Capture and validate the stable identity before purpose validation or any
+	// asynchronous load. The dialog's index must still refer to this source.
+	if artifactMaskTargetKey(input) != expectedKey {
+		dialog.ShowInformation("Artifact Masks", "The selected input changed while the dialog was open. Reopen the editor for the current input.", ws.win)
+		return
+	}
 	if purpose == models.ArtifactMaskPurposeRowDestripe && !isNIRCamPrimary(input) {
 		dialog.ShowInformation("Artifact Masks", "NIRCam row-stat masks can only be exported for NIRCam inputs.", ws.win)
 		return
@@ -125,20 +166,39 @@ func (ws *mosaicWorkspace) openArtifactMaskEditorForInput(idx int, purpose model
 		dialog.ShowInformation("Artifact Masks", "MIRI artifact masks can only be exported for MIRI inputs.", ws.win)
 		return
 	}
+	// Keep the source identity stable across the asynchronous load. The index
+	// can be reused when inputs are reordered while the dialog is opening.
 	go func() {
 		pt := newProgressTracker("Artifact Mask", "Loading selected input...", ws.win)
-		err := ws.ensureInputPixelsLoadedAt(idx)
+		err := ws.ensureInputPixelsLoadedAtKey(idx, expectedKey)
 		pt.hide()
 		if err != nil {
 			fyne.Do(func() { dialog.ShowError(err, ws.win) })
 			return
 		}
-		input := ws.state.inputs[idx]
-		ctrl, err := newArtifactMaskEditorControllerForPurpose(idx, input, purpose, findArtifactMaskDocumentForPurpose(ws.state.artifactMasks, input, purpose))
+		ws.inputMu.RLock()
+		if ws.state == nil || idx < 0 || idx >= len(ws.state.inputs) {
+			ws.inputMu.RUnlock()
+			fyne.Do(func() { dialog.ShowError(fmt.Errorf("input index %d is no longer available", idx), ws.win) })
+			return
+		}
+		input = ws.state.inputs[idx]
+		if artifactMaskTargetKey(input) != expectedKey {
+			ws.inputMu.RUnlock()
+			fyne.Do(func() {
+				dialog.ShowInformation("Artifact Masks", "The selected input changed while it was opening. Reopen the editor for the current input.", ws.win)
+			})
+			return
+		}
+		generation := ws.inputGenerationLocked(input)
+		existing := findArtifactMaskDocumentForPurpose(ws.state.artifactMasks, input, purpose)
+		ws.inputMu.RUnlock()
+		ctrl, err := newArtifactMaskEditorControllerForPurpose(idx, input, purpose, existing)
 		if err != nil {
 			fyne.Do(func() { dialog.ShowError(err, ws.win) })
 			return
 		}
+		ctrl.sourceGeneration = generation
 		black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
 		preview := buildArtifactInputPreview(input, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 		fyne.Do(func() {
@@ -174,6 +234,7 @@ func (ws *mosaicWorkspace) openArtifactMaskEditorForMosaic() {
 	black, white, bg, peak, scaledPeak := ws.parseLevelEntries()
 	preview := buildMosaicPreviewImageWithLevels(result, black, white, bg, peak, scaledPeak, ws.stretchMode, ws.mtfMidtone)
 	editor := newArtifactMaskEditorWindow(ws, ctrl, preview)
+	editor.sourceResult = result
 	editor.show()
 }
 
@@ -190,6 +251,11 @@ func newArtifactMaskEditorWindow(ws *mosaicWorkspace, ctrl *artifactMaskEditorCo
 		erase:         widget.NewCheck("Erase", nil),
 		tool:          artifactMaskToolBrush,
 		zoom:          1,
+	}
+	editor.sourceKey = ctrl.sourceKey
+	editor.sourceWidth, editor.sourceHeight = ctrl.width, ctrl.height
+	if ctrl.sourceMode == models.ArtifactMaskSourceInput {
+		editor.sourceGeneration = ctrl.sourceGeneration
 	}
 	editor.radius.SetValue(8)
 	editor.preview.FillMode = canvas.ImageFillOriginal
@@ -474,7 +540,9 @@ func (e *artifactMaskEditorWindow) openExportReview() {
 			dialog.ShowInformation("Preview Target", "Choose a target to preview.", e.win)
 			return
 		}
-		e.openTargetPreview(targets[idx])
+		e.openTargetPreviewWithUpdate(targets[idx], func(updated artifactMaskExportTarget) {
+			updateArtifactMaskPreviewTarget(targets, updated)
+		})
 	})
 	content := container.NewVBox(
 		widget.NewLabel(e.exportReviewDescription()),
@@ -543,38 +611,50 @@ func (e *artifactMaskEditorWindow) buildExportTargets(propagate bool) []artifact
 		return e.buildMosaicExportTargets()
 	}
 	targets := []artifactMaskExportTarget{{
-		Input:    e.ctrl.input,
-		Index:    e.ctrl.inputIndex,
-		Label:    mosaic.InputLabel(e.ctrl.input),
-		Mask:     cloneBoolMask(e.ctrl.mask),
-		Selected: true,
+		Input:      e.ctrl.input,
+		Index:      e.ctrl.inputIndex,
+		Key:        artifactMaskTargetKey(e.ctrl.input),
+		Width:      e.ctrl.input.HDU.Data.Width,
+		Height:     e.ctrl.input.HDU.Data.Height,
+		Generation: e.ws.inputGeneration(e.ctrl.input),
+		Label:      mosaic.InputLabel(e.ctrl.input),
+		Mask:       cloneBoolMask(e.ctrl.mask),
+		Selected:   true,
 	}}
 	if !propagate || e.ctrl.purpose == models.ArtifactMaskPurposeRowDestripe {
 		return targets
 	}
 	geom := mosaic.MaskOutputGeometry{Width: e.ctrl.width, Height: e.ctrl.height, OriginX: 0, OriginY: 0, Scale: 1}
-	for i, input := range e.ws.state.inputs {
+	for i, input := range e.ws.inputsSnapshot() {
 		if i == e.ctrl.inputIndex || input.Excluded || input.ReferenceOnly || !isMIRIPrimary(input) {
 			continue
 		}
 		mask, err := mosaic.ProjectAuthoringMaskToDetector(input, e.ctrl.input, geom, e.ctrl.mask, mosaic.MaskProjectionOptions{ConservativeRadius: 0.5})
 		if err != nil || mosaic.CountMaskPixels(mask) == 0 {
 			targets = append(targets, artifactMaskExportTarget{
-				Input:    input,
-				Index:    i,
-				Label:    mosaic.InputLabel(input) + " (no overlap)",
-				Mask:     make([]bool, input.HDU.Data.Width*input.HDU.Data.Height),
-				Selected: false,
-				Error:    err,
+				Input:      input,
+				Index:      i,
+				Key:        artifactMaskTargetKey(input),
+				Width:      input.HDU.Data.Width,
+				Height:     input.HDU.Data.Height,
+				Generation: e.ws.inputGeneration(input),
+				Label:      mosaic.InputLabel(input) + " (no overlap)",
+				Mask:       make([]bool, input.HDU.Data.Width*input.HDU.Data.Height),
+				Selected:   false,
+				Error:      err,
 			})
 			continue
 		}
 		targets = append(targets, artifactMaskExportTarget{
-			Input:    input,
-			Index:    i,
-			Label:    mosaic.InputLabel(input),
-			Mask:     mask,
-			Selected: false,
+			Input:      input,
+			Index:      i,
+			Key:        artifactMaskTargetKey(input),
+			Width:      input.HDU.Data.Width,
+			Height:     input.HDU.Data.Height,
+			Generation: e.ws.inputGeneration(input),
+			Label:      mosaic.InputLabel(input),
+			Mask:       mask,
+			Selected:   false,
 		})
 	}
 	return targets
@@ -591,7 +671,7 @@ func (e *artifactMaskEditorWindow) buildMosaicExportTargets() []artifactMaskExpo
 		return targets
 	}
 	geom := mosaic.MaskOutputGeometry{Width: result.Width, Height: result.Height, OriginX: result.OriginX, OriginY: result.OriginY, Scale: result.Scale}
-	for i, input := range e.ws.state.inputs {
+	for i, input := range e.ws.inputsSnapshot() {
 		if input.Excluded || input.ReferenceOnly || !isMIRIPrimary(input) {
 			continue
 		}
@@ -607,12 +687,16 @@ func (e *artifactMaskEditorWindow) buildMosaicExportTargets() []artifactMaskExpo
 			}
 		}
 		targets = append(targets, artifactMaskExportTarget{
-			Input:    input,
-			Index:    i,
-			Label:    label,
-			Mask:     mask,
-			Selected: selected,
-			Error:    err,
+			Input:      input,
+			Index:      i,
+			Key:        artifactMaskTargetKey(input),
+			Width:      input.HDU.Data.Width,
+			Height:     input.HDU.Data.Height,
+			Generation: e.ws.inputGeneration(input),
+			Label:      label,
+			Mask:       mask,
+			Selected:   selected,
+			Error:      err,
 		})
 	}
 	return targets
@@ -633,19 +717,46 @@ func (e *artifactMaskEditorWindow) mosaicProjectionReference() (mosaic.Input, bo
 }
 
 func (e *artifactMaskEditorWindow) openTargetPreview(target artifactMaskExportTarget) {
+	e.openTargetPreviewWithUpdate(target, nil)
+}
+
+func (e *artifactMaskEditorWindow) openTargetPreviewWithUpdate(target artifactMaskExportTarget, onLoaded func(artifactMaskExportTarget)) {
 	go func() {
-		if target.Index >= 0 && target.Index < len(e.ws.state.inputs) && e.ws.state.inputs[target.Index].HDU.Data.Pixels == nil {
+		current, currentOK := e.ws.inputSnapshot(target.Index)
+		if !currentOK || artifactMaskTargetKey(current) != target.Key ||
+			current.HDU.Data.Width != target.Width || current.HDU.Data.Height != target.Height ||
+			e.ws.inputGeneration(current) != target.Generation {
+			fyne.Do(func() {
+				dialog.ShowInformation("Preview Target", "The selected target changed or was reordered. Reopen the export dialog.", e.win)
+			})
+			return
+		}
+		if current.HDU.Data.Pixels == nil {
 			pt := newProgressTracker("Preview Target", "Loading target input...", e.win)
-			err := e.ws.ensureInputPixelsLoadedAt(target.Index)
+			err := e.ws.ensureInputPixelsLoadedAtKey(target.Index, target.Key)
 			pt.hide()
 			if err != nil {
 				fyne.Do(func() { dialog.ShowError(err, e.win) })
 				return
 			}
-			target.Input = e.ws.state.inputs[target.Index]
+			current, currentOK = e.ws.inputSnapshot(target.Index)
+			if !currentOK {
+				return
+			}
+			if artifactMaskTargetKey(current) != target.Key || current.HDU.Data.Width != target.Width || current.HDU.Data.Height != target.Height {
+				fyne.Do(func() {
+					dialog.ShowInformation("Preview Target", "The selected target changed or was reordered. Reopen the export dialog.", e.win)
+				})
+				return
+			}
+			target.Input = current
+			target.Generation = e.ws.inputGeneration(current)
 		}
 		img := buildDetectorMaskPreview(target.Input, target.Mask)
 		fyne.Do(func() {
+			if onLoaded != nil {
+				onLoaded(target)
+			}
 			win := e.ws.app.NewWindow("Mask Preview - " + target.Label)
 			preview := canvas.NewImageFromImage(img)
 			preview.FillMode = canvas.ImageFillOriginal
@@ -658,7 +769,28 @@ func (e *artifactMaskEditorWindow) openTargetPreview(target artifactMaskExportTa
 	}()
 }
 
+// updateArtifactMaskPreviewTarget publishes a successfully reloaded keyed
+// preview back into the export dialog's target snapshot. Matching both index
+// and stable key prevents a reordered dialog from being retargeted.
+func updateArtifactMaskPreviewTarget(targets []artifactMaskExportTarget, updated artifactMaskExportTarget) {
+	for i := range targets {
+		if targets[i].Index == updated.Index && targets[i].Key == updated.Key {
+			targets[i].Input = updated.Input
+			targets[i].Generation = updated.Generation
+			return
+		}
+	}
+}
+
 func (e *artifactMaskEditorWindow) exportMasks(dir string, overwrite bool, targets []artifactMaskExportTarget) {
+	if e.ctrl.sourceMode == models.ArtifactMaskSourceMosaic && e.ws.state.result != e.sourceResult {
+		dialog.ShowInformation("Export Mask", "The mosaic result changed while the editor was open. Reopen the editor before exporting.", e.win)
+		return
+	}
+	if e.ctrl.sourceMode == models.ArtifactMaskSourceInput && !e.sourceInputCurrent() {
+		dialog.ShowInformation("Export Mask", "The source input changed or was reloaded while the editor was open. Reopen the editor before exporting.", e.win)
+		return
+	}
 	projectDirValue := encodeProjectRelativePath(e.ws.currentProjectPath, dir)
 	resolvedDir := resolveProjectRelativePath(e.ws.currentProjectPath, projectDirValue)
 	go func() {
@@ -666,11 +798,21 @@ func (e *artifactMaskEditorWindow) exportMasks(dir string, overwrite bool, targe
 		var written []string
 		var err error
 		selected := 0
+		if !e.exportTargetsCurrent(targets) {
+			err = fmt.Errorf("a selected target changed or was reloaded while the editor was open")
+		}
 		for _, target := range targets {
+			if err != nil {
+				break
+			}
 			if !target.Selected {
 				continue
 			}
 			selected++
+			if !e.exportTargetCurrent(target) {
+				err = fmt.Errorf("target %s changed or was reloaded while the editor was open", target.Label)
+				break
+			}
 			if target.Error != nil {
 				err = target.Error
 				break
@@ -695,21 +837,92 @@ func (e *artifactMaskEditorWindow) exportMasks(dir string, overwrite bool, targe
 			return
 		}
 		fyne.Do(func() {
-			doc := e.ctrl.document()
-			doc.Targets = artifactMaskTargetsFromExportTargets(targets)
-			doc.Stale = false
-			e.ws.state.artifactMasks = upsertArtifactMaskDocument(e.ws.state.artifactMasks, doc)
-			if e.ctrl.purpose == models.ArtifactMaskPurposeRowDestripe {
-				e.ws.state.skysubSettings.RowDestripe = true
-				e.ws.state.skysubSettings.RowDestripeMaskDir = projectDirValue
-			} else {
-				e.ws.state.skysubSettings.MIRIArtifactMask = true
-				e.ws.state.skysubSettings.MIRIArtifactMaskDir = projectDirValue
+			e.ws.inputMu.Lock()
+			defer e.ws.inputMu.Unlock()
+			if !e.exportTargetsCurrentLocked(targets) {
+				dialog.ShowInformation("Export Mask", "A selected target changed or was reloaded while the export was running. Reopen the editor before exporting.", e.win)
+				return
 			}
-			e.ws.state.skysubSettingsSet = true
+			e.commitExportStateLocked(targets, projectDirValue)
 			dialog.ShowInformation("Mask Exported", fmt.Sprintf("Saved %d mask file(s) and enabled the matching mask directory for the next build.", len(written)), e.win)
 		})
 	}()
+}
+
+// commitExportStateLocked publishes the in-memory mask document and skysub
+// settings only after the caller has validated every selected target while
+// holding inputMu. Keeping this as one operation prevents a reload from
+// leaving settings pointing at masks written for an older input generation.
+func (e *artifactMaskEditorWindow) commitExportStateLocked(targets []artifactMaskExportTarget, projectDirValue string) {
+	doc := e.ctrl.document()
+	doc.Targets = artifactMaskTargetsFromExportTargets(targets)
+	doc.Stale = false
+	e.ws.state.artifactMasks = upsertArtifactMaskDocument(e.ws.state.artifactMasks, doc)
+	if e.ctrl.purpose == models.ArtifactMaskPurposeRowDestripe {
+		e.ws.state.skysubSettings.RowDestripe = true
+		e.ws.state.skysubSettings.RowDestripeMaskDir = projectDirValue
+	} else {
+		e.ws.state.skysubSettings.MIRIArtifactMask = true
+		e.ws.state.skysubSettings.MIRIArtifactMaskDir = projectDirValue
+	}
+	e.ws.state.skysubSettingsSet = true
+}
+
+func (e *artifactMaskEditorWindow) sourceInputCurrent() bool {
+	e.ws.inputMu.RLock()
+	defer e.ws.inputMu.RUnlock()
+	if e.ctrl.inputIndex < 0 || e.ctrl.inputIndex >= len(e.ws.state.inputs) {
+		return false
+	}
+	input := e.ws.state.inputs[e.ctrl.inputIndex]
+	return artifactMaskTargetKey(input) == e.sourceKey &&
+		input.HDU.Data.Width == e.sourceWidth && input.HDU.Data.Height == e.sourceHeight &&
+		e.ws.inputGenerationLocked(input) == e.sourceGeneration
+}
+
+func (e *artifactMaskEditorWindow) exportTargetsCurrent(targets []artifactMaskExportTarget) bool {
+	if e == nil || e.ws == nil {
+		return false
+	}
+	e.ws.inputMu.RLock()
+	defer e.ws.inputMu.RUnlock()
+	for _, target := range targets {
+		if target.Selected && !e.exportTargetCurrentLocked(target) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *artifactMaskEditorWindow) exportTargetsCurrentLocked(targets []artifactMaskExportTarget) bool {
+	if e == nil || e.ws == nil || e.ws.state == nil {
+		return false
+	}
+	for _, target := range targets {
+		if target.Selected && !e.exportTargetCurrentLocked(target) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *artifactMaskEditorWindow) exportTargetCurrent(target artifactMaskExportTarget) bool {
+	if e == nil || e.ws == nil {
+		return false
+	}
+	e.ws.inputMu.RLock()
+	defer e.ws.inputMu.RUnlock()
+	return e.exportTargetCurrentLocked(target)
+}
+
+func (e *artifactMaskEditorWindow) exportTargetCurrentLocked(target artifactMaskExportTarget) bool {
+	if e == nil || e.ws == nil || e.ws.state == nil || target.Index < 0 || target.Index >= len(e.ws.state.inputs) {
+		return false
+	}
+	current := e.ws.state.inputs[target.Index]
+	return artifactMaskTargetKey(current) == target.Key &&
+		current.HDU.Data.Width == target.Width && current.HDU.Data.Height == target.Height &&
+		e.ws.inputGenerationLocked(current) == target.Generation
 }
 
 func (e *artifactMaskEditorWindow) exportTargetMask(target artifactMaskExportTarget, dir string, overwrite bool) (string, error) {
@@ -964,25 +1177,38 @@ func (l *artifactMaskLayer) drawOverlay(w, h int) image.Image {
 }
 
 type artifactMaskExportTarget struct {
-	Input    mosaic.Input
-	Index    int
-	Label    string
-	Mask     []bool
-	Selected bool
-	Error    error
+	Input      mosaic.Input
+	Index      int
+	Key        string
+	Width      int
+	Height     int
+	Generation uint64
+	Label      string
+	Mask       []bool
+	Selected   bool
+	Error      error
 }
 
 func artifactMaskTargetLabels(targets []artifactMaskExportTarget) []string {
 	labels := make([]string, len(targets))
+	counts := make(map[string]int, len(targets))
+	for _, target := range targets {
+		counts[target.Label]++
+	}
 	for i, target := range targets {
-		labels[i] = target.Label
+		label := target.Label
+		if counts[target.Label] > 1 {
+			// Use the stable target identity rather than the current slice index.
+			label = fmt.Sprintf("%s [%s]", label, target.Key)
+		}
+		labels[i] = label
 	}
 	return labels
 }
 
 func artifactMaskTargetIndex(targets []artifactMaskExportTarget, label string) int {
-	for i, target := range targets {
-		if target.Label == label {
+	for i, targetLabel := range artifactMaskTargetLabels(targets) {
+		if targetLabel == label {
 			return i
 		}
 	}

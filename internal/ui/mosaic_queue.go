@@ -70,6 +70,8 @@ type drizzleQueueEvent struct {
 	Status      drizzleQueueStatus
 	Stage       string
 	Done, Total int
+	OutputPath  string
+	Err         string
 }
 
 type drizzleQueueRunner struct {
@@ -118,14 +120,17 @@ func (r *drizzleQueueRunner) Run(ctx context.Context, jobs []drizzleQueueJob) {
 			r.onDone()
 		}
 	}()
-	for i := range jobs {
-		if jobs[i].Status != queuePending {
+	// Own the work slice so progress callbacks never race the queue window's
+	// editable jobs. Results are published only as immutable events.
+	work := append([]drizzleQueueJob(nil), jobs...)
+	for i := range work {
+		if work[i].Status != queuePending {
 			continue
 		}
 		if r.shouldStop() || (ctx != nil && ctx.Err() != nil) {
 			return
 		}
-		job := &jobs[i]
+		job := &work[i]
 		job.Status = queueLoading
 		r.emit(i, queueLoading, "Loading project", 0, 0)
 		jobCtx, cancel := context.WithCancel(ctx)
@@ -142,7 +147,7 @@ func (r *drizzleQueueRunner) Run(ctx context.Context, jobs []drizzleQueueJob) {
 				status = queueSaving
 			}
 			job.Status = status
-			r.emit(i, status, stage, done, total)
+			r.emitResult(i, status, stage, done, total, "", "")
 		})
 		wasCancelled := errors.Is(err, mosaic.ErrCancelled) || jobCtx.Err() != nil
 		cancel()
@@ -150,25 +155,40 @@ func (r *drizzleQueueRunner) Run(ctx context.Context, jobs []drizzleQueueJob) {
 		if wasCancelled {
 			job.Status = queueCancelled
 			job.Err = "cancelled"
-			r.emit(i, queueCancelled, "Cancelled", 0, 0)
+			r.emitResult(i, queueCancelled, "Cancelled", 0, 0, "", job.Err)
+			if i < len(jobs) {
+				jobs[i] = *job
+			}
 			continue
 		}
 		if err != nil {
 			job.Status = queueFailed
 			job.Err = err.Error()
-			r.emit(i, queueFailed, err.Error(), 0, 0)
+			r.emitResult(i, queueFailed, err.Error(), 0, 0, "", job.Err)
+			if i < len(jobs) {
+				jobs[i] = *job
+			}
 			continue
 		}
 		job.Status = queueSucceeded
 		job.OutputPath = output
 		job.Err = ""
-		r.emit(i, queueSucceeded, "Saved", 1, 1)
+		r.emitResult(i, queueSucceeded, "Saved", 1, 1, job.OutputPath, "")
+		// Preserve the historical direct-runner API for non-UI callers. The UI
+		// passes its own copy, so its editable jobs remain main-thread owned.
+		if i < len(jobs) {
+			jobs[i] = *job
+		}
 	}
 }
 
 func (r *drizzleQueueRunner) emit(index int, status drizzleQueueStatus, stage string, done, total int) {
+	r.emitResult(index, status, stage, done, total, "", "")
+}
+
+func (r *drizzleQueueRunner) emitResult(index int, status drizzleQueueStatus, stage string, done, total int, outputPath, errText string) {
 	if r.onEvent != nil {
-		r.onEvent(drizzleQueueEvent{Index: index, Status: status, Stage: stage, Done: done, Total: total})
+		r.onEvent(drizzleQueueEvent{Index: index, Status: status, Stage: stage, Done: done, Total: total, OutputPath: outputPath, Err: errText})
 	}
 }
 

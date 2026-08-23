@@ -15,7 +15,11 @@ import (
 // sidecar cannot be loaded against the new reference and is therefore safe to
 // leave in place for a later return to the original reference frame.
 func (ws *mosaicWorkspace) confirmReferenceFrameChange(next *mosaic.Input, apply func()) {
-	confirmReferenceFrameChangeWith(ws.state.inputs, ws.state.referenceInput, next, apply,
+	confirmReferenceFrameChangeWith(ws.state.inputs, ws.state.referenceInput, next, func() {
+		ws.cancelMosaicBuild()
+		ws.cancelMosaicAlignment()
+		apply()
+	},
 		func(message string, decide func(bool)) {
 			dialog.ShowConfirm("Reference Frame Changed", message, decide, ws.win)
 		},

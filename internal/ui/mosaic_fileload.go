@@ -218,26 +218,32 @@ func (ws *mosaicWorkspace) rebuildOffsetControls() {
 
 		upBtn := widget.NewButton("↑", func(index int) func() {
 			return func() {
+				ws.inputMu.Lock()
 				if index == 0 {
+					ws.inputMu.Unlock()
 					return
 				}
 				ws.state.inputs[index-1], ws.state.inputs[index] = ws.state.inputs[index], ws.state.inputs[index-1]
 				if index < len(ws.state.statuses) && index-1 < len(ws.state.statuses) {
 					ws.state.statuses[index-1], ws.state.statuses[index] = ws.state.statuses[index], ws.state.statuses[index-1]
 				}
+				ws.inputMu.Unlock()
 				ws.resetPreview()
 				ws.rebuildOffsetControls()
 			}
 		}(idx))
 		downBtn := widget.NewButton("↓", func(index int) func() {
 			return func() {
+				ws.inputMu.Lock()
 				if index >= len(ws.state.inputs)-1 {
+					ws.inputMu.Unlock()
 					return
 				}
 				ws.state.inputs[index], ws.state.inputs[index+1] = ws.state.inputs[index+1], ws.state.inputs[index]
 				if index < len(ws.state.statuses) && index+1 < len(ws.state.statuses) {
 					ws.state.statuses[index], ws.state.statuses[index+1] = ws.state.statuses[index+1], ws.state.statuses[index]
 				}
+				ws.inputMu.Unlock()
 				ws.resetPreview()
 				ws.rebuildOffsetControls()
 			}
@@ -448,26 +454,32 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 
 		upBtn := widget.NewButton("↑", func(index int) func() {
 			return func() {
+				ws.inputMu.Lock()
 				if index == 0 {
+					ws.inputMu.Unlock()
 					return
 				}
 				ws.state.inputs[index-1], ws.state.inputs[index] = ws.state.inputs[index], ws.state.inputs[index-1]
 				if index < len(ws.state.statuses) && index-1 < len(ws.state.statuses) {
 					ws.state.statuses[index-1], ws.state.statuses[index] = ws.state.statuses[index], ws.state.statuses[index-1]
 				}
+				ws.inputMu.Unlock()
 				ws.resetPreview()
 				ws.rebuildOffsetControls()
 			}
 		}(idx))
 		downBtn := widget.NewButton("↓", func(index int) func() {
 			return func() {
+				ws.inputMu.Lock()
 				if index >= len(ws.state.inputs)-1 {
+					ws.inputMu.Unlock()
 					return
 				}
 				ws.state.inputs[index], ws.state.inputs[index+1] = ws.state.inputs[index+1], ws.state.inputs[index]
 				if index < len(ws.state.statuses) && index+1 < len(ws.state.statuses) {
 					ws.state.statuses[index], ws.state.statuses[index+1] = ws.state.statuses[index+1], ws.state.statuses[index]
 				}
+				ws.inputMu.Unlock()
 				ws.resetPreview()
 				ws.rebuildOffsetControls()
 			}
@@ -761,8 +773,13 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 		}
 		messages = append(messages, offsetMessages...)
 		fyne.Do(func() {
+			ws.inputMu.Lock()
+			defer ws.inputMu.Unlock()
 			pt.hide()
 			ws.state.inputs = append(ws.state.inputs, newInputs...)
+			for _, input := range newInputs {
+				ws.advanceInputGenerationLocked(input)
+			}
 			ws.state.statuses = append(ws.state.statuses, newStatuses...)
 			// Re-sort the full inputs list so overall drizzle order is correct.
 			if len(ws.state.inputs) > 1 {

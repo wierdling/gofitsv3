@@ -1,10 +1,27 @@
 package mosaic
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestArtifactMaskRejectsPixelCountOverflow(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	if _, err := NewZeroArtifactMask(maxInt, 2); err == nil {
+		t.Fatal("NewZeroArtifactMask error = nil, want overflow")
+	}
+	if _, err := ApplyRasterMaskOperations(maxInt, 2, nil); err == nil {
+		t.Fatal("ApplyRasterMaskOperations error = nil, want overflow")
+	}
+	if _, err := RasterizeThresholdMask(nil, maxInt, 2, 0, 0, 0, 0, 0, math.MaxFloat32); err == nil {
+		t.Fatal("RasterizeThresholdMask error = nil, want overflow")
+	}
+	if _, err := ProjectAuthoringMaskToDetector(Input{}, Input{}, MaskOutputGeometry{Width: maxInt, Height: 2}, nil, MaskProjectionOptions{}); err == nil {
+		t.Fatal("ProjectAuthoringMaskToDetector error = nil, want overflow")
+	}
+}
 
 func TestApplyRasterMaskOperationsAddsAndErasesBinaryPixels(t *testing.T) {
 	add := []bool{true, true, false, false, false, false}

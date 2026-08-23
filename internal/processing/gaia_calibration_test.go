@@ -3,12 +3,35 @@ package processing
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
 	"gofitsv3/internal/catalog/gaia"
 	"gofitsv3/internal/models"
 )
+
+func TestGaiaCalibrationRejectsInvalidSyntheticPhotometryInputs(t *testing.T) {
+	if _, err := IntegrateXPSpectrum(gaia.XPSpectrum{Wavelengths: []float64{500, 400}, Flux: []float64{1, 1}}, GaiaPassband{MinWavelengthNm: 400, MaxWavelengthNm: 600}); err == nil {
+		t.Fatal("descending XP grid accepted")
+	}
+	if _, err := IntegrateXPSpectrum(gaia.XPSpectrum{Wavelengths: []float64{400, 500}, Flux: []float64{1, math.NaN()}}, GaiaPassband{MinWavelengthNm: 400, MaxWavelengthNm: 600}); err == nil {
+		t.Fatal("non-finite XP flux accepted")
+	}
+	if _, err := IntegrateXPSpectrum(gaia.XPSpectrum{Wavelengths: []float64{400, 500}, Flux: []float64{1, 1}}, GaiaPassband{MinWavelengthNm: 400, MaxWavelengthNm: 600, Throughput: []float64{0, -1}, ThroughputWavelengths: []float64{400, 500}}); err == nil {
+		t.Fatal("negative throughput accepted")
+	}
+	if _, err := IntegrateXPSpectrum(gaia.XPSpectrum{Wavelengths: []float64{400, 500}, Flux: []float64{1, 1}}, GaiaPassband{MinWavelengthNm: 400, MaxWavelengthNm: 600, Throughput: []float64{0, 1}, ThroughputWavelengths: []float64{500, 400}}); err == nil {
+		t.Fatal("non-monotonic passband grid accepted")
+	}
+}
+
+func TestGaiaCalibrationRejectsMoreThanThreePassbands(t *testing.T) {
+	s := GaiaCalibrationSettings{Release: "DR3", XPRepresentation: "xp-v1", AlgorithmVersion: "test", Passbands: []string{"G", "BP", "RP", "F435W"}, MagnitudeLimit: 18, MatchRadiusArcsec: 2, ObservationEpoch: 2024}
+	if err := s.Validate(); err == nil {
+		t.Fatal("more than three passbands accepted")
+	}
+}
 
 type fakeGaiaProvider struct {
 	sources                         []gaia.Source

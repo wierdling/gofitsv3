@@ -225,13 +225,19 @@ func (p *RemoteProvider) RetrieveXPSpectra(ctx context.Context, release, represe
 	}
 	ids = uniqueIDs(ids)
 	p.mu.Lock()
-	known := ids[:0]
+	known := make([]uint64, 0, len(ids))
+	unknown := make([]uint64, 0)
 	for _, id := range ids {
 		if p.known[id] {
 			known = append(known, id)
+		} else {
+			unknown = append(unknown, id)
 		}
 	}
 	p.mu.Unlock()
+	if len(unknown) > 0 {
+		return nil, fmt.Errorf("%w: requested source %d was not discovered", ErrUnknownSource, unknown[0])
+	}
 	ids = known
 	if len(ids) == 0 {
 		return nil, ErrUnknownSource
@@ -354,7 +360,23 @@ func (p *RemoteProvider) fetchSpectra(ctx context.Context, release, repr string,
 	if len(rows) == 0 {
 		rows = e.Results
 	}
-	return NormalizeXPSpectra(rows, release, repr)
+	normalized, err := NormalizeXPSpectra(rows, release, repr)
+	if err != nil {
+		return nil, err
+	}
+	want := make(map[uint64]struct{}, len(ids))
+	for _, id := range ids {
+		want[id] = struct{}{}
+	}
+	if len(normalized) != len(want) {
+		return nil, fmt.Errorf("Gaia remote spectra response did not contain exactly the requested source IDs")
+	}
+	for _, spectrum := range normalized {
+		if _, ok := want[spectrum.SourceID]; !ok {
+			return nil, fmt.Errorf("Gaia remote spectra response contained unexpected source ID %d", spectrum.SourceID)
+		}
+	}
+	return normalized, nil
 }
 
 func (p *RemoteProvider) requestJSON(ctx context.Context, path string, q url.Values, out any) error {
@@ -398,7 +420,7 @@ func (p *RemoteProvider) requestJSON(ctx context.Context, path string, q url.Val
 						}
 						last = e
 					} else if e == nil {
-						last = fmt.Errorf("Gaia response exceeds %d bytes", p.cfg.MaxResponseBytes)
+						return fmt.Errorf("%w: response exceeds %d bytes", ErrRemoteLimit, p.cfg.MaxResponseBytes)
 					} else {
 						last = e
 					}

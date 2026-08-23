@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
+	"io"
 	"math"
 	"path/filepath"
 	"sort"
@@ -22,6 +23,15 @@ import (
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
 )
+
+func encodeLegendPNG(w io.Writer, closer io.Closer, img image.Image) error {
+	encodeErr := png.Encode(w, img)
+	closeErr := closer.Close()
+	if encodeErr != nil {
+		return encodeErr
+	}
+	return closeErr
+}
 
 // legendEntry is one row of the Compose color legend: a swatch color plus the
 // display name that goes on the PNG. filter (FITS header) and path are shown
@@ -210,8 +220,7 @@ func showColorLegendWindow(app fyne.App, parent fyne.Window, entries []legendEnt
 			if err != nil || uc == nil {
 				return
 			}
-			defer uc.Close()
-			if err := png.Encode(uc, img); err != nil {
+			if err := encodeLegendPNG(uc, uc, img); err != nil {
 				dialog.ShowError(err, parent)
 			}
 		}, parent)

@@ -119,3 +119,54 @@
 - All channel controls, copy/match/normalize/align/clean/reset, RGB/overlay composition, project I/O, color calibration, grayscale/RGB 8-bit and PNG 16-bit export, and Send to Edit work in large mode with normal-mode semantics.
 - Cancellation and failures are transactional and do not corrupt channel artifacts, previews, project state, calibration state, or output files.
 - Session and transferred Edit artifacts are cleaned by their owner; no raw session path is persisted; normal mode remains unchanged; focused and full repository tests pass.
+
+# Internal Code and Unit-Test Audit Plan
+
+## Purpose and workflow
+
+Review every production Go file beneath `internal/` with its relevant unit tests. Each lane follows: reviewer identifies concrete defects and meaningful test gaps; implementer fixes only confirmed findings and adds focused deterministic tests; a reviewer verifies the diff. Do not add tests for trivial wrappers or widget rendering details. Follow `docs/unit-test-standards.md` and use `docs/unit-test-audit.md` as the coverage baseline.
+
+Keep lane ownership separate. Route cross-package findings to the owning lane rather than editing another lane. Preserve the disk-backed Compose invariants described above: transactional artifacts, bounded row/tile access, no accidental multi-plane memory retention, cancellable background work, and UI commits through `fyne.Do`.
+
+## Audit lanes
+
+1. [x] Core data, I/O, and services
+   - Ownership: `internal/{fitsio,models,instrument,catalog/gaia,badpix,export,histogram,render,stretch,utils,config,debuglog,debugtime,version}` and their tests.
+   - Review FITS parsing/writing, artifact lifetime, persistence compatibility, Gaia cache behavior, numeric/empty-input handling, and output error paths.
+   - Completed: review found and the implementer fixed exact 32-bit DQ-mask loss, malformed FITS dimension safety, and FITS writer header/payload validation. Focused `fitsio` and `badpix` tests pass.
+   - Completed: independent review approved the FITS/DQ fixes. The remaining audit found and fixed unsupported export formats truncating existing destinations; regression coverage preserves a sentinel output. All scoped core-package tests, `go vet ./...`, and `go test ./...` pass.
+   - Validation: `go test ./internal/fitsio ./internal/models ./internal/instrument ./internal/catalog/gaia ./internal/badpix ./internal/export ./internal/histogram ./internal/render ./internal/stretch ./internal/utils ./internal/config ./internal/debuglog ./internal/debugtime ./internal/version`.
+
+2. [x] Processing engine
+   - Ownership: `internal/processing` and its tests.
+   - Review WCS/alignment/catalog transforms, interpolation and dimensions, disk compositor boundedness and cancellation, calibration, cleaning/masks, NaN/short-slice behavior, and goroutine/resource safety.
+   - Add focused synthetic tests only for concrete unprotected behavior, including the audit's `ImageDataForReferenceGrid` WCS-failure-to-resize fallback if still absent.
+   - Completed: fixed disk-compositor edge clipping, reference-grid affine ordering, transactional preview publication, and the calibration reader's matching edge behavior. Added direct WCS-failure resize-fallback coverage. Independent review approved the changes; focused and full test/vet runs pass.
+   - Validation: `go test ./internal/processing`.
+
+3. [x] Mosaic engine
+   - Ownership: `internal/mosaic` and its tests.
+   - Review input/frame loading, drizzle/grid/weights, combine and normalization, sky subtraction, artifact services, sidecars, temporary-file cleanup, cancellation/progress, and malformed WCS/geometry.
+   - Prioritize small regression tests for malformed WCS/CRPIX, multi-extension input, and failure bookkeeping/status where warranted.
+   - Completed: fixed final-drizzle cancellation returning partial success and made combined-cache replacement recovery-safe, including preservation of legacy recovery backups. Added malformed numeric WCS status coverage. Independent review approved the changes; focused, full, and vet test runs pass.
+   - Validation: `go test ./internal/mosaic`.
+
+4. [x] Compose/Edit/Examine and shared UI
+   - Ownership: Compose/Edit/Examine workspace and shared UI files, including `compose_*.go`, `workspace_compose.go`, `workspace_edit.go`, `workspace_examine.go`, `gaia_compose.go`, `viewport.go`, and their matching tests; excludes mosaic/artifact/alignment UI files in lane 5.
+   - Review job generation/cancellation/stale completion, Fyne-thread confinement, project load/save/reset parity, large-store cleanup, calibration invalidation, bounded previews and Edit handoff.
+   - Test pure state/coordinator seams, not widget implementation details.
+   - Completed: fixed large-mode reset, alignment, and transactional artifact state; Edit handoff and stale-operation safety; Examine stale loads; and Reset/Magic synchronization and store-descriptor guards. Independent review approved the final guard changes. Focused UI tests, vet, and full test runs pass where the Go cache was available.
+   - Validation: focused UI tests first, then `go test ./internal/ui` after lane 5 stabilizes.
+
+5. [x] Mosaic, artifact, and alignment UI
+   - Ownership: `mosaic_*.go`, `workspace_mosaic.go`, `artifact_mask_editor*.go`, alignment settings/results/debug files, and drizzle/exposure/sky-sub UI files with matching tests.
+   - Review queues, project/sidecar round-trips, reference changes, artifact ownership, progress/cancellation/stale UI updates, error propagation, and pure settings/header/default logic.
+   - Completed: fixed stale/cancellable mosaic alignment and builds, transactional project loading, queue ownership, artifact editor/export identity and generation guards, and disabled the no-op memory-heavy alignment debug option. Independent review approved the final preview/export lifecycle safeguards. Focused UI, vet, and full test runs pass with a workspace-local Go cache.
+   - Validation: focused mosaic/artifact/alignment UI tests, then the coordinated full UI suite.
+
+## Sequencing and final gate
+
+- Complete lanes 1, 2, and 3 in order. Lanes 4 and 5 may then proceed concurrently because their file ownership is disjoint.
+- After each implementation pass, run its narrow tests before reviewer verification.
+- At the end, check ownership boundaries, rerun reviewer verification for each lane, then run `go test ./internal/fitsio ./internal/processing ./internal/mosaic ./internal/export ./internal/ui` followed by `go test ./...`.
+- Record any manual-only UI/file-dialog smoke checks separately; they are not substitutes for unit tests.

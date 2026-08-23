@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -298,42 +299,74 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		}
 		ws.exitStarMode()
 
-		progressDialog := dialog.NewCustom("Aligning By Selected Stars", "Matching selected stars across images...", widget.NewProgressBarInfinite(), win)
-		progressDialog.Show()
+		alignCtx, alignGeneration, started := ws.beginMosaicAlignment()
+		if !started {
+			dialog.ShowInformation("Star Alignment", "An alignment operation is already running.", win)
+			return
+		}
+		settings := state.alignmentSettings
 		go func() {
-			if state.alignmentSettings.DebugAlignment {
-				defer installAlignmentDebugHook(win)()
+			var finishOnce sync.Once
+			finishOK := false
+			finish := func() bool {
+				finishOnce.Do(func() { finishOK = ws.finishMosaicAlignment(alignGeneration) })
+				return finishOK
+			}
+			queued := false
+			defer func() {
+				if !queued {
+					finish()
+				}
+			}()
+			pt := newProgressTrackerWithContext("Aligning By Selected Stars", "Matching selected stars across images...", win, alignCtx, func() { ws.cancelMosaicAlignment() })
+			if alignCtx.Err() != nil {
+				pt.hide()
+				return
 			}
 			// TweakReg modes stream each frame's pixels on demand during
-			// alignment, so only the legacy warp-based modes (and the debug hook,
-			// which needs image backdrops) require every frame resident up front.
-			alignMode := mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode)
-			if !mosaic.AlignmentStreamsPixels(alignMode) || state.alignmentSettings.DebugAlignment {
+			// alignment, so only legacy warp-based modes require every frame
+			// resident up front.
+			alignMode := mosaic.AlignmentMode(settings.AlignmentMode)
+			if !mosaic.AlignmentStreamsPixels(alignMode) {
 				if err := ws.ensureInputPixelsLoaded(); err != nil {
 					fyne.Do(func() {
-						progressDialog.Hide()
+						pt.hide()
 						dialog.ShowError(err, win)
 					})
 					return
 				}
 			}
-			alignInputs, stateIndices := ws.alignmentWorkset()
+			workerSnapshot := ws.alignmentInputSnapshot()
+			alignInputs, stateIndices := alignmentWorksetFor(workerSnapshot.inputs, workerSnapshot.statuses, workerSnapshot.reference, settings.NumRefs)
 			if len(alignInputs) < 2 {
 				fyne.Do(func() {
-					progressDialog.Hide()
+					pt.hide()
 					dialog.ShowInformation("Star Alignment", "All eligible inputs already have saved alignments.", win)
 				})
 				return
 			}
-			results, err := mosaic.AlignInputsBySelectedStarsWithMode(alignInputs, refStars, ws.alignmentNumRefs(), mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec)
+			results, err := mosaic.AlignInputsBySelectedStarsWithModeCtx(alignCtx, alignInputs, refStars, alignmentNumRefsFor(workerSnapshot.reference, settings.NumRefs), alignMode, settings.SearchRadiusArcsec)
+			if alignCtx.Err() != nil {
+				pt.hide()
+				return
+			}
 
 			var rows []alignmentResultRow
 			if err == nil {
 				rows = buildAlignmentResultRowsForStateIndices(results, stateIndices)
+				if len(alignInputs) > 0 {
+					bindAlignmentResultSnapshot(rows, workerSnapshot)
+				}
 			}
 
+			queued = true
 			fyne.Do(func() {
-				progressDialog.Hide()
+				finished := finish()
+				if alignCtx.Err() != nil || !finished {
+					pt.hide()
+					return
+				}
+				pt.hide()
 				if err != nil {
 					dialog.ShowError(err, win)
 					return
@@ -346,7 +379,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				content := container.NewVBox()
 				checks := make([]*widget.Check, len(rows))
 				for i, r := range rows {
-					name := mosaic.InputLabel(state.inputs[r.stateIdx])
+					name := mosaic.InputLabel(workerSnapshot.inputs[r.stateIdx])
 					if r.result.Applied {
 						rot := 0.0
 						if r.result.HasManualTransform {
@@ -826,23 +859,43 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			dialog.ShowInformation("Missing Inputs", "Load at least two FITS files before star alignment.", win)
 			return
 		}
+		alignCtx, alignGeneration, started := ws.beginMosaicAlignment()
+		if !started {
+			dialog.ShowInformation("Star Alignment", "An alignment operation is already running.", win)
+			return
+		}
+		settings := state.alignmentSettings
 		go func() {
-			pt := newProgressTracker("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", win)
-			if state.alignmentSettings.DebugAlignment {
-				defer installAlignmentDebugHook(win)()
+			var finishOnce sync.Once
+			finishOK := false
+			finish := func() bool {
+				finishOnce.Do(func() { finishOK = ws.finishMosaicAlignment(alignGeneration) })
+				return finishOK
+			}
+			queued := false
+			defer func() {
+				if !queued {
+					finish()
+				}
+			}()
+			pt := newProgressTrackerWithContext("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", win, alignCtx, func() { ws.cancelMosaicAlignment() })
+			if alignCtx.Err() != nil {
+				pt.hide()
+				return
 			}
 			// TweakReg modes stream each frame's pixels on demand during
-			// alignment, so only the legacy warp-based modes (and the debug hook,
-			// which needs image backdrops) require every frame resident up front.
-			alignMode := mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode)
-			if !mosaic.AlignmentStreamsPixels(alignMode) || state.alignmentSettings.DebugAlignment {
+			// alignment, so only legacy warp-based modes require every frame
+			// resident up front.
+			alignMode := mosaic.AlignmentMode(settings.AlignmentMode)
+			if !mosaic.AlignmentStreamsPixels(alignMode) {
 				if err := ws.ensureInputPixelsLoaded(); err != nil {
 					pt.hide()
 					fyne.Do(func() { dialog.ShowError(err, win) })
 					return
 				}
 			}
-			alignInputs, stateIndices := ws.alignmentWorkset()
+			workerSnapshot := ws.alignmentInputSnapshot()
+			alignInputs, stateIndices := alignmentWorksetFor(workerSnapshot.inputs, workerSnapshot.statuses, workerSnapshot.reference, settings.NumRefs)
 			if len(alignInputs) < 2 {
 				pt.hide()
 				fyne.Do(func() {
@@ -850,10 +903,14 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				})
 				return
 			}
-			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, ws.alignmentNumRefs(), alignMode, state.alignmentSettings.SearchRadiusArcsec, mosaic.AlignProgress{
+			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, alignmentNumRefsFor(workerSnapshot.reference, settings.NumRefs), alignMode, settings.SearchRadiusArcsec, mosaic.AlignProgress{
 				Progress: func(done, total int) { pt.progress("Aligning", done, total) },
 				Ctx:      pt.ctx,
 			})
+			if alignCtx.Err() != nil {
+				pt.hide()
+				return
+			}
 			if errors.Is(err, mosaic.ErrCancelled) {
 				debuglog.Log("starAlign: cancelled by user")
 				pt.hide()
@@ -864,10 +921,18 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			var rows []alignmentResultRow
 			if err == nil {
 				rows = buildAlignmentResultRowsForStateIndices(results, stateIndices)
+				if len(alignInputs) > 0 {
+					bindAlignmentResultSnapshot(rows, workerSnapshot)
+				}
 			}
 
 			pt.hide()
+			queued = true
 			fyne.Do(func() {
+				finished := finish()
+				if alignCtx.Err() != nil || !finished {
+					return
+				}
 				if err != nil {
 					dialog.ShowError(err, win)
 					return
@@ -880,7 +945,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				content := container.NewVBox()
 				checks := make([]*widget.Check, len(rows))
 				for i, r := range rows {
-					name := mosaic.InputLabel(state.inputs[r.stateIdx])
+					name := mosaic.InputLabel(workerSnapshot.inputs[r.stateIdx])
 					if r.result.Applied {
 						rot := 0.0
 						if r.result.HasManualTransform {
@@ -1087,7 +1152,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	clearOffsetsBtn.Importance = widget.DangerImportance
 
 	clearBtn := widget.NewButton("Clear", func() {
+		ws.inputMu.Lock()
 		state.inputs = nil
+		ws.inputGenerations = make(map[string]uint64)
+		ws.inputMu.Unlock()
 		state.statuses = nil
 		ws.activeFilter = ""
 		ws.levelsSet = false
@@ -1309,19 +1377,19 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		ws.zoomFitMode = false
 		s := strings.TrimSuffix(sel, "%")
 		if val, err := strconv.ParseFloat(s, 64); err == nil {
-			ws.zoomLevel = math.Max(math.Min(val/100.0, 16), 1.0/16)
+			ws.zoomLevel = clampMosaicZoom(val / 100.0)
 			ws.updateZoom()
 		}
 	}
 
 	zoomInBtn := widget.NewButton("+", func() {
 		ws.zoomFitMode = false
-		ws.zoomLevel = math.Min(ws.zoomLevel*1.25, 16)
+		ws.zoomLevel = clampMosaicZoom(ws.zoomLevel * 1.25)
 		ws.updateZoom()
 	})
 	zoomOutBtn := widget.NewButton("-", func() {
 		ws.zoomFitMode = false
-		ws.zoomLevel = math.Max(ws.zoomLevel/1.25, 1.0/16)
+		ws.zoomLevel = clampMosaicZoom(ws.zoomLevel / 1.25)
 		ws.updateZoom()
 	})
 

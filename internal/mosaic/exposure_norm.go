@@ -59,6 +59,22 @@ func bunitIsCalibratedFlux(bunit string) bool {
 	return strings.Contains(u, "JY") // MJY/SR, MJY, JY, UJY, ...
 }
 
+// bunitIsTotalCounts reports whether BUNIT explicitly identifies detector
+// totals. NormAuto must not guess that an arbitrary/unknown unit is counts.
+func bunitIsTotalCounts(bunit string) bool {
+	u := strings.ToUpper(strings.TrimSpace(bunit))
+	u = strings.ReplaceAll(u, " ", "")
+	for _, suffix := range []string{"/PIXEL", "/PIX", "PERPIXEL", "PERPIX"} {
+		u = strings.TrimSuffix(u, suffix)
+	}
+	switch u {
+	case "ELECTRON", "ELECTRONS", "E-", "E", "COUNT", "COUNTS", "DN", "ADU":
+		return true
+	default:
+		return false
+	}
+}
+
 // exposureScaleFor returns the per-frame normalization factor 1/exptime and
 // whether it is usable. It rejects non-positive, NaN, and Inf exposure times so
 // a bogus scale is never silently applied.
@@ -86,7 +102,7 @@ func resolveNormalization(mode NormalizationMode, bunit string, exptime float64)
 		return true, scale
 	case NormAuto:
 		rate, known := bunitIsRate(bunit)
-		if !known || rate || bunitIsCalibratedFlux(bunit) {
+		if !known || rate || bunitIsCalibratedFlux(bunit) || !bunitIsTotalCounts(bunit) {
 			// Unknown/missing BUNIT defaults to Off; rate units and calibrated
 			// flux/surface-brightness units (e.g. JWST MJy/sr) need no divide.
 			return false, scale

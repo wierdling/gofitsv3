@@ -27,6 +27,99 @@ func TestCrossChannelCleanTiledCancellation(t *testing.T) {
 	}
 }
 
+func TestCrossChannelCleanTiledCancellationAfterStart(t *testing.T) {
+	const w, h = 256, 256
+	chs := make([][]float32, 3)
+	for c := range chs {
+		chs[c] = make([]float32, w*h)
+		for i := range chs[c] {
+			chs[c][i] = 10
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	seen := 0
+	_, err := CrossChannelCleanTiled(chs, []int{w, w, w}, []int{h, h, h}, []float64{1, 1, 1}, CrossChannelCleanOptions{Context: ctx, TileWidth: 1, TileHeight: 1, ObserveTile: func(int, int) {
+		seen++
+		if seen == 1 {
+			cancel()
+		}
+	}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+	if seen != 1 {
+		t.Fatalf("observer saw %d tiles after cancellation", seen)
+	}
+}
+
+func TestCrossChannelCleanDiskSharedStatsIgnoreUnequalTrailingOutlier(t *testing.T) {
+	const sw, sh = 10, 20001 // shared area > 200k forces compact-stat stride 2
+	widths, heights := []int{11, 10, 10}, []int{sh, sh, sh}
+	src := make([][]float32, 3)
+	for c := range src {
+		src[c] = make([]float32, widths[c]*sh)
+		for y := 0; y < sh; y++ {
+			for x := 0; x < widths[c]; x++ {
+				src[c][y*widths[c]+x] = 10
+			}
+		}
+	}
+	for y := 1; y < sh; y += 2 {
+		src[0][y*widths[0]+sw] = 1e6
+	}
+	// Distinguish compact/shared positions from the wider channel's trailing
+	// outlier so a full-width background estimate would change the result.
+	for y := 1; y < sh; y += 2 {
+		for _, x := range []int{0, 2, 4, 6, 8} {
+			src[0][y*widths[0]+x], src[1][y*widths[1]+x], src[2][y*widths[2]+x] = 40, 40, 40
+		}
+	}
+	src[0][101*widths[0]+2], src[1][101*widths[1]+2], src[2][101*widths[2]+2] = 40, 40, 40
+	src[0][5001*widths[0]+2], src[1][5001*widths[1]+2], src[2][5001*widths[2]+2] = 100, 100, 100
+	got := make([][]float32, 3)
+	for c := range got {
+		got[c] = append([]float32(nil), src[c]...)
+	}
+	opts := CrossChannelCleanDiskOptions{Widths: widths, Heights: heights, TileWidth: 64, TileHeight: 64, Halo: 6, Passes: 1}
+	for c := 0; c < 3; c++ {
+		cc := c
+		opts.ReadRow[c] = func(y int, row []float32) error { copy(row, src[cc][y*widths[cc]:(y+1)*widths[cc]]); return nil }
+		opts.WriteRow[c] = func(y int, row []float32) error { copy(got[cc][y*widths[cc]:(y+1)*widths[cc]], row); return nil }
+	}
+	if err := CrossChannelCleanDisk(opts); err != nil {
+		t.Fatal(err)
+	}
+	shared := [][]float32{make([]float32, sw*sh), make([]float32, sw*sh), make([]float32, sw*sh)}
+	for c := range shared {
+		for y := 0; y < sh; y++ {
+			copy(shared[c][y*sw:(y+1)*sw], src[c][y*widths[c]:y*widths[c]+sw])
+		}
+	}
+	want := make([][]float32, 3)
+	masks := BuildLayerStarMasks(shared, sw, sh, []float64{1, 1, 1})
+	for c := range want {
+		want[c] = RemoveCosmicRays(shared[c], sw, sh, 1, 1, masks[c])
+	}
+	for c := range want {
+		for y := 0; y < sh; y++ {
+			for x := 0; x < sw; x++ {
+				if got[c][y*widths[c]+x] != want[c][y*sw+x] {
+					t.Fatalf("channel %d (%d,%d) got %v want %v", c, x, y, got[c][y*widths[c]+x], want[c][y*sw+x])
+				}
+			}
+		}
+	}
+}
+
+func TestSharedSampleRowsUsesSharedWidthStride(t *testing.T) {
+	if got := sharedSampleStep(200010, 1); got != 2 {
+		t.Fatalf("step=%d", got)
+	}
+	if got := sharedSampleIndex(1, 2, 10); got != 12 {
+		t.Fatalf("index=%d", got)
+	}
+}
+
 func TestCrossChannelCleanTiledRejectsTruncated(t *testing.T) {
 	_, err := CrossChannelCleanTiled([][]float32{make([]float32, 3), make([]float32, 4), make([]float32, 4)}, []int{2, 2, 2}, []int{2, 2, 2}, []float64{1, 1, 1}, CrossChannelCleanOptions{})
 	if err == nil {

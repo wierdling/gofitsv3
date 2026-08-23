@@ -16,6 +16,35 @@ import (
 	"gofitsv3/internal/mosaic"
 )
 
+// measureAutoSelection chooses the later drizzle group only when the two
+// clicked footprints are disjoint and have known ordering. Overlap is
+// intentionally manual: guessing a mover from a shared exposure is unsafe.
+func measureAutoSelection(pathsA, pathsB map[string]bool, ranks map[string]int) (map[string]bool, bool) {
+	for p := range pathsA {
+		if pathsB[p] {
+			return nil, false
+		}
+	}
+	bestA, bestB := math.MaxInt64, math.MaxInt64
+	for p := range pathsA {
+		if r, ok := ranks[p]; ok && r < bestA {
+			bestA = r
+		}
+	}
+	for p := range pathsB {
+		if r, ok := ranks[p]; ok && r < bestB {
+			bestB = r
+		}
+	}
+	if bestA == math.MaxInt64 || bestB == math.MaxInt64 || len(pathsA) == 0 || len(pathsB) == 0 {
+		return nil, false
+	}
+	if bestA <= bestB {
+		return pathsB, true
+	}
+	return pathsA, true
+}
+
 func (ws *mosaicWorkspace) exitMeasureMode() {
 	ws.activeMeasure = nil
 	ws.previewSwap.Objects = []fyne.CanvasObject{ws.previewScroll}
@@ -90,7 +119,7 @@ func (ws *mosaicWorkspace) showMeasureResultDialog(ptA, ptB measurePoint) {
 	// dxApply/dyApply is the offset to add to each mover image.
 	var moverPaths map[string]bool
 	var dxApply, dyApply float64
-	autoDirection := minRankA != math.MaxInt64 && minRankB != math.MaxInt64 && len(pathsA) > 0 && len(pathsB) > 0
+	moverPaths, autoDirection := measureAutoSelection(pathsA, pathsB, drizzleRank)
 	if autoDirection {
 		if minRankA <= minRankB {
 			// A is earlier; move B's images toward A.

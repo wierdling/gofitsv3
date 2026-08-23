@@ -48,6 +48,32 @@ func TestAlignedArtifactReadWindowSamplesOnlyRequestedSourceRange(t *testing.T) 
 	}
 }
 
+func TestAlignedArtifactReadWindowClampsRightBottomEdges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.rawf32")
+	a, err := fitsio.CreateFloat32Artifact(path, 3, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for y := 0; y < 3; y++ {
+		row := []float32{float32(y * 10), float32(y*10 + 1), float32(y*10 + 2)}
+		if err := a.WriteRow(y, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r := &alignedArtifactRowReader{path: path, source: models.LoadedImage{}, reference: models.LoadedImage{}, width: 3, height: 3}
+	defer r.Close()
+	dst := make([]float32, 1)
+	if err := r.ReadWindow(2, 2, 3, dst); err != nil {
+		t.Fatal(err)
+	}
+	if dst[0] != 22 {
+		t.Fatalf("bottom-right sample = %v, want 22", dst[0])
+	}
+}
+
 func TestGaiaMatchRadiusParsingAndNormalization(t *testing.T) {
 	if got := normalizeGaiaMatchRadiusArcsec(0); got != 10 {
 		t.Fatalf("unset radius = %v, want 10", got)
@@ -246,6 +272,24 @@ func TestDeriveGaiaFieldQueryAcceptsRotatedCD(t *testing.T) {
 	got, err := proj(1, 0)
 	if err != nil || math.Abs(got.RA-10) > 1e-12 || math.Abs(got.Dec-19.999) > 1e-12 {
 		t.Fatalf("rotated projection=%+v err=%v", got, err)
+	}
+}
+
+func TestDeriveGaiaFieldQueryDefaultsOmittedPCTerms(t *testing.T) {
+	base := map[string]string{"CRVAL1": "10", "CRVAL2": "20", "DATE-OBS": "2024-01-01"}
+	headers := make(map[string]string, len(base)+3)
+	for k, v := range base {
+		headers[k] = v
+	}
+	headers["CDELT1"], headers["CDELT2"], headers["PC2_1"] = "0.001", "0.001", "1"
+	img := &models.LoadedImage{HDU: fitsio.HDU{Header: fitsio.Header{Cards: headers}, Data: fitsio.ImageData{Width: 2, Height: 2}}}
+	_, proj, err := deriveGaiaFieldQuery(img, models.GaiaCalibrationSettings{Release: "DR3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := proj(1, 0)
+	if err != nil || math.Abs(got.RA-10.001) > 1e-12 || math.Abs(got.Dec-20.001) > 1e-12 {
+		t.Fatalf("partial PC projection=%+v err=%v", got, err)
 	}
 }
 

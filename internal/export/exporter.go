@@ -89,8 +89,13 @@ func clampToUint16(v float32) uint16 {
 }
 
 func saveImage(path string, img image.Image, format Format, opt Options) error {
-	if format == WEBP {
+	switch format {
+	case WEBP:
 		return webpwriter.WriteImageWebPLosslessFile(path, img)
+	case PNG, JPEG, TIFF:
+		// Supported formats are opened below after validation.
+	default:
+		return errors.New("unsupported format")
 	}
 
 	f, err := os.Create(path)

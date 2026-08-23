@@ -208,6 +208,108 @@ func TestComposeLargeStoreReplaceSlotIsTransactional(t *testing.T) {
 	}
 }
 
+func TestComposeLargeStoreReplaceManySizedPreservesOnPrepareFailure(t *testing.T) {
+	s, err := newComposeLargeStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	old, err := s.Replace("channel-0", 2, 1, func(a *fitsio.Float32Artifact) error { return a.WriteRow(0, []float32{3, 4}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.ReplaceManyIfCurrentSized([]composeArtifactDescriptor{old}, [][2]int{{1, 2}}, []func(*fitsio.Float32Artifact) error{
+		func(a *fitsio.Float32Artifact) error {
+			if err := a.WriteRow(0, []float32{8}); err != nil {
+				return err
+			}
+			return a.WriteRow(1, []float32{9})
+		},
+	}, func(staged []composeArtifactDescriptor) error {
+		if len(staged) != 1 || staged[0].Width != 1 || staged[0].Height != 2 {
+			t.Fatalf("staged dimensions = %+v", staged)
+		}
+		return errors.New("injected preview failure")
+	})
+	if err == nil {
+		t.Fatal("prepare failure unexpectedly committed")
+	}
+	current, ok := s.Descriptor("channel-0")
+	if !ok || current.Path != old.Path || current.Generation != old.Generation || current.Width != 2 || current.Height != 1 {
+		t.Fatalf("old descriptor not preserved: %+v", current)
+	}
+	r, err := fitsio.OpenFloat32ArtifactReadOnly(current.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	row := make([]float32, 2)
+	if err := r.ReadRow(0, row); err != nil {
+		t.Fatal(err)
+	}
+	if row[0] != 3 || row[1] != 4 {
+		t.Fatalf("old pixels changed: %v", row)
+	}
+}
+
+func TestComposeLargeStoreReplaceManySizedRollsBackEarlierCommit(t *testing.T) {
+	s, err := newComposeLargeStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	first, err := s.Replace("channel-0", 1, 1, func(a *fitsio.Float32Artifact) error {
+		return a.WriteRow(0, []float32{1})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Replace("channel-1", 1, 1, func(a *fitsio.Float32Artifact) error {
+		return a.WriteRow(0, []float32{2})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force the second fresh-generation destination to fail its rename after
+	// the first destination has already committed.
+	blocked := filepath.Join(s.root, "channel-1-2.bin")
+	if err := os.Mkdir(blocked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blocked, "keep"), []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backup := blocked + ".replace-backup"
+	if err := os.Mkdir(backup, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backup, "keep"), []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.ReplaceManyIfCurrentSized(
+		[]composeArtifactDescriptor{first, second},
+		[][2]int{{1, 1}, {1, 1}},
+		[]func(*fitsio.Float32Artifact) error{
+			func(a *fitsio.Float32Artifact) error { return a.WriteRow(0, []float32{8}) },
+			func(a *fitsio.Float32Artifact) error { return a.WriteRow(0, []float32{9}) },
+		}, nil,
+	)
+	if err == nil {
+		t.Fatal("later commit unexpectedly succeeded")
+	}
+	cur0, ok := s.Descriptor("channel-0")
+	if !ok || cur0.Path != first.Path || cur0.Generation != first.Generation {
+		t.Fatalf("first slot changed after rollback: %+v", cur0)
+	}
+	cur1, ok := s.Descriptor("channel-1")
+	if !ok || cur1.Path != second.Path || cur1.Generation != second.Generation {
+		t.Fatalf("second slot changed after rollback: %+v", cur1)
+	}
+	if _, statErr := os.Stat(filepath.Join(s.root, "channel-0-2.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("committed first destination remains: %v", statErr)
+	}
+}
+
 func TestComposeLargeStoreRemoveSlotIfCurrentKeepsNewerGeneration(t *testing.T) {
 	s, err := newComposeLargeStore(t.TempDir())
 	if err != nil {
@@ -331,5 +433,46 @@ func TestSnapshotCompositeForEditCopiesOwnedPlanes(t *testing.T) {
 	ed.cleanup()
 	if _, err := os.Stat(ed.root); !os.IsNotExist(err) {
 		t.Fatalf("cleanup left root: %v", err)
+	}
+}
+
+func TestSnapshotCompositeForEditRejectsMalformedPlaneDimensions(t *testing.T) {
+	s, err := newComposeLargeStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var paths [3]string
+	for i := range paths {
+		paths[i] = filepath.Join(s.root, fmt.Sprintf("src-%d.bin", i))
+		a, e := fitsio.CreateFloat32Artifact(paths[i], 2, 1)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = a.WriteRow(0, []float32{1, 2}); e != nil {
+			t.Fatal(e)
+		}
+		if e = a.Close(); e != nil {
+			t.Fatal(e)
+		}
+	}
+	d, err := s.PublishComposite(paths, 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a malformed descriptor pointing at a valid artifact with the
+	// wrong dimensions; SnapshotCompositeForEdit must reject it transactionally.
+	d.Planes[1].Width = 3
+	if _, err := s.SnapshotCompositeForEdit(context.Background(), d); err == nil {
+		t.Fatal("malformed plane dimensions accepted")
+	}
+	entries, err := os.ReadDir(filepath.Dir(s.root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "edit-") {
+			t.Fatalf("staging root leaked after malformed plane: %s", entry.Name())
+		}
 	}
 }

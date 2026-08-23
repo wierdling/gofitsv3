@@ -36,6 +36,7 @@ type examineState struct {
 	measureStart   *imagePoint
 	measureEnd     *imagePoint
 	measurement    *rulerMeasurement
+	loadGeneration uint64
 }
 
 func examineChipLabel(img *models.LoadedImage, ordinal int) string {
@@ -355,10 +356,15 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			selectedChip = state.selectedChip
 		}
 
+		state.loadGeneration++
+		generation := state.loadGeneration
 		go func() {
 			imgs, loadErr := loadImagesFromPath(path)
 			fyne.Do(func() {
 				progressDialog.Hide()
+				if generation != state.loadGeneration {
+					return
+				}
 				if loadErr != nil {
 					dialog.ShowError(loadErr, win)
 					return
@@ -515,6 +521,9 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	controlsScroll.SetMinSize(fyne.NewSize(280, 220))
 
 	globalSendToExamine = func(pixels []float32, width, height int) {
+		// A direct handoff supersedes any FITS load still completing in the
+		// background, just like a newer file request does.
+		state.loadGeneration++
 		img := &models.LoadedImage{
 			Path: "(mosaic result)",
 			HDU: fitsio.HDU{

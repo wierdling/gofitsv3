@@ -2,6 +2,7 @@ package processing
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -107,6 +108,17 @@ func TestStreamingCalibrationFingerprintMatchesCanonical(t *testing.T) {
 	}
 }
 
+func TestStreamingCalibrationRejectsNonFiniteAndReaderErrors(t *testing.T) {
+	base := CalibrationStreamInput{Width: 1, Height: 1, ReadRow: func(_ int, dst []float32) error { dst[0] = float32(math.NaN()); return nil }}
+	if r, err := CalculateCalibrationStreaming(context.Background(), []CalibrationStreamInput{base}, CalibrationSettings{}); err == nil || r.Status != models.CalibrationUnsupported {
+		t.Fatalf("non-finite stream result=%+v err=%v", r, err)
+	}
+	base.ReadRow = func(_ int, _ []float32) error { return fmt.Errorf("reader failed") }
+	if r, err := CalculateCalibrationStreaming(context.Background(), []CalibrationStreamInput{base}, CalibrationSettings{}); err == nil || r.Status != models.CalibrationUnsupported {
+		t.Fatalf("reader failure result=%+v err=%v", r, err)
+	}
+}
+
 func TestEstimateBackgroundStreamHonorsValidAndROI(t *testing.T) {
 	p := []float32{10, 10, 100, 10, 10, 10, 100, 10, 10, 10, 10, 10}
 	valid := make([]bool, len(p))
@@ -119,6 +131,25 @@ func TestEstimateBackgroundStreamHonorsValidAndROI(t *testing.T) {
 	r, err := EstimateBackgroundStream(context.Background(), in, &models.CalibrationROI{X: 0, Y: 0, Width: 4, Height: 3}, BackgroundConfig{MinSamples: 4, TileSize: 2})
 	if err != nil || r.Status != models.CalibrationValid || r.Transform.Offset != 10 {
 		t.Fatalf("estimate=%+v err=%v", r, err)
+	}
+}
+
+func TestEstimateBackgroundStreamUsesAcceptedSamplesForTiles(t *testing.T) {
+	const w, h = 8, 8
+	p := make([]float32, w*h)
+	for i := range p {
+		p[i] = 10
+	}
+	p[0] = 10000
+	in := CalibrationStreamInput{Width: w, Height: h,
+		ReadRow: func(y int, dst []float32) error {
+			copy(dst, p[y*w:(y+1)*w])
+			return nil
+		},
+	}
+	r, err := EstimateBackgroundStream(context.Background(), in, nil, BackgroundConfig{MinSamples: 8, TileSize: 4})
+	if err != nil || r.Status != models.CalibrationValid || r.Accepted != 63 || r.Rejected != 1 || r.TileSpread != 0 {
+		t.Fatalf("stream result=%+v err=%v", r, err)
 	}
 }
 

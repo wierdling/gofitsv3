@@ -1,6 +1,7 @@
 package mosaic
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"runtime"
@@ -31,6 +32,14 @@ const (
 // loaded from disk, its catalog extracted, and the pixels dropped before the next
 // frame on that worker.
 func extractStarCatalogsForAlignment(inputs []Input, maxStars int) [][]processing.Star {
+	catalogs, _ := extractStarCatalogsForAlignmentCtx(context.Background(), inputs, maxStars)
+	return catalogs
+}
+
+func extractStarCatalogsForAlignmentCtx(ctx context.Context, inputs []Input, maxStars int) ([][]processing.Star, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if maxStars <= 0 {
 		maxStars = processing.TweakRegCatalogMaxStars
 	}
@@ -40,18 +49,28 @@ func extractStarCatalogsForAlignment(inputs []Input, maxStars int) [][]processin
 		workers = len(inputs)
 	}
 	if workers < 1 {
-		return catalogs
+		return catalogs, ctx.Err()
 	}
 
 	debuglog.Log(fmt.Sprintf("extractStarCatalogsForAlignment: %d input(s), %d worker(s)", len(inputs), workers))
 	logMemStats("align: before catalog extraction")
 	var next int64 = -1
+	var firstErr error
+	var errMu sync.Mutex
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
+				if err := ctx.Err(); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					return
+				}
 				i := int(atomic.AddInt64(&next, 1))
 				if i >= len(inputs) {
 					return
@@ -71,6 +90,14 @@ func extractStarCatalogsForAlignment(inputs []Input, maxStars int) [][]processin
 						continue
 					}
 				}
+				if err := ctx.Err(); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					return
+				}
 				catalogs[i] = processing.ExtractAndLimitStars(
 					sci, w, h, alignStarThresholdSigma, alignStarMinArea, maxStars)
 			}
@@ -78,7 +105,13 @@ func extractStarCatalogsForAlignment(inputs []Input, maxStars int) [][]processin
 	}
 	wg.Wait()
 	logMemStats("align: after catalog extraction")
-	return catalogs
+	errMu.Lock()
+	err := firstErr
+	errMu.Unlock()
+	if err == nil {
+		err = ctx.Err()
+	}
+	return catalogs, err
 }
 
 // alignExtractionMemoryBudget caps the transient memory the concurrent catalog
@@ -129,6 +162,14 @@ func alignExtractionWorkers(inputs []Input) int {
 func resolveFramePixels(in Input, opts Options) (sci, errPix, whtPix []float32, owned bool, err error) {
 	if in.HDU.Data.Pixels != nil {
 		return in.HDU.Data.Pixels, in.ERRPixels, in.WeightPixels, false, nil
+	}
+	if opts.FrameLoaderCtx != nil {
+		ctx := opts.Ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		sci, errPix, err = opts.FrameLoaderCtx(ctx, in)
+		return sci, errPix, nil, true, err
 	}
 	if opts.FrameLoader != nil {
 		// FrameLoader is a test/legacy seam that supplies SCI and ERR only; a

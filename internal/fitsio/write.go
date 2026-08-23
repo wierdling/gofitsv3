@@ -27,6 +27,14 @@ type ImageExtension struct {
 // WriteFloat32ImageWithExtensions writes a primary-HDU float32 FITS image
 // followed by zero or more float32 IMAGE extensions (e.g. a WHT weight plane).
 func WriteFloat32ImageWithExtensions(path string, header Header, data ImageData, exts ...ImageExtension) error {
+	if err := validatePrimaryData(data); err != nil {
+		return err
+	}
+	for i, ext := range exts {
+		if err := validateExtensionData(ext.Data); err != nil {
+			return fmt.Errorf("extension %d (%s): %w", i, ext.ExtName, err)
+		}
+	}
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -49,6 +57,50 @@ func WriteFloat32ImageWithExtensions(path string, header Header, data ImageData,
 		}
 	}
 	return bw.Flush()
+}
+
+func validatePrimaryData(data ImageData) error {
+	if len(data.Pixels) == 0 && len(data.Int32Pixels) == 0 {
+		if data.Width == 0 && data.Height == 0 {
+			return nil // metadata-only primary HDU
+		}
+		return fmt.Errorf("metadata-only primary requires zero dimensions, got %dx%d", data.Width, data.Height)
+	}
+	return validateFloatData(data)
+}
+
+func validateExtensionData(data ImageData) error {
+	if data.Width <= 0 || data.Height <= 0 {
+		return fmt.Errorf("invalid image dimensions %dx%d", data.Width, data.Height)
+	}
+	if data.Width > int(^uint(0)>>1)/data.Height {
+		return fmt.Errorf("image dimensions overflow: %dx%d", data.Width, data.Height)
+	}
+	total := data.Width * data.Height
+	if len(data.Int32Pixels) > 0 {
+		if len(data.Int32Pixels) != total {
+			return fmt.Errorf("int32 pixel count %d does not match %dx%d", len(data.Int32Pixels), data.Width, data.Height)
+		}
+		if len(data.Pixels) != 0 && len(data.Pixels) != total {
+			return fmt.Errorf("float32 pixel count %d does not match %dx%d", len(data.Pixels), data.Width, data.Height)
+		}
+		return nil
+	}
+	return validateFloatData(data)
+}
+
+func validateFloatData(data ImageData) error {
+	if data.Width <= 0 || data.Height <= 0 {
+		return fmt.Errorf("invalid image dimensions %dx%d", data.Width, data.Height)
+	}
+	if data.Width > int(^uint(0)>>1)/data.Height {
+		return fmt.Errorf("image dimensions overflow: %dx%d", data.Width, data.Height)
+	}
+	total := data.Width * data.Height
+	if len(data.Pixels) != total {
+		return fmt.Errorf("float32 pixel count %d does not match %dx%d", len(data.Pixels), data.Width, data.Height)
+	}
+	return nil
 }
 
 func CloneHeader(header Header) Header {

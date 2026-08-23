@@ -14,6 +14,7 @@ type CrossChannelCleanOptions struct {
 	Halo                  int
 	Passes                int
 	Context               context.Context
+	ObserveTile           func(width, height int)
 }
 
 // CrossChannelCleanDiskOptions describes bounded row access for disk-backed
@@ -261,20 +262,22 @@ func CrossChannelCleanDisk(opts CrossChannelCleanDiskOptions) error {
 		row := make([]float32, opts.Widths[c])
 		// Match EstimateBackground exactly: sample every linear pixel at the
 		// same stride (rather than sampling the first N values of selected rows).
-		step := (opts.Widths[c] * opts.Heights[c]) / 100000
+		// Statistics must use the same shared top-left rectangle as the mask
+		// operation; trailing pixels from a larger channel are not comparable.
+		step := sharedSampleStep(sharedW, sharedH)
 		if step < 1 {
 			step = 1
 		}
 		sample := make([]float32, 0, 100000)
-		for y := 0; y < opts.Heights[c]; y++ {
+		for y := 0; y < sharedH; y++ {
 			if err := check(); err != nil {
 				return err
 			}
 			if err := opts.ReadRow[c](y, row); err != nil {
 				return err
 			}
-			base := y * opts.Widths[c]
-			for x, v := range row {
+			base := sharedSampleIndex(y, 0, sharedW)
+			for x, v := range row[:sharedW] {
 				// Match EstimateBackground's strided walk exactly, including the
 				// short tail when the raster size is not divisible by the stride.
 				if (base+x)%step == 0 {
@@ -522,6 +525,19 @@ func CrossChannelCleanDisk(opts CrossChannelCleanDiskOptions) error {
 	return nil
 }
 
+// sharedSampleRows returns the compact statistic sample over the shared
+// top-left rectangle. The linear base intentionally uses sharedW, not the
+// source channel width.
+func sharedSampleStep(sharedW, sharedH int) int {
+	step := (sharedW * sharedH) / 100000
+	if step < 1 {
+		step = 1
+	}
+	return step
+}
+
+func sharedSampleIndex(y, x, sharedW int) int { return y*sharedW + x }
+
 // removeCosmicRaysRows replays the cosmic-ray detector over a row-addressable
 // working store. It keeps an 11-row halo and two bounded output rows; the
 // scratch store is updated pass-by-pass, so memory is independent of image
@@ -635,6 +651,7 @@ func buildDiskStarMask(channel, width, height int, sigmas, bgs []float64, all [3
 	rows := [3][]float32{make([]float32, width), make([]float32, width), make([]float32, width)}
 	mask, prev, next := make([]byte, width), make([]byte, width), make([]byte, width)
 	dilated := make([]byte, width)
+	origPrev := make([]byte, width)
 	readMask := func(y int, dst []byte) error {
 		if y < 0 || y >= height {
 			for i := range dst {
@@ -718,7 +735,13 @@ func buildDiskStarMask(channel, width, height int, sigmas, bgs []float64, all [3
 			if err := read(y, rows[channel]); err != nil {
 				return err
 			}
-			if err := readMask(y-1, prev); err != nil {
+			if !useScratch {
+				if y == 0 {
+					clear(prev)
+				} else {
+					copy(prev, origPrev)
+				}
+			} else if err := readMask(y-1, prev); err != nil {
 				return err
 			}
 			if err := readMask(y, mask); err != nil {
@@ -726,6 +749,9 @@ func buildDiskStarMask(channel, width, height int, sigmas, bgs []float64, all [3
 			}
 			if err := readMask(y+1, next); err != nil {
 				return err
+			}
+			if !useScratch {
+				copy(origPrev, mask)
 			}
 			for x := 0; x < width; x++ {
 				v := float64(rows[channel][x])
@@ -772,7 +798,13 @@ func buildDiskStarMask(channel, width, height int, sigmas, bgs []float64, all [3
 		if err := check(); err != nil {
 			return err
 		}
-		if err := readMask(y-1, prev); err != nil {
+		if scratchRead == nil || scratchWrite == nil {
+			if y == 0 {
+				clear(prev)
+			} else {
+				copy(prev, origPrev)
+			}
+		} else if err := readMask(y-1, prev); err != nil {
 			return err
 		}
 		if err := readMask(y, mask); err != nil {
@@ -780,6 +812,13 @@ func buildDiskStarMask(channel, width, height int, sigmas, bgs []float64, all [3
 		}
 		if err := readMask(y+1, next); err != nil {
 			return err
+		}
+		// With no immutable scratch callback, writeMask may update the same
+		// backing rows read by readMask. Preserve the source row needed by the
+		// next iteration before mutating it, so dilation remains one-pass and
+		// deterministic instead of cascading through newly written pixels.
+		if scratchRead == nil || scratchWrite == nil {
+			copy(origPrev, mask)
 		}
 		copy(dilated, mask)
 		// Match dilateMask exactly: only interior source pixels expand, but
@@ -1487,14 +1526,8 @@ func CrossChannelCleanTiled(channels [][]float32, widths, heights []int, sigmas 
 	if sharedW <= 0 || sharedH <= 0 {
 		return nil, fmt.Errorf("empty shared region")
 	}
-	// The reference implementation operates on the complete shared region.  A
-	// connected star/CR component is not bounded by any fixed halo, so running
-	// independent halo tiles can change both component classification and the
-	// representative background value at a seam.  Keep the tiled entry point
-	// exact by deriving the shared-region result once, then copying only that
-	// result back into the channel-shaped outputs.  Disk callers use the same
-	// semantics through their deferred/global-mask pass rather than treating a
-	// halo as a correctness boundary.
+	// Each halo tile computes only its interior ownership region. Callers should
+	// choose a halo large enough for morphology and cosmic-ray neighborhoods.
 	if opts.Context != nil {
 		select {
 		case <-opts.Context.Done():
@@ -1502,34 +1535,75 @@ func CrossChannelCleanTiled(channels [][]float32, widths, heights []int, sigmas 
 		default:
 		}
 	}
-	shared := make([][]float32, 3)
-	for c := 0; c < 3; c++ {
-		shared[c] = make([]float32, sharedW*sharedH)
-		for y := 0; y < sharedH; y++ {
-			copy(shared[c][y*sharedW:(y+1)*sharedW], channels[c][y*widths[c]:y*widths[c]+sharedW])
-		}
-	}
 	passes := opts.Passes
 	if passes <= 0 {
 		passes = 2
 	}
-	global := BuildLayerStarMasks(shared, sharedW, sharedH, sigmas)
-	outShared := make([][]float32, 3)
-	for c := 0; c < 3; c++ {
-		if opts.Context != nil {
-			select {
-			case <-opts.Context.Done():
-				return nil, opts.Context.Err()
-			default:
-			}
-		}
-		outShared[c] = RemoveCosmicRays(shared[c], sharedW, sharedH, sigmas[c], passes, global[c])
-	}
 	out := make([][]float32, 3)
 	for c := range out {
 		out[c] = append([]float32(nil), channels[c]...)
-		for y := 0; y < sharedH; y++ {
-			copy(out[c][y*widths[c]:y*widths[c]+sharedW], outShared[c][y*sharedW:(y+1)*sharedW])
+	}
+	tw, th, halo := opts.TileWidth, opts.TileHeight, opts.Halo
+	if tw <= 0 {
+		tw = 256
+	}
+	if th <= 0 {
+		th = 256
+	}
+	if halo < 6 {
+		halo = 6
+	}
+	for y0 := 0; y0 < sharedH; y0 += th {
+		for x0 := 0; x0 < sharedW; x0 += tw {
+			if opts.Context != nil {
+				select {
+				case <-opts.Context.Done():
+					return nil, opts.Context.Err()
+				default:
+				}
+			}
+			if opts.ObserveTile != nil {
+				opts.ObserveTile(minInt(tw, sharedW-x0), minInt(th, sharedH-y0))
+			}
+			x1, y1 := x0+tw, y0+th
+			if x1 > sharedW {
+				x1 = sharedW
+			}
+			if y1 > sharedH {
+				y1 = sharedH
+			}
+			sx0, sy0 := x0-halo, y0-halo
+			if sx0 < 0 {
+				sx0 = 0
+			}
+			if sy0 < 0 {
+				sy0 = 0
+			}
+			sx1, sy1 := x1+halo, y1+halo
+			if sx1 > sharedW {
+				sx1 = sharedW
+			}
+			if sy1 > sharedH {
+				sy1 = sharedH
+			}
+			w, h := sx1-sx0, sy1-sy0
+			tile := make([][]float32, 3)
+			for c := 0; c < 3; c++ {
+				tile[c] = make([]float32, w*h)
+				for yy := 0; yy < h; yy++ {
+					copy(tile[c][yy*w:(yy+1)*w], channels[c][(sy0+yy)*widths[c]+sx0:(sy0+yy)*widths[c]+sx1])
+				}
+			}
+			cleaned, err := CrossChannelCleanTile(tile, w, h, sigmas, passes)
+			if err != nil {
+				return nil, err
+			}
+			for c := 0; c < 3; c++ {
+				for yy := y0; yy < y1; yy++ {
+					src := (yy-sy0)*w + x0 - sx0
+					copy(out[c][yy*widths[c]+x0:yy*widths[c]+x1], cleaned[c][src:src+x1-x0])
+				}
+			}
 		}
 	}
 	return out, nil

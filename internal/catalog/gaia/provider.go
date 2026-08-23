@@ -129,7 +129,7 @@ func (s Source) Validate(expectedRelease string) error {
 		}
 	}
 	for name, v := range map[string]float64{"G": s.G, "BP": s.BP, "RP": s.RP, "GError": s.GError, "BPError": s.BPError, "RPError": s.RPError} {
-		if !finite(v) || (name != "G" && name != "BP" && name != "RP" && v <= 0) || ((name == "G" || name == "BP" || name == "RP") && v < 0) {
+		if !finite(v) || (name != "G" && name != "BP" && name != "RP" && v <= 0) {
 			return fmt.Errorf("source %d has invalid %s photometry", s.SourceID, name)
 		}
 	}

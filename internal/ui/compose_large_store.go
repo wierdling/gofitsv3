@@ -86,6 +86,11 @@ func (s *composeLargeStore) SnapshotCompositeForEdit(ctx context.Context, d comp
 			cleanup()
 			return nil, err
 		}
+		if in.Width != src.Width || in.Height != src.Height || src.Width != d.Width || src.Height != d.Height {
+			_ = in.Close()
+			cleanup()
+			return nil, fmt.Errorf("composite plane %d dimensions %dx%d do not match descriptor %dx%d", i, in.Width, in.Height, d.Width, d.Height)
+		}
 		name := filepath.Join(root, fmt.Sprintf("plane-%d.bin", i))
 		a, err := fitsio.CreateFloat32Artifact(name, d.Width, d.Height)
 		if err != nil {
@@ -349,6 +354,96 @@ func (s *composeLargeStore) ReplaceManyIfCurrentPrepared(expected []composeArtif
 	return s.replaceManyIfCurrent(expected, writes, prepare)
 }
 
+// ReplaceManyIfCurrentSized is the transactional variant for resets, where a
+// quarter-turn may swap a channel's dimensions. All outputs are staged and
+// previews validated before any slot is published.
+func (s *composeLargeStore) ReplaceManyIfCurrentSized(expected []composeArtifactDescriptor, sizes [][2]int, writes []func(*fitsio.Float32Artifact) error, prepare func([]composeArtifactDescriptor) error) ([]composeArtifactDescriptor, error) {
+	if len(expected) != len(writes) || len(expected) != len(sizes) {
+		return nil, errors.New("replacement count mismatch")
+	}
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, errors.New("Compose temporary session is closed")
+	}
+	type staged struct {
+		d  composeArtifactDescriptor
+		tx *fitsio.Float32ArtifactTransaction
+	}
+	items := make([]staged, 0, len(expected))
+	abort := func() {
+		for _, x := range items {
+			_ = x.tx.Abort()
+		}
+	}
+	for i, old := range expected {
+		cur, ok := s.artifacts[old.Slot]
+		if !ok || cur.Path != old.Path || cur.Generation != old.Generation {
+			abort()
+			return nil, errors.New("stale Compose artifact generation")
+		}
+		p, err := s.path(fmt.Sprintf("%s-%d.bin", old.Slot, old.Generation+1))
+		if err != nil {
+			abort()
+			return nil, err
+		}
+		w, h := sizes[i][0], sizes[i][1]
+		tx, err := fitsio.BeginFloat32ArtifactTransaction(p, w, h)
+		if err != nil {
+			abort()
+			return nil, err
+		}
+		if err := writes[i](tx.Artifact()); err != nil {
+			_ = tx.Abort()
+			abort()
+			return nil, err
+		}
+		items = append(items, staged{composeArtifactDescriptor{Path: p, Width: w, Height: h, Generation: old.Generation + 1, Slot: old.Slot}, tx})
+	}
+	if prepare != nil {
+		desc := make([]composeArtifactDescriptor, len(items))
+		for i := range items {
+			if err := items[i].tx.Artifact().Sync(); err != nil {
+				abort()
+				return nil, err
+			}
+			desc[i] = items[i].d
+			desc[i].Path = items[i].tx.StagedPath()
+		}
+		if err := prepare(desc); err != nil {
+			abort()
+			return nil, err
+		}
+	}
+	for _, x := range items {
+		if err := x.tx.Commit(); err != nil {
+			// A transaction commits to a fresh generation path, so a later
+			// commit failure cannot damage the currently published slots. Remove
+			// every destination we may have committed before returning, otherwise
+			// a partial multi-slot reset is left on disk for a future generation.
+			for _, committed := range items {
+				_ = os.Remove(committed.d.Path)
+			}
+			abort()
+			return nil, err
+		}
+	}
+	for _, x := range items {
+		old := s.artifacts[x.d.Slot]
+		s.artifacts[x.d.Slot] = x.d
+		if old.Path != "" {
+			_ = os.Remove(old.Path)
+		}
+	}
+	out := make([]composeArtifactDescriptor, len(items))
+	for i := range items {
+		out[i] = items[i].d
+	}
+	return out, nil
+}
+
 // ReplaceManyIfCurrentArtifacts stages all outputs and exposes their bounded
 // artifact handles to one coordinator, allowing cross-channel jobs to read
 // all sources and write all destinations before any slot is published.
@@ -504,6 +599,12 @@ func (s *composeLargeStore) replaceManyIfCurrent(expected []composeArtifactDescr
 	}
 	for _, x := range stagedTx {
 		if err := x.tx.Commit(); err != nil {
+			// Commit destinations are unique, newly generated paths. Roll back
+			// all destinations (including ones committed earlier in this loop)
+			// so a later commit failure remains all-or-nothing.
+			for _, committed := range stagedTx {
+				_ = os.Remove(committed.d.Path)
+			}
 			abort()
 			return nil, err
 		}

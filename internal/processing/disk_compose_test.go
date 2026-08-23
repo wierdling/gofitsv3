@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/stretch"
 )
@@ -105,6 +106,77 @@ func TestComposeDiskRejectsOutputInputOverlap(t *testing.T) {
 	_, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Output: [3]string{filepath.Join(dir, "out.bin"), filepath.Join(dir, "g.bin"), filepath.Join(dir, "out2.bin")}})
 	if err == nil {
 		t.Fatal("expected output/input overlap rejection")
+	}
+}
+
+func TestArtifactSamplerPreservesInBoundsEdges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "edge.bin")
+	a, err := fitsio.CreateFloat32Artifact(path, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WriteRow(0, []float32{1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WriteRow(1, []float32{3, 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a, err = fitsio.OpenFloat32ArtifactReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	s := newArtifactSampler(a)
+	for _, tc := range []struct{ x, y, want float64 }{{1, 1, 4}, {0, 1, 3}, {1, .5, 3}} {
+		if got := s.sample(tc.x, tc.y); math.Abs(float64(got)-tc.want) > 1e-6 {
+			t.Fatalf("sample(%v,%v)=%v, want %v", tc.x, tc.y, got, tc.want)
+		}
+	}
+	if got := s.sample(2, 1); got != 0 {
+		t.Fatalf("out-of-footprint sample = %v, want 0", got)
+	}
+}
+
+func TestComposeDiskPreviewFailurePreservesDestinations(t *testing.T) {
+	dir := t.TempDir()
+	paths := [3]string{filepath.Join(dir, "b.bin"), filepath.Join(dir, "g.bin"), filepath.Join(dir, "r.bin")}
+	for _, p := range paths {
+		writeDiskComposeFixture(t, p, .5)
+	}
+	out := [3]string{filepath.Join(dir, "out-r.bin"), filepath.Join(dir, "out-g.bin"), filepath.Join(dir, "out-b.bin")}
+	for i, p := range out {
+		if err := os.WriteFile(p, []byte{byte('Q' + i)}, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := diskCompositePreviewForCompose
+	diskCompositePreviewForCompose = func(context.Context, [3]string, int, int, int, *models.RgbLevels) ([]byte, [3]histogram.Stats, error) {
+		return nil, [3]histogram.Stats{}, context.Canceled
+	}
+	t.Cleanup(func() { diskCompositePreviewForCompose = old })
+	ch := [3]DiskChannel{diskComposeTestChannel(paths[0]), diskComposeTestChannel(paths[1]), diskComposeTestChannel(paths[2])}
+	if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Output: out}); err == nil {
+		t.Fatal("expected preview failure")
+	}
+	for i, p := range out {
+		got, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, []byte{byte('Q' + i)}) {
+			t.Fatalf("destination %d changed: %q", i, got)
+		}
+	}
+}
+
+func TestMapDiskCoordinateUsesStoredAffineOnReferenceGrid(t *testing.T) {
+	img := models.LoadedImage{HasAlignTransform: true, AlignA: .5, AlignB: .25, AlignC: 1, AlignD: -.25, AlignE: .75, AlignF: 2}
+	fx, fy := MapDiskCoordinate(img, models.LoadedImage{}, 0, 0, 0, 4, 6, 8, 10, 3, 2)
+	if math.Abs(fx-4.5) > 1e-9 || math.Abs(fy-5.5) > 1e-9 {
+		t.Fatalf("affine mapping=(%v,%v), want (4.5,5.5)", fx, fy)
 	}
 }
 

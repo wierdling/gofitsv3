@@ -109,6 +109,13 @@ func (c *Cache) PutCell(ctx context.Context, batch CellBatch) error {
 	}
 	rollback := func(e error) error { _ = tx.Rollback(); return e }
 	stamp := batch.FetchedAt.UnixNano()
+	// A non-nil source batch is authoritative for this exact cell membership.
+	// Replace prior membership so refreshed results cannot retain stale IDs.
+	if batch.Sources != nil {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM query_cell_sources WHERE query_signature=? AND spatial_cell=? AND release=?`, batch.Cell.Signature, batch.Cell.SpatialCell, batch.Cell.Release); err != nil {
+			return rollback(err)
+		}
+	}
 	for _, source := range batch.Sources {
 		if err := contextErr(ctx); err != nil {
 			return rollback(err)

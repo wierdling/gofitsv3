@@ -26,10 +26,10 @@ type curvePoint struct {
 // ToLUT(ch) composes the "All" curve with the channel-specific curve.
 type curvesWidget struct {
 	widget.BaseWidget
-	points   [4][]curvePoint // 0=All, 1=R, 2=G, 3=B
-	active   int             // 0=All, 1=R, 2=G, 3=B
-	dragIdx   int       // index of point being dragged, -1 = none
-	lastSize  fyne.Size // widget size captured during the last Dragged call
+	points    [4][]curvePoint // 0=All, 1=R, 2=G, 3=B
+	active    int             // 0=All, 1=R, 2=G, 3=B
+	dragIdx   int             // index of point being dragged, -1 = none
+	lastSize  fyne.Size       // widget size captured during the last Dragged call
 	onChange  func()
 	onDragEnd func()
 }
@@ -262,6 +262,9 @@ func (cw *curvesWidget) CreateRenderer() fyne.WidgetRenderer {
 
 func (cw *curvesWidget) draw(w, h int) image.Image {
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	if w <= 0 || h <= 0 {
+		return img
+	}
 
 	// Background
 	for i := 0; i < len(img.Pix); i += 4 {
@@ -295,7 +298,10 @@ func (cw *curvesWidget) draw(w, h int) image.Image {
 
 	// Identity diagonal
 	for x := 0; x < w; x++ {
-		y := h - 1 - x*(h-1)/(w-1)
+		y := h - 1
+		if w > 1 {
+			y = h - 1 - x*(h-1)/(w-1)
+		}
 		setPixel(x, y, 70, 70, 70)
 	}
 
@@ -319,7 +325,10 @@ func (cw *curvesWidget) draw(w, h int) image.Image {
 
 		prevPy := -1
 		for x := 0; x < w; x++ {
-			t := float64(x) / float64(w-1)
+			t := 0.0
+			if w > 1 {
+				t = float64(x) / float64(w-1)
+			}
 			yv := evalMonotoneCubic(xs, ys, tangents, t)
 			py := h - 1 - int(clampF64(yv, 0, 1)*float64(h-1))
 			// Connect vertically to previous pixel to avoid gaps
@@ -381,11 +390,11 @@ type curvesRenderer struct {
 	raster *canvas.Raster
 }
 
-func (r *curvesRenderer) Layout(size fyne.Size)          { r.raster.Resize(size) }
-func (r *curvesRenderer) MinSize() fyne.Size             { return r.widget.MinSize() }
-func (r *curvesRenderer) Objects() []fyne.CanvasObject   { return []fyne.CanvasObject{r.raster} }
-func (r *curvesRenderer) Refresh()                       { r.raster.Refresh() }
-func (r *curvesRenderer) Destroy()                       {}
+func (r *curvesRenderer) Layout(size fyne.Size)        { r.raster.Resize(size) }
+func (r *curvesRenderer) MinSize() fyne.Size           { return r.widget.MinSize() }
+func (r *curvesRenderer) Objects() []fyne.CanvasObject { return []fyne.CanvasObject{r.raster} }
+func (r *curvesRenderer) Refresh()                     { r.raster.Refresh() }
+func (r *curvesRenderer) Destroy()                     {}
 
 // --- spline math ---
 

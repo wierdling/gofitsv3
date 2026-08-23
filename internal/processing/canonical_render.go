@@ -250,7 +250,7 @@ func alignedOverlayMask(pixels []float32, width, height int, overlay, ref *model
 		for y := 0; y < height; y++ {
 			for x := 0; x < width; x++ {
 				sx, sy := ApplyAffineTransform(tr, float64(x), float64(y))
-				if sx < 0 || sy < 0 || sx+1 >= float64(overlay.HDU.Data.Width) || sy+1 >= float64(overlay.HDU.Data.Height) {
+				if !finite(sx) || !finite(sy) || sx < 0 || sy < 0 || sx > float64(overlay.HDU.Data.Width-1) || sy > float64(overlay.HDU.Data.Height-1) {
 					valid[y*width+x] = false
 				}
 			}
@@ -333,7 +333,7 @@ func composeAlignedPlanes(ctx context.Context, req ComposeRenderRequest) ([3]Ali
 				for y := 0; y < raw.Height; y++ {
 					for x := 0; x < raw.Width; x++ {
 						sx, sy := ApplyAffineTransform(tr, float64(x), float64(y))
-						if sx < 0 || sy < 0 || sx+1 >= float64(img.HDU.Data.Width) || sy+1 >= float64(img.HDU.Data.Height) {
+						if !finite(sx) || !finite(sy) || sx < 0 || sy < 0 || sx > float64(img.HDU.Data.Width-1) || sy > float64(img.HDU.Data.Height-1) {
 							valid[y*raw.Width+x] = false
 						}
 					}

@@ -125,6 +125,29 @@ func TestFromImageRejectsUnsupportedFormat(t *testing.T) {
 	}
 }
 
+func TestFromImageUnsupportedFormatPreservesExistingDestination(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.bin")
+	sentinel := []byte("existing output must survive format validation")
+	if err := os.WriteFile(path, sentinel, 0o600); err != nil {
+		t.Fatalf("WriteFile error: %v", err)
+	}
+
+	err := FromImage(path, image.NewRGBA(image.Rect(0, 0, 1, 1)), Format("gif"), Options{})
+	if err == nil {
+		t.Fatal("expected unsupported format error")
+	}
+	if got, want := err.Error(), "unsupported format"; got != want {
+		t.Fatalf("error = %q, want %q", got, want)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile error: %v", err)
+	}
+	if string(got) != string(sentinel) {
+		t.Fatalf("destination changed: got %q, want %q", got, sentinel)
+	}
+}
+
 func TestFromImagePropagatesCreateError(t *testing.T) {
 	err := FromImage(t.TempDir(), image.NewRGBA(image.Rect(0, 0, 1, 1)), PNG, Options{})
 	if err == nil {

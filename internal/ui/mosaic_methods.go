@@ -38,6 +38,12 @@ func (ws *mosaicWorkspace) freeInputPixels() {
 // exclusion flags on the in-memory inputs are preserved; only the pixel arrays
 // are restored.
 func (ws *mosaicWorkspace) ensureInputPixelsLoaded() error {
+	ws.inputMu.Lock()
+	defer ws.inputMu.Unlock()
+	return ws.ensureInputPixelsLoadedLocked()
+}
+
+func (ws *mosaicWorkspace) ensureInputPixelsLoadedLocked() error {
 	cache := map[string][]mosaic.Input{}
 	load := func(path string) ([]mosaic.Input, error) {
 		if v, ok := cache[path]; ok {
@@ -58,7 +64,11 @@ func (ws *mosaicWorkspace) ensureInputPixelsLoaded() error {
 		if err != nil {
 			return fmt.Errorf("reload %s: %w", dst.Path, err)
 		}
-		return assignPixelsFromLoaded(dst, loaded)
+		if err := assignPixelsFromLoaded(dst, loaded); err != nil {
+			return err
+		}
+		ws.advanceInputGenerationLocked(*dst)
+		return nil
 	}
 	for i := range ws.state.inputs {
 		if err := restore(&ws.state.inputs[i]); err != nil {
@@ -124,6 +134,27 @@ func freeInputPixelsFor(inputs []mosaic.Input, reference *mosaic.Input) {
 // load or a drizzle build). Use this when only one frame is needed — such as the
 // star-picker reference preview — so the whole dataset is not pulled into memory.
 func (ws *mosaicWorkspace) ensureInputPixelsLoadedAt(idx int) error {
+	ws.inputMu.Lock()
+	defer ws.inputMu.Unlock()
+	return ws.ensureInputPixelsLoadedAtLocked(idx)
+}
+
+// ensureInputPixelsLoadedAtKey performs the indexed load only while the
+// indexed input still identifies the source selected by the caller. This
+// prevents an asynchronous editor open from loading a reordered input.
+func (ws *mosaicWorkspace) ensureInputPixelsLoadedAtKey(idx int, expectedKey string) error {
+	ws.inputMu.Lock()
+	defer ws.inputMu.Unlock()
+	if ws == nil || ws.state == nil || idx < 0 || idx >= len(ws.state.inputs) {
+		return fmt.Errorf("input index %d is no longer available", idx)
+	}
+	if artifactMaskTargetKey(ws.state.inputs[idx]) != expectedKey {
+		return fmt.Errorf("source input changed while opening artifact mask")
+	}
+	return ws.ensureInputPixelsLoadedAtLocked(idx)
+}
+
+func (ws *mosaicWorkspace) ensureInputPixelsLoadedAtLocked(idx int) error {
 	if idx < 0 || idx >= len(ws.state.inputs) {
 		return fmt.Errorf("input index %d out of range (%d inputs)", idx, len(ws.state.inputs))
 	}
@@ -135,7 +166,55 @@ func (ws *mosaicWorkspace) ensureInputPixelsLoadedAt(idx int) error {
 	if err != nil {
 		return fmt.Errorf("reload %s: %w", dst.Path, err)
 	}
-	return assignPixelsFromLoaded(dst, loaded)
+	if err := assignPixelsFromLoaded(dst, loaded); err != nil {
+		return err
+	}
+	ws.advanceInputGenerationLocked(*dst)
+	return nil
+}
+
+func (ws *mosaicWorkspace) advanceInputGeneration(input mosaic.Input) {
+	ws.inputMu.Lock()
+	defer ws.inputMu.Unlock()
+	ws.advanceInputGenerationLocked(input)
+}
+
+func (ws *mosaicWorkspace) advanceInputGenerationLocked(input mosaic.Input) {
+	if ws.inputGenerations == nil {
+		ws.inputGenerations = make(map[string]uint64)
+	}
+	ws.inputGenerations[artifactMaskTargetKey(input)]++
+}
+
+func (ws *mosaicWorkspace) inputGeneration(input mosaic.Input) uint64 {
+	ws.inputMu.RLock()
+	defer ws.inputMu.RUnlock()
+	return ws.inputGenerationLocked(input)
+}
+
+func (ws *mosaicWorkspace) inputGenerationLocked(input mosaic.Input) uint64 {
+	if ws == nil || ws.inputGenerations == nil {
+		return 0
+	}
+	return ws.inputGenerations[artifactMaskTargetKey(input)]
+}
+
+func (ws *mosaicWorkspace) inputSnapshot(idx int) (mosaic.Input, bool) {
+	ws.inputMu.RLock()
+	defer ws.inputMu.RUnlock()
+	if ws == nil || ws.state == nil || idx < 0 || idx >= len(ws.state.inputs) {
+		return mosaic.Input{}, false
+	}
+	return ws.state.inputs[idx], true
+}
+
+func (ws *mosaicWorkspace) inputsSnapshot() []mosaic.Input {
+	ws.inputMu.RLock()
+	defer ws.inputMu.RUnlock()
+	if ws == nil || ws.state == nil {
+		return nil
+	}
+	return append([]mosaic.Input(nil), ws.state.inputs...)
 }
 
 // assignPixelsFromLoaded copies the SCI/ERR pixel arrays for dst out of a freshly
@@ -163,16 +242,22 @@ func assignPixelsFromLoaded(dst *mosaic.Input, loaded []mosaic.Input) error {
 // (if set). The reference is marked ReferenceOnly so Build() uses it only for
 // WCS anchoring and excludes its pixels from the output.
 func (ws *mosaicWorkspace) inputsWithRef() []mosaic.Input {
+	ws.inputMu.RLock()
+	defer ws.inputMu.RUnlock()
+	return inputsWithRefFor(ws.state.inputs, ws.state.referenceInput)
+}
+
+func inputsWithRefFor(inputs []mosaic.Input, reference *mosaic.Input) []mosaic.Input {
 	var active []mosaic.Input
-	for _, inp := range ws.state.inputs {
+	for _, inp := range inputs {
 		if !inp.Excluded {
 			active = append(active, inp)
 		}
 	}
-	if ws.state.referenceInput == nil {
+	if reference == nil {
 		return active
 	}
-	ref := *ws.state.referenceInput
+	ref := *reference
 	ref.ReferenceOnly = true
 	return append([]mosaic.Input{ref}, active...)
 }
@@ -410,8 +495,11 @@ func (ws *mosaicWorkspace) fitZoom() float64 {
 	if sz.Width <= 1 || sz.Height <= 1 {
 		sz = fyne.NewSize(600, 500)
 	}
+	if imgW <= 0 || imgH <= 0 {
+		return 1
+	}
 	z := math.Min(float64(sz.Width)/float64(imgW), float64(sz.Height)/float64(imgH))
-	return math.Max(z, 1.0/16)
+	return clampMosaicZoom(z)
 }
 
 func (ws *mosaicWorkspace) openDrizzleSettings() {

@@ -299,6 +299,23 @@ func TestHeaderStringUnescapesDoubledQuote(t *testing.T) {
 	}
 }
 
+func TestHeaderStringAndSelectionParseEXTVERComments(t *testing.T) {
+	header := Header{Cards: map[string]string{
+		"EXTNAME": "'SCI'           / detector image",
+		"EXTVER":  "2               / second extension",
+	}}
+	if got := HeaderString(header, "EXTVER"); got != "2" {
+		t.Fatalf("HeaderString(EXTVER) = %q, want 2", got)
+	}
+	f := &File{HDUs: []HDU{
+		{ExtName: "SCI", Header: Header{Cards: map[string]string{"EXTVER": "1 / first"}}},
+		{ExtName: "SCI", Header: header},
+	}}
+	if got := f.GetHDUByExtVer("SCI", "2"); got == nil || got != &f.HDUs[1] {
+		t.Fatalf("GetHDUByExtVer(SCI,2) = %#v, want second SCI HDU", got)
+	}
+}
+
 func TestFilterStringFallsBackToPupilForJWST(t *testing.T) {
 	// JWST NIRCam stores some bandpasses in the pupil wheel with FILTER=CLEAR.
 	header := Header{Cards: map[string]string{
@@ -461,6 +478,75 @@ func TestWriteFloat32ImageCreateError(t *testing.T) {
 	err := WriteFloat32Image(t.TempDir(), Header{}, ImageData{Width: 1, Height: 1, Pixels: []float32{1}})
 	if err == nil {
 		t.Fatal("expected create error")
+	}
+}
+
+func TestWriteFloat32ImageRejectsMalformedDataBeforeTruncating(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "image.fits")
+	if err := os.WriteFile(path, []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range []ImageData{
+		{Width: 2, Height: 2, Pixels: []float32{1}},
+		{Width: 2, Height: 2, Pixels: []float32{1, 2, 3, 4, 5}},
+		{Width: 0, Height: 2, Pixels: []float32{1}},
+		{Width: 2, Height: 2},
+		{Width: 0, Height: 2},
+		{Width: 2, Height: 0},
+		{Width: -1, Height: 0},
+	} {
+		if err := WriteFloat32Image(path, Header{}, data); err == nil {
+			t.Fatalf("expected validation error for %+v", data)
+		}
+		got, _ := os.ReadFile(path)
+		if string(got) != "sentinel" {
+			t.Fatalf("validation truncated output: %q", got)
+		}
+	}
+	if err := WriteFloat32Image(path, Header{}, ImageData{}); err != nil {
+		t.Fatalf("metadata-only primary: %v", err)
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() == 0 {
+		t.Fatalf("metadata-only output missing: %v", err)
+	}
+}
+
+func TestWriteFloat32ImageRejectsMalformedExtensionBeforeTruncating(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "image.fits")
+	if err := os.WriteFile(path, []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ext := ImageExtension{ExtName: "SCI", Data: ImageData{Width: 2, Height: 2, Pixels: []float32{1}}}
+	if err := WriteFloat32ImageWithExtensions(path, Header{}, ImageData{}, ext); err == nil {
+		t.Fatal("expected extension validation error")
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "sentinel" {
+		t.Fatalf("extension validation truncated output: %q", got)
+	}
+}
+
+func TestReadImageRejectsInvalidDimensions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		width  string
+		height string
+	}{
+		{"negative", "-1", "2"},
+		{"zero", "0", "2"},
+		{"overflow", "9223372036854775807", "2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hdr := Header{Cards: map[string]string{"NAXIS": "2", "NAXIS1": tc.width, "NAXIS2": tc.height, "BITPIX": "-32"}}
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("readImage panicked: %v", r)
+				}
+			}()
+			if _, _, err := readImage(bufio.NewReader(bytes.NewReader(nil)), hdr); err == nil {
+				t.Fatal("expected invalid-dimension error")
+			}
+		})
 	}
 }
 

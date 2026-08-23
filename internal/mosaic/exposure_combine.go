@@ -196,11 +196,57 @@ func writeCombinedWorkingFile(workingPath string, result *Result) error {
 		os.Remove(tmp)
 		return fmt.Errorf("write working file: %w", err)
 	}
-	// Windows rename will not overwrite an existing target, so clear it first.
-	os.Remove(workingPath)
-	if err := os.Rename(tmp, workingPath); err != nil {
+	if err := replaceWorkingFile(tmp, workingPath); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("finalize working file: %w", err)
+	}
+	return nil
+}
+
+// replaceWorkingFile publishes tmp at dst without deleting a valid existing
+// cache first. On platforms where rename cannot replace an existing file, the
+// old cache is moved aside and restored if publishing the replacement fails.
+// Tests may replace this function to deterministically exercise finalization
+// failures without touching the write path.
+var replaceWorkingFile = atomicReplaceWorkingFile
+
+// mosaicRename is isolated for deterministic transaction-failure tests.
+// Production uses os.Rename unchanged.
+var mosaicRename = os.Rename
+
+func atomicReplaceWorkingFile(tmp, dst string) error {
+	if err := mosaicRename(tmp, dst); err == nil {
+		return nil
+	}
+
+	// Never reuse dst+".bak": it may contain the only recoverable cache from
+	// an earlier interrupted replacement. A unique sibling backup preserves
+	// that file even if dst disappeared between the publish attempts.
+	backupFile, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".bak-*")
+	if err != nil {
+		return fmt.Errorf("create working backup: %w", err)
+	}
+	backup := backupFile.Name()
+	if err := backupFile.Close(); err != nil {
+		_ = os.Remove(backup)
+		return fmt.Errorf("close working backup: %w", err)
+	}
+	if err := os.Remove(backup); err != nil {
+		return fmt.Errorf("prepare working backup: %w", err)
+	}
+	if err := mosaicRename(dst, backup); err != nil {
+		return fmt.Errorf("stage existing working file: %w", err)
+	}
+	if err := mosaicRename(tmp, dst); err != nil {
+		if restoreErr := mosaicRename(backup, dst); restoreErr != nil {
+			return fmt.Errorf("publish replacement: %w (restore existing: %v)", err, restoreErr)
+		}
+		return fmt.Errorf("publish replacement: %w", err)
+	}
+	if err := os.Remove(backup); err != nil {
+		// The new cache is valid and published; a stale backup is harmless and
+		// can be cleaned up on a later replacement.
+		return fmt.Errorf("remove working backup: %w", err)
 	}
 	return nil
 }

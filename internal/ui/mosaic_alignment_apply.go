@@ -15,16 +15,22 @@ type alignmentSidecarSaver func(mosaic.Input, mosaic.Input, mosaic.StarAlignment
 // stateIndices maps each workset item back to state.inputs; -1 is an external
 // reference baseline.
 func (ws *mosaicWorkspace) alignmentWorkset() ([]mosaic.Input, []int) {
-	reference, ok := effectiveMosaicAlignmentReference(ws.state.inputs, ws.state.referenceInput)
+	ws.inputMu.RLock()
+	defer ws.inputMu.RUnlock()
+	return alignmentWorksetFor(ws.state.inputs, ws.state.statuses, ws.state.referenceInput, ws.state.alignmentSettings.NumRefs)
+}
+
+func alignmentWorksetFor(stateInputs []mosaic.Input, statuses []mosaic.InputStatus, external *mosaic.Input, numRefs int) ([]mosaic.Input, []int) {
+	reference, ok := effectiveMosaicAlignmentReference(stateInputs, external)
 	if !ok {
 		return nil, nil
 	}
 
 	inputs := []mosaic.Input{reference}
 	stateIndices := []int{-1}
-	if ws.state.referenceInput == nil {
-		for i := range ws.state.inputs {
-			if sameMosaicAlignmentInput(ws.state.inputs[i], reference) {
+	if external == nil {
+		for i := range stateInputs {
+			if sameMosaicAlignmentInput(stateInputs[i], reference) {
 				stateIndices[0] = i
 				break
 			}
@@ -33,14 +39,14 @@ func (ws *mosaicWorkspace) alignmentWorkset() ([]mosaic.Input, []int) {
 		inputs[0].ReferenceOnly = true
 	}
 
-	for i, input := range ws.state.inputs {
+	for i, input := range stateInputs {
 		if input.Excluded || sameMosaicAlignmentInput(input, reference) || input.OffsetLocked {
 			continue
 		}
 		// A sidecar describes a transform into one reference frame. Multiple
 		// designated references have different semantics, so retain the normal
 		// multi-reference alignment behavior instead of reusing that cache.
-		if ws.usesSingleAlignmentReference() && i < len(ws.state.statuses) && ws.state.statuses[i].Status == "loaded alignment" {
+		if (external != nil || numRefs <= 1) && i < len(statuses) && statuses[i].Status == "loaded alignment" {
 			continue
 		}
 		inputs = append(inputs, input)
@@ -54,10 +60,15 @@ func (ws *mosaicWorkspace) usesSingleAlignmentReference() bool {
 }
 
 func (ws *mosaicWorkspace) alignmentNumRefs() int {
-	if ws.state.referenceInput != nil {
+	ws.inputMu.RLock()
+	defer ws.inputMu.RUnlock()
+	return alignmentNumRefsFor(ws.state.referenceInput, ws.state.alignmentSettings.NumRefs)
+}
+
+func alignmentNumRefsFor(external *mosaic.Input, numRefs int) int {
+	if external != nil {
 		return 1
 	}
-	numRefs := ws.state.alignmentSettings.NumRefs
 	if numRefs < 1 {
 		return 1
 	}
@@ -69,6 +80,8 @@ func (ws *mosaicWorkspace) alignmentNumRefs() int {
 // unchecked rows are left untouched. A save error is returned so callers can
 // report it without implying persistence succeeded.
 func (ws *mosaicWorkspace) applyAlignmentRowsAndSave(rows []alignmentResultRow, checked func(int) bool, save alignmentSidecarSaver) error {
+	ws.inputMu.Lock()
+	defer ws.inputMu.Unlock()
 	reference, hasReference := effectiveMosaicAlignmentReference(ws.state.inputs, ws.state.referenceInput)
 	var saveErrs []error
 	for i, row := range rows {
@@ -76,6 +89,18 @@ func (ws *mosaicWorkspace) applyAlignmentRowsAndSave(rows []alignmentResultRow, 
 			continue
 		}
 		input := &ws.state.inputs[row.stateIdx]
+		if row.target.Path != "" && !sameMosaicAlignmentInput(*input, row.target) {
+			continue
+		}
+		if row.reference.Path != "" && (!hasReference || !sameMosaicAlignmentInput(reference, row.reference)) {
+			continue
+		}
+		if row.target.Path != "" && ws.inputGenerationLocked(*input) != row.targetGeneration {
+			continue
+		}
+		if row.reference.Path != "" && ws.inputGenerationLocked(reference) != row.referenceGeneration {
+			continue
+		}
 		if sameMosaicAlignmentInput(*input, reference) {
 			continue
 		}

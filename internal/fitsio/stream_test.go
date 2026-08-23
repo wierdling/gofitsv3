@@ -1,11 +1,84 @@
 package fitsio
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 )
+
+func TestCreateFloat32ArtifactOversizedPreservesDestination(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oversized.bin")
+	want := []byte("sentinel")
+	if err := os.WriteFile(path, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateFloat32Artifact(path, int(^uint32(0)), 1); err == nil {
+		t.Fatal("oversized artifact row was accepted")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("destination changed after rejected create: %q", got)
+	}
+}
+
+func TestOpenFloat32ArtifactRejectsMaxUint32Header(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "malicious.bin")
+	h := make([]byte, artifactHeaderSize)
+	copy(h[:8], artifactMagic[:])
+	binary.LittleEndian.PutUint32(h[8:12], ^uint32(0))
+	binary.LittleEndian.PutUint32(h[12:16], ^uint32(0))
+	if err := os.WriteFile(path, h, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenFloat32Artifact(path); err == nil {
+		t.Fatal("malicious max-uint32 header was accepted")
+	}
+}
+
+func TestFloat32ArtifactTransactionCommitPreclosedPreservesDestination(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "destination.bin")
+	a, err := CreateFloat32Artifact(path, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WriteRow(0, []float32{7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := BeginFloat32ArtifactTransaction(path, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Artifact().WriteRow(0, []float32{9}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Artifact().Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err == nil {
+		t.Fatal("commit succeeded with preclosed artifact")
+	}
+	b, err := OpenFloat32ArtifactReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := make([]float32, 1)
+	if err := b.ReadRow(0, row); err != nil {
+		t.Fatal(err)
+	}
+	_ = b.Close()
+	if row[0] != 7 {
+		t.Fatalf("destination changed after failed commit: %v", row[0])
+	}
+}
 
 func TestLoadSelectedHDUMatchesLoadFileAndSkipsOtherPixels(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "selected.fits")

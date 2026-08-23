@@ -17,19 +17,20 @@ const (
 )
 
 type artifactMaskEditorController struct {
-	inputIndex int
-	input      mosaic.Input
-	purpose    models.ArtifactMaskPurpose
-	sourceMode models.ArtifactMaskSourceMode
-	sourceKey  string
-	name       string
-	width      int
-	height     int
-	pixels     []float32
-	mask       []bool
-	preview    []bool
-	undo       [][]bool
-	redo       [][]bool
+	inputIndex       int
+	input            mosaic.Input
+	purpose          models.ArtifactMaskPurpose
+	sourceMode       models.ArtifactMaskSourceMode
+	sourceKey        string
+	name             string
+	width            int
+	height           int
+	pixels           []float32
+	sourceGeneration uint64
+	mask             []bool
+	preview          []bool
+	undo             [][]bool
+	redo             [][]bool
 }
 
 func newArtifactMaskEditorController(inputIndex int, input mosaic.Input, existing *models.ArtifactMaskDocument) (*artifactMaskEditorController, error) {
@@ -68,7 +69,7 @@ func newArtifactMaskEditorControllerForPurpose(inputIndex int, input mosaic.Inpu
 		name:       mosaic.InputLabel(input),
 		width:      w,
 		height:     h,
-		pixels:     input.HDU.Data.Pixels,
+		pixels:     append([]float32(nil), input.HDU.Data.Pixels...),
 		mask:       mask,
 	}, nil
 }

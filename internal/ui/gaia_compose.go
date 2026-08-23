@@ -40,6 +40,42 @@ func parseGaiaMatchRadiusArcsec(raw string) (float64, error) {
 	return radius, nil
 }
 
+func readGaiaLinearWCS(read func(string) (float64, bool)) (a, b, c, d float64, err error) {
+	cdKeys := []string{"CD1_1", "CD1_2", "CD2_1", "CD2_2"}
+	cd := make([]float64, 4)
+	cdPresent := false
+	for i, key := range cdKeys {
+		v, ok := read(key)
+		if ok {
+			cdPresent = true
+			cd[i] = v
+		}
+	}
+	if cdPresent {
+		for i, v := range cd {
+			if _, ok := read(cdKeys[i]); !ok {
+				return 0, 0, 0, 0, fmt.Errorf("incomplete CD WCS matrix")
+			}
+			cd[i] = v
+		}
+		return cd[0], cd[1], cd[2], cd[3], nil
+	}
+	sx, okx := read("CDELT1")
+	sy, oky := read("CDELT2")
+	if !okx || !oky {
+		return 0, 0, 0, 0, fmt.Errorf("Gaia requires verified linear WCS metadata")
+	}
+	pcKeys := []string{"PC1_1", "PC1_2", "PC2_1", "PC2_2"}
+	pc := []float64{1, 0, 0, 1}
+	for i, key := range pcKeys {
+		v, ok := read(key)
+		if ok {
+			pc[i] = v
+		}
+	}
+	return pc[0] * sx, pc[1] * sx, pc[2] * sy, pc[3] * sy, nil
+}
+
 func gaiaRequestSettings(settings models.GaiaCalibrationSettings, matchRadius, epoch, magnitude float64) processing.GaiaCalibrationSettings {
 	return processing.GaiaCalibrationSettings{
 		Release:           settings.Release,
@@ -127,36 +163,9 @@ func deriveGaiaFieldQuery(img *models.LoadedImage, settings models.GaiaCalibrati
 	if !ok1 || !ok2 {
 		return gaia.FieldQuery{}, nil, fmt.Errorf("Gaia requires verified CRVAL WCS metadata")
 	}
-	var a, b, c, d float64
-	if cd11, x1 := read("CD1_1"); x1 {
-		var x2, x3, x4 bool
-		b, x2 = read("CD1_2")
-		c, x3 = read("CD2_1")
-		d, x4 = read("CD2_2")
-		if !x2 || !x3 || !x4 {
-			return gaia.FieldQuery{}, nil, fmt.Errorf("incomplete CD WCS matrix")
-		}
-		a = cd11
-	} else {
-		sx, x1 := read("CDELT1")
-		sy, x2 := read("CDELT2")
-		if !x1 || !x2 {
-			return gaia.FieldQuery{}, nil, fmt.Errorf("Gaia requires verified linear WCS metadata")
-		}
-		p11, p12, p21, p22 := 1.0, 0.0, 0.0, 1.0
-		if v, ok := read("PC1_1"); ok {
-			p11 = v
-		}
-		if v, ok := read("PC1_2"); ok {
-			p12 = v
-		}
-		if v, ok := read("PC2_1"); ok {
-			p21 = v
-		}
-		if v, ok := read("PC2_2"); ok {
-			p22 = v
-		}
-		a, b, c, d = p11*sx, p12*sx, p21*sy, p22*sy
+	a, b, c, d, err := readGaiaLinearWCS(read)
+	if err != nil {
+		return gaia.FieldQuery{}, nil, err
 	}
 	if !isFinite(a) || !isFinite(b) || !isFinite(c) || !isFinite(d) || math.Abs(dec) > 90 || math.Abs(a*d-b*c) < 1e-18 {
 		return gaia.FieldQuery{}, nil, fmt.Errorf("invalid WCS scale")
@@ -261,41 +270,9 @@ func deriveGaiaFieldProjection(img *models.LoadedImage, settings models.GaiaCali
 	if !ok2 {
 		crpix2 = 1
 	}
-	var a, b, c, d float64
-	if a, ok1 = read("CD1_1"); ok1 {
-		var ok bool
-		b, ok = read("CD1_2")
-		if !ok {
-			return q, nil, nil, fmt.Errorf("incomplete CD WCS matrix")
-		}
-		c, ok = read("CD2_1")
-		if !ok {
-			return q, nil, nil, fmt.Errorf("incomplete CD WCS matrix")
-		}
-		d, ok = read("CD2_2")
-		if !ok {
-			return q, nil, nil, fmt.Errorf("incomplete CD WCS matrix")
-		}
-	} else {
-		sx, oksx := read("CDELT1")
-		sy, oksy := read("CDELT2")
-		if !oksx || !oksy {
-			return q, nil, nil, fmt.Errorf("Gaia requires verified linear WCS metadata")
-		}
-		p11, p12, p21, p22 := 1.0, 0.0, 0.0, 1.0
-		if v, ok := read("PC1_1"); ok {
-			p11 = v
-		}
-		if v, ok := read("PC1_2"); ok {
-			p12 = v
-		}
-		if v, ok := read("PC2_1"); ok {
-			p21 = v
-		}
-		if v, ok := read("PC2_2"); ok {
-			p22 = v
-		}
-		a, b, c, d = p11*sx, p12*sx, p21*sy, p22*sy
+	a, b, c, d, err := readGaiaLinearWCS(read)
+	if err != nil {
+		return q, nil, nil, err
 	}
 	if !oka || !okd || math.Abs(a*d-b*c) < 1e-18 {
 		return q, nil, nil, fmt.Errorf("singular WCS matrix")

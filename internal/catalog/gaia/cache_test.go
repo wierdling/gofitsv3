@@ -51,6 +51,32 @@ func TestCacheFreshUpsertAndVersionCoexistence(t *testing.T) {
 	}
 }
 
+func TestCacheSourceBatchReplacesCellMembership(t *testing.T) {
+	c, err := OpenCache(context.Background(), filepath.Join(t.TempDir(), "gaia.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	cell := QueryCell{Signature: "sig", SpatialCell: "cell", Release: "DR3"}
+	for _, sources := range [][]Source{{testSource(1), testSource(2)}, {testSource(2)}, {}} {
+		if err := c.PutCell(context.Background(), CellBatch{Cell: cell, Sources: sources}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := c.Sources(context.Background(), cell)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(sources) {
+			t.Fatalf("membership=%v, want %v", got, sources)
+		}
+		for i := range got {
+			if got[i].SourceID != sources[i].SourceID {
+				t.Fatalf("membership=%v, want %v", got, sources)
+			}
+		}
+	}
+}
+
 func TestCacheCancellationDoesNotCompleteCell(t *testing.T) {
 	c, err := OpenCache(context.Background(), filepath.Join(t.TempDir(), "gaia.db"))
 	if err != nil {

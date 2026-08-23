@@ -1,6 +1,7 @@
 package mosaic
 
 import (
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -9,6 +10,83 @@ import (
 
 	"gofitsv3/internal/fitsio"
 )
+
+func TestEnsureCombinedExposureFinalizationFailurePreservesCache(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "exp_flc.fits")
+	writeSyntheticExposure(t, src, 4, 4, 100, "F502N", twoOverlappingChips(50))
+	workingPath, _, err := EnsureCombinedExposure(src, CombineOptions{})
+	if err != nil {
+		t.Fatalf("initial combine error = %v", err)
+	}
+	old, err := os.ReadFile(workingPath)
+	if err != nil {
+		t.Fatalf("read initial cache: %v", err)
+	}
+	// Change the source identity so EnsureCombinedExposure must build a replacement.
+	writeSyntheticExposure(t, src, 4, 4, 100, "F502N", []synthChip{
+		{crpix1: 1, crpix2: 1, bunit: "ELECTRONS", pixels: uniform(16, 51)},
+		{crpix1: 1, crpix2: 1, bunit: "ELECTRONS", pixels: uniform(16, 51)},
+		{crpix1: 1, crpix2: 1, bunit: "ELECTRONS", pixels: uniform(16, 51)},
+	})
+	previous := replaceWorkingFile
+	replaceWorkingFile = func(string, string) error { return errors.New("injected finalization failure") }
+	defer func() { replaceWorkingFile = previous }()
+	if _, _, err := EnsureCombinedExposure(src, CombineOptions{}); err == nil {
+		t.Fatal("expected injected finalization failure")
+	}
+	got, err := os.ReadFile(workingPath)
+	if err != nil {
+		t.Fatalf("existing cache unreadable after failed replacement: %v", err)
+	}
+	if string(got) != string(old) {
+		t.Fatal("existing cache changed after failed replacement")
+	}
+	if _, err := LoadInputsMetadataFromPath(workingPath); err != nil {
+		t.Fatalf("existing cache no longer loadable: %v", err)
+	}
+}
+
+func TestAtomicReplacePreservesExistingRecoveryBackupWhenDestinationMissing(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, "working.tmp")
+	dst := filepath.Join(dir, "working.fits")
+	preexistingBackup := dst + ".bak"
+	if err := os.WriteFile(tmp, []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	const recoverable = "recoverable cache"
+	if err := os.WriteFile(preexistingBackup, []byte(recoverable), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRename := mosaicRename
+	first := true
+	mosaicRename = func(old, new string) error {
+		if first && old == tmp && new == dst {
+			first = false
+			return errors.New("injected publish staging failure")
+		}
+		return oldRename(old, new)
+	}
+	t.Cleanup(func() { mosaicRename = oldRename })
+
+	if err := atomicReplaceWorkingFile(tmp, dst); err == nil {
+		t.Fatal("expected replacement failure")
+	}
+	got, err := os.ReadFile(preexistingBackup)
+	if err != nil {
+		t.Fatalf("read recovery backup: %v", err)
+	}
+	if string(got) != recoverable {
+		t.Fatalf("recovery backup changed to %q", got)
+	}
+	if leftovers, err := filepath.Glob(filepath.Join(dir, ".working.fits.bak-*")); err != nil {
+		t.Fatalf("scan temporary backups: %v", err)
+	} else if len(leftovers) != 0 {
+		t.Fatalf("temporary backup leaked: %v", leftovers)
+	}
+}
 
 // synthChip describes one SCI chip written into a synthetic multi-extension FITS
 // exposure by writeSyntheticExposure.

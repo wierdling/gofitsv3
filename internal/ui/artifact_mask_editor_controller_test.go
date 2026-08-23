@@ -292,6 +292,188 @@ func TestArtifactMaskTargetKeyUsesSourcePathAndSCIExt(t *testing.T) {
 	}
 }
 
+func TestArtifactMaskEditorRejectsSameIdentityAfterGenerationAdvance(t *testing.T) {
+	input := artifactMaskTestInput("same.fits", 2, 2)
+	ws := &mosaicWorkspace{}
+	ws.advanceInputGeneration(input)
+	ctrl, err := newArtifactMaskEditorControllerForPurpose(0, input, models.ArtifactMaskPurposeMIRIArtifact, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &artifactMaskEditorWindow{ws: ws, ctrl: ctrl, sourceKey: ctrl.sourceKey, sourceWidth: 2, sourceHeight: 2, sourceGeneration: ws.inputGeneration(input)}
+	ws.advanceInputGeneration(input)
+	if e.ws.inputGeneration(input) == e.sourceGeneration {
+		t.Fatal("generation did not advance")
+	}
+}
+
+func TestArtifactMaskEditorOpenRejectsReorderedInput(t *testing.T) {
+	first := artifactMaskTestInput("first-open.fits", 2, 2)
+	second := artifactMaskTestInput("second-open.fits", 2, 2)
+	ws := &mosaicWorkspace{state: &mosaicState{inputs: []mosaic.Input{first, second}}}
+	stableKey := artifactMaskTargetKey(first)
+	// Simulate a reorder after the UI captured the selected input but before
+	// the background open starts its indexed load.
+	ws.inputMu.Lock()
+	ws.state.inputs[0], ws.state.inputs[1] = ws.state.inputs[1], ws.state.inputs[0]
+	ws.inputMu.Unlock()
+	if err := ws.ensureInputPixelsLoadedAtKey(0, stableKey); err == nil {
+		t.Fatal("reordered input was accepted for artifact editor open")
+	}
+}
+
+func TestArtifactMaskInputDialogOptionKeepsStableMappingAcrossReorder(t *testing.T) {
+	first := artifactMaskTestInput("same-name/first.fits", 2, 2)
+	second := artifactMaskTestInput("other/same-name/first.fits", 2, 2)
+	ws := &mosaicWorkspace{state: &mosaicState{inputs: []mosaic.Input{first, second}}}
+	options := ws.artifactMaskInputOptions()
+	labels := artifactMaskInputOptionLabels(options)
+	if len(options) != 2 || labels[0] == labels[1] {
+		t.Fatalf("duplicate chooser labels were not disambiguated: %#v", labels)
+	}
+	selected, ok := artifactMaskInputOptionByLabel(options, labels[1])
+	if !ok || selected.Key != artifactMaskTargetKey(second) || selected.Index != 1 {
+		t.Fatalf("selected option = %#v, want second input identity", selected)
+	}
+	ws.inputMu.Lock()
+	ws.state.inputs[0], ws.state.inputs[1] = ws.state.inputs[1], ws.state.inputs[0]
+	ws.inputMu.Unlock()
+	if err := ws.ensureInputPixelsLoadedAtKey(selected.Index, selected.Key); err == nil {
+		t.Fatal("dialog selection was retargeted to the reordered input")
+	}
+}
+
+func TestArtifactMaskExportTargetLabelsDisambiguateByStableKey(t *testing.T) {
+	targets := []artifactMaskExportTarget{
+		{Label: "same frame", Key: "first.fits[sci,1]"},
+		{Label: "same frame", Key: "second.fits[sci,1]"},
+	}
+	labels := artifactMaskTargetLabels(targets)
+	if labels[0] == labels[1] {
+		t.Fatalf("duplicate export labels were not disambiguated: %#v", labels)
+	}
+	selected := artifactMaskTargetIndex(targets, labels[1])
+	if selected != 1 {
+		t.Fatalf("stable selector resolved index %d, want 1", selected)
+	}
+	// Reordering the targets must not change which identity the selector names.
+	reordered := []artifactMaskExportTarget{targets[1], targets[0]}
+	if got := artifactMaskTargetIndex(reordered, labels[1]); got != 0 {
+		t.Fatalf("stable selector retargeted after reorder: got index %d, want 0", got)
+	}
+}
+
+func TestArtifactMaskPreviewKeyedLoadRejectsReorderedUnloadedTarget(t *testing.T) {
+	first := artifactMaskTestInput("preview-first.fits", 2, 2)
+	second := artifactMaskTestInput("preview-second.fits", 2, 2)
+	first.HDU.Data.Pixels = nil
+	second.HDU.Data.Pixels = nil
+	ws := &mosaicWorkspace{state: &mosaicState{inputs: []mosaic.Input{first, second}}}
+	target := artifactMaskExportTarget{Input: first, Index: 0, Key: artifactMaskTargetKey(first), Width: 2, Height: 2, Generation: ws.inputGeneration(first), Selected: true}
+	ws.inputMu.Lock()
+	ws.state.inputs[0], ws.state.inputs[1] = ws.state.inputs[1], ws.state.inputs[0]
+	ws.inputMu.Unlock()
+	if err := ws.ensureInputPixelsLoadedAtKey(target.Index, target.Key); err == nil {
+		t.Fatal("keyed preview load accepted reordered unloaded target")
+	}
+}
+
+func TestArtifactMaskPreviewUnloadedTargetUpdatesExportSnapshot(t *testing.T) {
+	input := artifactMaskTestInput("preview-export.fits", 2, 2)
+	input.HDU.Data.Pixels = nil
+	ws := &mosaicWorkspace{state: &mosaicState{inputs: []mosaic.Input{input}}}
+	ws.advanceInputGeneration(input)
+	targets := []artifactMaskExportTarget{{
+		Input: input, Index: 0, Key: artifactMaskTargetKey(input), Width: 2, Height: 2,
+		Generation: ws.inputGeneration(input), Selected: true,
+	}}
+	loaded := input
+	loaded.HDU.Data.Pixels = make([]float32, 4)
+	ws.inputMu.Lock()
+	ws.state.inputs[0] = loaded
+	ws.advanceInputGenerationLocked(loaded)
+	loadedGeneration := ws.inputGenerationLocked(loaded)
+	ws.inputMu.Unlock()
+	updated := targets[0]
+	updated.Input = loaded
+	updated.Generation = loadedGeneration
+	updateArtifactMaskPreviewTarget(targets, updated)
+	e := &artifactMaskEditorWindow{ws: ws}
+	if !e.exportTargetsCurrent(targets) {
+		t.Fatal("preview-reloaded target remained stale for export")
+	}
+}
+
+func TestArtifactMaskExportTargetRejectsSameKeyAndDimensionsAfterGenerationAdvance(t *testing.T) {
+	input := artifactMaskTestInput("same-target.fits", 2, 2)
+	ws := &mosaicWorkspace{state: &mosaicState{inputs: []mosaic.Input{input}}}
+	ws.advanceInputGeneration(input)
+	target := artifactMaskExportTarget{
+		Input: input, Index: 0, Key: artifactMaskTargetKey(input), Width: 2, Height: 2,
+		Generation: ws.inputGeneration(input), Selected: true,
+	}
+	e := &artifactMaskEditorWindow{ws: ws}
+	if !e.exportTargetsCurrent([]artifactMaskExportTarget{target}) {
+		t.Fatal("fresh target rejected")
+	}
+	ws.advanceInputGeneration(input)
+	if e.exportTargetsCurrent([]artifactMaskExportTarget{target}) {
+		t.Fatal("same-key, same-dimension target accepted after generation advance")
+	}
+}
+
+func TestArtifactMaskExportLifecycleRejectsStaleMultiTargetWithoutPublishingState(t *testing.T) {
+	first := artifactMaskTestInput("first.fits", 2, 2)
+	second := artifactMaskTestInput("second.fits", 2, 2)
+	ws := &mosaicWorkspace{state: &mosaicState{
+		inputs:            []mosaic.Input{first, second},
+		skysubSettings:    models.SkysubSettings{MIRIArtifactMaskDir: "old"},
+		artifactMasks:     &models.ArtifactMaskProject{},
+		skysubSettingsSet: true,
+	}}
+	ws.advanceInputGeneration(first)
+	ws.advanceInputGeneration(second)
+	ctrl, err := newArtifactMaskEditorControllerForPurpose(0, first, models.ArtifactMaskPurposeMIRIArtifact, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &artifactMaskEditorWindow{ws: ws, ctrl: ctrl}
+	targets := []artifactMaskExportTarget{
+		{Input: first, Index: 0, Key: artifactMaskTargetKey(first), Width: 2, Height: 2, Generation: ws.inputGeneration(first), Selected: true},
+		{Input: second, Index: 1, Key: artifactMaskTargetKey(second), Width: 2, Height: 2, Generation: ws.inputGeneration(second), Selected: true},
+	}
+	before := ws.state.skysubSettings
+	ws.advanceInputGeneration(second)
+	if e.exportTargetsCurrent(targets) {
+		t.Fatal("stale second target accepted after generation advance")
+	}
+	if ws.state.skysubSettings != before || !ws.state.skysubSettingsSet || len(ws.state.artifactMasks.Documents) != 0 {
+		t.Fatal("stale multi-target export changed settings or artifact documents")
+	}
+	// A final publication check must remain stale-safe even when all writes
+	// completed before the reload was observed.
+	ws.inputMu.RLock()
+	if e.exportTargetsCurrentLocked(targets) {
+		ws.inputMu.RUnlock()
+		t.Fatal("final stale publication check accepted old targets")
+	}
+	ws.inputMu.RUnlock()
+
+	// A fresh locked check permits the publication path to commit state.
+	fresh := targets
+	fresh[1].Generation = ws.inputGeneration(second)
+	ws.inputMu.Lock()
+	if !e.exportTargetsCurrentLocked(fresh) {
+		ws.inputMu.Unlock()
+		t.Fatal("fresh final publication check rejected current targets")
+	}
+	e.commitExportStateLocked(fresh, "masks")
+	ws.inputMu.Unlock()
+	if ws.state.skysubSettings.MIRIArtifactMaskDir != "masks" || len(ws.state.artifactMasks.Documents) != 1 {
+		t.Fatal("fresh publication did not commit export state")
+	}
+}
+
 func artifactMaskTestInput(path string, width, height int) mosaic.Input {
 	return mosaic.Input{
 		Path: path,
