@@ -14,14 +14,6 @@ No more than five groups may have active implementation/review pairs.
 
 ## Audit groups
 
-### 1. Gaia catalog provider and cache
-
-Scope: all remaining `internal/catalog/gaia/*.go` and tests.
-
-Review migrations, SQLite rollback, cache keys/deduplication, cache-only behavior, retries, cancellation, malformed HTTP responses, query construction, and resource closure. Use mock HTTP and temporary databases only.
-
-Validation: `go test ./internal/catalog/gaia`.
-
 ### 2. FITS headers, resize, and streaming
 
 Scope: remaining `internal/fitsio/{header_only,resize,stream}.go` and tests.
@@ -56,19 +48,11 @@ Validation: `go test ./internal/processing -run "Test.*(Align|Affine|Star|Tweak|
 
 ### 6. Processing render, helpers, edit, and magic
 
-Scope: remaining `canonical_render.go`, `downsample.go`, `edit.go`, `magic_levels.go`, `processing.go`, and related tests.
+Scope: remaining `downsample.go`, `edit.go`, `magic_levels.go`, `processing.go`, and related tests.
 
 Review reference-grid/resize fallback, interpolation, finite samples, percentiles, RGB levels/histograms, dimensions, fingerprints/status, and non-mutating helpers.
 
 Validation: `go test ./internal/processing -run "Test.*(Canonical|ComposeRGB|Magic|MTF|Downsample|Resize|ReferenceGrid|RGBLevels|Histogram)"`.
-
-### 7. Processing calibration, Gaia projection, and photometry
-
-Scope: remaining color-calibration, Gaia aperture/calibration/projection, instrument-photometry files/tests.
-
-Review provenance, invalid footprints, background math, nonpositive flux, aperture bounds, insufficient stars, passband selection, cancellation, and bounded sampling. No live Gaia tests.
-
-Validation: `go test ./internal/processing -run "Test.*(Calibration|Gaia|Photometry|Aperture|Projection|Background)"`.
 
 ### 8. Processing masks and cleaning
 
@@ -104,11 +88,11 @@ Validation: `go test ./internal/mosaic -run "Test.*(ExposureNorm|Sky|Background|
 
 ### 12. Compose UI controllers and state
 
-Scope: remaining Compose/Blink/Gaia/Magic controllers/state/tests, including `compose_*`, `channel_tabs`, `blinker_window`, and `gaia_compose`.
+Scope: remaining Compose/Blink/Magic controllers/state/tests, including `compose_*`, `channel_tabs`, and `blinker_window`.
 
-Review stale generations, cancellation, atomic batch state, calibration invalidation, eligibility/reference rules, large-mode Blink gating, picker coordinates, dialog validation, and UI-thread commits.
+Review stale generations, cancellation, atomic batch state, eligibility/reference rules, large-mode Blink gating, picker coordinates, dialog validation, and UI-thread commits.
 
-Validation: `go test ./internal/ui -run "Test.*(Compose|Blink|Magic|Gaia|Alignment|Offset|ChannelState|Accordion|CompositeStatus)"`.
+Validation: `go test ./internal/ui -run "Test.*(Compose|Blink|Magic|Alignment|Offset|ChannelState|Accordion|CompositeStatus)"`.
 
 ### 13. Edit/Examine tools and viewport
 
@@ -152,20 +136,18 @@ Validation: `go test ./internal/ui -run "Test.*(DrizzleSetting|ExposureReview|Mo
 
 ## Recommended waves
 
-- Wave 1: groups 1, 2, 5, 9, 12.
+- Wave 1: groups 2, 5, 9, 12.
 - Wave 2: groups 3, 6, 10, 13, 15.
-- Wave 3: groups 4, 7, 11, 14, 16.
+- Wave 3: groups 4, 11, 14, 16.
 - Wave 4: groups 8 and 17.
 - Final reconciliation alone.
-
-Accept group 5 before group 7 if calibration findings depend on transform conventions.
 
 ## Final reconciliation
 
 Confirm every currently unverified Go row has direct evidence, preserve the PNG as excluded, check ownership and reviewer approvals, and run:
 
 ```powershell
-go test ./internal/catalog/gaia ./internal/fitsio ./internal/export ./internal/histogram ./internal/render ./internal/stretch ./internal/models ./internal/instrument ./internal/utils
+go test ./internal/fitsio ./internal/export ./internal/histogram ./internal/render ./internal/stretch ./internal/models ./internal/instrument ./internal/utils
 go test ./internal/processing
 go test ./internal/mosaic
 go test ./internal/ui
@@ -174,4 +156,3 @@ go test ./...
 ```
 
 Record manual-only UI smoke checks separately; they do not substitute for unit tests.
-

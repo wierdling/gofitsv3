@@ -24,13 +24,9 @@ func TestComposeLargeProjectStageRollbackDecision(t *testing.T) {
 	previousPreviews := map[int]*image.RGBA{}
 	previousOverlays := []*overlayLayer{{name: "old-layer"}}
 	var overlays []*overlayLayer
-	calibration := models.ColorCalibrationState{Status: models.CalibrationCalculating}
-	previousCalibration := models.ColorCalibrationState{Status: models.CalibrationValid}
-	saveCalibration := false
-	previousSaveCalibration := true
 	orig := new([][]float32)
-	restoreComposeLargeProjectSnapshot(&current, orig, &overlays, &artifacts, &previews, &calibration, &saveCalibration, previous, nil, previousOverlays, previousArtifacts, previousPreviews, previousCalibration, previousSaveCalibration)
-	if current[0] != oldImg || artifacts[0].Path != "old" || len(overlays) != 1 || overlays[0].name != "old-layer" || calibration.Status != models.CalibrationValid || !saveCalibration {
+	restoreComposeLargeProjectSnapshot(&current, orig, &overlays, &artifacts, &previews, previous, nil, previousOverlays, previousArtifacts, previousPreviews)
+	if current[0] != oldImg || artifacts[0].Path != "old" || len(overlays) != 1 || overlays[0].name != "old-layer" {
 		t.Fatal("rollback did not restore prior image/artifact state")
 	}
 }

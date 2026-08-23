@@ -20,6 +20,8 @@ import (
 
 const fitsLiberatorAutoScaledPeak = 10.0
 
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+
 func AutoScaleLikeFitsLiberator(img *models.LoadedImage) {
 	if img == nil {
 		return
@@ -271,9 +273,6 @@ func ComposeRGB(ctx context.Context, imgs []*models.LoadedImage) ([]byte, int, i
 type OverlayLayer struct {
 	Image    *models.LoadedImage
 	Settings models.OrangeLayerState
-	// Photometry is optional metadata captured for a calibrated overlay. The
-	// persisted overlay transform remains authoritative during rendering.
-	Photometry *InstrumentPhotometry
 }
 
 func ComposeRGBWithOrange(ctx context.Context, imgs []*models.LoadedImage, orange *models.LoadedImage, settings models.OrangeLayerState) ([]byte, int, int, [3]histogram.Stats) {

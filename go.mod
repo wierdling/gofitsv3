@@ -8,7 +8,6 @@ require (
 	github.com/wierdling/gofiledialog v0.1.3
 	golang.org/x/image v0.25.0
 	gonum.org/v1/gonum v0.17.0
-	modernc.org/sqlite v1.36.1
 )
 
 require (
@@ -50,7 +49,4 @@ require (
 	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	modernc.org/libc v1.61.13 // indirect
-	modernc.org/mathutil v1.7.1 // indirect
-	modernc.org/memory v1.8.2 // indirect
 )

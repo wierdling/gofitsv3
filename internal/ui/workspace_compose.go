@@ -15,7 +15,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,7 +29,6 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"github.com/wierdling/gofiledialog"
 
-	"gofitsv3/internal/catalog/gaia"
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/export"
 	"gofitsv3/internal/fitsio"
@@ -57,7 +55,6 @@ var globalSelectComposeTab func()
 // globalComposeLargeCleanup is invoked by the application close handler.
 var globalComposeLargeCleanup func()
 var composeLargeModeActive func() bool
-var globalComposeGaiaRefinementInvalidate func()
 
 // maxOverlayLayers bounds how many colored overlay layers can exist at once.
 // imgs/origPixels are pre-allocated with room for the 3 RGB base channels plus
@@ -70,233 +67,12 @@ const maxOverlayLayers = 16
 // windows): a grayscale image assigned a tint, screen/additively blended onto the
 // base RGB composite. idx is its stable index into imgs/origPixels.
 type overlayLayer struct {
-	idx                    int
-	name                   string
-	settings               models.OrangeLayerState
-	win                    fyne.Window
-	viewport               *viewport
-	control                *models.ChannelControl
-	calibrationStatus      models.CalibrationStatus
-	calibrationStatusLabel *widget.Label
-}
-
-// artifactRowReader adapts a runtime float artifact to the bounded Gaia
-// aperture reader contract. A handle is opened only for the requested row.
-type artifactRowReader struct{ path string }
-
-func (r artifactRowReader) Dimensions() (int, int) {
-	a, err := fitsio.OpenFloat32ArtifactReadOnly(r.path)
-	if err != nil {
-		return 0, 0
-	}
-	defer a.Close()
-	return a.Width, a.Height
-}
-
-func (r artifactRowReader) ReadRow(y int, dst []float32) error {
-	a, err := fitsio.OpenFloat32ArtifactReadOnly(r.path)
-	if err != nil {
-		return err
-	}
-	defer a.Close()
-	return a.ReadRow(y, dst)
-}
-
-// alignedArtifactRowReader presents a source artifact on the reference
-// output grid. It uses the same affine/WCS/manual-offset mapping as the disk
-// compositor and returns NaN for invalid footprints so Gaia aperture
-// photometry excludes fill pixels.
-type alignedArtifactRowReader struct {
-	path         string
-	source       models.LoadedImage
-	reference    models.LoadedImage
-	width        int
-	height       int
-	offsetX      float64
-	offsetY      float64
-	offsetRot    float64
-	a            *fitsio.Float32Artifact
-	rows         map[int][]float32
-	order        []int
-	validScratch []float32
-}
-
-// ReadValidRow reports the same footprint validity as the aligned samples.
-// Invalid affine footprints and non-finite source pixels are excluded from
-// neutral-background statistics rather than being treated as zero-valued data.
-func (r *alignedArtifactRowReader) ReadValidRow(y int, dst []bool) error {
-	if len(dst) < r.width {
-		return fmt.Errorf("invalid aligned validity row %d", y)
-	}
-	if cap(r.validScratch) < r.width {
-		r.validScratch = make([]float32, r.width)
-	} else {
-		r.validScratch = r.validScratch[:r.width]
-	}
-	if err := r.ReadRow(y, r.validScratch); err != nil {
-		return err
-	}
-	for x, v := range r.validScratch {
-		dst[x] = !math.IsNaN(float64(v)) && !math.IsInf(float64(v), 0)
-	}
-	return nil
-}
-
-func (r alignedArtifactRowReader) Dimensions() (int, int) { return r.width, r.height }
-
-func (r *alignedArtifactRowReader) ReadRow(y int, dst []float32) error {
-	if len(dst) < r.width {
-		return fmt.Errorf("invalid aligned artifact row %d", y)
-	}
-	return r.ReadWindow(y, 0, r.width, dst[:r.width])
-}
-
-// ReadWindow maps and samples only the requested output range. Source rows are
-// fetched with ReadRange over the minimum contiguous span needed by the
-// mapped pixels; no full output row (or full source row) is materialized.
-func (r *alignedArtifactRowReader) ReadWindow(y, x0, x1 int, dst []float32) error {
-	if y < 0 || y >= r.height {
-		return fmt.Errorf("invalid aligned artifact row %d", y)
-	}
-	if x0 < 0 {
-		x0 = 0
-	}
-	if x1 > r.width {
-		x1 = r.width
-	}
-	if x1 < x0 || len(dst) < x1-x0 {
-		return fmt.Errorf("invalid aligned artifact window")
-	}
-	if r.a == nil {
-		a, err := fitsio.OpenFloat32ArtifactReadOnly(r.path)
-		if err != nil {
-			return err
-		}
-		r.a = a
-		r.rows = make(map[int][]float32, 8)
-	}
-	a := r.a
-	type mapped struct {
-		fx, fy float64
-		valid  bool
-	}
-	mappedPixels := make([]mapped, x1-x0)
-	rowRanges := make(map[int][2]int, 2)
-	for x := x0; x < x1; x++ {
-		fx, fy := processing.MapDiskCoordinate(r.source, r.reference, r.offsetX, r.offsetY, r.offsetRot, x, y, r.width, r.height, a.Width, a.Height)
-		m := &mappedPixels[x-x0]
-		m.fx, m.fy = fx, fy
-		if fx < 0 || fy < 0 || fx > float64(a.Width-1) || fy > float64(a.Height-1) {
-			continue
-		}
-		m.valid = true
-		sx0, sy := int(math.Floor(fx)), int(math.Floor(fy))
-		sx1, sy1 := sx0+1, sy+1
-		if sx1 >= a.Width {
-			sx1 = sx0
-		}
-		if sy1 >= a.Height {
-			sy1 = sy
-		}
-		for _, ry := range []int{sy, sy + 1} {
-			if ry >= a.Height {
-				ry = sy1
-			}
-			if old, ok := rowRanges[ry]; ok {
-				if sx0 < old[0] {
-					old[0] = sx0
-				}
-				if sx1+1 > old[1] {
-					old[1] = sx1 + 1
-				}
-				rowRanges[ry] = old
-			} else {
-				rowRanges[ry] = [2]int{sx0, sx1 + 1}
-			}
-		}
-	}
-	rows := make(map[int]struct {
-		x0     int
-		values []float32
-	}, len(rowRanges))
-	for ry, span := range rowRanges {
-		vals := make([]float32, span[1]-span[0])
-		if err := a.ReadRange(ry, span[0], span[1], vals); err != nil {
-			return err
-		}
-		rows[ry] = struct {
-			x0     int
-			values []float32
-		}{span[0], vals}
-	}
-	for i, m := range mappedPixels {
-		if !m.valid {
-			dst[i] = float32(math.NaN())
-			continue
-		}
-		sx, sy := int(math.Floor(m.fx)), int(math.Floor(m.fy))
-		sx1, sy1 := sx+1, sy+1
-		wx, wy := m.fx-float64(sx), m.fy-float64(sy)
-		if sx1 >= a.Width {
-			sx1, wx = sx, 0
-		}
-		if sy1 >= a.Height {
-			sy1, wy = sy, 0
-		}
-		r0, r1 := rows[sy], rows[sy1]
-		v00, v10 := r0.values[sx-r0.x0], r0.values[sx1-r0.x0]
-		v01, v11 := r1.values[sx-r1.x0], r1.values[sx1-r1.x0]
-		if math.IsNaN(float64(v00)) || math.IsNaN(float64(v10)) || math.IsNaN(float64(v01)) || math.IsNaN(float64(v11)) || math.IsInf(float64(v00), 0) || math.IsInf(float64(v10), 0) || math.IsInf(float64(v01), 0) || math.IsInf(float64(v11), 0) {
-			dst[i] = float32(math.NaN())
-			continue
-		}
-		dst[i] = float32(float64(v00)*(1-wx)*(1-wy) + float64(v10)*wx*(1-wy) + float64(v01)*(1-wx)*wy + float64(v11)*wx*wy)
-	}
-	return nil
-}
-
-func (r *alignedArtifactRowReader) Close() error {
-	if r.a == nil {
-		return nil
-	}
-	err := r.a.Close()
-	r.a = nil
-	r.rows = nil
-	r.order = nil
-	return err
-}
-
-type composeOverlayPreviewData struct {
-	image      *image.RGBA
-	bins       [256]int
-	width      int
-	height     int
-	sky        float64
-	mean       float64
-	std        float64
-	filterText string
-}
-
-func buildComposeOverlayPreviewData(ctx context.Context, img *models.LoadedImage) (*composeOverlayPreviewData, error) {
-	if err := composeMagicCanceled(ctx); err != nil {
-		return nil, err
-	}
-	stretched, mask := processing.ApplyStretchParallel(img)
-	if err := composeMagicCanceled(ctx); err != nil {
-		return nil, err
-	}
-	stats := histogram.Compute(stretched.Pixels)
-	sky, _ := processing.EstimateBackground(stretched.Pixels)
-	return &composeOverlayPreviewData{
-		image:      processing.ToGrayRGBA(stretched, mask),
-		bins:       stats.Hist,
-		width:      stretched.Width,
-		height:     stretched.Height,
-		sky:        sky,
-		mean:       stats.Mean,
-		std:        stats.Std,
-		filterText: fitsio.FilterString(img.Primary),
-	}, nil
+	idx      int
+	name     string
+	settings models.OrangeLayerState
+	win      fyne.Window
+	viewport *viewport
+	control  *models.ChannelControl
 }
 
 func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*fyne.Menu) {
@@ -312,47 +88,20 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	levels := defaultRGBLevels()
 	var levelsWin *rgbLevelsWindow
 	var overlayLayers []*overlayLayer
-	colorCalibration := models.ColorCalibrationState{Status: models.CalibrationDisabled}
-	var refinedGaiaResidual *processing.AffineTransform
-	var refinedGaiaSources []gaia.Source
-	var gaiaRefinementGeneration uint64
-	clearGaiaRefinement := func() {
-		refinedGaiaResidual = nil
-		refinedGaiaSources = nil
-		gaiaRefinementGeneration++
-	}
-	globalComposeGaiaRefinementInvalidate = clearGaiaRefinement
-	// Any source, alignment, stretch, or overlay edit invalidates a previously
-	// calculated result. The persisted transforms remain inspectable but are
-	// never silently applied to changed pixels.
-	invalidateCalibration := func() { clearGaiaRefinement(); markComposeCalibrationStale(&colorCalibration) }
-	ensureOverlayCalibration := func(n int) {
-		for len(colorCalibration.Overlays) <= n {
-			colorCalibration.Overlays = append(colorCalibration.Overlays, models.OverlayCalibrationState{Mode: models.OverlayArtistic, Status: models.CalibrationDisabled, Strength: 1})
-		}
-	}
 
-	// Updated to track the new struct
-	var latestRGBStats [3]histogram.Stats
-	suspendRefresh := false
-	var composeRGB func(ctx context.Context, calibrationSnapshot *models.ColorCalibrationState) ([]byte, int, int, [3]histogram.Stats, *processing.ComposeRenderResult, error)
-	var composeChannelOffsetFields func(int) (float64, float64, float64, bool)
 	// renderImages returns an offset-applied view of imgs (Manual Offsets applied
 	// at render time). Forward-declared so refresh/compose can use it; assigned
 	// once controlSets exists.
 	var renderImages func() []*models.LoadedImage
+	var latestRGBStats [3]histogram.Stats
+	suspendRefresh := false
+	var composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, error)
+	var composeChannelOffsetFields func(int) (float64, float64, float64, bool)
 	var previewMu sync.Mutex
 	previewSeq := 0
 	var genCancel context.CancelFunc
-	var calibrationJob composeCalibrationJob
-	var calibrationGeneration uint64
 	var editSnapshotCancel context.CancelFunc
 	var editSnapshotMu sync.Mutex
-	// SaveColorCalibration controls the normal render/export gate and whether
-	// calibration is included in the next project save.  The live state is
-	// retained when disabled so it can be compared or re-enabled immediately.
-	saveColorCalibration := true
-	var calibrationPreviewOverride *bool
 	var blinkMu sync.Mutex
 	var blinkPrepared []composeBlinkFrame
 	blinkSeq := 0
@@ -454,25 +203,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 	}
 
-	cloneCalibration := func() *models.ColorCalibrationState {
-		return composeCalibrationSnapshot(colorCalibration, !saveColorCalibration)
-	}
-	cloneCalibrationForPreview := func() *models.ColorCalibrationState {
-		return composeCalibrationPreviewSnapshot(colorCalibration, saveColorCalibration, calibrationPreviewOverride)
-	}
-	composeRenderWithCalibration := func(ctx context.Context, composeImgs []*models.LoadedImage, calibrationSnapshot *models.ColorCalibrationState) (processing.ComposeRenderResult, error) {
-		var overlays []processing.OverlayLayer
-		for _, l := range overlayLayers {
-			if l.win != nil && l.idx < len(imgs) && imgs[l.idx] != nil {
-				overlays = append(overlays, processing.OverlayLayer{Image: imgs[l.idx], Settings: l.settings})
-			}
-		}
-		if len(overlays) > 0 {
-			rendered, err := processing.ComposeRender(ctx, processing.ComposeRenderRequest{Images: composeImgs, Overlays: overlays, Calibration: calibrationSnapshot})
-			return rendered, err
-		}
-		return processing.ComposeRender(ctx, processing.ComposeRenderRequest{Images: composeImgs, Calibration: calibrationSnapshot})
-	}
 	// startGeneration cancels any in-flight compose generation and starts a
 	// fresh one in the background. Triggering this repeatedly in quick
 	// succession (e.g. dragging a slider) kills the stale generation's work
@@ -550,14 +280,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			largePreviewSnapshot[i] = p
 		}
 		largeMu.RUnlock()
-		for i := range overlayLayers {
-			ensureOverlayCalibration(i)
-		}
-		calibrationSnapshot := cloneCalibrationForPreview()
 		go func() {
 			start := time.Now()
 			debuglog.Log("compose refresh async: starting preview computation")
-			var renderedResult *processing.ComposeRenderResult
 			var data composePreviewData
 			if largeMode {
 				for i := range data.Views {
@@ -573,9 +298,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					}
 				}
 				if buildComposite && composeHasAllBaseChannels(imgSnapshot) {
-					b, w, h, s, rendered, e := composeRGB(ctx, calibrationSnapshot)
+					b, w, h, s, e := composeRGB(ctx)
 					if e == nil && len(b) > 0 {
-						renderedResult = rendered
 						data.RGBStats = s
 						pw, ph := w, h
 						if len(b) != w*h*4 {
@@ -597,12 +321,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}
 			} else {
 				data = buildComposePreviewData(ctx, imgSnapshot, sharedHistScale, buildComposite, &levelsSnapshot, func(c context.Context) ([]byte, int, int, [3]histogram.Stats, error) {
-					b, w, h, s, rendered, e := composeRGB(c, calibrationSnapshot)
-					renderedResult = rendered
+					b, w, h, s, e := composeRGB(c)
 					return b, w, h, s, e
 				})
 			}
-			data.Rendered = renderedResult
 			if blinkEnabled {
 				data.BlinkFrames = buildComposeBlinkFrames(ctx, imgSnapshot, blinkSourcesSnapshot, blinkSelectionSnapshot, data.Views)
 			}
@@ -637,24 +359,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				// error result; a newer generation, if any, owns the indicator.
 				viewports[3].SetCompositeRendering(false)
 				applyComposePreviewData(data, viewports, pushRGBHist)
-				if data.Rendered != nil {
-					for i, l := range overlayLayers {
-						if i >= len(data.Rendered.OverlayStatus) {
-							continue
-						}
-						l.calibrationStatus = data.Rendered.OverlayStatus[i]
-						if l.calibrationStatusLabel != nil {
-							reason := ""
-							if i < len(data.Rendered.OverlayDiagnostics) {
-								reason = data.Rendered.OverlayDiagnostics[i].Message
-							}
-							if reason != "" {
-								reason = " — " + reason
-							}
-							l.calibrationStatusLabel.SetText("Calibration: " + string(l.calibrationStatus) + reason)
-						}
-					}
-				}
 				blinkMu.Lock()
 				blinkPrepared = append([]composeBlinkFrame(nil), data.BlinkFrames...)
 				blinkMu.Unlock()
@@ -811,10 +515,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 	}
 
-	composeRGB = func(ctx context.Context, calibrationSnapshot *models.ColorCalibrationState) ([]byte, int, int, [3]histogram.Stats, *processing.ComposeRenderResult, error) {
+	composeRGB = func(ctx context.Context) ([]byte, int, int, [3]histogram.Stats, error) {
 		if largeMode {
 			if largeStore == nil || len(imgs) < 3 || imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
-				return nil, 0, 0, [3]histogram.Stats{}, nil, errors.New("all three channels are required for disk-backed Compose")
+				return nil, 0, 0, [3]histogram.Stats{}, errors.New("all three channels are required for disk-backed Compose")
 			}
 			largeMu.RLock()
 			expectedCompositeGeneration := uint64(0)
@@ -826,7 +530,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				d, ok := largeArtifacts[i]
 				if !ok || d.Path == "" {
 					largeMu.RUnlock()
-					return nil, 0, 0, [3]histogram.Stats{}, nil, fmt.Errorf("missing disk artifact for channel %d", i)
+					return nil, 0, 0, [3]histogram.Stats{}, fmt.Errorf("missing disk artifact for channel %d", i)
 				}
 				dx, dy, rot, _ := composeChannelOffsetFields(i)
 				channels[i] = processing.DiskChannel{ArtifactPath: d.Path, Image: *imgs[i], OffsetX: dx, OffsetY: dy, OffsetRot: rot}
@@ -852,24 +556,33 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}
 			}
 			largeMu.RUnlock()
-			result, err := processing.ComposeDisk(ctx, processing.DiskComposeRequest{Channels: channels, Overlays: ovs, Calibration: calibrationSnapshot, Output: outs, PreviewMax: 1600, RGBLevels: levels})
+			result, err := processing.ComposeDisk(ctx, processing.DiskComposeRequest{Channels: channels, Overlays: ovs, Output: outs, PreviewMax: 1600, RGBLevels: levels})
 			if err != nil {
 				for _, p := range outs {
 					_ = os.Remove(p)
 				}
-				return nil, 0, 0, [3]histogram.Stats{}, nil, err
+				return nil, 0, 0, [3]histogram.Stats{}, err
 			}
 			if _, err := largeStore.PublishCompositeIfCurrent(expectedCompositeGeneration, outs, result.Width, result.Height); err != nil {
 				for _, p := range outs {
 					_ = os.Remove(p)
 				}
-				return nil, 0, 0, [3]histogram.Stats{}, nil, err
+				return nil, 0, 0, [3]histogram.Stats{}, err
 			}
-			rendered := &processing.ComposeRenderResult{Preview: result.Preview, Width: result.Width, Height: result.Height, Stats: result.Stats, Status: result.Status}
-			return result.Preview, result.Width, result.Height, result.Stats, rendered, nil
+			return result.Preview, result.Width, result.Height, result.Stats, nil
 		}
-		rendered, err := composeRenderWithCalibration(ctx, renderImages(), calibrationSnapshot)
-		return rendered.Preview, rendered.Width, rendered.Height, rendered.Stats, &rendered, err
+		var overlays []processing.OverlayLayer
+		for _, l := range overlayLayers {
+			if l.win != nil && l.idx < len(imgs) && imgs[l.idx] != nil {
+				overlays = append(overlays, processing.OverlayLayer{Image: imgs[l.idx], Settings: l.settings})
+			}
+		}
+		if len(overlays) > 0 {
+			b, w, h, s := processing.ComposeRGBWithOverlays(ctx, renderImages(), overlays)
+			return b, w, h, s, nil
+		}
+		b, w, h, s := processing.ComposeRGB(ctx, renderImages())
+		return b, w, h, s, nil
 	}
 
 	saveChannelGray := func(idx int) {
@@ -1166,7 +879,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				clearComposeOrigPixels(&origPixels, idx)
 
 				fyne.Do(func() {
-					invalidateCalibration()
 					if controlSets != nil {
 						applyChannelState(idx, channelStateFromImage(img), imgs, viewports, controlSets)
 					}
@@ -1556,14 +1268,12 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			slider.OnChanged = func(v float64) {
 				n := uint8(math.Round(v))
 				set(n)
-				invalidateCalibration()
 				valueEntry.SetValue(float64(n))
 				updateSwatch()
 			}
 			valueEntry.OnChanged = func(v float64) {
 				n := uint8(math.Round(v))
 				set(n)
-				invalidateCalibration()
 				slider.Value = float64(n)
 				slider.Refresh()
 				updateSwatch()
@@ -1580,13 +1290,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		opacityValue.SetValue(opacitySlider.Value)
 		opacitySlider.OnChanged = func(v float64) {
 			l.settings.Opacity = v / 100
-			invalidateCalibration()
 			opacityValue.SetValue(v)
 			refresh()
 		}
 		opacityValue.OnChanged = func(v float64) {
 			l.settings.Opacity = v / 100
-			invalidateCalibration()
 			opacitySlider.Value = v
 			opacitySlider.Refresh()
 			refresh()
@@ -1601,13 +1309,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		protectValue.SetValue(protectSlider.Value)
 		protectSlider.OnChanged = func(v float64) {
 			l.settings.HighlightProtect = v / 100
-			invalidateCalibration()
 			protectValue.SetValue(v)
 			refresh()
 		}
 		protectValue.OnChanged = func(v float64) {
 			l.settings.HighlightProtect = v / 100
-			invalidateCalibration()
 			protectSlider.Value = v
 			protectSlider.Refresh()
 			refresh()
@@ -1615,74 +1321,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 		if l.idx < len(imgs) && imgs[l.idx] != nil {
 			applyChannelState(l.idx, channelStateFromImage(imgs[l.idx]), imgs, layerViews(l), layerControls(l))
-		}
-		overlayStateIndex := 0
-		for i, candidate := range overlayLayers {
-			if candidate == l {
-				overlayStateIndex = i
-				break
-			}
-		}
-		ensureOverlayCalibration(overlayStateIndex)
-		modeSelect := NewSafeSelect([]string{"Artistic", "Calibrated Linear"}, nil)
-		if colorCalibration.Overlays[overlayStateIndex].Mode == models.OverlayCalibratedLinear {
-			modeSelect.SetSelected("Calibrated Linear")
-		} else {
-			modeSelect.SetSelected("Artistic")
-		}
-		calibratedMode := colorCalibration.Overlays[overlayStateIndex].Mode == models.OverlayCalibratedLinear
-		modeSelect.OnChanged = func(v string) {
-			invalidateCalibration()
-			state := &colorCalibration.Overlays[overlayStateIndex]
-			if v == "Calibrated Linear" {
-				state.Mode = models.OverlayCalibratedLinear
-			} else {
-				state.Mode = models.OverlayArtistic
-			}
-			state.Status = models.CalibrationStale
-			calibratedMode = state.Mode == models.OverlayCalibratedLinear
-			if calibratedMode {
-				opacitySlider.Disable()
-				protectSlider.Disable()
-			} else {
-				opacitySlider.Enable()
-				protectSlider.Enable()
-			}
-			refresh()
-		}
-		neutralizeCheck := NewToggle(nil)
-		neutralizeCheck.SetChecked(colorCalibration.Overlays[overlayStateIndex].NeutralizeBackground)
-		neutralizeCheck.OnChanged = func(v bool) {
-			invalidateCalibration()
-			colorCalibration.Overlays[overlayStateIndex].NeutralizeBackground = v
-			colorCalibration.Overlays[overlayStateIndex].Status = models.CalibrationStale
-			refresh()
-		}
-		strengthSlider := widget.NewSlider(0, 2)
-		strengthSlider.Step = 0.01
-		strengthSlider.Value = colorCalibration.Overlays[overlayStateIndex].Strength
-		strengthValue := NewNumberEntry(2, 0)
-		strengthValue.Min, strengthValue.Max = 0, 2
-		strengthValue.SetValue(strengthSlider.Value)
-		strengthSlider.OnChanged = func(v float64) {
-			invalidateCalibration()
-			colorCalibration.Overlays[overlayStateIndex].Strength = v
-			colorCalibration.Overlays[overlayStateIndex].Status = models.CalibrationStale
-			strengthValue.SetValue(v)
-			refresh()
-		}
-		strengthValue.OnChanged = func(v float64) {
-			invalidateCalibration()
-			colorCalibration.Overlays[overlayStateIndex].Strength = v
-			colorCalibration.Overlays[overlayStateIndex].Status = models.CalibrationStale
-			strengthSlider.Value = v
-			strengthSlider.Refresh()
-			refresh()
-		}
-		l.calibrationStatusLabel = widget.NewLabel("Calibration: " + string(colorCalibration.Overlays[overlayStateIndex].Status))
-		if calibratedMode {
-			opacitySlider.Disable()
-			protectSlider.Disable()
 		}
 		colorControls := container.NewVBox(
 			canvas.NewText("Overlay", color.RGBA{R: l.settings.ColorR, G: l.settings.ColorG, B: l.settings.ColorB, A: 255}),
@@ -1692,10 +1330,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			colorSlider("Blue", l.settings.ColorB, func(v uint8) { l.settings.ColorB = v }),
 			container.NewBorder(nil, nil, widget.NewLabel("Opacity"), container.NewHBox(opacityValue, widget.NewLabel("%")), opacitySlider),
 			container.NewBorder(nil, nil, widget.NewLabel("Highlight protect"), container.NewHBox(protectValue, widget.NewLabel("%")), protectSlider),
-			container.NewBorder(nil, nil, widget.NewLabel("Mix mode"), nil, modeSelect),
-			container.NewHBox(neutralizeCheck, widget.NewLabel("Neutralize background")),
-			container.NewBorder(nil, nil, widget.NewLabel("Linear strength"), strengthValue, strengthSlider),
-			l.calibrationStatusLabel,
 		)
 		controls := container.NewVScroll(container.NewVBox(l.control.Content, colorControls))
 		controls.SetMinSize(fyne.NewSize(300, 200))
@@ -1840,7 +1474,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						largeArtifacts[l.idx] = artifact
 						largeMu.Unlock()
 					}
-					invalidateCalibration()
 					openOverlayLayerWindow(l)
 					if updateMenus != nil {
 						updateMenus()
@@ -2000,7 +1633,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		// Always render from the save-gated snapshot. The cached composite
 		// viewport may have been produced while a temporary Before/After
 		// comparison override was active and must never leak into Export to Edit.
-		buf, w, h, _, _, err := composeRGB(context.Background(), cloneCalibration())
+		buf, w, h, _, err := composeRGB(context.Background())
 		if err != nil || buf == nil {
 			return nil
 		}
@@ -2350,14 +1983,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			MeasureComposite:     measureEnabled,
 			BlinkFilters:         blinkCheck.Checked,
 			BlinkExcludedFilter:  blinkExcludedIdx,
-			// New saves use ColorCalibration pointer presence as the canonical
-			// persisted indicator; retain the legacy field only for decoding.
-			DisableColorCalibration: false,
-		}
-		if saveColorCalibration {
-			calibrationCopy := colorCalibration
-			calibrationCopy.Overlays = append([]models.OverlayCalibrationState(nil), colorCalibration.Overlays...)
-			project.ColorCalibration = &calibrationCopy
 		}
 		if blinkChannels != nil {
 			selection := append([]int(nil), blinkChannels...)
@@ -2468,16 +2093,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				dialog.ShowError(err, win)
 				return
 			}
-			clearGaiaRefinement()
-			previousCalibration := colorCalibration
-			previousSaveCalibration := saveColorCalibration
-			if project.ColorCalibration != nil {
-				colorCalibration = *project.ColorCalibration
-				colorCalibration.Overlays = append([]models.OverlayCalibrationState(nil), project.ColorCalibration.Overlays...)
-			} else {
-				colorCalibration = models.ColorCalibrationState{Status: models.CalibrationDisabled}
-			}
-			saveColorCalibration = project.ColorCalibration != nil && !project.DisableColorCalibration
 
 			if globalSelectComposeTab != nil {
 				globalSelectComposeTab()
@@ -2657,15 +2272,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				fyne.Do(func() {
 					if largeMode && len(errors) > 0 {
 						// Restore the detached runtime snapshot before reporting failure.
-						restoreComposeLargeProjectSnapshot(&imgs, &origPixels, &overlayLayers, &largeArtifacts, &largePreviews, &colorCalibration, &saveColorCalibration, previousImgs, previousOrig, previousOverlays, previousArtifacts, previousPreviews, previousCalibration, previousSaveCalibration)
+						restoreComposeLargeProjectSnapshot(&imgs, &origPixels, &overlayLayers, &largeArtifacts, &largePreviews, previousImgs, previousOrig, previousOverlays, previousArtifacts, previousPreviews)
 						largeMu.Lock()
 						largeArtifacts = previousArtifacts
 						largePreviews = previousPreviews
 						largeRuntime.artifacts = largeArtifacts
 						largeRuntime.previews = largePreviews
 						largeMu.Unlock()
-						colorCalibration = previousCalibration
-						saveColorCalibration = previousSaveCalibration
 						for _, l := range overlayLayers {
 							if l.win != nil {
 								l.win.SetCloseIntercept(nil)
@@ -2941,7 +2554,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						largeArtifacts[idx], largePreviews[idx] = descs[j], previews[j]
 					}
 					largeMu.Unlock()
-					invalidateCalibration()
 					refresh()
 					restoreViewportStates(savedStates)
 					dialog.ShowInformation("Reset Complete", "Channels restored from disk.", win)
@@ -2972,7 +2584,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				applyChannelState(i, state, imgs, viewports, controlSets)
 			}
 		})
-		invalidateCalibration()
 
 		if !loaded {
 			dialog.ShowInformation("Reset", "No loaded channels to reset.", win)
@@ -3075,7 +2686,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						if idx < len(controlSets) {
 							resetComposeAlignmentOffsets(controlSets[idx])
 						}
-						invalidateCalibration()
 					}
 					refresh()
 				})
@@ -3134,7 +2744,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					// the summary line only.
 					dx, dy, rot = extractManualOffset(back, w, h)
 					setChannelAlignTransform(imgs[idx], back)
-					invalidateCalibration()
 					if idx < len(controlSets) && controlSets[idx] != nil {
 						if controlSets[idx].XOffsetEntry != nil {
 							controlSets[idx].XOffsetEntry.SetValue(0)
@@ -3746,7 +3355,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 							imgs[i].HDU.Data.Pixels = nil
 							clearComposeOrigPixels(&origPixels, i)
 						}
-						invalidateCalibration()
 						progressDialog.Hide()
 						refresh()
 						restoreViewportStates(savedStates)
@@ -3988,7 +3596,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				imgs[i].HDU.Data.Pixels = out
 				clearComposeOrigPixels(&origPixels, i)
 			}
-			invalidateCalibration()
 
 			fyne.Do(func() {
 				win.Canvas().Refresh(win.Content())
@@ -4001,7 +3608,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	exportRGB := func() {
-		buf, w, h, _, rendered, err := composeRGB(context.Background(), cloneCalibration())
+		buf, w, h, _, err := composeRGB(context.Background())
 		if buf == nil {
 			dialog.ShowInformation("Missing", "Load three FITS first", win)
 			return
@@ -4023,17 +3630,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			w, h = comp.Width, comp.Height
 		}
 		finalBuf := processing.ApplyRGBLevels(buf, levels)
-		// Use the same immutable render result for high-bit-depth output as for
-		// the preview (including the existing overlay blend).
-		// Reuse the same immutable manual-offset-applied snapshot used by preview.
-		if rendered == nil {
-			dialog.ShowError(fmt.Errorf("missing render result"), win)
-			return
-		}
-		finalBuf = append([]byte(nil), rendered.Preview...)
-		processing.ApplyRGBLevels(finalBuf, levels)
-		w, h = rendered.Width, rendered.Height
-		rF, gF, bF := rendered.R, rendered.G, rendered.B
 		save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
 			if err != nil || uc == nil {
 				return
@@ -4051,15 +3647,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						return
 					}
 					debuglog.Log(fmt.Sprintf("exportRGB: wrote disk composite %s", path))
-					return
-				}
-				if format == export.PNG && opts.BitDepth == 16 && rF != nil {
-					rA, gA, bA := processing.ApplyRGBLevelsFloat32(rF, gF, bF, levels)
-					if err := export.FromFloat32Channels(path, rA, gA, bA, w, h, format, opts); err != nil {
-						dialog.ShowError(err, win)
-						return
-					}
-					debuglog.Log(fmt.Sprintf("exportRGB: wrote 16-bit composite %s", path))
 					return
 				}
 				if err := export.FromRGBABytes(path, finalBuf, w, h, format, opts); err != nil {
@@ -4712,678 +4299,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}, win)
 	}
 
-	var colorCalibrationWindow fyne.Window
-	var openColorCalibration func()
-	openColorCalibration = func() {
-		if colorCalibrationWindow != nil {
-			colorCalibrationWindow.RequestFocus()
-			return
-		}
-		if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
-			dialog.ShowInformation("Color Calibration", "Load all three base channels first.", win)
-			return
-		}
-		mode := NewSafeSelect([]string{"Off", "Instrument", "Gaia"}, nil)
-		mode.SetSelected(map[models.PhotometricMode]string{models.PhotometricInstrument: "Instrument", models.PhotometricGaia: "Gaia"}[colorCalibration.PhotometricMode])
-		if colorCalibration.PhotometricMode == models.PhotometricOff || colorCalibration.PhotometricMode == "" {
-			mode.SetSelected("Off")
-		}
-		gaiaAccess := NewSafeSelect([]string{"Online", "Cache Only"}, nil)
-		if colorCalibration.Gaia.AccessMode == "cacheOnly" {
-			gaiaAccess.SetSelected("Cache Only")
-		} else {
-			gaiaAccess.SetSelected("Online")
-		}
-		gaiaRelease := widget.NewEntry()
-		gaiaRelease.SetText(colorCalibration.Gaia.Release)
-		if gaiaRelease.Text == "" {
-			gaiaRelease.SetText("DR3")
-		}
-		gaiaEndpoint := widget.NewEntry()
-		gaiaEndpoint.SetText(colorCalibration.Gaia.Endpoint)
-		if gaiaEndpoint.Text == "" {
-			gaiaEndpoint.SetText("https://gea.esac.esa.int/tap-server/tap")
-		}
-		gaiaMatchRadius := widget.NewEntry()
-		gaiaMatchRadius.SetText(strconv.FormatFloat(normalizeGaiaMatchRadiusArcsec(colorCalibration.Gaia.MatchRadiusArcsec), 'f', -1, 64))
-		gaiaCachePathEntry := widget.NewEntry()
-		effectiveGaiaSettings := applyGaiaCachePathPreference(colorCalibration.Gaia, app.Preferences().String(gaiaCachePathPreferenceKey))
-		gaiaCachePathEntry.SetText(effectiveGaiaSettings.CachePath)
-		gaiaCacheStatusLabel := widget.NewLabel("")
-		refreshGaiaCacheStatus := func() {
-			path, err := gaiaCachePath(applyGaiaCachePathPreference(colorCalibration.Gaia, app.Preferences().String(gaiaCachePathPreferenceKey)), "")
-			if err != nil {
-				gaiaCacheStatusLabel.SetText("Cache unavailable: " + err.Error())
-				return
-			}
-			exists, bytes, err := gaiaCacheStatus(path)
-			if err != nil {
-				gaiaCacheStatusLabel.SetText("Cache unavailable: " + err.Error())
-				return
-			}
-			if !exists {
-				gaiaCacheStatusLabel.SetText("Cache: not created")
-			} else {
-				gaiaCacheStatusLabel.SetText(fmt.Sprintf("Cache: %s (%d bytes)", path, bytes))
-			}
-		}
-		clearGaiaCacheButton := widget.NewButton("Clear cache", func() {
-			path, err := gaiaCachePath(applyGaiaCachePathPreference(colorCalibration.Gaia, app.Preferences().String(gaiaCachePathPreferenceKey)), "")
-			if err == nil {
-				err = clearGaiaCache(path)
-			}
-			if err != nil {
-				gaiaCacheStatusLabel.SetText("Cache clear failed: " + err.Error())
-			} else {
-				refreshGaiaCacheStatus()
-			}
-		})
-		gaiaInfo := widget.NewLabel("")
-		updateGaiaInfo := func() {
-			gaiaInfo.SetText(fmt.Sprintf("Gaia %s · %s · cache %s", gaiaRelease.Text, map[bool]string{true: "cache-only", false: "online"}[colorCalibration.Gaia.AccessMode == "cacheOnly"], func() string {
-				if effectiveGaiaSettings.CachePath == "" {
-					return "default"
-				}
-				return effectiveGaiaSettings.CachePath
-			}()))
-		}
-		updateGaiaInfo()
-		refreshGaiaCacheStatus()
-		neutral := NewToggle(nil)
-		neutral.SetChecked(colorCalibration.NeutralizeBackground)
-		white := NewSafeSelect([]string{"Flat Fnu", "Flat Flambda", "Average spiral galaxy"}, nil)
-		white.SetSelected(map[models.WhiteReference]string{models.WhiteReferenceFlatFlambda: "Flat Flambda", models.WhiteReferenceAverageSpiralGalaxy: "Average spiral galaxy"}[colorCalibration.WhiteReference])
-		if colorCalibration.WhiteReference == "" || colorCalibration.WhiteReference == models.WhiteReferenceFlatFnu {
-			white.SetSelected("Flat Fnu")
-		}
-		selection := NewSafeSelect([]string{"Automatic", "Aligned reference ROI"}, nil)
-		if colorCalibration.BackgroundSelection == models.BackgroundROI {
-			selection.SetSelected("Aligned reference ROI")
-		} else {
-			selection.SetSelected("Automatic")
-		}
-		roiX, roiY, roiW, roiH := NewNumberEntry(0, 0), NewNumberEntry(0, 0), NewNumberEntry(0, 0), NewNumberEntry(0, 0)
-		roiX.SetValue(float64(colorCalibration.BackgroundROI.X))
-		roiY.SetValue(float64(colorCalibration.BackgroundROI.Y))
-		roiW.SetValue(float64(colorCalibration.BackgroundROI.Width))
-		roiH.SetValue(float64(colorCalibration.BackgroundROI.Height))
-		saveCalibration := NewToggle(nil)
-		saveCalibration.SetChecked(saveColorCalibration)
-		beforePreview := widget.NewButton("Before", func() { v := false; calibrationPreviewOverride = &v; refresh() })
-		afterPreview := widget.NewButton("After", func() { v := true; calibrationPreviewOverride = &v; refresh() })
-		status := widget.NewLabel(composeCalibrationStatusText(colorCalibration))
-		status.Wrapping = fyne.TextWrapWord
-		calculate := widget.NewButton("Calculate", nil)
-		cancelButton := widget.NewButton("Cancel", nil)
-		setStale := func() {
-			clearGaiaRefinement()
-			markComposeCalibrationStale(&colorCalibration)
-			status.SetText(composeCalibrationStatusText(colorCalibration))
-			refresh()
-		}
-		mode.OnChanged = func(v string) {
-			if v == "Instrument" {
-				colorCalibration.PhotometricMode = models.PhotometricInstrument
-			} else if v == "Gaia" {
-				colorCalibration.PhotometricMode = models.PhotometricGaia
-			} else {
-				colorCalibration.PhotometricMode = models.PhotometricOff
-			}
-			setStale()
-		}
-		gaiaAccess.OnChanged = func(v string) {
-			if v == "Cache Only" {
-				colorCalibration.Gaia.AccessMode = "cacheOnly"
-			} else {
-				colorCalibration.Gaia.AccessMode = "online"
-			}
-			updateGaiaInfo()
-			setStale()
-		}
-		gaiaRelease.OnChanged = func(v string) { colorCalibration.Gaia.Release = v; updateGaiaInfo(); setStale() }
-		gaiaEndpoint.OnChanged = func(v string) { colorCalibration.Gaia.Endpoint = v; setStale() }
-		gaiaMatchRadius.OnChanged = func(v string) {
-			if radius, err := parseGaiaMatchRadiusArcsec(v); err == nil {
-				colorCalibration.Gaia.MatchRadiusArcsec = radius
-				setStale()
-			}
-		}
-		gaiaCachePathEntry.OnChanged = func(v string) {
-			updateComposeGaiaCachePath(&colorCalibration, v)
-			app.Preferences().SetString(gaiaCachePathPreferenceKey, v)
-			effectiveGaiaSettings.CachePath = v
-			refreshGaiaCacheStatus()
-		}
-		neutral.OnChanged = func(v bool) { colorCalibration.NeutralizeBackground = v; setStale() }
-		white.OnChanged = func(v string) {
-			switch v {
-			case "Flat Flambda":
-				colorCalibration.WhiteReference = models.WhiteReferenceFlatFlambda
-			case "Average spiral galaxy":
-				colorCalibration.WhiteReference = models.WhiteReferenceAverageSpiralGalaxy
-			default:
-				colorCalibration.WhiteReference = models.WhiteReferenceFlatFnu
-			}
-			setStale()
-		}
-		selection.OnChanged = func(v string) {
-			if v == "Aligned reference ROI" {
-				colorCalibration.BackgroundSelection = models.BackgroundROI
-			} else {
-				colorCalibration.BackgroundSelection = models.BackgroundAutomatic
-			}
-			setStale()
-		}
-		setROI := func() {
-			colorCalibration.BackgroundROI = models.CalibrationROI{X: int(roiX.Value()), Y: int(roiY.Value()), Width: int(roiW.Value()), Height: int(roiH.Value())}
-			setStale()
-		}
-		roiX.OnChanged, roiY.OnChanged, roiW.OnChanged, roiH.OnChanged = func(float64) { setROI() }, func(float64) { setROI() }, func(float64) { setROI() }, func(float64) { setROI() }
-		saveCalibration.OnChanged = func(v bool) { saveColorCalibration = v; refresh() }
-		prior := colorCalibration
-		cancelButton.Disable()
-		calculate.OnTapped = func() {
-			if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
-				return
-			}
-			if colorCalibration.PhotometricMode == models.PhotometricGaia {
-				radius, err := parseGaiaMatchRadiusArcsec(gaiaMatchRadius.Text)
-				if err != nil {
-					status.SetText(err.Error())
-					return
-				}
-				colorCalibration.Gaia.MatchRadiusArcsec = radius
-			}
-			prior = colorCalibration
-			calibrationGeneration++
-			generation := calibrationGeneration
-			ctx, ok := calibrationJob.begin(generation)
-			if !ok {
-				return
-			}
-			calibrationSnapshot := colorCalibration
-			refinedResidualSnapshot := refinedGaiaResidual
-			refinedSourcesSnapshot := append([]gaia.Source(nil), refinedGaiaSources...)
-			calibrationSnapshot.Overlays = append([]models.OverlayCalibrationState(nil), colorCalibration.Overlays...)
-			for i := range calibrationSnapshot.Overlays {
-				calibrationSnapshot.Overlays[i].Diagnostics.Warnings = append([]string(nil), colorCalibration.Overlays[i].Diagnostics.Warnings...)
-			}
-			priorForJob := prior
-			imageSnapshots := make([]*models.LoadedImage, 3)
-			var offsetSnapshots [3][3]float64
-			for i := range imageSnapshots {
-				imageSnapshots[i] = cloneLoadedImageForStretchMatch(imgs[i])
-				if composeChannelOffsetFields != nil {
-					dx, dy, rot, _ := composeChannelOffsetFields(i)
-					offsetSnapshots[i] = [3]float64{dx, dy, rot}
-				}
-			}
-			colorCalibration.Status = models.CalibrationCalculating
-			status.SetText(composeCalibrationStatusText(colorCalibration))
-			calculate.Disable()
-			cancelButton.Enable()
-			mode.Disable()
-			neutral.Disable()
-			white.Disable()
-			selection.Disable()
-			gaiaMatchRadius.Disable()
-			inputs := make([]processing.CalibrationInput, 3)
-			streamInputs := make([]processing.CalibrationStreamInput, 3)
-			largeCalibration := composeLargeModeActive != nil && composeLargeModeActive()
-			var inputErr error
-			var backgroundReaders [3]*alignedArtifactRowReader
-			if largeCalibration && calibrationSnapshot.NeutralizeBackground {
-				ref, ok := largeArtifacts[1]
-				if !ok {
-					inputErr = fmt.Errorf("channel 2 disk artifact is unavailable")
-				} else {
-					for i := range backgroundReaders {
-						d, exists := largeArtifacts[i]
-						if !exists {
-							inputErr = fmt.Errorf("channel %d disk artifact is unavailable", i+1)
-							break
-						}
-						off := offsetSnapshots[i]
-						backgroundReaders[i] = &alignedArtifactRowReader{
-							path: d.Path, source: *imageSnapshots[i], reference: *imageSnapshots[1],
-							width: ref.Width, height: ref.Height, offsetX: off[0], offsetY: off[1], offsetRot: off[2],
-						}
-					}
-				}
-			}
-			for i := range inputs {
-				img := imageSnapshots[i]
-				if !largeCalibration {
-					pixels := append([]float32(nil), img.HDU.Data.Pixels...)
-					inputs[i] = processing.CalibrationInput{SourceIdentity: img.Path, Width: img.HDU.Data.Width, Height: img.HDU.Data.Height, Pixels: pixels, Valid: make([]bool, len(pixels)), Alignment: fmt.Sprintf("channel-%d", i)}
-					for j := range inputs[i].Valid {
-						inputs[i].Valid[j] = true
-					}
-				} else {
-					d, ok := largeArtifacts[i]
-					if !ok {
-						inputErr = fmt.Errorf("channel %d disk artifact is unavailable", i+1)
-						break
-					}
-					streamInputs[i] = processing.CalibrationStreamInput{SourceIdentity: img.Path, Width: d.Width, Height: d.Height, Alignment: fmt.Sprintf("channel-%d", i)}
-					path := d.Path
-					streamInputs[i].ReadRow = func(y int, dst []float32) error {
-						a, err := fitsio.OpenFloat32ArtifactReadOnly(path)
-						if err != nil {
-							return err
-						}
-						defer a.Close()
-						return a.ReadRow(y, dst)
-					}
-					streamInputs[i].ReadValidRow = func(y int, dst []bool) error {
-						for j := range dst {
-							dst[j] = true
-						}
-						return nil
-					}
-				}
-				if settingsMode := calibrationSnapshot.PhotometricMode; settingsMode == models.PhotometricInstrument {
-					ref := processing.ReferenceFnu
-					if calibrationSnapshot.WhiteReference == models.WhiteReferenceFlatFlambda {
-						ref = processing.ReferenceFlambda
-					}
-					headerValue := func(h fitsio.Header, keys ...string) string {
-						for _, key := range keys {
-							if value := fitsio.HeaderString(h, key); value != "" {
-								return value
-							}
-						}
-						return ""
-					}
-					detector := headerValue(img.HDU.Header, "DETECTOR")
-					if strings.HasPrefix(strings.ToUpper(detector), "NRC") {
-						detector = "NRC"
-					}
-					metadata := processing.InstrumentMetadata{Telescope: headerValue(img.Primary, "TELESCOP", "TELESCOPE"), Instrument: headerValue(img.Primary, "INSTRUME", "INSTRUMENT"), Detector: detector, Filter: headerValue(img.HDU.Header, "FILTER", "FILTER1", "FILTER2"), Primary: img.Primary, SCI: img.HDU.Header, Reference: ref}
-					photometry, parseErr := processing.ParseInstrumentPhotometry(metadata)
-					if parseErr != nil {
-						inputErr = parseErr
-						break
-					}
-					if largeCalibration {
-						streamInputs[i].Metadata = metadata
-						streamInputs[i].Photometry = &photometry
-					} else {
-						inputs[i].Metadata = metadata
-						inputs[i].Photometry = &photometry
-					}
-				}
-			}
-			settings := processing.CalibrationSettings{PhotometricMode: calibrationSnapshot.PhotometricMode, NeutralizeBackground: calibrationSnapshot.NeutralizeBackground, BackgroundSelection: calibrationSnapshot.BackgroundSelection, BackgroundROI: calibrationSnapshot.BackgroundROI, WhiteReference: calibrationSnapshot.WhiteReference, LinkedStretch: calibrationSnapshot.LinkedStretch, Overlays: append([]models.OverlayCalibrationState(nil), calibrationSnapshot.Overlays...), AlgorithmVersion: "ui-v1", ReferenceVersion: "local-v1", Gaia: calibrationSnapshot.Gaia}
-			go func() {
-				var result processing.CalibrationResult
-				gaiaDone := false
-				err := inputErr
-				if err == nil && calibrationSnapshot.PhotometricMode == models.PhotometricGaia {
-					debuglog.Log(fmt.Sprintf("Gaia UI calibration start: access=%s release=%s radius=%.3f magnitude=%.2f cache=%s", calibrationSnapshot.Gaia.AccessMode, calibrationSnapshot.Gaia.Release, calibrationSnapshot.Gaia.MatchRadiusArcsec, calibrationSnapshot.Gaia.MagnitudeLimit, calibrationSnapshot.Gaia.CachePath))
-					// Gaia is a staged provider job; construct it from the immutable
-					// image/settings snapshot so cache-only mode never reaches HTTP.
-					calibrationSnapshot.Gaia = applyGaiaCachePathPreference(calibrationSnapshot.Gaia, app.Preferences().String(gaiaCachePathPreferenceKey))
-					cachePath, pathErr := gaiaCachePath(calibrationSnapshot.Gaia, "")
-					if pathErr != nil {
-						err = pathErr
-					} else {
-						calibrationSnapshot.Gaia = resolveGaiaSettings(calibrationSnapshot.Gaia)
-						cache, openErr := composeGaiaCacheOpener(ctx, cachePath)
-						if openErr != nil {
-							err = openErr
-						} else {
-							defer cache.Close()
-							mode := gaia.AccessOnline
-							if calibrationSnapshot.Gaia.AccessMode == "cacheOnly" {
-								mode = gaia.AccessCacheOnly
-							}
-							provider, providerErr := newGaiaProvider(calibrationSnapshot.Gaia.Endpoint, mode, calibrationSnapshot.Gaia.Release, calibrationSnapshot.Gaia.XPRepresentation, cache)
-							if providerErr != nil {
-								err = providerErr
-							} else {
-								query, pixelToSky, queryErr := deriveGaiaFieldQuery(imageSnapshots[1], calibrationSnapshot.Gaia)
-								if queryErr != nil {
-									err = queryErr
-								} else {
-									calibrationSnapshot.Gaia.ObservationEpoch = query.ObservationEpoch
-									query.Release = calibrationSnapshot.Gaia.Release
-									if calibrationSnapshot.Gaia.MagnitudeLimit > 0 {
-										query.MagnitudeLimit = calibrationSnapshot.Gaia.MagnitudeLimit
-									}
-									query.ObservationEpoch = calibrationSnapshot.Gaia.ObservationEpoch
-									// Discover and normalize Gaia sources once. The same immutable
-									// slice is reused by refinement/calibration so refinement never
-									// triggers a second catalog or XP request.
-									sources := refinedSourcesSnapshot
-									discoverErr := error(nil)
-									if len(sources) == 0 {
-										sources, discoverErr = provider.DiscoverSources(ctx, query)
-										if discoverErr == nil {
-											sources, discoverErr = gaia.NormalizeSources(sources, calibrationSnapshot.Gaia.Release)
-										}
-									}
-									if discoverErr != nil {
-										err = discoverErr
-									}
-									var stars []processing.Star
-									var aw, ah int
-									var alignedPlanes [3]processing.AlignedPlane
-									var detectionLease *fitsio.MaterializedPlane
-									if largeCalibration {
-										d, ok := largeArtifacts[1]
-										if !ok {
-											err = fmt.Errorf("channel 2 disk artifact is unavailable")
-										} else {
-											aw, ah = d.Width, d.Height
-											reader := artifactRowReader{path: d.Path}
-											stars, err = processing.ExtractStarsTiledReader(ctx, reader, aw, ah, 256, 5, 3)
-											if len(stars) > processing.TweakRegCatalogMaxStars {
-												stars = stars[:processing.TweakRegCatalogMaxStars]
-											}
-										}
-									} else {
-										aligned, aw0, ah0, alignErr := processing.AlignedPlanesForCalibration(ctx, imageSnapshots)
-										if alignErr != nil {
-											err = alignErr
-										} else {
-											aw, ah = aw0, ah0
-											alignedPlanes = aligned
-											stars = processing.ExtractAndLimitStars(alignedPlanes[1].Pixels, aw, ah, 5, 3, 500)
-										}
-									}
-									if detectionLease != nil {
-										defer detectionLease.Release()
-									}
-									if err == nil {
-										debuglog.Log(fmt.Sprintf("Gaia UI alignment/detection: aligned=%dx%d detected_stars=%d", aw, ah, len(stars)))
-										planes := [3]processing.GaiaPlane{}
-										readers := [3]processing.GaiaPlaneReader{}
-										for c := range planes {
-											if largeCalibration {
-												d, ok := largeArtifacts[2-c]
-												if !ok {
-													err = fmt.Errorf("channel %d disk artifact is unavailable", 3-c)
-													break
-												}
-												off := offsetSnapshots[2-c]
-												readers[c] = &alignedArtifactRowReader{path: d.Path, source: *imageSnapshots[2-c], reference: *imageSnapshots[1], width: aw, height: ah, offsetX: off[0], offsetY: off[1], offsetRot: off[2]}
-												planes[c].Width, planes[c].Height = aw, ah
-												continue
-											}
-											// UI channels are B,G,R while the canonical planes are R,G,B.
-											p := alignedPlanes[2-c]
-											pixels := append([]float32(nil), p.Pixels...)
-											for i, valid := range p.Valid {
-												if i < len(pixels) && !valid {
-													pixels[i] = float32(math.NaN())
-												}
-											}
-											planes[c] = processing.GaiaPlane{Pixels: pixels, Valid: append([]bool(nil), p.Valid...), Width: aw, Height: ah}
-										}
-										matchRadius := calibrationSnapshot.Gaia.MatchRadiusArcsec
-										if matchRadius <= 0 {
-											matchRadius = 2
-										}
-										epoch := calibrationSnapshot.Gaia.ObservationEpoch
-										if epoch <= 0 {
-											epoch = 2000
-										}
-										magnitude := calibrationSnapshot.Gaia.MagnitudeLimit
-										if magnitude <= 0 {
-											magnitude = 18
-										}
-										if refinedResidualSnapshot != nil {
-											pixelToSky, err = processing.RefinedPixelToSky(pixelToSky, *refinedResidualSnapshot)
-										}
-										greq := processing.GaiaCalibrationRequest{Query: query, Settings: gaiaRequestSettings(calibrationSnapshot.Gaia, matchRadius, epoch, magnitude), Sources: sources, DetectedStars: stars, Planes: planes, Readers: readers, PixelToSky: pixelToSky}
-										greq.Settings.ObservationEpoch = query.ObservationEpoch
-										gaiaResult, runErr := composeGaiaJobService.Run(ctx, GaiaJobRequest{Provider: provider, Query: query, Settings: greq.Settings, Calibration: greq}, func(p GaiaJobProgress) {
-											debuglog.Log(fmt.Sprintf("Gaia UI stage: %s", p.Stage))
-											fyne.Do(func() { status.SetText(fmt.Sprintf("Calibration: calculating — Gaia %s", p.Stage)) })
-										})
-										for c := range readers {
-											if r, ok := readers[c].(*alignedArtifactRowReader); ok {
-												_ = r.Close()
-											}
-										}
-										if runErr != nil {
-											err = runErr
-											debuglog.Log(fmt.Sprintf("Gaia UI terminal: failed error=%v", runErr))
-										} else {
-											gaiaDone = true
-											result.Base = [3]models.LinearTransform{{Gain: gaiaResult.Diagnostics.Gains[0]}, {Gain: gaiaResult.Diagnostics.Gains[1]}, {Gain: gaiaResult.Diagnostics.Gains[2]}}
-											result.Status = gaiaResult.Status
-											result.Diagnostics.Message = fmt.Sprintf("Gaia: %d matched, %d accepted", gaiaResult.Diagnostics.MatchedStars, gaiaResult.Diagnostics.AcceptedStars)
-											result.Provenance = gaiaResult.Provenance
-											result.SourceFingerprint = gaiaResult.SourceFingerprint
-											result.SettingsFingerprint = gaiaResult.SettingsFingerprint
-											debuglog.Log(fmt.Sprintf("Gaia UI terminal: status=%s matched=%d accepted=%d rejected=%d", gaiaResult.Status, gaiaResult.Diagnostics.MatchedStars, gaiaResult.Diagnostics.AcceptedStars, gaiaResult.Diagnostics.RejectedStars))
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-				if err == nil && largeCalibration && calibrationSnapshot.PhotometricMode != models.PhotometricGaia {
-					backgroundInputs := append([]processing.CalibrationStreamInput(nil), streamInputs...)
-					calibrationInputs := streamInputs
-					if calibrationSnapshot.NeutralizeBackground {
-						for i, reader := range backgroundReaders {
-							if reader == nil {
-								err = fmt.Errorf("channel %d aligned background reader is unavailable", i+1)
-								break
-							}
-							backgroundInputs[i].Width, backgroundInputs[i].Height = reader.width, reader.height
-							backgroundInputs[i].ReadRow = reader.ReadRow
-							backgroundInputs[i].ReadValidRow = reader.ReadValidRow
-						}
-						// The aligned reference-grid samples are the canonical input
-						// for neutralized calibration. Use them for the final streamed
-						// fingerprint/calculation as well as background estimation;
-						// otherwise the persisted fingerprint would describe a raw,
-						// differently sized raster than normal Compose.
-						calibrationInputs = append([]processing.CalibrationStreamInput(nil), backgroundInputs...)
-						defer func() {
-							for _, reader := range backgroundReaders {
-								if reader != nil {
-									_ = reader.Close()
-								}
-							}
-						}()
-					}
-					if err == nil {
-						for i := range streamInputs {
-							if calibrationSnapshot.NeutralizeBackground {
-								var roi *models.CalibrationROI
-								if calibrationSnapshot.BackgroundSelection == models.BackgroundROI {
-									r := calibrationSnapshot.BackgroundROI
-									roi = &r
-								}
-								e, eerr := processing.EstimateBackgroundStream(ctx, backgroundInputs[i], roi, processing.DefaultBackgroundConfig())
-								if eerr != nil {
-									err = eerr
-									break
-								}
-								if e.Status != models.CalibrationValid {
-									err = &processing.UnsupportedCalibrationError{Reason: fmt.Sprintf("channel %d background: %s", i+1, e.RejectionReason)}
-									break
-								}
-								calibrationInputs[i].Background = e.Transform
-							}
-						}
-						if err == nil {
-							result, err = processing.CalculateCalibrationStreaming(ctx, calibrationInputs, settings)
-						}
-					}
-				}
-				if err != nil {
-					// Metadata parsing above produced the actionable unsupported reason.
-				} else if ctx.Err() != nil {
-					err = ctx.Err()
-				} else if !largeCalibration {
-					if calibrationSnapshot.NeutralizeBackground {
-						roi := calibrationSnapshot.BackgroundROI
-						var roiPtr *models.CalibrationROI
-						if calibrationSnapshot.BackgroundSelection == models.BackgroundROI {
-							roiPtr = &roi
-						}
-						alignedPlanes, _, _, alignErr := processing.AlignedPlanesForCalibration(ctx, imageSnapshots)
-						if alignErr != nil {
-							err = alignErr
-						}
-						if err == nil {
-							for i := range inputs {
-								plane := alignedPlanes[2-i]
-								inputs[i].Pixels = append([]float32(nil), plane.Pixels...)
-								inputs[i].Valid = append([]bool(nil), plane.Valid...)
-								inputs[i].Width, inputs[i].Height = plane.Width, plane.Height
-							}
-						}
-						for i := range inputs {
-							if err != nil {
-								break
-							}
-							if ctx.Err() != nil {
-								err = ctx.Err()
-								break
-							}
-							// Compose's canonical plane order is R,G,B while the UI
-							// channel slots are B,G,R.
-							plane := alignedPlanes[2-i]
-							estimate, estimateErr := processing.EstimateBackgroundPlane(ctx, processing.BackgroundPlane{Pixels: plane.Pixels, Width: plane.Width, Height: plane.Height, Valid: plane.Valid, ROI: roiPtr}, processing.DefaultBackgroundConfig())
-							if estimateErr != nil {
-								err = estimateErr
-								break
-							}
-							if estimate.Status != models.CalibrationValid {
-								err = &processing.UnsupportedCalibrationError{Reason: fmt.Sprintf("channel %d background: %s", i+1, estimate.RejectionReason)}
-								break
-							}
-							estimate.Transform.Gain = 1
-							inputs[i].Background = estimate.Transform
-						}
-					}
-				}
-				if err == nil && ctx.Err() != nil {
-					err = ctx.Err()
-				}
-				if err == nil && !gaiaDone && !largeCalibration {
-					result, err = processing.CalculateCalibration(inputs, settings)
-				}
-				fyne.Do(func() {
-					if ctx.Err() != nil && err == nil {
-						err = ctx.Err()
-					}
-					liveGaiaCachePath := colorCalibration.Gaia.CachePath
-					accepted := composeCalibrationResultForUI(&calibrationJob, generation, calibrationGeneration, &colorCalibration, &priorForJob, result, err)
-					if accepted {
-						if gaiaDone {
-							// Persist only the resolved settings of an accepted Gaia job;
-							// failed or superseded jobs must not alter current settings.
-							liveSettings := colorCalibration.Gaia
-							liveSettings.CachePath = liveGaiaCachePath
-							colorCalibration.Gaia = retainComposeProjectGaiaCachePath(liveSettings, calibrationSnapshot.Gaia)
-						}
-						status.SetText(composeCalibrationStatusText(colorCalibration))
-						refresh()
-					}
-					if accepted && generation == calibrationGeneration {
-						calculate.Enable()
-						cancelButton.Disable()
-						mode.Enable()
-						neutral.Enable()
-						white.Enable()
-						selection.Enable()
-						gaiaMatchRadius.Enable()
-					}
-				})
-			}()
-		}
-		cancelButton.OnTapped = func() {
-			if calibrationJob.cancelJob() {
-				colorCalibration = prior
-				if prior.Status != models.CalibrationValid {
-					colorCalibration.Status = models.CalibrationCancelled
-				}
-				status.SetText(composeCalibrationStatusText(colorCalibration))
-				calculate.Enable()
-				cancelButton.Disable()
-				mode.Enable()
-				neutral.Enable()
-				white.Enable()
-				selection.Enable()
-				gaiaMatchRadius.Enable()
-				refresh()
-			}
-		}
-		var calibrationWindow fyne.Window
-		closeCalibration := widget.NewButton("Close", func() {
-			if calibrationWindow != nil {
-				calibrationWindow.Close()
-			}
-		})
-		content := container.NewVBox(
-			container.NewBorder(nil, nil, widget.NewLabel("Photometric mode"), nil, mode),
-			container.NewHBox(neutral, widget.NewLabel("Neutralize background")),
-			container.NewBorder(nil, nil, widget.NewLabel("White reference"), nil, white),
-			container.NewBorder(nil, nil, widget.NewLabel("Background selection"), nil, selection),
-			container.NewBorder(nil, nil, widget.NewLabel("Gaia access"), nil, gaiaAccess),
-			container.NewGridWithColumns(2, widget.NewLabel("Gaia release"), gaiaRelease, widget.NewLabel("Gaia endpoint"), gaiaEndpoint),
-			container.NewBorder(nil, nil, widget.NewLabel("Gaia match radius (arcsec)"), nil, gaiaMatchRadius),
-			container.NewBorder(nil, nil, widget.NewLabel("Cache path"), clearGaiaCacheButton, gaiaCachePathEntry),
-			gaiaCacheStatusLabel,
-			gaiaInfo,
-			container.NewGridWithColumns(4, roiX, roiY, roiW, roiH), status,
-			container.NewHBox(calculate, cancelButton, saveCalibration, widget.NewLabel("Save Color Calibration"), beforePreview, afterPreview, layout.NewSpacer(), closeCalibration),
-		)
-		calibrationWindow = app.NewWindow("Color Calibration")
-		colorCalibrationWindow = calibrationWindow
-		// Keep the controls clear of every edge of the scroll viewport. The
-		// explicit spacers make this a stable 20 px margin regardless of theme.
-		calibrationWindow.SetContent(container.NewVScroll(container.NewBorder(vpad(20), vpad(20), hpad(20), hpad(20), content)))
-		calibrationWindow.SetOnClosed(func() {
-			if colorCalibrationWindow == calibrationWindow {
-				colorCalibrationWindow = nil
-			}
-			calibrationPreviewOverride = nil
-			refresh()
-		})
-		// A scroll container reports only its first child's minimum height until its
-		// viewport is explicitly sized. Without this, the Color Calibration window
-		// can appear as just the photometric-mode row, hiding the settings and
-		// Calculate controls below it.
-		calibrationWindow.Resize(fyne.NewSize(760, 640))
-		calibrationWindow.Show()
-	}
-
 	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 Settings to 2 & 3", copySettings)
 	matchStretchItem := fyne.NewMenuItem("Match Channel Stretch...", showMatchStretchDialog)
-	showGaiaPicker := func() {
-		if imgs[1] == nil {
-			dialog.ShowInformation("Missing Channel 2", "Load Channel 2 before selecting Gaia reference stars.", win)
-			return
-		}
-		preview, _ := viewports[1].image.Image.(image.Image)
-		snapshot := cloneLoadedImageForStretchMatch(imgs[1])
-		pickerGeneration := gaiaRefinementGeneration
-		sourcePath, sourceWidth, sourceHeight := snapshot.Path, snapshot.HDU.Data.Width, snapshot.HDU.Data.Height
-		showComposeGaiaPicker(app, win, snapshot, preview, composeGaiaResidualRunnerForImage(snapshot, colorCalibration.Gaia), func(result composeGaiaResidualResult) bool {
-			if pickerGeneration != gaiaRefinementGeneration || imgs[1] == nil || imgs[1].Path != sourcePath || imgs[1].HDU.Data.Width != sourceWidth || imgs[1].HDU.Data.Height != sourceHeight || imgs[1].Rotation90 != 0 || imgs[1].HasAlignTransform {
-				return false
-			}
-			residual := result.Transform
-			refinedGaiaResidual = &residual
-			refinedGaiaSources = append([]gaia.Source(nil), result.Sources...)
-			markComposeCalibrationStale(&colorCalibration)
-			refresh()
-			return true
-		})
-	}
-	gaiaPickerItem := fyne.NewMenuItem("Pick Channel 2 Gaia Stars...", showGaiaPicker)
 	addLayerItem := fyne.NewMenuItem("Add Colored Layer...", addColoredLayer)
-	colorCalibrationItem := fyne.NewMenuItem("Color Calibration...", openColorCalibration)
 	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
 	sendToEditItem := fyne.NewMenuItem("Send Composite to Edit", sendToEdit)
 	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
@@ -5413,7 +4331,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	// former Channels and Process menus).
 	composeMenu := fyne.NewMenu("Compose",
 		alignChannelsItem,
-		gaiaPickerItem,
 		cleanChannelsItem,
 		resetDataItem,
 		fyne.NewMenuItemSeparator(),
@@ -5422,7 +4339,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		normalizeScaleItem,
 		fyne.NewMenuItemSeparator(),
 		addLayerItem,
-		colorCalibrationItem,
 	)
 	// View: display tuning plus the per-channel FITS header viewers/savers.
 	viewMenu := fyne.NewMenu("View",
@@ -5446,7 +4362,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 		copySettingsItem.Disabled = imgs[0] == nil
 		matchStretchItem.Disabled = imgs[0] == nil && imgs[1] == nil && imgs[2] == nil
-		gaiaPickerItem.Disabled = imgs[1] == nil
 
 		allLoaded := imgs[0] != nil && imgs[1] != nil && imgs[2] != nil
 
@@ -5456,7 +4371,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		resetDataItem.Disabled = !allLoaded
 		exportRGBItem.Disabled = !allLoaded
 		sendToEditItem.Disabled = !allLoaded || (largeMode && largeStore != nil && func() bool { _, ok := largeStore.Composite(); return !ok }())
-		colorCalibrationItem.Disabled = !allLoaded
 
 		// if allLoaded {
 		// 	alignBtn.Enable()
@@ -5628,7 +4542,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					largeMu.Unlock()
 					clearComposeOrigPixels(&origPixels, channelIdx)
 					applyChannelState(channelIdx, channelStateFromImage(&incoming), imgs, viewports, controlSets)
-					invalidateCalibration()
 					refresh()
 					if updateMenus != nil {
 						updateMenus()
@@ -6666,9 +5579,6 @@ func largeRotateChannel(rt *largeChannelRuntime, idx int, imgs []*models.LoadedI
 
 func channelControls(label string, col color.Color, idx int, imgs []*models.LoadedImage, origPixels *[][]float32, views []*viewport, refresh func(), magicPreset *widget.Select, allowRotate bool, large ...*largeChannelRuntime) *models.ChannelControl {
 	invalidateChannelRefinement := func() {
-		if idx == 1 && globalComposeGaiaRefinementInvalidate != nil {
-			globalComposeGaiaRefinementInvalidate()
-		}
 	}
 	var disk *largeChannelRuntime
 	if len(large) > 0 {
@@ -6691,9 +5601,6 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		disk.mu.RUnlock()
 		if !ok {
 			return
-		}
-		if idx == 1 && globalComposeGaiaRefinementInvalidate != nil {
-			globalComposeGaiaRefinementInvalidate()
 		}
 		go func() {
 			disk.jobMu.Lock()
@@ -7011,9 +5918,6 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		if imgs[idx] == nil {
 			return
 		}
-		if idx == 1 && globalComposeGaiaRefinementInvalidate != nil {
-			globalComposeGaiaRefinementInvalidate()
-		}
 		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
 			largeJob("offset", func(_ *models.LoadedImage) error { return nil })
 			return
@@ -7023,9 +5927,6 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 	rotate := widget.NewButton("Rotate 90°", func() {
 		if imgs[idx] == nil {
 			return
-		}
-		if idx == 1 && globalComposeGaiaRefinementInvalidate != nil {
-			globalComposeGaiaRefinementInvalidate()
 		}
 		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
 			largeRotateChannel(disk, idx, imgs, refresh, func() {
@@ -7128,7 +6029,6 @@ type composePreviewData struct {
 	Views       [4]composeViewportPreview
 	RGBStats    [3]histogram.Stats
 	BlinkFrames []composeBlinkFrame
-	Rendered    *processing.ComposeRenderResult
 }
 
 type composeBlinkFrame struct {
@@ -7170,6 +6070,17 @@ func buildComposeBlinkFrames(ctx context.Context, imgs []*models.LoadedImage, so
 		frames = append(frames, composeBlinkFrame{ProjectIndex: projectIndex, Name: source.Name, Preview: preview})
 	}
 	return frames
+}
+
+func clearComposeOrigPixels(origPixels *[][]float32, idxs ...int) {
+	if origPixels == nil {
+		return
+	}
+	for _, idx := range idxs {
+		if idx >= 0 && idx < len(*origPixels) {
+			(*origPixels)[idx] = nil
+		}
+	}
 }
 
 func buildComposePreviewData(ctx context.Context, imgs []*models.LoadedImage, sharedHistScale bool, buildComposite bool, levels *models.RgbLevels, composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, error)) composePreviewData {

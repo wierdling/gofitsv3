@@ -17,14 +17,12 @@ import (
 	"gofitsv3/internal/models"
 )
 
-func restoreComposeLargeProjectSnapshot(imgs *[]*models.LoadedImage, orig *[][]float32, overlays *[]*overlayLayer, artifacts *map[int]composeArtifactDescriptor, previews *map[int]*image.RGBA, calibration *models.ColorCalibrationState, saveCalibration *bool, previousImgs []*models.LoadedImage, previousOrig [][]float32, previousOverlays []*overlayLayer, previousArtifacts map[int]composeArtifactDescriptor, previousPreviews map[int]*image.RGBA, previousCalibration models.ColorCalibrationState, previousSaveCalibration bool) {
+func restoreComposeLargeProjectSnapshot(imgs *[]*models.LoadedImage, orig *[][]float32, overlays *[]*overlayLayer, artifacts *map[int]composeArtifactDescriptor, previews *map[int]*image.RGBA, previousImgs []*models.LoadedImage, previousOrig [][]float32, previousOverlays []*overlayLayer, previousArtifacts map[int]composeArtifactDescriptor, previousPreviews map[int]*image.RGBA) {
 	*imgs = previousImgs
 	*orig = previousOrig
 	*overlays = previousOverlays
 	*artifacts = previousArtifacts
 	*previews = previousPreviews
-	*calibration = previousCalibration
-	*saveCalibration = previousSaveCalibration
 }
 func composeLargeInstallAllowed(ctx context.Context) bool {
 	return ctx == nil || ctx.Err() == nil

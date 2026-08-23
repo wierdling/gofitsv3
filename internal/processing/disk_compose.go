@@ -39,12 +39,11 @@ type DiskOverlay struct {
 // DiskComposeRequest describes a disk-backed RGB render. Output paths are
 // replaced atomically and are never retained by processing.
 type DiskComposeRequest struct {
-	Channels    [3]DiskChannel // B, G, R, matching Compose's channel ordering
-	Overlays    []DiskOverlay
-	Calibration *models.ColorCalibrationState
-	Output      [3]string // R, G, B artifact paths
-	PreviewMax  int
-	RGBLevels   *models.RgbLevels
+	Channels   [3]DiskChannel // B, G, R, matching Compose's channel ordering
+	Overlays   []DiskOverlay
+	Output     [3]string // R, G, B artifact paths
+	PreviewMax int
+	RGBLevels  *models.RgbLevels
 }
 
 type DiskComposeResult struct {
@@ -52,7 +51,6 @@ type DiskComposeResult struct {
 	PreviewWidth, PreviewHeight int
 	Width, Height               int
 	Stats                       [3]histogram.Stats
-	Status                      models.CalibrationStatus
 }
 
 var diskComposeSem = make(chan struct{}, 1)
@@ -132,17 +130,7 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 			prepared[i] = req.Channels[i].ArtifactPath + fmt.Sprintf(".prepared-%d", i)
 		}
 		intermediates = append(intermediates, prepared[i])
-		transform := models.LinearTransform{Gain: 1}
-		applyTransform := req.Calibration != nil && req.Calibration.Effective().Status == models.CalibrationValid
-		if applyTransform {
-			// DiskCompose channels are supplied in Compose's historical B,G,R
-			// order, while calibration transforms are persisted R,G,B.
-			transform = req.Calibration.BaseTransforms[[3]int{2, 1, 0}[i]]
-		}
-		// Keep the base channels in calibrated linear space until all
-		// calibrated-linear overlays have been accumulated. The shared Channel 2
-		// stretch is applied in a separate pass below.
-		if err := prepareDiskChannel(ctx, req.Channels[i], req.Channels[1].Image, stretchMeta, w, h, prepared[i], applyTransform, transform, false); err != nil {
+		if err := prepareDiskChannel(ctx, req.Channels[i], req.Channels[1].Image, stretchMeta, w, h, prepared[i], false); err != nil {
 			for _, p := range prepared {
 				if p != "" {
 					_ = os.Remove(p)
@@ -160,26 +148,10 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 		}
 		p := ov.Channel.ArtifactPath + fmt.Sprintf(".overlay-prepared-%d", oi)
 		intermediates = append(intermediates, p)
-		cal := overlayCalibration(req.Calibration, oi)
-		applyCal := cal != nil && cal.Mode == models.OverlayCalibratedLinear && cal.Status == models.CalibrationValid && cal.Transform.Valid()
-		// Both overlay kinds are prepared in linear space. Calibrated overlays
-		// are accumulated before the shared stretch; artistic overlays are held
-		// until after that stretch.
-		if err := prepareDiskChannel(ctx, ov.Channel, req.Channels[1].Image, stretchMeta, w, h, p, false, models.LinearTransform{Gain: 1}, false); err != nil {
+		if err := prepareDiskChannel(ctx, ov.Channel, req.Channels[1].Image, stretchMeta, w, h, p, false); err != nil {
 			return DiskComposeResult{}, err
 		}
-		// Blend overlays directly into prepared base artifacts, one row at a time.
-		if applyCal {
-			if err := blendCalibratedDiskOverlay(ctx, prepared, p, ov.Settings, *cal, w, h); err != nil {
-				_ = os.Remove(p)
-				return DiskComposeResult{}, err
-			}
-		} else {
-			artistic = append(artistic, artisticDiskOverlay{path: p, settings: ov.Settings, meta: ov.Channel.Image})
-		}
-		if applyCal {
-			_ = os.Remove(p)
-		}
+		artistic = append(artistic, artisticDiskOverlay{path: p, settings: ov.Settings, meta: ov.Channel.Image})
 	}
 	var cdf []float32
 	if stretchMeta.Mode == stretch.HistEq {
@@ -233,10 +205,6 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 	if err := combineDiskChannels(ctx, [3]string{staged[2], staged[1], staged[0]}, req.Output, w, h); err != nil {
 		return DiskComposeResult{}, err
 	}
-	status := models.CalibrationDisabled
-	if req.Calibration != nil {
-		status = req.Calibration.Effective().Status
-	}
 	step := 1
 	if w > req.PreviewMax || h > req.PreviewMax {
 		if w > h {
@@ -245,7 +213,7 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 			step = (h + req.PreviewMax - 1) / req.PreviewMax
 		}
 	}
-	return DiskComposeResult{Preview: preview, PreviewWidth: (w + step - 1) / step, PreviewHeight: (h + step - 1) / step, Width: w, Height: h, Stats: stats, Status: status}, nil
+	return DiskComposeResult{Preview: preview, PreviewWidth: (w + step - 1) / step, PreviewHeight: (h + step - 1) / step, Width: w, Height: h, Stats: stats}, nil
 }
 
 func sameDiskPath(a, b string) bool {
@@ -260,7 +228,7 @@ func sameDiskPath(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(aa), filepath.Clean(bb))
 }
 
-func prepareDiskChannel(ctx context.Context, src DiskChannel, ref, stretchMeta models.LoadedImage, dw, dh int, dst string, applyTransform bool, transform models.LinearTransform, applyStretch bool) error {
+func prepareDiskChannel(ctx context.Context, src DiskChannel, ref, stretchMeta models.LoadedImage, dw, dh int, dst string, applyStretch bool) error {
 	a, err := fitsio.OpenFloat32ArtifactReadOnly(src.ArtifactPath)
 	if err != nil {
 		return err
@@ -281,14 +249,9 @@ func prepareDiskChannel(ctx context.Context, src DiskChannel, ref, stretchMeta m
 		for x := 0; x < dw; x++ {
 			fx, fy := mapDiskCoordinate(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, x, y, dw, dh, a.Width, a.Height)
 			row[x] = sampler.sample(fx, fy)
-			v := row[x]
-			if applyTransform {
-				v = float32((float64(v) - transform.Offset) * transform.Gain)
-			}
 			if applyStretch {
-				v = stretchDiskValue(v, stretchMeta)
+				row[x] = stretchDiskValue(row[x], stretchMeta)
 			}
-			row[x] = v
 		}
 		if err := out.WriteRow(y, row); err != nil {
 			_ = tx.Abort()
@@ -455,14 +418,6 @@ func mapDiskCoordinate(img, ref models.LoadedImage, offsetX, offsetY, offsetRot 
 	return fx, fy
 }
 
-// MapDiskCoordinate exposes the compositor's output-to-source mapping to
-// bounded consumers (for example Gaia aperture readers). Keeping this as the
-// single mapping implementation prevents calibration from sampling a raw,
-// unaligned artifact while rendering samples the fitted/offset grid.
-func MapDiskCoordinate(img, ref models.LoadedImage, offsetX, offsetY, offsetRot float64, x, y, dw, dh, sw, sh int) (float64, float64) {
-	return mapDiskCoordinate(img, ref, offsetX, offsetY, offsetRot, x, y, dw, dh, sw, sh)
-}
-
 type artifactSampler struct {
 	a      *fitsio.Float32Artifact
 	y0, y1 int
@@ -576,68 +531,6 @@ func stretchDiskValue(v float32, img models.LoadedImage) float32 {
 // preview sampling.
 func DiskStretchPreviewValue(v float32, img models.LoadedImage) float32 {
 	return stretchDiskValue(v, img)
-}
-
-func overlayCalibration(state *models.ColorCalibrationState, index int) *models.OverlayCalibrationState {
-	if state == nil || index < 0 || index >= len(state.Overlays) {
-		return nil
-	}
-	return &state.Overlays[index]
-}
-func overlayTransform(state *models.OverlayCalibrationState) models.LinearTransform {
-	if state == nil {
-		return models.LinearTransform{Gain: 1}
-	}
-	return state.Transform
-}
-
-func blendCalibratedDiskOverlay(ctx context.Context, bases [3]string, overlay string, settings models.OrangeLayerState, state models.OverlayCalibrationState, w, h int) error {
-	if state.Strength == 0 || !state.Transform.Valid() {
-		return nil
-	}
-	o, err := fitsio.OpenFloat32ArtifactReadOnly(overlay)
-	if err != nil {
-		return err
-	}
-	defer o.Close()
-	rows := [3]*fitsio.Float32Artifact{}
-	for i, p := range bases {
-		rows[i], err = fitsio.OpenFloat32Artifact(p)
-		if err != nil {
-			return err
-		}
-		defer rows[i].Close()
-	}
-	base, ov := make([]float32, w), make([]float32, w)
-	tints := [3]float64{float64(settings.ColorR) / 255, float64(settings.ColorG) / 255, float64(settings.ColorB) / 255}
-	offset := state.Transform.Offset
-	if !state.NeutralizeBackground {
-		offset = 0
-	}
-	for y := 0; y < h; y++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := o.ReadRow(y, ov); err != nil {
-			return err
-		}
-		for c := 0; c < 3; c++ {
-			bi := [3]int{2, 1, 0}[c]
-			if err := rows[bi].ReadRow(y, base); err != nil {
-				return err
-			}
-			for x, v := range ov {
-				if !finite(float64(v)) {
-					continue
-				}
-				base[x] += float32((float64(v) - offset) * state.Transform.Gain * state.Strength * tints[c])
-			}
-			if err := rows[bi].WriteRow(y, base); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 func blendDiskOverlay(ctx context.Context, bases [3]string, overlay string, s models.OrangeLayerState, w, h int) error {

@@ -172,14 +172,6 @@ func TestComposeDiskPreviewFailurePreservesDestinations(t *testing.T) {
 	}
 }
 
-func TestMapDiskCoordinateUsesStoredAffineOnReferenceGrid(t *testing.T) {
-	img := models.LoadedImage{HasAlignTransform: true, AlignA: .5, AlignB: .25, AlignC: 1, AlignD: -.25, AlignE: .75, AlignF: 2}
-	fx, fy := MapDiskCoordinate(img, models.LoadedImage{}, 0, 0, 0, 4, 6, 8, 10, 3, 2)
-	if math.Abs(fx-4.5) > 1e-9 || math.Abs(fy-5.5) > 1e-9 {
-		t.Fatalf("affine mapping=(%v,%v), want (4.5,5.5)", fx, fy)
-	}
-}
-
 func TestComposeDiskPreviewUsesRGBOutputOrderAndByteScaleLevels(t *testing.T) {
 	dir := t.TempDir()
 	paths := [3]string{filepath.Join(dir, "blue.bin"), filepath.Join(dir, "green.bin"), filepath.Join(dir, "red.bin")}
@@ -208,42 +200,14 @@ func TestComposeDiskPreviewUsesRGBOutputOrderAndByteScaleLevels(t *testing.T) {
 	}
 }
 
-func TestComposeDiskCalibratedOverlayIsLinearBeforeSharedStretch(t *testing.T) {
-	dir := t.TempDir()
-	base, overlay := filepath.Join(dir, "base.bin"), filepath.Join(dir, "overlay.bin")
-	writeDiskComposeFixture(t, base, .2)
-	writeDiskComposeFixture(t, overlay, .4)
-	out := [3]string{filepath.Join(dir, "r.bin"), filepath.Join(dir, "g.bin"), filepath.Join(dir, "b.bin")}
-	state := &models.ColorCalibrationState{
-		Status:         models.CalibrationValid,
-		BaseTransforms: [3]models.LinearTransform{{Gain: 1}, {Gain: 1}, {Gain: 1}},
-		Overlays:       []models.OverlayCalibrationState{{Mode: models.OverlayCalibratedLinear, Status: models.CalibrationValid, Transform: models.LinearTransform{Gain: 1}, Strength: 1}},
-	}
-	ch := [3]DiskChannel{diskComposeTestChannel(base), diskComposeTestChannel(base), diskComposeTestChannel(base)}
-	got, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Overlays: []DiskOverlay{{Channel: diskComposeTestChannel(overlay), Settings: models.OrangeLayerState{ColorR: 255}}}, Calibration: state, Output: out, PreviewMax: 1600})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Width != 2 || got.Height != 2 {
-		t.Fatalf("dimensions = %dx%d", got.Width, got.Height)
-	}
-	if v := readDiskComposePixel(t, out[0]); math.Abs(float64(v-.6)) > 1e-5 {
-		t.Fatalf("calibrated red pixel = %v, want 0.6 (linear add then stretch)", v)
-	}
-	if v := readDiskComposePixel(t, out[1]); math.Abs(float64(v-.2)) > 1e-5 {
-		t.Fatalf("calibrated green pixel = %v, want 0.2", v)
-	}
-}
-
 func TestComposeDiskArtisticOverlayRemainsPostStretchBlend(t *testing.T) {
 	dir := t.TempDir()
 	base, overlay := filepath.Join(dir, "base.bin"), filepath.Join(dir, "overlay.bin")
 	writeDiskComposeFixture(t, base, .2)
 	writeDiskComposeFixture(t, overlay, .4)
 	out := [3]string{filepath.Join(dir, "r.bin"), filepath.Join(dir, "g.bin"), filepath.Join(dir, "b.bin")}
-	state := &models.ColorCalibrationState{Status: models.CalibrationValid, BaseTransforms: [3]models.LinearTransform{{Gain: 1}, {Gain: 1}, {Gain: 1}}, Overlays: []models.OverlayCalibrationState{{Mode: models.OverlayArtistic, Status: models.CalibrationValid}}}
 	ch := [3]DiskChannel{diskComposeTestChannel(base), diskComposeTestChannel(base), diskComposeTestChannel(base)}
-	_, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Overlays: []DiskOverlay{{Channel: diskComposeTestChannel(overlay), Settings: models.OrangeLayerState{ColorR: 255, Opacity: .5}}}, Calibration: state, Output: out, PreviewMax: 1600})
+	_, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Overlays: []DiskOverlay{{Channel: diskComposeTestChannel(overlay), Settings: models.OrangeLayerState{ColorR: 255, Opacity: .5}}}, Output: out, PreviewMax: 1600})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,9 +228,8 @@ func TestComposeDiskArtisticOverlayUsesItsOwnNonlinearStretch(t *testing.T) {
 	overlayCh := diskComposeTestChannel(overlay)
 	overlayCh.Image.Mode = stretch.Linear
 	overlayCh.Image.Background, overlayCh.Image.Peak, overlayCh.Image.ScaledPeak = .2, .6, 1
-	state := &models.ColorCalibrationState{Status: models.CalibrationValid, BaseTransforms: [3]models.LinearTransform{{Gain: 1}, {Gain: 1}, {Gain: 1}}, Overlays: []models.OverlayCalibrationState{{Mode: models.OverlayArtistic, Status: models.CalibrationValid}}}
 	ch := [3]DiskChannel{baseCh, baseCh, baseCh}
-	if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Overlays: []DiskOverlay{{Channel: overlayCh, Settings: models.OrangeLayerState{ColorR: 255, Opacity: 1}}}, Calibration: state, Output: out, PreviewMax: 1600}); err != nil {
+	if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Overlays: []DiskOverlay{{Channel: overlayCh, Settings: models.OrangeLayerState{ColorR: 255, Opacity: 1}}}, Output: out, PreviewMax: 1600}); err != nil {
 		t.Fatal(err)
 	}
 	// Overlay normalization is (0.4-0.2)/(0.6-0.2)=0.5, then blended onto
@@ -296,9 +259,8 @@ func TestComposeDiskHistEqUsesSharedCDFAfterCalibratedAccumulation(t *testing.T)
 	out := [3]string{filepath.Join(dir, "r.bin"), filepath.Join(dir, "g.bin"), filepath.Join(dir, "b.bin")}
 	meta := diskComposeTestChannel(base)
 	meta.Image.Mode = stretch.HistEq
-	state := &models.ColorCalibrationState{Status: models.CalibrationValid, BaseTransforms: [3]models.LinearTransform{{Gain: 1}, {Gain: 1}, {Gain: 1}}, Overlays: []models.OverlayCalibrationState{{Mode: models.OverlayCalibratedLinear, Status: models.CalibrationValid, Transform: models.LinearTransform{Gain: 1}, Strength: 1}}}
 	ch := [3]DiskChannel{meta, meta, meta}
-	if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Overlays: []DiskOverlay{{Channel: diskComposeTestChannel(overlay), Settings: models.OrangeLayerState{ColorR: 255}}}, Calibration: state, Output: out, PreviewMax: 1600}); err != nil {
+	if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Overlays: []DiskOverlay{{Channel: diskComposeTestChannel(overlay), Settings: models.OrangeLayerState{ColorR: 255}}}, Output: out, PreviewMax: 1600}); err != nil {
 		t.Fatal(err)
 	}
 	// The bounded bilinear sampler treats the outer edge as invalid; for this
