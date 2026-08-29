@@ -306,6 +306,46 @@ func TestSaveResultFITSRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSaveResultFITSWritesOptionalDiagnosticProducts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "diagnostic.fits")
+	result := &Result{
+		Pixels: []float32{1, 2, 3, 4}, Width: 2, Height: 2,
+		OutputHeader: fitsio.Header{Cards: map[string]string{}},
+		Weights:      []float32{1, 2, 3, 4}, DiagnosticProducts: true,
+		NContrib: []int32{1, 2, 1, 0}, Context: []uint32{1, 3, 2, 0}, ContextPlanes: [][]uint32{{1, 3, 2, 0}, {0, 0, 1, 0}},
+		CRMask: []int32{0, 1, 0, 0}, DQ: []int32{0, 0, 2, 0},
+		SkyModel: []float32{0.5, 0.5, 0.5, 0.5}, Seam: []float32{0, 0, 1, 0},
+	}
+	if err := SaveResultFITS(path, result); err != nil {
+		t.Fatalf("SaveResultFITS: %v", err)
+	}
+	file, err := fitsio.LoadFile(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	want := []string{"WHT", "NCONTRIB", "CTX", "CTX01", "CTX02", "CRMASK", "DQ", "SKYMODEL", "SEAM"}
+	for _, name := range want {
+		if file.GetHDU(name) == nil {
+			t.Errorf("missing diagnostic extension %s", name)
+		}
+	}
+}
+
+func TestSaveResultFITSLeavesLegacyOutputWithoutDiagnostics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.fits")
+	result := &Result{Pixels: []float32{1}, Width: 1, Height: 1, Weights: []float32{1}, OutputHeader: fitsio.Header{Cards: map[string]string{}}}
+	if err := SaveResultFITS(path, result); err != nil {
+		t.Fatalf("SaveResultFITS: %v", err)
+	}
+	file, err := fitsio.LoadFile(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if file.GetHDU("WHT") != nil {
+		t.Fatal("legacy result unexpectedly contains WHT")
+	}
+}
+
 func TestLooksLikeFLC(t *testing.T) {
 	if !LooksLikeFLC(filepath.Join("TestImages", "HST", "ick909c1q_flc.fits")) {
 		t.Fatalf("expected _flc path to be recognized")

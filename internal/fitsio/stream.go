@@ -270,6 +270,10 @@ type Float32Artifact struct {
 	Height int
 	mu     sync.Mutex
 	buf    []byte
+	// rowBuf is reused by accessors that need a source row (currently the
+	// rotated-row primitive). Keeping it on the artifact avoids allocating a
+	// full-width float slice for every requested output row.
+	rowBuf []float32
 }
 
 // ArtifactInstrumentation records bounded-access activity for deterministic
@@ -280,6 +284,10 @@ type ArtifactInstrumentation struct {
 	MaterializedPlanes    atomic.Int64
 	MaxMaterializedPlanes atomic.Int64
 	LargestBuffer         atomic.Int64
+	// FailCommitAt injects a deterministic transaction commit failure when the
+	// one-based commit count reaches this value. Zero leaves commits untouched.
+	CommitCount  atomic.Int64
+	FailCommitAt atomic.Int64
 }
 
 var artifactInstrumentation atomic.Pointer[ArtifactInstrumentation]
@@ -406,6 +414,10 @@ func (a *Float32Artifact) ReadRow(row int, dst []float32) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.readRowLocked(row, dst)
+}
+
+func (a *Float32Artifact) readRowLocked(row int, dst []float32) error {
 	if cap(a.buf) < a.Width*4 {
 		a.buf = make([]byte, a.Width*4)
 	}
@@ -428,19 +440,12 @@ func (a *Float32Artifact) ReadRows(row, count int, dst []float32) error {
 	if row < 0 || count < 0 || row > a.Height-count || len(dst) < count*a.Width {
 		return errors.New("row range is out of bounds")
 	}
-	n := count * a.Width * 4
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if cap(a.buf) < n {
-		a.buf = make([]byte, n)
-	}
-	buf := a.buf[:n]
-	recordBuffer(len(buf))
-	if _, err := a.f.ReadAt(buf, artifactHeaderSize+int64(row*a.Width*4)); err != nil {
-		return err
-	}
-	for i := 0; i < count*a.Width; i++ {
-		dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[i*4:]))
+	for i := 0; i < count; i++ {
+		if err := a.readRowLocked(row+i, dst[i*a.Width:(i+1)*a.Width]); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -492,9 +497,14 @@ func (a *Float32Artifact) ReadRowRotatedCW(row int, dst []float32) error {
 	if row < 0 || row >= a.Width || len(dst) < a.Height {
 		return errors.New("rotated row is out of bounds")
 	}
-	buf := make([]float32, a.Width)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if cap(a.rowBuf) < a.Width {
+		a.rowBuf = make([]float32, a.Width)
+	}
+	buf := a.rowBuf[:a.Width]
 	for x := 0; x < a.Height; x++ {
-		if err := a.ReadRow(a.Height-1-x, buf); err != nil {
+		if err := a.readRowLocked(a.Height-1-x, buf); err != nil {
 			return err
 		}
 		dst[x] = buf[row]
@@ -523,6 +533,31 @@ func (a *Float32Artifact) WriteRow(row int, src []float32) error {
 	return err
 }
 
+// WriteRange writes a half-open x range within one row. It is used by tiled
+// transforms to publish fixed-width interiors without materializing a full
+// image row.
+func (a *Float32Artifact) WriteRange(row, x0, x1 int, src []float32) error {
+	if a == nil || a.f == nil {
+		return errors.New("float32 artifact is closed")
+	}
+	if row < 0 || row >= a.Height || x0 < 0 || x1 < x0 || x1 > a.Width || len(src) < x1-x0 {
+		return errors.New("row range is out of bounds")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := (x1 - x0) * 4
+	if cap(a.buf) < n {
+		a.buf = make([]byte, n)
+	}
+	buf := a.buf[:n]
+	recordBuffer(len(buf))
+	for i := 0; i < x1-x0; i++ {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(src[i]))
+	}
+	_, err := a.f.WriteAt(buf, artifactHeaderSize+int64((row*a.Width+x0)*4))
+	return err
+}
+
 // WriteRows writes count contiguous full rows starting at row from src.
 func (a *Float32Artifact) WriteRows(row, count int, src []float32) error {
 	if a == nil || a.f == nil {
@@ -531,19 +566,27 @@ func (a *Float32Artifact) WriteRows(row, count int, src []float32) error {
 	if row < 0 || count < 0 || row > a.Height-count || len(src) < count*a.Width {
 		return errors.New("row range is out of bounds")
 	}
-	n := count * a.Width * 4
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if cap(a.buf) < n {
-		a.buf = make([]byte, n)
+	for i := 0; i < count; i++ {
+		buf := a.ensureRowBuffer()
+		for x := 0; x < a.Width; x++ {
+			binary.LittleEndian.PutUint32(buf[x*4:], math.Float32bits(src[i*a.Width+x]))
+		}
+		if _, err := a.f.WriteAt(buf, artifactHeaderSize+int64((row+i)*a.Width*4)); err != nil {
+			return err
+		}
 	}
-	buf := a.buf[:n]
+	return nil
+}
+
+func (a *Float32Artifact) ensureRowBuffer() []byte {
+	if cap(a.buf) < a.Width*4 {
+		a.buf = make([]byte, a.Width*4)
+	}
+	buf := a.buf[:a.Width*4]
 	recordBuffer(len(buf))
-	for i := 0; i < count*a.Width; i++ {
-		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(src[i]))
-	}
-	_, err := a.f.WriteAt(buf, artifactHeaderSize+int64(row*a.Width*4))
-	return err
+	return buf
 }
 
 func (a *Float32Artifact) Close() error {
@@ -624,6 +667,15 @@ func (t *Float32ArtifactTransaction) Abort() error {
 func (t *Float32ArtifactTransaction) Commit() error {
 	if t == nil || t.done {
 		return errors.New("artifact transaction is closed")
+	}
+	if i := artifactInstrumentation.Load(); i != nil {
+		n := i.CommitCount.Add(1)
+		if failAt := i.FailCommitAt.Load(); failAt > 0 && n == failAt {
+			_ = t.artifact.Close()
+			_ = os.Remove(t.tmpPath)
+			t.done = true
+			return errors.New("injected artifact commit failure")
+		}
 	}
 	if err := t.artifact.Sync(); err != nil {
 		_ = t.artifact.Close()

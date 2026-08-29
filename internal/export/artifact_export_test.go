@@ -3,6 +3,7 @@ package export
 import (
 	"context"
 	"fmt"
+	"image/jpeg"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
 	"gofitsv3/internal/stretch"
+	"golang.org/x/image/tiff"
+	"golang.org/x/image/webp"
 )
 
 func TestFromFloat32ArtifactsPNGBitDepths(t *testing.T) {
@@ -226,5 +229,80 @@ func TestFromFloat32ArtifactsRejectsNonRegularDestination(t *testing.T) {
 	}
 	if info, err := os.Stat(out); err != nil || !info.IsDir() {
 		t.Fatalf("destination changed: info=%v err=%v", info, err)
+	}
+}
+
+func TestFromFloat32ArtifactsAllExportFormatsUseEditedPixels(t *testing.T) {
+	d := t.TempDir()
+	path := filepath.Join(d, "source.bin")
+	a, err := fitsio.CreateFloat32Artifact(path, 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WriteRow(0, []float32{0.125, 0.875}); err != nil {
+		_ = a.Close()
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	formats := []struct {
+		name   string
+		format Format
+		check  func(*os.File) (uint32, error)
+	}{
+		{"png", PNG, func(f *os.File) (uint32, error) {
+			img, err := png.Decode(f)
+			if err != nil {
+				return 0, err
+			}
+			r, _, _, _ := img.At(1, 0).RGBA()
+			return r, nil
+		}},
+		{"jpg", JPEG, func(f *os.File) (uint32, error) {
+			img, err := jpeg.Decode(f)
+			if err != nil {
+				return 0, err
+			}
+			r, _, _, _ := img.At(1, 0).RGBA()
+			return r, nil
+		}},
+		{"tiff", TIFF, func(f *os.File) (uint32, error) {
+			img, err := tiff.Decode(f)
+			if err != nil {
+				return 0, err
+			}
+			r, _, _, _ := img.At(1, 0).RGBA()
+			return r, nil
+		}},
+		{"webp", WEBP, func(f *os.File) (uint32, error) {
+			img, err := webp.Decode(f)
+			if err != nil {
+				return 0, err
+			}
+			r, _, _, _ := img.At(1, 0).RGBA()
+			return r, nil
+		}},
+	}
+	for _, tc := range formats {
+		t.Run(tc.name, func(t *testing.T) {
+			out := filepath.Join(d, "edited."+tc.name)
+			if err := FromFloat32Artifacts(context.Background(), out, [3]string{path, path, path}, 2, 1, tc.format, Options{Quality: 100}); err != nil {
+				t.Fatal(err)
+			}
+			f, err := os.Open(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := tc.check(f)
+			_ = f.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got < 0xD000 || got > 0xE500 {
+				t.Fatalf("edited bright pixel=%#x, want approximately 0.875", got)
+			}
+		})
 	}
 }

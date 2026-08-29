@@ -52,6 +52,20 @@ func TestRANSACIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestRScaleRANSACWithInliersExcludesOutlier(t *testing.T) {
+	pairs := []MatchedPair{{0, 0, 4, -2, 0}, {20, 0, 24, -2, 0}, {0, 20, 4, 18, 0}, {20, 20, 24, 18, 0}, {10, 10, 80, 80, 0}}
+	transform, inliers, err := SolveRScaleTransformationRANSACWithInliers(pairs, 500, 1.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inliers) != 4 {
+		t.Fatalf("inliers=%d, want 4", len(inliers))
+	}
+	if math.Abs(transform.C-4) > 0.1 || math.Abs(transform.F+2) > 0.1 {
+		t.Fatalf("transform=%+v", transform)
+	}
+}
+
 // TestFitCatalogResidualRecoversRScale verifies the catalog-only residual fit
 // (used by the mosaic chain fallback) recovers a small rotation+scale+shift, not
 // just a translation — the correctness upgrade over the old translation-only

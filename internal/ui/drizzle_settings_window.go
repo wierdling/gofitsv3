@@ -186,6 +186,9 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 	sbNormCheck := widget.NewCheck("Normalize mixed-scale chips by surface brightness", nil)
 	sbNormCheck.SetChecked(current.SurfaceBrightnessNorm)
 
+	diagnosticProductsCheck := widget.NewCheck("Save diagnostic mosaic products (WHT, NCONTRIB, CTX, CRMASK, DQ, SKYMODEL, SEAM)", nil)
+	diagnosticProductsCheck.SetChecked(current.DiagnosticProducts)
+
 	crSeedSNREntry := widget.NewEntry()
 	crSeedSNR := current.CRSeedSNR
 	if crSeedSNR <= 0 {
@@ -240,6 +243,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 		widget.NewFormItem("Final Kernel", finalSelect),
 		widget.NewFormItem("Weighting", weightSelect),
 		widget.NewFormItem("Surface Brightness", sbNormCheck),
+		widget.NewFormItem("Diagnostics", diagnosticProductsCheck),
 		widget.NewFormItem("CR Seed SNR", crSeedSNREntry),
 		widget.NewFormItem("CR Deriv Scale", crDerivScaleEntry),
 		widget.NewFormItem("Debug Output Dir", debugDirEntry),
@@ -297,6 +301,7 @@ func showDrizzleSettingsDialog(win fyne.Window, current models.DrizzleSettings, 
 			FinalKernel:           finalKernel,
 			WeightingMode:         weightingMode,
 			SurfaceBrightnessNorm: sbNormCheck.Checked,
+			DiagnosticProducts:    diagnosticProductsCheck.Checked,
 			CRSeedSNR:             crSNRVal,
 			CRDerivScale:          crDSVal,
 			DebugOutputDir:        strings.TrimSpace(debugDirEntry.Text),

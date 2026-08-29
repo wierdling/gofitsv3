@@ -22,6 +22,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"gofitsv3/internal/debuglog"
+	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
@@ -74,6 +75,36 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	saveBtn.Disable()
 	sendToExamineBtn := widget.NewButton("Send to Examine", func() {
 		if globalSendToExamine == nil || state.result == nil {
+			return
+		}
+		if globalSendDiagnosticToExamine != nil && state.result.DiagnosticProducts {
+			layers := map[string]fitsio.ImageData{}
+			if len(state.result.Weights) == state.result.Width*state.result.Height {
+				layers["WHT"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Pixels: state.result.Weights}
+			}
+			if len(state.result.NContrib) == state.result.Width*state.result.Height {
+				layers["NCONTRIB"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Int32Pixels: state.result.NContrib}
+			}
+			for i, plane := range state.result.ContextPlanes {
+				ctx := make([]int32, len(plane))
+				for j, v := range plane {
+					ctx[j] = int32(v)
+				}
+				layers[fmt.Sprintf("CTX%02d", i+1)] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Int32Pixels: ctx}
+			}
+			if len(state.result.CRMask) == state.result.Width*state.result.Height {
+				layers["CRMASK"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Int32Pixels: state.result.CRMask}
+			}
+			if len(state.result.DQ) == state.result.Width*state.result.Height {
+				layers["DQ"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Int32Pixels: state.result.DQ}
+			}
+			if len(state.result.SkyModel) == state.result.Width*state.result.Height {
+				layers["SKYMODEL"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Pixels: state.result.SkyModel}
+			}
+			if len(state.result.Seam) == state.result.Width*state.result.Height {
+				layers["SEAM"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Pixels: state.result.Seam}
+			}
+			globalSendDiagnosticToExamine(state.result.Pixels, state.result.Width, state.result.Height, layers)
 			return
 		}
 		globalSendToExamine(state.result.Pixels, state.result.Width, state.result.Height)
@@ -391,6 +422,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						chk.SetChecked(true)
 						checks[i] = chk
 						content.Add(chk)
+						content.Add(widget.NewLabel(alignmentDiagnosticsText(r.result)))
+						diagBtn := widget.NewButton("Diagnostics…", func() {
+							showAlignmentDiagnosticsDialog(win, r, name)
+						})
+						content.Add(diagBtn)
 					} else {
 						label := fmt.Sprintf("%s  [failed: %s]", name, r.result.Error)
 						chk := widget.NewCheck(label, nil)
@@ -957,6 +993,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						chk.SetChecked(true)
 						checks[i] = chk
 						content.Add(chk)
+						content.Add(widget.NewLabel(alignmentDiagnosticsText(r.result)))
+						diagBtn := widget.NewButton("Diagnostics…", func() {
+							showAlignmentDiagnosticsDialog(win, r, name)
+						})
+						content.Add(diagBtn)
 					} else {
 						label := fmt.Sprintf("%s  [failed: %s]", name, r.result.Error)
 						chk := widget.NewCheck(label, nil)

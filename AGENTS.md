@@ -28,6 +28,7 @@ Prefer narrow, deliberate changes over broad exploration.
 - Prefer standard library and existing project utilities over adding packages.
 - Follow the existing style of the repository.
 - Avoid placeholder implementations unless explicitly requested.
+- Whenever a user-visible feature is added, changed, or removed, update `docs/feature-list.md` in the same change so the comparison-oriented feature inventory remains accurate and complete. This includes meaningful capability changes, limitations, supported formats or instruments, and workspace behavior; purely internal refactors do not require an inventory update.
 
 ## Go guidance
 - Prefer clear, idiomatic Go.

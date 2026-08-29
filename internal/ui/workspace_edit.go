@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -36,6 +37,7 @@ type editDiskSource struct {
 	levels        models.RgbLevels
 	root          string
 	cleanupOnce   sync.Once
+	store         *editDiskStore
 }
 
 type editImageHandoff struct {
@@ -119,9 +121,29 @@ type editWorkspaceState struct {
 
 func (es *editWorkspaceState) applyEdits() {
 	if es.diskSource != nil {
-		if es.cleanStatusLabel != nil {
-			es.cleanStatusLabel.SetText("Editing tools are disabled for disk-backed previews.")
+		if es.diskSource.store == nil {
+			return
 		}
+		recipe := es.diskEditRecipe()
+		generation := es.jobGeneration + 1
+		es.jobGeneration = generation
+		go func() {
+			result, err := es.diskSource.store.Render(context.Background(), recipe, 1600)
+			if err != nil {
+				return
+			}
+			fyne.Do(func() {
+				if es.diskSource == nil || es.jobGeneration != generation {
+					return
+				}
+				planes, _, _, _ := es.diskSource.store.Source()
+				es.diskSource.planes = planes
+				es.diskSource.levels = models.RgbLevels{Max: [3]float64{255, 255, 255}}
+				es.canvasImg.Image = result.Preview
+				es.canvasImg.Refresh()
+				es.refreshHistograms(result.Preview)
+			})
+		}()
 		return
 	}
 	if es.base == nil {
@@ -156,6 +178,14 @@ func (es *editWorkspaceState) applyEdits() {
 			es.canvasImg.Refresh()
 		})
 	}()
+}
+
+func (es *editWorkspaceState) diskEditRecipe() processing.DiskEditRecipe {
+	recipe := processing.DiskEditRecipe{Min: [3]float64{es.rMinSlider.Value, es.gMinSlider.Value, es.bMinSlider.Value}, Max: [3]float64{es.rMaxSlider.Value, es.gMaxSlider.Value, es.bMaxSlider.Value}, Strength: es.sharpSlider.Value, Radius: es.sharpRadiusSlider.Value}
+	for c := range recipe.Curves {
+		recipe.Curves[c] = es.curves.ToLUT(c)
+	}
+	return recipe
 }
 
 // updateHealBrushScreenRadius syncs the overlay's screen-space circle to the current brush size and zoom.
@@ -270,6 +300,48 @@ func (es *editWorkspaceState) resetAdjustmentControls() {
 // doHealStroke performs the heal for the full destination stroke.
 func (es *editWorkspaceState) doHealStroke(srcScreen fyne.Position, dstScreens []fyne.Position) {
 	if es.diskSource != nil {
+		disk := es.diskSource
+		if disk.store == nil {
+			return
+		}
+		srcPt, ok := es.screenToImagePt(srcScreen)
+		if !ok {
+			return
+		}
+		dsts := make([]image.Point, 0, len(dstScreens))
+		for _, p := range dstScreens {
+			if q, valid := es.screenToImagePt(p); valid {
+				dsts = append(dsts, q)
+			}
+		}
+		if len(dsts) == 0 {
+			return
+		}
+		radius := int(math.Round(es.healBrushSlider.Value / 2))
+		if radius < 1 {
+			radius = 1
+		}
+		es.jobGeneration++
+		generation := es.jobGeneration
+		prog := dialog.NewCustom("Healing", "Healing full-resolution disk source...", widget.NewProgressBarInfinite(), es.win)
+		prog.Show()
+		go func() {
+			result, err := disk.store.Heal(context.Background(), processing.DiskHealStroke{Source: srcPt, Destinations: dsts, Radius: radius}, 1600)
+			fyne.Do(func() {
+				prog.Hide()
+				if err != nil || es.diskSource != disk || es.jobGeneration != generation {
+					return
+				}
+				planes, w, h, _ := disk.store.Source()
+				disk.planes, disk.width, disk.height = planes, w, h
+				disk.levels = models.RgbLevels{Max: [3]float64{255, 255, 255}}
+				es.origW, es.origH = w, h
+				es.canvasImg.Image = result.Preview
+				es.canvasImg.Refresh()
+				es.refreshHistograms(result.Preview)
+				es.cleanStatusLabel.SetText("Heal applied at full resolution. One Heal undo is available.")
+			})
+		}()
 		return
 	}
 	rgba := es.working
@@ -312,6 +384,27 @@ func (es *editWorkspaceState) doHealStroke(srcScreen fyne.Position, dstScreens [
 // undoHeal rolls back the last heal operation.
 func (es *editWorkspaceState) undoHeal() {
 	if es.diskSource != nil {
+		disk := es.diskSource
+		if disk.store == nil {
+			return
+		}
+		es.jobGeneration++
+		generation := es.jobGeneration
+		go func() {
+			result, ok, err := disk.store.UndoHeal(context.Background(), 1600)
+			fyne.Do(func() {
+				if err != nil || !ok || es.diskSource != disk || es.jobGeneration != generation {
+					return
+				}
+				planes, w, h, _ := disk.store.Source()
+				disk.planes, disk.width, disk.height = planes, w, h
+				es.origW, es.origH = w, h
+				es.canvasImg.Image = result.Preview
+				es.canvasImg.Refresh()
+				es.refreshHistograms(result.Preview)
+				es.cleanStatusLabel.SetText("Heal undone.")
+			})
+		}()
 		return
 	}
 	if es.healUndo == nil {
@@ -352,9 +445,34 @@ func (es *editWorkspaceState) onCropChange(min, max fyne.Position, active bool) 
 // applyCrop replaces the current image with the selected rectangle.
 func (es *editWorkspaceState) applyCrop() {
 	if es.diskSource != nil {
-		if es.cleanStatusLabel != nil {
-			es.cleanStatusLabel.SetText("Crop is unavailable for disk-backed previews.")
+		if !es.cropHasSel || es.diskSource.store == nil {
+			return
 		}
+		disk := es.diskSource
+		rect := image.Rectangle{Min: es.cropMin, Max: es.cropMax}.Canon()
+		es.jobGeneration++
+		generation := es.jobGeneration
+		prog := dialog.NewCustom("Cropping", "Cropping full-resolution disk source...", widget.NewProgressBarInfinite(), es.win)
+		prog.Show()
+		go func() {
+			result, w, h, err := disk.store.Crop(context.Background(), rect, 1600)
+			fyne.Do(func() {
+				prog.Hide()
+				if err != nil || es.diskSource != disk || es.jobGeneration != generation {
+					return
+				}
+				planes, _, _, _ := disk.store.Source()
+				disk.planes, disk.width, disk.height = planes, w, h
+				disk.levels = models.RgbLevels{Max: [3]float64{255, 255, 255}}
+				es.origW, es.origH = w, h
+				es.resetInteractionStateAfterCrop()
+				es.canvasImg.Image = result.Preview
+				es.applyZoom()
+				es.canvasImg.Refresh()
+				es.refreshHistograms(result.Preview)
+				es.cleanStatusLabel.SetText(fmt.Sprintf("Cropped full-resolution source to %d × %d.", w, h))
+			})
+		}()
 		return
 	}
 	if !es.cropHasSel {
@@ -411,6 +529,9 @@ func (d *editDiskSource) cleanup() {
 		return
 	}
 	d.cleanupOnce.Do(func() {
+		if d.store != nil {
+			_ = d.store.Close()
+		}
 		if d.root != "" {
 			_ = os.RemoveAll(d.root)
 		}
@@ -444,6 +565,14 @@ func (es *editWorkspaceState) setDiskSource(d *editDiskSource) error {
 		if d != es.diskSource {
 			d.cleanup()
 		}
+	}
+	if d.store == nil {
+		store, err := newEditDiskStore(d.root, d.planes, d.width, d.height, d.levels)
+		if err != nil {
+			cleanupIncoming()
+			return fmt.Errorf("prepare disk Edit store: %w", err)
+		}
+		d.store = store
 	}
 	maxDim := 1600
 	scale := math.Min(1, math.Min(float64(maxDim)/float64(d.width), float64(maxDim)/float64(d.height)))
@@ -507,38 +636,86 @@ func (es *editWorkspaceState) setDiskSource(d *editDiskSource) error {
 		old.cleanup()
 	}
 	es.origW, es.origH = d.width, d.height
-	es.rMinSlider.SetValue(d.levels.Min[0])
-	es.rMaxSlider.SetValue(d.levels.Max[0])
-	es.gMinSlider.SetValue(d.levels.Min[1])
-	es.gMaxSlider.SetValue(d.levels.Max[1])
-	es.bMinSlider.SetValue(d.levels.Min[2])
-	es.bMaxSlider.SetValue(d.levels.Max[2])
+	// A disk handoff has no in-memory image setter to establish the initial
+	// viewport. Mirror setImageOpts so coordinate mapping and the canvas size
+	// start from the current fit zoom.
+	es.zoom = 1.0
+	if es.imgScroll != nil {
+		sz := es.imgScroll.Size()
+		if sz.Width > 1 && sz.Height > 1 && es.origW > 0 && es.origH > 0 {
+			zw := float64(sz.Width) / float64(es.origW)
+			zh := float64(sz.Height) / float64(es.origH)
+			es.zoom = math.Min(zw, zh)
+		}
+	}
+	es.setZoomSelectLabel("fit")
+	es.applyZoom()
+	// Compose RGB levels are the immutable baseline used by the disk renderer;
+	// Edit's Levels controls begin at identity so they are not applied twice.
+	es.rMinSlider.SetValue(0)
+	es.rMaxSlider.SetValue(255)
+	es.gMinSlider.SetValue(0)
+	es.gMaxSlider.SetValue(255)
+	es.bMinSlider.SetValue(0)
+	es.bMaxSlider.SetValue(255)
 	es.refreshHistograms(preview)
 	es.canvasImg.Image = preview
 	es.canvasImg.Refresh()
 	if es.editTabs != nil {
-		for i := range es.editTabs.Items {
-			es.editTabs.DisableIndex(i)
-		}
+		setDiskEditTabAvailability(es.editTabs)
 	}
 	for _, s := range []*widget.Slider{es.rMinSlider, es.rMaxSlider, es.gMinSlider, es.gMaxSlider, es.bMinSlider, es.bMaxSlider} {
 		if s != nil {
-			s.Disable()
+			s.Enable()
 		}
 	}
 	if es.applyButton != nil {
-		es.applyButton.Disable()
+		es.applyButton.Enable()
 	}
 	if es.resetButton != nil {
-		es.resetButton.Disable()
+		es.resetButton.Enable()
 	}
 	if es.cleanStatusLabel != nil {
-		es.cleanStatusLabel.SetText("Disk-backed preview (1600×1600 maximum); editing tools are unavailable. Save streams from the full-resolution source.")
+		es.cleanStatusLabel.SetText("Disk-backed preview (1600×1600 maximum). Adjustments, Clean, Heal, and Crop apply at full resolution. Save streams from the full-resolution source.")
 	}
 	if es.editTabs != nil {
 		es.editTabs.SelectIndex(0)
 	}
 	return nil
+}
+
+func (es *editWorkspaceState) resetInteractionStateAfterCrop() {
+	es.cropHasSel = false
+	if es.cropOverlay != nil {
+		es.cropOverlay.Reset()
+	}
+	es.healUndo = nil
+	if es.healOverlay != nil {
+		es.healOverlay.Reset()
+	}
+	if es.cropStatusLabel != nil {
+		if es.cropActive {
+			es.cropStatusLabel.SetText("Drag a rectangle over the image, then Apply Crop.")
+		} else {
+			es.cropStatusLabel.SetText("")
+		}
+	}
+	if es.healStatusLabel != nil {
+		if es.healActive {
+			es.healStatusLabel.SetText("Step 1: click source (sample area)")
+		} else {
+			es.healStatusLabel.SetText("")
+		}
+	}
+}
+
+func setDiskEditTabAvailability(tabs *container.AppTabs) {
+	if tabs == nil {
+		return
+	}
+	for i := range tabs.Items {
+		tabs.EnableIndex(i)
+	}
 }
 
 func toByte(v float32) uint8 {
@@ -659,9 +836,35 @@ func (es *editWorkspaceState) setImageOpts(img image.Image, keepZoomAndScroll, r
 
 func (es *editWorkspaceState) runColorSpeckClean() {
 	if es.diskSource != nil {
-		if es.cleanStatusLabel != nil {
-			es.cleanStatusLabel.SetText("Clean is unavailable for disk-backed previews.")
+		disk := es.diskSource
+		if disk.store == nil {
+			return
 		}
+		es.jobGeneration++
+		generation := es.jobGeneration
+		cfg := processing.ColorSpeckCleanConfigFromSettings(int(math.Round(es.cleanBlobSlider.Value)), es.cleanIntensitySlider.Value)
+		prog := dialog.NewCustom("Cleaning", "Cleaning full-resolution disk source...", widget.NewProgressBarInfinite(), es.win)
+		prog.Show()
+		go func() {
+			result, err := disk.store.Clean(context.Background(), cfg, 1600)
+			fyne.Do(func() {
+				prog.Hide()
+				if err != nil || es.diskSource != disk || es.jobGeneration != generation {
+					return
+				}
+				planes, _, _, _ := disk.store.Source()
+				disk.planes = planes
+				disk.levels = models.RgbLevels{Max: [3]float64{255, 255, 255}}
+				es.canvasImg.Image = result.Preview
+				es.canvasImg.Refresh()
+				es.refreshHistograms(result.Preview)
+				if result.Repaired == 0 {
+					es.cleanStatusLabel.SetText("No tiny pure-color specks were detected.")
+				} else {
+					es.cleanStatusLabel.SetText(fmt.Sprintf("Removed %d speck pixels; the result is now the disk Edit base.", result.Repaired))
+				}
+			})
+		}()
 		return
 	}
 	rgba := es.working
@@ -1006,6 +1209,16 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 	es.applyButton = applyBtn
 	es.curves.onDragEnd = func() { es.applyEdits() }
 	resetBtn := widget.NewButton("Reset", func() {
+		if es.diskSource != nil && es.diskSource.store != nil {
+			es.diskSource.store.Reset()
+			es.resetAdjustmentControls()
+			planes, _, _, _ := es.diskSource.store.Source()
+			es.diskSource.planes = planes
+			es.diskSource.levels = models.RgbLevels{Max: [3]float64{255, 255, 255}}
+			// Re-render the immutable baseline to refresh the bounded preview.
+			es.applyEdits()
+			return
+		}
 		if es.base == nil {
 			return
 		}
@@ -1052,7 +1265,27 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 			showExportOptionsDialog(format, win, func(opts export.Options) {
 				var err error
 				if es.diskSource != nil {
-					err = export.FromFloat32ArtifactsWithLevels(context.Background(), path, es.diskSource.planes, es.diskSource.width, es.diskSource.height, format, opts, &es.diskSource.levels)
+					disk := es.diskSource
+					recipe := es.diskEditRecipe()
+					ctx, cancel := context.WithCancel(context.Background())
+					status := widget.NewLabel("Rendering full-resolution Edit source…")
+					progress := dialog.NewCustom("Saving", "", container.NewBorder(nil, widget.NewButton("Cancel", func() { cancel() }), nil, nil, container.NewVBox(status, widget.NewProgressBarInfinite())), win)
+					progress.Show()
+					go func() {
+						snapshot, snapshotErr := disk.store.ExportSnapshot(ctx, recipe)
+						if snapshotErr == nil {
+							snapshotErr = export.FromFloat32Artifacts(ctx, path, snapshot.planes, snapshot.width, snapshot.height, format, opts)
+							snapshot.cleanup()
+						}
+						fyne.Do(func() {
+							cancel()
+							progress.Hide()
+							if snapshotErr != nil && !errors.Is(snapshotErr, context.Canceled) {
+								dialog.ShowError(snapshotErr, win)
+							}
+						})
+					}()
+					return
 				} else {
 					err = export.FromImage(path, rgba, format, opts)
 				}

@@ -121,6 +121,9 @@ type OrangeLayerState struct {
 // via the Settings > Drizzle dialog. All kernel/method values are stored as
 // ints so they round-trip through JSON without importing the mosaic package.
 type DrizzleSettings struct {
+	// DiagnosticProducts enables optional diagnostic IMAGE extensions in saved
+	// drizzle products. It is false by default for legacy-compatible output.
+	DiagnosticProducts bool `json:"diagnosticProducts,omitempty"`
 	// FinalScale is the desired output plate scale in arcsec/pixel (AstroDrizzle
 	// final_scale semantics).  When > 0, the internal multiplier is computed from
 	// the reference image WCS.  Scale is used as a raw multiplier fallback when

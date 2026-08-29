@@ -223,6 +223,47 @@ func TestFloat32ArtifactBoundedRangeTileAndTransaction(t *testing.T) {
 	}
 }
 
+func TestFloat32ArtifactRotatedRowsReuseBoundedBuffer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rect.bin")
+	a, err := CreateFloat32Artifact(path, 3, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WriteRow(0, []float32{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WriteRow(1, []float32{4, 5, 6}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a, err = OpenFloat32ArtifactReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	row := make([]float32, 2)
+	if err := a.ReadRowRotatedCW(0, row); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(row, []float32{4, 1}) {
+		t.Fatalf("rotated row 0 = %v", row)
+	}
+	if err := a.ReadRowRotatedCW(2, row); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(row, []float32{6, 3}) {
+		t.Fatalf("rotated row 2 = %v", row)
+	}
+	// The rotated accessor's source row is artifact-owned and reused. This
+	// also guards against regressing to a per-call full-row allocation.
+	if len(a.rowBuf) != a.Width {
+		t.Fatalf("rotated source buffer length = %d, want %d", len(a.rowBuf), a.Width)
+	}
+}
+
 func TestFloat32ArtifactTransactionAbortPreservesDestination(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.bin")

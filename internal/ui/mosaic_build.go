@@ -22,6 +22,7 @@ func drizzleOptionsFromSettings(s models.DrizzleSettings, sky models.SkysubSetti
 		weightingMode = mosaic.WeightERR
 	}
 	return mosaic.Options{
+		DiagnosticProducts:    s.DiagnosticProducts,
 		Scale:                 s.Scale,
 		FinalScale:            s.FinalScale,
 		LockToReferenceFrame:  s.LockToReferenceFrame,
@@ -37,6 +38,9 @@ func drizzleOptionsFromSettings(s models.DrizzleSettings, sky models.SkysubSetti
 		Skysub:                skysubOptionsFromSettings(sky),
 		Progress:              progress,
 		Ctx:                   ctx,
+		FrameLoaderDiagnosticsCtx: func(_ context.Context, in mosaic.Input) ([]bool, []bool, error) {
+			return mosaic.LoadDiagnosticMasks(in)
+		},
 	}
 }
 

@@ -1,8 +1,10 @@
 package processing
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
@@ -28,10 +30,44 @@ import (
 // data so callers can surface (or reject) low-confidence solutions instead of
 // silently applying a possibly-wrong transform.
 type AlignStats struct {
-	MatchedStars  int     // matched pairs used for the fit
-	GlobalInliers int     // full-catalog source stars that land on a ref star under the fit
-	RMS           float64 // RMS residual of the matched pairs (px)
-	MaxError      float64 // worst matched-pair residual (px)
+	DetectedSourceStars    int
+	DetectedReferenceStars int
+	MatchedStars           int // matched pairs used for the fit
+	GlobalInliers          int // full-catalog source stars that land on a ref star under the fit
+	AcceptedStars          int
+	RejectedStars          int
+	RANSACInlierPercent    float64
+	FinalSupport           int
+	FinalSupportPercent    float64
+	RMS                    float64 // RMS residual of the matched pairs (px)
+	XRMS                   float64
+	YRMS                   float64
+	RadialRMS              float64
+	MedianError            float64
+	MaxError               float64 // worst matched-pair residual (px)
+	Residuals              string  // JSON-encoded []Residual; kept comparable for result equality/tests.
+	RScaleTransform        AffineTransform
+	RScaleRMS              float64
+	RScaleMaxError         float64
+	Warnings               string
+}
+
+// Residual is one matched-star fit residual in reference-pixel coordinates.
+// DX and DY are the final-transform prediction minus the matched reference.
+type Residual struct{ X, Y, TargetX, TargetY, DX, DY, Radial float64 }
+
+// AlignmentTransformSummary exposes the physically meaningful components of an
+// affine fit for reports and diagnostics. Skew is the off-diagonal shear after
+// removing the rotation/scale component.
+type AlignmentTransformSummary struct{ ShiftX, ShiftY, RotationDeg, Scale, Skew, A, B, C, D, E, F float64 }
+
+func SummarizeAlignmentTransform(t AffineTransform) AlignmentTransformSummary {
+	rotation := math.Atan2(t.D-t.B, t.A+t.E)
+	scale := math.Sqrt(math.Abs(t.A*t.E - t.B*t.D))
+	if !math.IsNaN(scale) && scale > 0 {
+		return AlignmentTransformSummary{ShiftX: t.C, ShiftY: t.F, RotationDeg: rotation * 180 / math.Pi, Scale: scale, Skew: (t.A*t.B + t.D*t.E) / (scale * scale), A: t.A, B: t.B, C: t.C, D: t.D, E: t.E, F: t.F}
+	}
+	return AlignmentTransformSummary{ShiftX: t.C, ShiftY: t.F, RotationDeg: rotation * 180 / math.Pi, A: t.A, B: t.B, C: t.C, D: t.D, E: t.E, F: t.F}
 }
 
 const (
@@ -304,10 +340,11 @@ func fitCatalogTransform(projected, refStars []Star, refWidth, refHeight int, se
 	}
 
 	var result AffineTransform
+	var consensus []MatchedPair
 	effectiveFitgeom := fitgeom
 	var recoveryRScaleErr error
 	if fitgeom == "rscale" {
-		rscale, err := SolveRScaleTransformationRANSAC(pairs, 300, 1.5)
+		rscale, rscaleConsensus, err := SolveRScaleTransformationRANSACWithInliers(pairs, 300, 1.5)
 		if err != nil {
 			debuglog.Log(fmt.Sprintf("fitCatalogTransform: rscale RANSAC failed (pairs=%d projected=%d reference=%d search-radius=%.1f): %v", len(pairs), len(projected), len(refStars), searchRadiusPx, err))
 			if len(pairs) < 3 {
@@ -315,31 +352,34 @@ func fitCatalogTransform(projected, refStars []Star, refWidth, refHeight int, se
 			}
 			recoveryRScaleErr = err
 			debuglog.Log(fmt.Sprintf("fitCatalogTransform: starting guarded general RANSAC recovery (pairs=%d, rscale error=%v)", len(pairs), err))
-			general, generalErr := SolveTransformationRANSAC(pairs, 2000, 1.5)
+			general, generalConsensus, generalErr := SolveTransformationRANSACWithInliers(pairs, 2000, 1.5)
 			if generalErr != nil {
 				debuglog.Log(fmt.Sprintf("fitCatalogTransform: guarded general RANSAC recovery failed (pairs=%d): %v", len(pairs), generalErr))
 				return AffineTransform{}, AlignStats{}, pairs, fmt.Errorf("rscale RANSAC failed: %w; guarded general recovery failed: %v", err, generalErr)
 			}
 			result = general
+			consensus = generalConsensus
 			effectiveFitgeom = "general"
 		} else {
-			general, generalErr := SolveTransformationRANSAC(pairs, 2000, 1.5)
+			general, generalConsensus, generalErr := SolveTransformationRANSACWithInliers(pairs, 2000, 1.5)
 			if generalErr == nil && shouldUpgradeTweakRegFit(pairs, rscale, general, refWidth, refHeight) {
 				rRMS, rMax := residualStats(pairs, rscale)
 				gRMS, gMax := residualStats(pairs, general)
 				debuglog.Log(fmt.Sprintf("fitCatalogTransform: upgrading fitgeom from rscale to general (pairs=%d, rscale rms=%.2f max=%.2f, general rms=%.2f max=%.2f)", len(pairs), rRMS, rMax, gRMS, gMax))
 				result = general
+				consensus = generalConsensus
 				effectiveFitgeom = "general"
 			} else {
 				if generalErr != nil {
 					debuglog.Log(fmt.Sprintf("fitCatalogTransform: optional general RANSAC comparison failed (pairs=%d): %v", len(pairs), generalErr))
 				}
 				result = rscale
+				consensus = rscaleConsensus
 			}
 		}
 	} else {
 		var err error
-		result, err = SolveTransformationRANSAC(pairs, 2000, 1.5)
+		result, consensus, err = SolveTransformationRANSACWithInliers(pairs, 2000, 1.5)
 		if err != nil {
 			debuglog.Log(fmt.Sprintf("fitCatalogTransform: general RANSAC failed (pairs=%d projected=%d reference=%d search-radius=%.1f): %v", len(pairs), len(projected), len(refStars), searchRadiusPx, err))
 			return AffineTransform{}, AlignStats{}, pairs, err
@@ -348,9 +388,42 @@ func fitCatalogTransform(projected, refStars []Star, refWidth, refHeight int, se
 
 	rms, maxErr := residualStats(pairs, result)
 	support := transformGlobalSupport(projected, refStars, result, tweakRegGlobalTolPx)
-	stats := AlignStats{MatchedStars: len(pairs), GlobalInliers: support, RMS: rms, MaxError: maxErr}
+	stats := alignmentStats(projected, refStars, pairs, result, support)
+	if consensus != nil {
+		stats.AcceptedStars = len(consensus)
+		stats.RejectedStars = len(pairs) - len(consensus)
+		stats.RANSACInlierPercent = 100 * float64(len(consensus)) / float64(len(pairs))
+	}
+	// Always retain the simpler RScale fit for review, even when the requested
+	// model is affine. This lets users choose the least complex adequate model.
+	if rscale, _, rerr := SolveRScaleTransformationRANSACWithInliers(pairs, 300, 1.5); rerr == nil {
+		stats.RScaleTransform = rscale
+		stats.RScaleRMS, stats.RScaleMaxError = residualStats(pairs, rscale)
+		if effectiveFitgeom == "general" && stats.RMS > 1.25*stats.RScaleRMS {
+			stats.Warnings = appendAlignmentWarning(stats.Warnings, "affine fit is not materially better than RScale")
+		}
+	}
+	if len(projected) < 6 {
+		stats.Warnings = appendAlignmentWarning(stats.Warnings, "weak solution: fewer than six projected stars")
+	}
+	if len(pairs) > 0 && float64(support)/float64(len(projected)) < 0.5 {
+		stats.Warnings = appendAlignmentWarning(stats.Warnings, "low RANSAC inlier fraction")
+	}
+	if clusteredStars(pairs, refWidth, refHeight) {
+		stats.Warnings = appendAlignmentWarning(stats.Warnings, "matched stars are spatially clustered")
+	}
+	if effectiveFitgeom == "general" && len(pairs) <= 6 {
+		stats.Warnings = appendAlignmentWarning(stats.Warnings, "general affine fit may be overfit")
+	}
 	if identity, identityStats, preferred := preferIdentityTweakRegFit(projected, refStars, result, stats); preferred {
 		debuglog.Log(fmt.Sprintf("fitCatalogTransform: candidate support %d does not improve identity support %d; preferring identity", support, identityStats.GlobalInliers))
+		// Identity preference is a post-solver safety decision; identityStats is
+		// threshold support, not RANSAC consensus. Keep it separately named.
+		identityStats.AcceptedStars, identityStats.RejectedStars, identityStats.RANSACInlierPercent = 0, 0, 0
+		identityStats.FinalSupport = identityStats.GlobalInliers
+		if len(projected) > 0 {
+			identityStats.FinalSupportPercent = 100 * float64(identityStats.FinalSupport) / float64(len(projected))
+		}
 		return identity, identityStats, pairs, nil
 	}
 	debuglog.Log(fmt.Sprintf("fitCatalogTransform: solved fitgeom=%s transform=[%.8f %.8f %.3f; %.8f %.8f %.3f] pairs=%d support=%d rms=%.3f max=%.3f", effectiveFitgeom, result.A, result.B, result.C, result.D, result.E, result.F, len(pairs), support, rms, maxErr))
@@ -477,8 +550,120 @@ func pairByTransform(targetStars, refStars []Star, t AffineTransform, radius flo
 // stars that land within that tolerance.
 func statsForTransform(targetStars, refStars []Star, t AffineTransform) AlignStats {
 	pairs := pairByTransform(targetStars, refStars, t, tweakRegGlobalTolPx)
-	rms, maxErr := residualStats(pairs, t)
-	return AlignStats{MatchedStars: len(pairs), GlobalInliers: len(pairs), RMS: rms, MaxError: maxErr}
+	return alignmentStats(targetStars, refStars, pairs, t, len(pairs))
+}
+
+func alignmentStats(projected, refStars []Star, pairs []MatchedPair, t AffineTransform, support int) AlignStats {
+	s := AlignStats{DetectedSourceStars: len(projected), DetectedReferenceStars: len(refStars), MatchedStars: len(pairs), GlobalInliers: support}
+	if len(pairs) == 0 {
+		return s
+	}
+	values := make([]float64, 0, len(pairs))
+	var sx, sy, sr float64
+	residuals := make([]Residual, 0, len(pairs))
+	for _, p := range pairs {
+		px, py := ApplyAffineTransform(t, p.RefX, p.RefY)
+		dx, dy := px-p.TargetX, py-p.TargetY
+		r := math.Hypot(dx, dy)
+		sx += dx * dx
+		sy += dy * dy
+		sr += r * r
+		values = append(values, r)
+		residuals = append(residuals, Residual{X: p.RefX, Y: p.RefY, TargetX: p.TargetX, TargetY: p.TargetY, DX: dx, DY: dy, Radial: r})
+	}
+	// RANSAC consensus is membership among the matched pairs, not global
+	// catalogue support. The solver threshold is 1.5 px throughout this path.
+	for _, residual := range residuals {
+		if residual.Radial <= 1.5 {
+			s.AcceptedStars++
+		}
+	}
+	s.RejectedStars = len(pairs) - s.AcceptedStars
+	if len(pairs) > 0 {
+		s.RANSACInlierPercent = 100 * float64(s.AcceptedStars) / float64(len(pairs))
+	}
+	encoded, _ := json.Marshal(residuals)
+	s.Residuals = string(encoded)
+	s.XRMS = math.Sqrt(sx / float64(len(pairs)))
+	s.YRMS = math.Sqrt(sy / float64(len(pairs)))
+	s.RadialRMS = math.Sqrt(sr / float64(len(pairs)))
+	s.RMS = s.RadialRMS
+	s.MaxError = values[0]
+	for _, v := range values[1:] {
+		if v > s.MaxError {
+			s.MaxError = v
+		}
+	}
+	sort.Float64s(values)
+	mid := len(values) / 2
+	if len(values)%2 == 0 {
+		s.MedianError = (values[mid-1] + values[mid]) / 2
+	} else {
+		s.MedianError = values[mid]
+	}
+	return s
+}
+
+func appendAlignmentWarning(existing, warning string) string {
+	if existing == "" {
+		return warning
+	}
+	return existing + "; " + warning
+}
+
+// RecomputeAlignmentDiagnostics evaluates a final transform against catalogs.
+// It is used after bundle adjustment so reports describe the transform that is
+// actually persisted, rather than the pre-adjustment pair fit.
+func RecomputeAlignmentDiagnostics(projected, reference []Star, t AffineTransform) AlignStats {
+	pairs := pairByTransform(projected, reference, t, tweakRegGlobalTolPx)
+	support := len(pairs)
+	stats := alignmentStats(projected, reference, pairs, t, support)
+	stats.FinalSupport = support
+	if len(projected) > 0 {
+		stats.FinalSupportPercent = 100 * float64(support) / float64(len(projected))
+	}
+	stats.AcceptedStars, stats.RejectedStars, stats.RANSACInlierPercent = 0, 0, 0
+	if rscale, _, err := SolveRScaleTransformationRANSACWithInliers(pairs, 300, 1.5); err == nil {
+		stats.RScaleTransform = rscale
+		stats.RScaleRMS, stats.RScaleMaxError = residualStats(pairs, rscale)
+		if stats.RMS > 1.25*stats.RScaleRMS {
+			stats.Warnings = appendAlignmentWarning(stats.Warnings, "affine fit is not materially better than RScale")
+		}
+	}
+	if len(projected) < 6 {
+		stats.Warnings = appendAlignmentWarning(stats.Warnings, "weak solution: fewer than six projected stars")
+	}
+	if len(projected) > 0 && stats.FinalSupportPercent < 50 {
+		stats.Warnings = appendAlignmentWarning(stats.Warnings, "low final support fraction")
+	}
+	if len(pairs) <= 6 {
+		stats.Warnings = appendAlignmentWarning(stats.Warnings, "general affine fit may be overfit")
+	}
+	if len(pairs) >= 4 {
+		maxX, maxY := 1.0, 1.0
+		for _, p := range pairs {
+			maxX = math.Max(maxX, p.RefX)
+			maxY = math.Max(maxY, p.RefY)
+		}
+		if clusteredStars(pairs, int(maxX+1), int(maxY+1)) {
+			stats.Warnings = appendAlignmentWarning(stats.Warnings, "matched stars are spatially clustered")
+		}
+	}
+	return stats
+}
+
+func clusteredStars(pairs []MatchedPair, width, height int) bool {
+	if len(pairs) < 4 || width <= 0 || height <= 0 {
+		return false
+	}
+	var minX, maxX, minY, maxY = pairs[0].RefX, pairs[0].RefX, pairs[0].RefY, pairs[0].RefY
+	for _, p := range pairs[1:] {
+		minX = math.Min(minX, p.RefX)
+		maxX = math.Max(maxX, p.RefX)
+		minY = math.Min(minY, p.RefY)
+		maxY = math.Max(maxY, p.RefY)
+	}
+	return (maxX-minX) < 0.25*float64(width) || (maxY-minY) < 0.25*float64(height)
 }
 
 // refineGlobalAffine improves an initial target → ref fit by re-pairing the full

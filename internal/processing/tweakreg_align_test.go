@@ -14,6 +14,17 @@ func tweakRegTestStars(points ...[2]float64) []Star {
 	return stars
 }
 
+func TestAlignmentStatsUsesMatchedPairConsensus(t *testing.T) {
+	pairs := []MatchedPair{{RefX: 0, RefY: 0, TargetX: 0, TargetY: 0}, {RefX: 10, RefY: 0, TargetX: 10, TargetY: 0}, {RefX: 0, RefY: 10, TargetX: 0, TargetY: 10}, {RefX: 10, RefY: 10, TargetX: 13, TargetY: 10}}
+	s := alignmentStats([]Star{{}, {}, {}, {}}, []Star{{}, {}, {}, {}}, pairs, IdentityTransform(), 3)
+	if s.MatchedStars != 4 || s.AcceptedStars != 3 || s.RejectedStars != 1 || s.RANSACInlierPercent != 75 {
+		t.Fatalf("consensus stats = %+v", s)
+	}
+	if len(s.Residuals) == 0 {
+		t.Fatalf("residual diagnostics missing: %+v", s)
+	}
+}
+
 func tweakRegTestTransform(t AffineTransform, points []Star) []Star {
 	transformed := make([]Star, len(points))
 	for i, point := range points {

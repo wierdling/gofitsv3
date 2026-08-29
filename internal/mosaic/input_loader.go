@@ -27,6 +27,7 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 	inst, _ := instrument.FromHeader(primary)
 	sci := file.SelectSCI()
 	if len(sci) == 0 {
+		excluded, repaired := diagnosticDQMasks(file.HDUs[0], file, inst)
 		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst)
 		return []Input{{
 			Path:          path,
@@ -36,11 +37,13 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 			DateObs:       loadDateObs(primary, hdu.Header),
 			BUnit:         loadBUnit(hdu.Header, primary),
 			WeightPixels:  loadWHTPixels(file),
+			DQExcluded:    excluded, DQRepaired: repaired,
 		}}, nil
 	}
 
 	inputs := make([]Input, 0, len(sci))
 	for i := range sci {
+		excluded, repaired := diagnosticDQMasks(sci[i], file, inst)
 		hdu := cleanSCIWithMatchingDQ(sci[i], file, inst)
 		extver := sciExtNumber(hdu.Header, i+1)
 		d2iX, d2iY := loadD2ITables(file, extver)
@@ -55,6 +58,7 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 			D2IX:          d2iX,
 			D2IY:          d2iY,
 			ERRPixels:     loadERRPixels(file, extver, fitsio.HeaderString(hdu.Header, "EXTVER") == ""),
+			DQExcluded:    excluded, DQRepaired: repaired,
 		})
 	}
 	return inputs, nil
@@ -335,6 +339,63 @@ func cleanSCIWithMatchingDQ(hdu fitsio.HDU, file *fitsio.File, inst instrument.I
 	}
 	hdu.Data = badpix.RepairMaskedPixels(hdu.Data, mask)
 	return hdu
+}
+
+func diagnosticDQMasks(hdu fitsio.HDU, file *fitsio.File, inst instrument.Info) (excluded, repaired []bool) {
+	dq := matchingDQHDU(file, hdu)
+	if dq == nil {
+		return nil, nil
+	}
+	mask, err := badpix.MaskFromDQ(hdu, *dq, inst.BadDQBits)
+	if err != nil {
+		return nil, nil
+	}
+	if inst.DQAction == instrument.DQActionExclude {
+		excluded = append([]bool(nil), mask...)
+	} else {
+		repaired = append([]bool(nil), mask...)
+		edge := dqEdgeNoDataMask(mask, hdu.Data.Width, hdu.Data.Height, 0.75)
+		for i, isEdge := range edge {
+			if isEdge {
+				repaired[i] = false
+				if excluded == nil {
+					excluded = make([]bool, len(mask))
+				}
+				excluded[i] = true
+			}
+		}
+	}
+	return excluded, repaired
+}
+
+// LoadDiagnosticMasks loads only the matching SCI/DQ pair for a streamed
+// input, preserving the same DQ interpretation used by normal input loading.
+func LoadDiagnosticMasks(in Input) (excluded, repaired []bool, err error) {
+	file, err := fitsio.LoadFile(in.Path)
+	if err != nil {
+		return nil, nil, err
+	}
+	primary := file.HDUs[0].Header
+	inst, _ := instrument.FromHeader(primary)
+	var target fitsio.HDU
+	if in.SCIExt > 0 {
+		for _, h := range file.SelectSCI() {
+			if sciExtNumber(h.Header, 0) == in.SCIExt {
+				target = h
+				break
+			}
+		}
+	}
+	if target.Data.Width == 0 {
+		sci := file.SelectSCI()
+		if len(sci) > 0 {
+			target = sci[0]
+		} else {
+			target = file.HDUs[0]
+		}
+	}
+	excluded, repaired = diagnosticDQMasks(target, file, inst)
+	return excluded, repaired, nil
 }
 
 func excludeMaskedPixels(hdu fitsio.HDU, mask []bool) fitsio.HDU {

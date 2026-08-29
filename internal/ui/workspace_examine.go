@@ -3,6 +3,8 @@ package ui
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -24,19 +26,21 @@ import (
 // globalSendToExamine is set by newExamineWorkspace and called by the mosaic workspace
 // to load a drizzle result directly into the examine view.
 var globalSendToExamine func(pixels []float32, width, height int)
+var globalSendDiagnosticToExamine func(pixels []float32, width, height int, layers map[string]fitsio.ImageData)
 
 type examineState struct {
-	img            *models.LoadedImage
-	images         []*models.LoadedImage
-	selectedChip   int
-	headerLines    []string
-	flip           bool
-	measureEnabled bool
-	cursor         *imagePoint
-	measureStart   *imagePoint
-	measureEnd     *imagePoint
-	measurement    *rulerMeasurement
-	loadGeneration uint64
+	img              *models.LoadedImage
+	images           []*models.LoadedImage
+	selectedChip     int
+	headerLines      []string
+	flip             bool
+	measureEnabled   bool
+	cursor           *imagePoint
+	measureStart     *imagePoint
+	measureEnd       *imagePoint
+	measurement      *rulerMeasurement
+	loadGeneration   uint64
+	diagnosticLayers map[string]*models.LoadedImage
 }
 
 func examineChipLabel(img *models.LoadedImage, ordinal int) string {
@@ -75,10 +79,22 @@ func examineChipIndex(images []*models.LoadedImage, extver string, fallback int)
 	return 0
 }
 
+func diagnosticLoadedImage(name, path string, data fitsio.ImageData) *models.LoadedImage {
+	pixels := data.Pixels
+	if len(pixels) == 0 && len(data.Int32Pixels) > 0 {
+		pixels = make([]float32, len(data.Int32Pixels))
+		for i, v := range data.Int32Pixels {
+			pixels[i] = float32(v)
+		}
+	}
+	return &models.LoadedImage{Path: path + "[" + name + "]", HDU: fitsio.HDU{Data: fitsio.ImageData{Width: data.Width, Height: data.Height, Pixels: pixels}}, Mode: 0, Black: 0, White: 1, Peak: 1, ScaledPeak: 1, ShowClip: true}
+}
+
 func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	state := &examineState{
-		flip:        true,
-		headerLines: []string{"No FITS loaded."},
+		flip:             true,
+		headerLines:      []string{"No FITS loaded."},
+		diagnosticLayers: make(map[string]*models.LoadedImage),
 	}
 	vp := newViewport()
 	vp.actionRow.Objects = []fyne.CanvasObject{layout.NewSpacer(), vp.StatsLabel, hpad(6)}
@@ -86,6 +102,16 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	reloadBtn.SetToolTip("Reload the current FITS from disk, keeping the current stretch settings")
 	reloadBtn.Disable()
 	var chipSelect *SafeSelect
+	var syncControlsFromImage func()
+	var refresh func()
+	diagnosticSelect := NewSafeSelect(nil, func(value string) {
+		if img, ok := state.diagnosticLayers[value]; ok {
+			state.img = img
+			syncControlsFromImage()
+			refresh()
+		}
+	})
+	diagnosticSelect.Hide()
 
 	pathLabel := widget.NewLabel("No FITS loaded.")
 	pathLabel.Wrapping = fyne.TextWrapWord
@@ -135,8 +161,6 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		state.measurement = nil
 		updateMeasurement()
 	}
-
-	var refresh func()
 
 	var modeSelect *SafeSelect
 	var mtfMidtoneRow fyne.CanvasObject
@@ -191,7 +215,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		}
 	})
 
-	syncControlsFromImage := func() {
+	syncControlsFromImage = func() {
 		if state.img == nil {
 			modeSelect.SetSelected("Linear")
 			bgEntry.SetValue(0)
@@ -371,6 +395,28 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				}
 
 				state.images = imgs
+				state.diagnosticLayers = make(map[string]*models.LoadedImage)
+				if diagnosticFile, e := fitsio.LoadFile(path); e == nil {
+					for _, hdu := range diagnosticFile.HDUs {
+						name := fitsio.HeaderString(hdu.Header, "EXTNAME")
+						if name == "WHT" || name == "NCONTRIB" || name == "CRMASK" || name == "DQ" || name == "SKYMODEL" || name == "SEAM" || (strings.HasPrefix(name, "CTX") && name != "CTXMAP") {
+							state.diagnosticLayers[name] = diagnosticLoadedImage(name, path, hdu.Data)
+						}
+					}
+				}
+				diagnosticNames := make([]string, 0, len(state.diagnosticLayers))
+				for name := range state.diagnosticLayers {
+					diagnosticNames = append(diagnosticNames, name)
+				}
+				sort.Strings(diagnosticNames)
+				diagnosticSelect.Options = diagnosticNames
+				if len(diagnosticNames) > 0 {
+					diagnosticSelect.SetSelected(diagnosticNames[0])
+					diagnosticSelect.Show()
+				} else {
+					diagnosticSelect.Hide()
+				}
+				diagnosticSelect.Refresh()
 				state.selectedChip = examineChipIndex(imgs, selectedExtVer, selectedChip)
 				if state.selectedChip < 0 {
 					state.img = nil
@@ -506,6 +552,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		widget.NewSeparator(),
 		widget.NewLabel("SCI chip"),
 		chipSelect,
+		widget.NewLabel("Diagnostic layer"),
+		diagnosticSelect,
 		widget.NewLabel("Examine Tools"),
 		measureCheck,
 		coordLabel,
@@ -556,6 +604,24 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		clearMeasurement()
 		headerList.Refresh()
 		refresh()
+	}
+	globalSendDiagnosticToExamine = func(pixels []float32, width, height int, layers map[string]fitsio.ImageData) {
+		globalSendToExamine(pixels, width, height)
+		state.diagnosticLayers = make(map[string]*models.LoadedImage)
+		names := make([]string, 0, len(layers))
+		for name, data := range layers {
+			state.diagnosticLayers[name] = diagnosticLoadedImage(name, "(mosaic diagnostic)", data)
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		diagnosticSelect.Options = names
+		if len(names) > 0 {
+			diagnosticSelect.SetSelected(names[0])
+			diagnosticSelect.Show()
+		} else {
+			diagnosticSelect.Hide()
+		}
+		diagnosticSelect.Refresh()
 	}
 
 	viewerTabs := container.NewAppTabs(

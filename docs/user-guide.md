@@ -43,6 +43,8 @@ All Hubble Space Telescope data is public and stored in the **Mikulski Archive f
 
 ### Step-by-Step Data Retrieval
 1. Go to the official MAST search portal: **[https://mast.stsci.edu/search/ui/#/hst](https://mast.stsci.edu/search/ui/#/hst)**
+
+![SCREENSHOT: Searching for MAST data in web browser](images/screenshots/mast_search.png)
 2. **Search for a Target**: In the search bar, type the name of a famous deep-sky object. Excellent beginner targets include:
    * `M16` (Eagle Nebula / Pillars of Creation)
    * `M51` (Whirlpool Galaxy)
@@ -82,6 +84,8 @@ GoFitsV3 is a desktop application built to make processing these raw files intui
 2. **Examine**: Inspect single FITS files, view their raw histograms, explore FITS header metadata, and measure pixel coordinates.
 3. **Compose**: Take your combined filter images (e.g., Red, Green, Blue filters), align them relative to each other, stretch them to reveal details, and merge them into a single color image.
 4. **Edit**: Apply final touches to the color image, such as tone curves, sharpening, pixel healing, color speck cleaning, and export the file.
+
+![SCREENSHOT: GoFitsV3 Main Application Window](images/screenshots/main_window.png)
 
 ---
 
@@ -170,6 +174,9 @@ Background sky brightness can vary due to zodiacal light, scattered light, or sm
   * The default project-local output is `masks/`. Mask directories are saved relative to the mosaic project when possible, so moving the project with its `masks/` folder keeps the links working.
   * The export review shows target frames, dimensions, masked-pixel counts, detector-space previews, and an overwrite checkbox. Existing mask files are preserved unless **Overwrite existing mask** is checked.
   * Troubleshooting: if **Current Mosaic** is unavailable, build a drizzle result first and make sure the result has WCS metadata. If a mosaic-authored mask is marked stale, reopen/reproject it after rebuilding or changing alignment/drizzle geometry. A mask dimension error means the FITS mask does not match that specific calibrated input. MIRI showers/snowballs and severe ramp-level artifacts should usually be fixed by rerunning the current STScI JWST pipeline rather than by drawing masks over calibrated products.
+  
+![SCREENSHOT: Artifact Mask Editor showing drawn regions](images/screenshots/artifact_mask_editor.png)
+
 
 ![Sky Subtraction Settings](images/screenshots/SkysubSettings.png)
 
@@ -190,6 +197,16 @@ Once aligned, you are ready to combine the images.
 2. **IMPORTANT SAVE STEP**: Once the drizzle combine finishes, you **must save the file** by clicking the **Save Drizzle FITS** button in the upper-right panel. This exports the 32-bit FITS file for this filter, which you will load into the Compose workspace later.
 3. Click **Send to Examine** to review the result.
 
+#### Batch Processing (Drizzle Queue)
+If you have multiple filter stacks to process, you can automate the alignment and drizzling using the Drizzle Queue.
+1. First, set up and save a Mosaic project for each of your filters (`File -> Save Project As...`).
+2. Open the **`Mosaic -> Drizzle Queue...`** window.
+3. Click **Add Projects** and select your saved JSON project files.
+4. For each project, you can toggle **Auto-Align** on or off. If off, it will use the alignment offsets already saved in the project.
+5. Click **Start Queue**. The application will sequentially process each project unattended, saving a final `<filter>_<datetime>_drizzle.fits` file next to each project file.
+
+![SCREENSHOT: Drizzle Queue window showing batch jobs](images/screenshots/drizzle_queue.png)
+
 ---
 
 ### Examine Workspace (Inspecting Raw Images & Metadata)
@@ -204,7 +221,12 @@ The Examine workspace acts as a scientific magnifying glass.
 * **Measurement Tool**: Check **Measure offsets**:
   * Click point A and then point B on the image preview.
   * The interface will display the starting and ending pixel coordinates, the delta X and delta Y shifts, and the exact distance in pixels. This is helpful for measuring offsets manually.
-* **Stretch Previews**: Choose between different stretches (`Linear`, `Log`, `Sqrt`, `Asinh`, `HistEq`) to check the structure of your image and its background noise levels.
+* **Stretch Previews**: Both the Mosaic and Examine workspaces feature powerful stretch controls to help you visualize raw data:
+  * **Modes**: Choose between `Linear`, `Log`, `Sqrt`, `Asinh`, `HistEq`, and `MTF` (Midtones Transfer Function).
+  * **Magic Presets**: Click the **Magic** button to automatically estimate black and white points. You can select presets like **Balanced**, **Nebula**, or **Galaxy** to optimize the auto-stretch for different types of targets.
+  * **Auto MTF**: When using the MTF stretch mode, click **Auto MTF** to mathematically calculate the ideal midtone balance for the image.
+
+![SCREENSHOT: Magic stretch presets in the Examine workspace](images/screenshots/examine_magic_stretch.png)
 
 Here is an example of Cassiopeia A (a supernova remnant) stretched using the MTF (Midtones Transfer Function) model to reveal the faint shockwaves and ejecta:
 
@@ -227,6 +249,8 @@ Assign your FITS files to the channel slots:
 * **Red Channel**: Load your longest-wavelength filter (e.g., `F814W` or `SII`).
 * *Tip: If you do not have three filters, you can load the same file into multiple channels, or use the "Copy Settings" menu item to help balance them.*
 
+![SCREENSHOT: Compose Workspace showing loaded color channels](images/screenshots/compose_channels.png)
+
 #### Aligning the Channels
 Filters are photographed sequentially, so the telescope may have drifted between them.
 * Open the **Compose Menu** and select **Align to Channel 2**. GoFitsV3 will detect stars across all three channels and apply a full affine transform to register the Red and Blue channels perfectly to the Green channel.
@@ -241,6 +265,8 @@ To make the image visible, you must configure the stretch parameters for each ch
    * **Strength**: How strongly the stretch is applied.
    * **Center (SP - Stretch Point)**: The pixel value you want to stretch around (usually set just above your background noise level).
    * **Symmetry (BP)**: Controls the width of the stretch region.
+
+![SCREENSHOT: Compose stretching tools and histogram](images/screenshots/compose_stretch.png)
 
 #### Blending an "Orange Layer" (4-Channel Composition)
 If you have a fourth filter (for example, a narrow-band Hydrogen-Alpha `F656N` image that contains rich details), you can blend it in:
@@ -273,6 +299,8 @@ The Edit tab is where you perform traditional photography adjustments before sav
   * **JPEG** (with quality controls)
   * **TIFF**
   * **WebP** (lossless compression)
+
+![SCREENSHOT: Edit workspace showing Tone Curves and Sharpening](images/screenshots/edit_tools.png)
 
 ---
 
