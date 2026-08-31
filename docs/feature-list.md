@@ -68,6 +68,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Configures star-match search radius in arcseconds.
 - Configures how many leading images are treated as pre-aligned references; a target can align to whichever reference it overlaps.
 - Streams catalogs/pixels in the TweakReg-style modes rather than retaining all full-resolution images.
+- For multi-tile external reference baselines, matches each target against reference stars in its projected footprint; if cross-frame consensus over-filters a narrowband catalog, retries with the retained candidate catalog under the same transform-safety checks.
 - Shows per-frame alignment results before applying them, including X/Y offset, rotation, and failed matches.
 - Provides an alignment diagnostics report for each result: detected/matched/accepted/rejected star counts, X/Y/radial RMS, median and maximum residual, RANSAC inlier percentage, transform decomposition and affine matrix, RScale-versus-affine comparison, residual samples, and warnings for weak, clustered, or overfit solutions.
 - Allows successful alignment results to be selectively applied.

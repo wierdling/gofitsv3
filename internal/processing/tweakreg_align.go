@@ -198,6 +198,35 @@ func EstimateTweakRegAlignmentFromCatalogs(
 	return result, stats, err
 }
 
+// EstimateTweakRegAlignmentFromCatalogsWithDebug is the catalog-only alignment
+// path with the same diagnostic callback used by the pixel-backed entry point.
+// It is used when callers must retry with a retained catalog larger than the
+// normal extraction cap while still showing the exact projected stars and
+// matched pairs that produced the result.
+func EstimateTweakRegAlignmentFromCatalogsWithDebug(
+	sourceStars []Star,
+	mapper *WCSMapper,
+	refPixels []float32,
+	refStars []Star,
+	refWidth, refHeight int, refHeader fitsio.Header,
+	searchRadiusArcsec float64,
+	fitgeom string,
+) (AffineTransform, AlignStats, error) {
+	result, stats, projected, pairs, err := estimateTweakRegFromCatalogs(
+		sourceStars, mapper, refStars, refWidth, refHeight, refHeader, searchRadiusArcsec, fitgeom)
+	if AlignmentDebugHook != nil {
+		AlignmentDebugHook(AlignmentDiag{
+			RefPixels:   refPixels,
+			RefW:        refWidth,
+			RefH:        refHeight,
+			RefStars:    refStars,
+			SourceStars: projected,
+			Pairs:       pairs,
+		})
+	}
+	return result, stats, err
+}
+
 // estimateTweakRegFromCatalogs is the catalog-only core shared by the pixel and
 // streaming TweakReg entry points. It projects the source catalog into reference
 // pixel space through the WCS mapper and fits the residual against the reference

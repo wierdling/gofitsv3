@@ -25,6 +25,31 @@ import (
 // Very small denominators are treated as uncovered to avoid edge blow-ups.
 const weightEpsilon float32 = 1e-12
 
+// catalogsEffectivelyIdentical avoids repeating a fit when consensus retained
+// exactly the same detections as the raw candidate catalog. The small tolerance
+// accommodates harmless floating-point copies without suppressing a meaningful
+// raw-catalog fallback.
+func catalogsEffectivelyIdentical(a, b []processing.Star) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if math.Abs(a[i].X-b[i].X) > 1e-9 || math.Abs(a[i].Y-b[i].Y) > 1e-9 || math.Abs(a[i].Flux-b[i].Flux) > 1e-9 {
+			return false
+		}
+	}
+	return true
+}
+
+// shouldRetryRawCatalog reports whether a failed consensus fit has a different
+// source or reference catalog available for a meaningful raw-catalog retry.
+// Keeping this decision centralized prevents the direct and chained paths from
+// accidentally retrying identical catalogs (or skipping a retry when only the
+// reference was filtered).
+func shouldRetryRawCatalog(source, rawSource, reference, rawReference []processing.Star) bool {
+	return !catalogsEffectivelyIdentical(source, rawSource) || !catalogsEffectivelyIdentical(reference, rawReference)
+}
+
 type Input struct {
 	DQExcluded         []bool
 	DQRepaired         []bool
@@ -1692,6 +1717,47 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 					inputs[i].OffsetX, inputs[i].OffsetY,
 				)
 			}
+			if err != nil && isTweakReg {
+				// Consensus can discard real but weakly corroborated stars. Retry the
+				// same target/reference footprint with the complete candidate catalog,
+				// while leaving all physical/support gates in the processing matcher.
+				rawReferenceStars := candidateCatalogs[r]
+				if externalReference && r == 0 {
+					var fallbackFootprintErr error
+					rawReferenceStars, fallbackFootprintErr = referenceStarsForTarget(inputs[i], rc.input, mapper, rawReferenceStars, searchRadiusArcsec)
+					if fallbackFootprintErr != nil {
+						rawReferenceStars = nil
+					}
+				}
+				retrySource := catalogs[i]
+				if processing.AlignmentDebugHook != nil {
+					retrySource = candidateCatalogs[i]
+				}
+				if shouldRetryRawCatalog(retrySource, candidateCatalogs[i], referenceStars, rawReferenceStars) && len(rawReferenceStars) > 0 {
+					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: direct fallback attempt source=%s reference=%s raw-source-stars=%d raw-reference-stars=%d after consensus error: %v", InputKey(inputs[i]), InputKey(rc.input), len(candidateCatalogs[i]), len(rawReferenceStars), err))
+					var fallbackRefinement processing.AffineTransform
+					var fallbackStats processing.AlignStats
+					var fallbackErr error
+					if processing.AlignmentDebugHook != nil {
+						refPix, _, _, _, refErr := resolveFramePixels(rc.input, Options{})
+						if refErr != nil {
+							fallbackErr = fmt.Errorf("debug reference pixel reload: %v", refErr)
+						} else {
+							fallbackRefinement, fallbackStats, fallbackErr = processing.EstimateTweakRegAlignmentFromCatalogsWithDebug(candidateCatalogs[i], mapper, refPix, rawReferenceStars, rc.input.HDU.Data.Width, rc.input.HDU.Data.Height, rc.input.HDU.Header, searchRadiusArcsec, fitgeom)
+						}
+					} else {
+						fallbackRefinement, fallbackStats, fallbackErr = processing.EstimateTweakRegAlignmentFromCatalogs(candidateCatalogs[i], mapper, rawReferenceStars, rc.input.HDU.Data.Width, rc.input.HDU.Data.Height, rc.input.HDU.Header, searchRadiusArcsec, fitgeom)
+					}
+					if fallbackErr == nil {
+						refinement, stats, err = fallbackRefinement, fallbackStats, nil
+						debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: direct fallback success source=%s reference=%s matched=%d support=%d rms=%.3f", InputKey(inputs[i]), InputKey(rc.input), stats.MatchedStars, stats.GlobalInliers, stats.RMS))
+					} else {
+						err = fmt.Errorf("%v; raw catalog retry: %v", err, fallbackErr)
+					}
+				} else if shouldRetryRawCatalog(retrySource, candidateCatalogs[i], referenceStars, rawReferenceStars) {
+					err = fmt.Errorf("%v; raw catalog retry: no usable reference stars", err)
+				}
+			}
 			if err != nil {
 				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: match source=%s reference=%s: %v", InputKey(inputs[i]), InputKey(rc.input), err))
 				attemptErrors = append(attemptErrors, fmt.Sprintf("reference %s: %v", InputKey(rc.input), err))
@@ -1732,49 +1798,45 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	// projectRaw maps a frame's catalog into inputs[0] pixel space using only its
 	// WCS placement (mapper + base offset), i.e. before any residual correction —
 	// the "projected source" role for a residual fit.
-	projectRaw := func(idx int) ([]processing.Star, bool) {
+	projectCatalog := func(idx int, source []processing.Star, corrected bool) ([]processing.Star, bool) {
 		m, ok := getMapper(idx)
 		if !ok {
 			return nil, false
 		}
-		src := getStars(idx)
-		out := make([]processing.Star, len(src))
-		for k, s := range src {
+		offX, offY := inputs[idx].OffsetX, inputs[idx].OffsetY
+		if results[idx].Applied {
+			offX, offY = results[idx].OffsetX, results[idx].OffsetY
+		}
+		mt, hasMT := inputs[idx].ManualTransform, inputs[idx].HasManualTransform
+		if results[idx].Applied {
+			mt, hasMT = results[idx].ManualTransform, results[idx].HasManualTransform
+		}
+		out := make([]processing.Star, len(source))
+		for k, s := range source {
 			rx, ry := m.MapPixel(s.X, s.Y)
-			out[k] = processing.Star{X: rx + inputs[idx].OffsetX, Y: ry + inputs[idx].OffsetY, Flux: s.Flux}
+			rx += offX
+			ry += offY
+			if corrected && hasMT {
+				rx, ry = processing.ApplyAffineTransform(mt, rx, ry)
+			}
+			out[k] = processing.Star{X: rx, Y: ry, Flux: s.Flux}
 		}
 		return out, true
+	}
+	projectRaw := func(idx int) ([]processing.Star, bool) {
+		return projectCatalog(idx, getStars(idx), false)
 	}
 	// projectCorrected maps an already-aligned frame's catalog into inputs[0] pixel
 	// space using its FULL solution (mapper + offset + ManualTransform), exactly as
 	// plannedInput.mapPixel does at render. Chaining off this (not the raw WCS
 	// placement) propagates the intermediate's own residual into the new frame.
 	projectCorrected := func(idx int) ([]processing.Star, bool) {
-		m, ok := getMapper(idx)
+		_, ok := getMapper(idx)
 		if !ok {
 			return nil, false
 		}
 		src := getStars(idx)
-		// Use the computed solution once it exists; otherwise fall back to the
-		// frame's accepted placement (the path designated references take, since
-		// their results entry is only filled at the very end).
-		offX, offY := inputs[idx].OffsetX, inputs[idx].OffsetY
-		mt, hasMT := inputs[idx].ManualTransform, inputs[idx].HasManualTransform
-		if results[idx].Applied {
-			offX, offY = results[idx].OffsetX, results[idx].OffsetY
-			mt, hasMT = results[idx].ManualTransform, results[idx].HasManualTransform
-		}
-		out := make([]processing.Star, len(src))
-		for k, s := range src {
-			rx, ry := m.MapPixel(s.X, s.Y)
-			rx += offX
-			ry += offY
-			if hasMT {
-				rx, ry = processing.ApplyAffineTransform(mt, rx, ry)
-			}
-			out[k] = processing.Star{X: rx, Y: ry, Flux: s.Flux}
-		}
-		return out, true
+		return projectCatalog(idx, src, true)
 	}
 
 	refW := inputs[0].HDU.Data.Width
@@ -1900,6 +1962,22 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				attemptedCandidates++
 				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: matching source=%s reference=%s mode=%s (chain fallback) source-stars=%d reference-stars=%d search-radius=%.2f", InputKey(inputs[i]), InputKey(inputs[j]), fitgeom, len(srcProj), len(intProj), chainSearchRadiusPx))
 				t, stats, err := processing.FitCatalogResidual(srcProj, intProj, refW, refH, chainSearchRadiusPx, fitgeom)
+				if err != nil && isTweakReg && shouldRetryRawCatalog(catalogs[i], candidateCatalogs[i], catalogs[j], candidateCatalogs[j]) {
+					rawSrcProj, rawSrcOK := projectCatalog(i, candidateCatalogs[i], false)
+					rawIntProj, rawIntOK := projectCatalog(j, candidateCatalogs[j], true)
+					if rawSrcOK && rawIntOK {
+						debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain fallback attempt source=%s reference=%s raw-source-stars=%d raw-reference-stars=%d after consensus error: %v", InputKey(inputs[i]), InputKey(inputs[j]), len(rawSrcProj), len(rawIntProj), err))
+						fallbackT, fallbackStats, fallbackErr := processing.FitCatalogResidual(rawSrcProj, rawIntProj, refW, refH, chainSearchRadiusPx, fitgeom)
+						if fallbackErr == nil {
+							t, stats, err = fallbackT, fallbackStats, nil
+							debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain fallback success source=%s reference=%s matched=%d support=%d rms=%.3f", InputKey(inputs[i]), InputKey(inputs[j]), stats.MatchedStars, stats.GlobalInliers, stats.RMS))
+						} else {
+							err = fmt.Errorf("%v; raw catalog retry: %v", err, fallbackErr)
+						}
+					} else {
+						err = fmt.Errorf("%v; raw catalog retry: projection unavailable", err)
+					}
+				}
 				if err != nil {
 					lastErr[i] = fmt.Sprintf("chain via %s: %v", InputKey(inputs[j]), err)
 					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain match failed source=%s reference=%s: %v", InputKey(inputs[i]), InputKey(inputs[j]), err))
