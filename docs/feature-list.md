@@ -1,6 +1,8 @@
 # GoFitsV3 Feature Inventory
 
-This document is a comparison-oriented inventory of features implemented in the GoFitsV3 desktop application as of August 23, 2026. It is organized by what a user is trying to accomplish, rather than by source package. The four primary workspaces are **Mosaic (drizzle)**, **Examine**, **Compose**, and **Edit**.
+Examine supports read-only JWST ASDF 1.0 / Standard 1.6 ImageModel files with embedded, uncompressed 2-D image arrays. The `data`, uncertainty, and DQ planes are available for display with source metadata. Validated JWST MIRI/MIRIMAGE and NIRCam module-B (`NRCB1`-`NRCB4`, `NRCBLONG`) ASDF profiles can also be loaded as Mosaic/drizzle inputs: native GWCS is evaluated per detector pixel for placement and alignment, while the saved mosaic uses a FITS TAN output WCS. Unknown instruments (including future Roman profiles), detectors, or incomplete GWCS models remain Examine-only until explicitly registered; ASDF writing remains unsupported.
+
+This document is a comparison-oriented inventory of features implemented in the GoFitsV3 desktop application as of August 28, 2026. It is organized by what a user is trying to accomplish, rather than by source package. The four primary workspaces are **Mosaic (drizzle)**, **Examine**, **Compose**, and **Edit**.
 
 GoFitsV3 is aimed at producing visually compelling astronomy images from calibrated FITS data, especially Hubble and selected JWST imaging products. It is not presented as a replacement for a mission calibration pipeline or as a photometry/astrometry package. Where an exposed control is disabled, reserved, or subject to an important limitation, that is called out explicitly so this inventory can be used fairly when comparing GoFitsV3 with other programs.
 
@@ -11,6 +13,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Loads individual FITS files with `.fits`, `.fit`, or `.fts` extensions.
 - Adds every supported FITS file from a selected directory.
 - Scans a directory and builds a selectable filter batch using FITS metadata.
+- Shows a metadata-only, numbered drizzle-footprint preview in the Add Filter Batch dialog so overlapping source files can be checkbox-selected before loading; invalid or missing WCS inputs remain listed with a warning and no outline.
 - Filters batch candidates by filter, proposal ID, exposure time, instrument, observation-date range, and product type.
 - Recognizes Hubble `_flt` and `_flc` products and JWST `_cal` products during batch discovery.
 - Loads multi-extension FITS images and treats individual `SCI` extensions/chips as drizzle inputs.
@@ -33,7 +36,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
   - HST WFC3/IR and WFC3/UVIS.
   - HST ACS/WFC, ACS/HRC, and ACS/SBC.
   - HST WFPC2 PC/WF multi-chip data.
-  - JWST MIRI imaging (`MIRI` / `MIRIMAGE`).
+  - JWST MIRI imaging (`MIRI` / `MIRIMAGE`) and NIRCam module-B imaging (`NIRCAM` / `NRCB1`-`NRCB4`, `NRCBLONG`) when native GWCS is present.
   - JWST NIRCam short-wave detectors NRCA1–4 and NRCB1–4, and long-wave NRCALONG/NRCBLONG.
 - Falls back to a conservative generic single-chip profile for unrecognized instruments; this is not the same as explicit instrument support.
 - Streams chip data from disk where supported to bound memory use on large datasets.
@@ -154,20 +157,21 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Generates per-filter Mosaic projects directly from a directory, using an existing project as the settings/reference template.
 - Generated-project discovery can select all, `.flc`, `.flt`, or `.cal` products and selected filters.
 
-## Examine — inspect a FITS image or drizzle result
+## Examine — inspect FITS/ASDF image planes or a drizzle result
 
 ### Loading and navigation
 
-- Loads `.fits`, `.fit`, and `.fts` files.
-- Reloads the current FITS file from disk while preserving the selected stretch settings and chip when possible.
+- Loads `.fits`, `.fit`, `.fts`, and supported JWST `.asdf` files.
+- Lists every supported FITS image HDU and every supported ASDF image plane, with format-neutral stable selection identities.
+- Reloads the current file from disk while preserving each plane's stretch settings and the selected plane when possible; decoding runs in the background.
 - Receives a Mosaic result directly without an intermediate save/reload.
-- Lists multiple `SCI` chips/extensions and allows switching among them.
+- Lists every supported image plane and allows switching among FITS extensions or ASDF arrays, including uncertainty and data-quality planes when present.
 - Provides fit and percentage zoom, zoom-in/out, scrolling, and image-size-aware display.
 - Can flip the displayed image vertically.
 
 ### Data inspection
 
-- Displays the combined primary and selected-extension FITS headers in a dedicated Headers tab.
+- Displays the selected FITS headers or ASDF source metadata in a dedicated Headers tab.
 - Shows the image histogram, mean, and standard deviation.
 - Reports the cursor's pixel coordinates.
 - Two-click ruler reports start/end coordinates, signed X/Y delta, and Euclidean distance in pixels.
@@ -187,7 +191,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 
 ### Channel and filter loading
 
-- Loads one FITS image into each of three base channels labeled Blue, Green, and Red.
+- Loads one FITS image into each of three base channels labeled Blue, Green, and Red, and uses the same custom FITS file picker for added colored channels.
 - Accepts a handoff from Examine into any base channel.
 - Loads a filter set from a directory by discovering named `_drz.fits`, `_driz.fits`, and `_drizzle.fits` products.
 - In filter-set loading, assigns each discovered filter to Blue, Green, Red, or a custom-colored overlay, and applies a selected Magic preset plus Auto MTF.
@@ -216,6 +220,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Supports manual X/Y translation and rotation for each base channel.
 - Rotates a base channel 90 degrees clockwise.
 - Provides pixel-value readout and image-region median pickers for black and white points.
+- Measures each base channel's stellar PSF/FWHM, suggests a common target, and non-destructively convolves sharper channels to match it. Normal in-memory Compose includes optional saturated-core protection and a visual before/after representative-star preview.
 
 ### Registration, cleaning, and color combination
 
@@ -223,8 +228,11 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Applies manual X/Y/rotation adjustments on top of automatic alignment.
 - Normalizes channel scales relative to Channel 2 for a balanced starting point.
 - Cross-channel cleaning identifies defects present in only one color channel, builds a protective star mask, and replaces isolated cosmic-ray/hot-pixel remnants while preserving real stars.
-- Builds a live RGB color composite from all three base channels.
+- Builds a live RGB color composite from the three base channels, with optional simultaneous multi-channel mixing when additional filters are loaded.
+- Offers Auto, Weighted multi-channel, and Artistic overlays composition modes; Auto uses weighted mixing when four or more sources are loaded while retaining artistic behavior for three-filter sets.
+- Provides editable non-negative RGB contribution weights for every loaded base channel and overlay. Weights persist by stable overlay identity and filter-set custom colors seed their initial values.
 - Applies per-channel RGB output levels in a separate levels window.
+- Supports optional LRGB-style combination with a dedicated luminance FITS input or synthetic luminance from selected RGB filters, adjustable luminance contribution, and chrominance-only smoothing that preserves luminance detail. Dedicated-L and LRGB settings persist in Compose projects. Disk-backed Compose rejects enabled LRGB with an actionable error until bounded LRGB processing is available, preventing a silently different render.
 - Adds custom-colored layers with independently adjustable RGB tint, opacity, and highlight protection; overlays are blended into the composite.
 - Displays a color legend describing base filters and active overlay colors.
 - Measures the composite with a two-point pixel ruler.
@@ -235,13 +243,13 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Supports a shared histogram scale across filters or per-filter automatic histogram scaling.
 - Can maximize one preview and restore the four-pane layout.
 - Blinks any chosen set of two or more base channels and colored overlays and allows the blink set to be changed.
-- Offers an opt-in disk-backed large-file mode that streams processing artifacts instead of retaining full channel arrays in memory.
+- Offers an opt-in disk-backed large-file mode that streams processing artifacts instead of retaining full channel arrays in memory, including weighted multi-channel mixing with bounded row processing.
 - **Current limitation:** Blink is disabled in disk-backed large-file mode.
 - Can disable live composite construction to reduce processing load while adjusting channels.
 
 ### Projects and output
 
-- Saves and loads Compose projects, including base-channel files, stretch settings, transforms, RGB levels, overlay layers, colors/opacity/highlight protection, and relevant view options.
+- Saves and loads Compose projects, including base-channel files, stretch settings, transforms, RGB levels, overlay layers, colors/opacity/highlight protection, composition mode, and stable per-source weighted-mix settings.
 - Exports the composed RGB image directly.
 - Sends the composite directly to Edit.
 - Direct Compose and Edit exports support:

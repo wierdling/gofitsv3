@@ -26,6 +26,19 @@ func TestNumberEntryRejectsNonFiniteAndNotifiesOncePerValue(t *testing.T) {
 	}
 }
 
+func TestNumberEntryAllowsTypingNegativeFraction(t *testing.T) {
+	n := NewNumberEntry(0.001, 4)
+
+	n.entry.SetText("-0")
+	if n.entry.Text != "-0" {
+		t.Fatalf("text after negative zero = %q, want to preserve intermediate input", n.entry.Text)
+	}
+	n.entry.SetText("-0.001")
+	if got := n.Value(); got != -0.001 {
+		t.Fatalf("Value() = %v, want -0.001", got)
+	}
+}
+
 func TestSafeSelectDetachedInteractionsAreNoOps(t *testing.T) {
 	s := NewSafeSelect([]string{"one", "two"}, nil)
 	s.Tapped(nil)

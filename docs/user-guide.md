@@ -81,7 +81,7 @@ GoFitsV3 is a desktop application built to make processing these raw files intui
 ```
 
 1. **Mosaic**: Load raw, individual exposures from a single filter, align them together, and "drizzle" them into a single, clean image stack with cosmic rays removed.
-2. **Examine**: Inspect single FITS files, view their raw histograms, explore FITS header metadata, and measure pixel coordinates.
+2. **Examine**: Inspect FITS or ASDF image planes, view their raw histograms, explore source metadata, and measure pixel coordinates.
 3. **Compose**: Take your combined filter images (e.g., Red, Green, Blue filters), align them relative to each other, stretch them to reveal details, and merge them into a single color image.
 4. **Edit**: Apply final touches to the color image, such as tone curves, sharpening, pixel healing, color speck cleaning, and export the file.
 
@@ -96,6 +96,19 @@ GoFitsV3 is a desktop application built to make processing these raw files intui
 ### Mosaic Workspace (Aligning & Combining Exposures)
 
 The Mosaic tab is where your processing begins. Telescopes take multiple short exposures of the same target to avoid overexposing bright stars and to allow the removal of random cosmic ray strikes. The Mosaic tab combines these exposures.
+
+Mosaic accepts supported JWST MIRI and NIRCam ASDF ImageModel files as single-chip inputs
+when they contain a registered native MIRI/MIRIMAGE or NIRCam module-B imaging GWCS profile.
+Mosaic/drizzle
+evaluates that native GWCS for every detector pixel, retaining nonlinear
+distortion during placement and alignment; it does not flatten the input to
+`meta.wcsinfo` for registration. The ASDF `data` plane is drizzled,
+`DO_NOT_USE`/`NON_SCIENCE` DQ pixels are excluded, and a dimension-matching
+`err` plane is used for inverse-variance weighting when present. The saved
+mosaic has a FITS TAN output WCS. Unknown or incomplete GWCS models remain
+available in Examine only, and ASDF writing is unsupported. Future instruments such as
+Nancy Grace Roman will require an explicitly registered native profile; they are not
+treated as MIRI or NIRCam by fallback.
 
 #### Step 1 - Loading Files
 
@@ -209,15 +222,16 @@ If you have multiple filter stacks to process, you can automate the alignment an
 
 ---
 
-### Examine Workspace (Inspecting Raw Images & Metadata)
+### Examine Workspace (Inspecting Image Planes & Metadata)
 
-The Examine workspace acts as a scientific magnifying glass.
+The Examine workspace acts as a scientific magnifying glass for supported FITS and ASDF images. Load an image to list every supported 2-D plane in stable selector order, then use the plane selector to switch among science, uncertainty, data-quality, and other image arrays. FITS planes retain their extension headers; ASDF planes retain source metadata and array names.
 
-* **FITS Header Viewer**: The scrollable list on the right displays the raw metadata stored in the FITS file. Here you can find:
+* **Source Metadata Viewer**: The scrollable list on the right displays metadata from the selected source. FITS files commonly include:
   * `INSTRUME` (e.g., `WFC3`)
   * `FILTER` (e.g., `F555W`)
   * `EXPTIME` (total exposure duration in seconds)
   * `DATE-OBS` (date of observation)
+  ASDF files expose the source metadata available in the ASDF tree, including the selected array's role and shape.
 * **Measurement Tool**: Check **Measure offsets**:
   * Click point A and then point B on the image preview.
   * The interface will display the starting and ending pixel coordinates, the delta X and delta Y shifts, and the exact distance in pixels. This is helpful for measuring offsets manually.
@@ -243,7 +257,7 @@ Here is a color composite of the colliding Antennae Galaxies, showing dust lanes
 ![The colliding Antennae Galaxies color composite](images/AntennaeGalaxies_MT.png)
 
 #### Mapping Channels
-Assign your FITS files to the channel slots:
+Assign your FITS files to the channel slots using the custom FITS file picker:
 * **Blue Channel**: Load your shortest-wavelength filter (e.g., `F390W`, `F438W` or `OIII`).
 * **Green Channel**: Load your middle-wavelength filter (e.g., `F555W`, `F606W` or `H-alpha`).
 * **Red Channel**: Load your longest-wavelength filter (e.g., `F814W` or `SII`).
@@ -254,6 +268,13 @@ Assign your FITS files to the channel slots:
 #### Aligning the Channels
 Filters are photographed sequentially, so the telescope may have drifted between them.
 * Open the **Compose Menu** and select **Align to Channel 2**. GoFitsV3 will detect stars across all three channels and apply a full affine transform to register the Red and Blue channels perfectly to the Green channel.
+
+#### Matching PSF (FWHM)
+If your color channels have different levels of sharpness (often because they were taken with different instruments or at different wavelengths), you can match their stellar profiles to prevent color fringing on stars:
+* Select **Match PSF/FWHM** from the Compose menu.
+* GoFitsV3 will measure each base channel's stellar PSF, suggest a common target, and non-destructively convolve the sharper channels to match the softest one.
+* It includes optional saturated-core protection and a visual before/after representative-star preview.
+* *Note: PSF matching is currently unavailable in disk-backed Compose.*
 
 #### Stretching the Data
 To make the image visible, you must configure the stretch parameters for each channel. GoFitsV3 offers several stretch modes:
@@ -273,6 +294,13 @@ If you have a fourth filter (for example, a narrow-band Hydrogen-Alpha `F656N` i
 * Go to `Compose -> Add Orange Image...`.
 * Load your fourth FITS file.
 * This opens a control window allowing you to adjust the custom RGB color tint (defaults to a beautiful golden-orange) and opacity slider to screen-blend this detail layer over your composite.
+
+#### LRGB Combination
+GoFitsV3 supports LRGB-style combination to enhance image detail and reduce color noise:
+* Access the **LRGB Processing** options from the Compose menu.
+* You can provide a dedicated high-resolution luminance FITS input, or generate a synthetic luminance from selected RGB filters.
+* Adjust the luminance contribution and apply chrominance-only smoothing to preserve fine luminance details while softening color noise.
+* *Note: LRGB settings persist in Compose projects, but processing is currently unavailable in disk-backed Compose.*
 
 #### Clean Operations
 * **Cross-Channel Clean**: Click this under the `Compose` menu. It builds a protective star mask and cleans up single-channel cosmic rays or hot pixels that survived the drizzling stage.
@@ -331,10 +359,12 @@ Let's walk through the creation of a color image of the **Whirlpool Galaxy (M51)
 1. Go to the **Compose** tab.
 2. Load `M51_Blue_Drizzled.fits` into the Blue channel slot, `M51_Green_Drizzled.fits` into Green, and `M51_Red_Drizzled.fits` into Red.
 3. Select `Compose -> Align to Channel 2` to register the three color channels together.
-4. Set the Stretch mode on all channels to **Asinh**.
-5. Adjust the sliders: set the Black levels just below the background peak on the histogram, and raise the stretch values until the galaxy's spiral arms are visible.
-6. Select `Compose -> Cross-Channel Clean` to erase any remaining pixel artifacts.
-7. Select `File -> Send Composite to Edit`.
+4. (Optional) Select `Compose -> Match PSF/FWHM` to normalize star sizes across channels and prevent color fringing.
+5. Set the Stretch mode on all channels to **Asinh**.
+6. Adjust the sliders: set the Black levels just below the background peak on the histogram, and raise the stretch values until the galaxy's spiral arms are visible.
+7. (Optional) Access **LRGB Processing** from the Compose menu to add luminance detail or chrominance smoothing.
+8. Select `Compose -> Cross-Channel Clean` to erase any remaining pixel artifacts.
+9. Select `File -> Send Composite to Edit`.
 
 ### Phase 4: Final Adjustments & Save
 1. In the **Edit** tab, open the **Curves** widget.

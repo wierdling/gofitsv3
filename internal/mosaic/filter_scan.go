@@ -57,7 +57,7 @@ func DiscoverFITSFiles(dir string) ([]string, error) {
 			continue
 		}
 		switch strings.ToLower(filepath.Ext(entry.Name())) {
-		case ".fits", ".fit", ".fts":
+		case ".fits", ".fit", ".fts", ".asdf":
 			paths = append(paths, filepath.Join(dir, entry.Name()))
 		}
 	}
@@ -151,7 +151,17 @@ func scanFilterHeaders(paths []string) []FilterFile {
 				if i >= len(paths) {
 					return
 				}
-				header, err := fitsio.LoadPrimaryHeader(paths[i])
+				var header fitsio.Header
+				var err error
+				if strings.EqualFold(filepath.Ext(paths[i]), ".asdf") {
+					var inputs []Input
+					inputs, err = LoadInputsMetadataFromPath(paths[i])
+					if len(inputs) > 0 {
+						header = inputs[0].PrimaryHeader
+					}
+				} else {
+					header, err = fitsio.LoadPrimaryHeader(paths[i])
+				}
 				if err != nil {
 					continue
 				}

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -15,6 +14,7 @@ import (
 
 	ttwidget "github.com/dweymouth/fyne-tooltip/widget"
 
+	"gofitsv3/internal/astroio"
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
@@ -31,6 +31,8 @@ var globalSendDiagnosticToExamine func(pixels []float32, width, height int, laye
 type examineState struct {
 	img              *models.LoadedImage
 	images           []*models.LoadedImage
+	planeIDs         []astroio.PlaneID
+	selectedPlaneID  astroio.PlaneID
 	selectedChip     int
 	headerLines      []string
 	flip             bool
@@ -93,13 +95,13 @@ func diagnosticLoadedImage(name, path string, data fitsio.ImageData) *models.Loa
 func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	state := &examineState{
 		flip:             true,
-		headerLines:      []string{"No FITS loaded."},
+		headerLines:      []string{"No image loaded."},
 		diagnosticLayers: make(map[string]*models.LoadedImage),
 	}
 	vp := newViewport()
 	vp.actionRow.Objects = []fyne.CanvasObject{layout.NewSpacer(), vp.StatsLabel, hpad(6)}
-	reloadBtn := ttwidget.NewButton("Reload Current FITS", func() {})
-	reloadBtn.SetToolTip("Reload the current FITS from disk, keeping the current stretch settings")
+	reloadBtn := ttwidget.NewButton("Reload Current Image", func() {})
+	reloadBtn.SetToolTip("Reload the current image from disk, keeping the current stretch settings")
 	reloadBtn.Disable()
 	var chipSelect *SafeSelect
 	var syncControlsFromImage func()
@@ -113,7 +115,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	})
 	diagnosticSelect.Hide()
 
-	pathLabel := widget.NewLabel("No FITS loaded.")
+	pathLabel := widget.NewLabel("No image loaded.")
 	pathLabel.Wrapping = fyne.TextWrapWord
 	coordLabel := widget.NewLabel("Cursor: --")
 	coordLabel.TextStyle = fyne.TextStyle{Monospace: true}
@@ -343,7 +345,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		sPeakEntry.SetValue(state.img.ScaledPeak)
 		refresh()
 	})
-	autoBtn.SetToolTip("Compute Background, Peak and Black/White levels automatically (FITS Liberator style)")
+	autoBtn.SetToolTip("Compute Background, Peak and Black/White levels automatically (Liberator style)")
 
 	autoMTFBtn := ttwidget.NewButton("Auto MTF", func() {
 		if state.img == nil {
@@ -369,21 +371,30 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	magicBtn.SetToolTip("Estimate stretch levels using the selected Magic target preset, then apply Auto MTF")
 
 	loadFitsFromPath := func(path string, preserveStretch bool) {
-		progressDialog := dialog.NewCustom("Loading FITS", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
+		progressDialog := dialog.NewCustom("Loading Image", "Reading image data...", widget.NewProgressBarInfinite(), win)
 		progressDialog.Show()
 		var savedState models.ChannelState
 		selectedExtVer := ""
 		selectedChip := 0
+		selectedPlaneID := astroio.PlaneID("")
+		savedStates := make(map[astroio.PlaneID]models.ChannelState)
 		if preserveStretch && state.img != nil {
+			selectedPlaneID = state.selectedPlaneID
 			savedState = channelStateFromImage(state.img)
 			selectedExtVer = fitsio.HeaderString(state.img.HDU.Header, "EXTVER")
 			selectedChip = state.selectedChip
+			for i, id := range state.planeIDs {
+				if i < len(state.images) && state.images[i] != nil {
+					savedStates[id] = channelStateFromImage(state.images[i])
+				}
+			}
 		}
 
 		state.loadGeneration++
 		generation := state.loadGeneration
 		go func() {
-			imgs, loadErr := loadImagesFromPath(path)
+			imgs, ids, loadErr := loadExaminePlanesFromPath(path)
+			diagnosticLayers := loadExamineDiagnosticsFromPath(path)
 			fyne.Do(func() {
 				progressDialog.Hide()
 				if generation != state.loadGeneration {
@@ -395,15 +406,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				}
 
 				state.images = imgs
-				state.diagnosticLayers = make(map[string]*models.LoadedImage)
-				if diagnosticFile, e := fitsio.LoadFile(path); e == nil {
-					for _, hdu := range diagnosticFile.HDUs {
-						name := fitsio.HeaderString(hdu.Header, "EXTNAME")
-						if name == "WHT" || name == "NCONTRIB" || name == "CRMASK" || name == "DQ" || name == "SKYMODEL" || name == "SEAM" || (strings.HasPrefix(name, "CTX") && name != "CTXMAP") {
-							state.diagnosticLayers[name] = diagnosticLoadedImage(name, path, hdu.Data)
-						}
-					}
-				}
+				state.planeIDs = ids
+				state.diagnosticLayers = diagnosticLayers
 				diagnosticNames := make([]string, 0, len(state.diagnosticLayers))
 				for name := range state.diagnosticLayers {
 					diagnosticNames = append(diagnosticNames, name)
@@ -418,25 +422,30 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				}
 				diagnosticSelect.Refresh()
 				state.selectedChip = examineChipIndex(imgs, selectedExtVer, selectedChip)
+				if selectedPlaneID != "" {
+					for i, id := range ids {
+						if id == selectedPlaneID {
+							state.selectedChip = i
+							break
+						}
+					}
+				}
 				if state.selectedChip < 0 {
 					state.img = nil
 					return
 				}
 				state.img = imgs[state.selectedChip]
+				state.selectedPlaneID = ids[state.selectedChip]
+				if saved, ok := savedStates[state.selectedPlaneID]; ok {
+					applyExamineChannelState(state.img, saved)
+				}
 				if preserveStretch {
-					state.img.Mode = labelToMode(savedState.Mode)
-					state.img.Black = savedState.Black
-					state.img.White = savedState.White
-					state.img.Background = savedState.Background
-					state.img.Peak = savedState.Peak
-					state.img.ScaledPeak = savedState.ScaledPeak
-					state.img.MTFMidtone = savedState.MTFMidtone
-					state.img.ShowClip = savedState.ShowClip
+					applyExamineChannelState(state.img, savedState)
 				}
 				state.headerLines = utils.FormatHeadersLines(state.img.Primary, state.img.HDU.Header)
 				pathLabel.SetText(path)
 				if chipSelect != nil {
-					chipSelect.Options = examineChipLabels(state.images)
+					chipSelect.Options = examinePlaneLabels(state.images, state.planeIDs)
 					chipSelect.SetSelectedIndex(state.selectedChip)
 					if len(state.images) > 1 {
 						chipSelect.Enable()
@@ -461,6 +470,9 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			return
 		}
 		state.selectedChip = idx
+		if idx < len(state.planeIDs) {
+			state.selectedPlaneID = state.planeIDs[idx]
+		}
 		state.img = state.images[idx]
 		state.headerLines = utils.FormatHeadersLines(state.img.Primary, state.img.HDU.Header)
 		pathLabel.SetText(state.img.Path)
@@ -482,7 +494,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 			app.Preferences().SetString("lastDir", filepath.Dir(path))
 			loadFitsFromPath(path, false)
 		}, win)
-		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts", ".asdf"}))
 		if last := app.Preferences().String("lastDir"); last != "" {
 			uri := storage.NewFileURI(last)
 			if l, err := storage.ListerForURI(uri); err == nil {
@@ -496,7 +508,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 
 	reloadBtn.OnTapped = func() {
 		if state.img == nil || state.img.Path == "" {
-			dialog.ShowInformation("Reload", "Load a FITS file first.", win)
+			dialog.ShowInformation("Reload", "Load an image first.", win)
 			return
 		}
 		loadFitsFromPath(state.img.Path, true)
@@ -525,8 +537,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	})
 	sendToChannelBtn.SetToolTip("Send this image (with current values) to the selected Compose channel")
 
-	loadFitsBtn := ttwidget.NewButton("Load FITS", loadFits)
-	loadFitsBtn.SetToolTip("Open a FITS file from disk")
+	loadFitsBtn := ttwidget.NewButton("Load image", loadFits)
+	loadFitsBtn.SetToolTip("Open a FITS or JWST ASDF file from disk")
 	clearMeasureBtn := ttwidget.NewButton("Clear Measurement", clearMeasurement)
 	clearMeasureBtn.SetToolTip("Clear the current ruler measurement")
 
@@ -550,7 +562,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		container.NewHBox(autoBtn, autoMTFBtn, applyBtn),
 		container.NewHBox(magicBtn, magicPreset),
 		widget.NewSeparator(),
-		widget.NewLabel("SCI chip"),
+		widget.NewLabel("Image plane"),
 		chipSelect,
 		widget.NewLabel("Diagnostic layer"),
 		diagnosticSelect,
@@ -593,6 +605,8 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		img.Peak = img.White
 		state.img = img
 		state.images = nil
+		state.planeIDs = nil
+		state.selectedPlaneID = ""
 		state.selectedChip = 0
 		chipSelect.Options = nil
 		chipSelect.Disable()

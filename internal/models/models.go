@@ -1,6 +1,9 @@
 package models
 
 import (
+	"fmt"
+	"math"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/widget"
 
@@ -98,8 +101,107 @@ type ComposeProject struct {
 	// BlinkChannels stores the selected channel indices in compact project order.
 	// An omitted value preserves the legacy BlinkFilters/BlinkExcludedFilter
 	// behavior when loading older projects.
-	BlinkChannels    *[]int    `json:"blinkChannels,omitempty"`
-	BlinkChannelKeys *[]string `json:"blinkChannelKeys,omitempty"`
+	BlinkChannels    *[]int       `json:"blinkChannels,omitempty"`
+	BlinkChannelKeys *[]string    `json:"blinkChannelKeys,omitempty"`
+	PSF              PSFSettings  `json:"psf,omitempty"`
+	LRGB             LRGBSettings `json:"lrgb,omitempty"`
+	// CompositionMode selects how Compose maps loaded sources to RGB. An empty
+	// value is intentionally treated as artistic for legacy projects.
+	CompositionMode ComposeMode `json:"compositionMode,omitempty"`
+	// MixWeights is keyed by overlay BlinkID, rather than the overlay's sparse
+	// slot, so inserting/removing overlays does not retarget saved weights.
+	MixWeights []ComposeMixWeight `json:"mixWeights,omitempty"`
+}
+
+// ComposeMode controls the RGB composition strategy.
+type ComposeMode string
+
+const (
+	ComposeModeAuto     ComposeMode = "auto"
+	ComposeModeWeighted ComposeMode = "weighted"
+	ComposeModeArtistic ComposeMode = "artistic"
+)
+
+// Stable identities used by persisted weights for the three standard slots.
+const (
+	ComposeChannel1BlinkID = "channel-1"
+	ComposeChannel2BlinkID = "channel-2"
+	ComposeChannel3BlinkID = "channel-3"
+)
+
+// ResolveComposeMode applies the compatibility and Auto rules used by Compose.
+// Empty mode is legacy artistic behavior; Auto chooses weighted for four or
+// more sources and retains artistic behavior for smaller sets.
+func (p ComposeProject) ResolveComposeMode(sourceCount int) ComposeMode {
+	switch p.CompositionMode {
+	case ComposeModeWeighted:
+		return ComposeModeWeighted
+	case ComposeModeAuto:
+		if sourceCount >= 4 {
+			return ComposeModeWeighted
+		}
+	}
+	return ComposeModeArtistic
+}
+
+// ComposeMixWeight assigns a non-negative RGB contribution to one stable
+// overlay identity. BlinkID is empty only for the three standard channels.
+type ComposeMixWeight struct {
+	BlinkID string  `json:"blinkId,omitempty"`
+	Red     float64 `json:"red"`
+	Green   float64 `json:"green"`
+	Blue    float64 `json:"blue"`
+}
+
+func (w ComposeMixWeight) Validate() error {
+	if !isFiniteModelNumber(w.Red) || !isFiniteModelNumber(w.Green) || !isFiniteModelNumber(w.Blue) {
+		return fmt.Errorf("compose mix weights must be finite")
+	}
+	if w.Red < 0 || w.Green < 0 || w.Blue < 0 {
+		return fmt.Errorf("compose mix weights must be non-negative")
+	}
+	if w.Red == 0 && w.Green == 0 && w.Blue == 0 {
+		return fmt.Errorf("compose mix weight must contribute to at least one RGB channel")
+	}
+	return nil
+}
+
+func (p ComposeProject) ValidateMixWeights() error {
+	seen := make(map[string]struct{}, len(p.MixWeights))
+	for _, w := range p.MixWeights {
+		if w.BlinkID == "" {
+			return fmt.Errorf("compose mix weight BlinkID is required")
+		}
+		if _, ok := seen[w.BlinkID]; ok {
+			return fmt.Errorf("duplicate compose mix weight BlinkID %q", w.BlinkID)
+		}
+		seen[w.BlinkID] = struct{}{}
+		if err := w.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isFiniteModelNumber(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+
+// PSFSettings stores the optional cross-filter PSF matching recipe.
+type PSFSettings struct {
+	Enabled          bool    `json:"enabled,omitempty"`
+	TargetFWHMX      float64 `json:"targetFwhmX,omitempty"`
+	TargetFWHMY      float64 `json:"targetFwhmY,omitempty"`
+	ProtectSaturated bool    `json:"protectSaturated,omitempty"`
+	Saturation       float64 `json:"saturation,omitempty"`
+}
+
+// LRGBSettings stores the optional luminance recipe used by Compose.
+type LRGBSettings struct {
+	Enabled              bool         `json:"enabled,omitempty"`
+	DedicatedLPath       string       `json:"dedicatedLPath,omitempty"`
+	DedicatedLState      ChannelState `json:"dedicatedLState,omitempty"`
+	SyntheticWeights     [3]float64   `json:"syntheticWeights,omitempty"`
+	LuminanceWeight      float64      `json:"luminanceWeight,omitempty"`
+	ChrominanceSmoothing float64      `json:"chrominanceSmoothing,omitempty"`
 }
 
 type OrangeLayerState struct {

@@ -1,5 +1,52 @@
 # Disk-Backed Compose Completion Plan
 
+## Weighted multi-channel Compose plan
+
+This plan adds a simultaneous float32 weighted RGB mixer for four or more
+filters while retaining the existing three-channel-plus-artistic-overlay
+behavior for compatibility.
+
+1. [x] Add the persisted mix contract and pure weighted-composition engine.
+   - Files: `internal/models/models.go`, `internal/models/models_test.go`,
+     `internal/processing/weighted_compose.go`, and
+     `internal/processing/weighted_compose_test.go`.
+   - Add `auto`, `weighted`, and `artistic` composition modes. Legacy projects
+     with no mode retain artistic behavior. Define validated non-negative RGB
+     weights and a float32, order-independent mixer that normalizes channels,
+     sums all contributions simultaneously, and applies hue-preserving gamut
+     compression. No UI or renderer routing in this step.
+   - Tests: JSON migration/round trip, mode resolution, one-hot RGB identity,
+     exact four/five-channel mixtures, permutation invariance, invalid inputs,
+     and highlight-ratio preservation.
+
+2. [x] Route normal in-memory Compose through the weighted engine and preserve
+   LRGB precision/order.
+   - Files: `internal/processing/processing.go`, `internal/processing/lrgb.go`,
+     related tests, and `internal/ui/workspace_compose.go`.
+   - Keep artistic output byte-for-byte compatible. In weighted mode, align all
+     loaded base/extra channels to Channel 2, mix in float32, apply LRGB before
+     conversion to RGBA, and apply RGB levels last.
+
+3. [x] Add mode/weight controls, project plumbing, and filter-set defaults.
+   - Files: a focused Compose weight dialog, `workspace_compose.go`,
+     `compose_magic_batch.go`, their tests, and `docs/feature-list.md`.
+   - Auto selects weighted mode for four or more loaded sources; explicit
+     artistic stays artistic. Persist weight by overlay identity rather than
+     sparse index. Magic/manual custom colors seed editable weights.
+
+4. [ ] Add bounded disk-backed weighted composition and rendering parity.
+   - Files: `internal/processing/disk_compose.go`, its tests, and Compose large
+     store/UI wiring.
+   - Stream each aligned, normalized source into three transactional float32
+     accumulators, apply the same linked stretch/compression semantics, then
+     provide LRGB and RGB-level parity without materializing full frames.
+
+5. [ ] Complete regression, compatibility, and documentation validation.
+   - Test normal/disk parity for 3/4/5 filters, weights, transforms, LRGB,
+     export, project reload, cancellation, and order independence. Update the
+     feature list with Auto behavior, weighted mixing, artistic compatibility,
+     and disk support.
+
 ## Scope and non-negotiable architecture
 
 - Finish the existing `Compose Options > Large files` mode. It remains a persisted global preference (`compose.largeFiles`), creates a unique session below `<current working directory>/working/tmp`, and may be toggled only while all three standard channels and every colored overlay slot are empty.

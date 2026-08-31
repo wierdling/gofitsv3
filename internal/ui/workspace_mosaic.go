@@ -523,7 +523,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 	// ---- File loading -------------------------------------------------------
 
-	loadBtn := widget.NewButton("Add FITS", func() {
+	loadBtn := widget.NewButton("Add FITS / ASDF", func() {
 		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
 			if err != nil || r == nil {
 				return
@@ -533,14 +533,14 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			app.Preferences().SetString("lastDir", filepath.Dir(path))
 			ws.loadPaths([]string{path}, "Loading FITS")
 		}, win)
-		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts", ".asdf"}))
 		ws.configureLastDir(fd)
 		fd.SetView(dialog.ListView)
 		sizeFileDialog(fd)
 		fd.Show()
 	})
 
-	directoryBtn := widget.NewButton("Add FITS Directory", func() {
+	directoryBtn := widget.NewButton("Add FITS / ASDF Directory", func() {
 		fd := dialog.NewFolderOpen(func(listable fyne.ListableURI, err error) {
 			if err != nil || listable == nil {
 				return
@@ -626,15 +626,16 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						dateByPath[f.Path] = f.DateObs
 					}
 
-					type fileCheck struct {
-						path    string
-						checked bool
-					}
-					var fileChecks []fileCheck
+					var fileChecks []mosaicFilterBatchFileCheck
 					var checkBoxes []*widget.Check
+					var updatingChecks bool
 					checkContainer := container.NewVBox()
 					filesScroll := container.NewVScroll(checkContainer)
-					filesScroll.SetMinSize(fyne.NewSize(420, 220))
+					filesScroll.SetMinSize(fyne.NewSize(300, 200))
+					footprintPreview := newMosaicFilterPreview()
+					var previewGeneration uint64
+					var previewWindow fyne.Window
+					var refreshPreview func()
 
 					filteredFiles := func() []mosaic.FilterFile {
 						filter := mosaic.FacetValue(filterSelect.Selected)
@@ -732,29 +733,81 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						}
 					}
 
+					planPreview := func(selected []mosaicFilterBatchPreviewRequest) {
+						previewGeneration++
+						generation := previewGeneration
+						footprintPreview.loading()
+						go func() {
+							var inputs []mosaic.Input
+							loaded := make(map[string]bool, len(selected))
+							for _, request := range selected {
+								meta, err := mosaic.LoadInputsMetadataFromPath(request.path)
+								if err == nil {
+									inputs = append(inputs, meta...)
+									loaded[request.path] = true
+								}
+							}
+							scale := mosaic.ResolvePreviewScale(inputs, state.drizzleSettings.Scale, state.drizzleSettings.FinalScale)
+							groups, width, height, _ := mosaic.PlanFootprintPreview(inputs, scale)
+							byPath := make(map[string]mosaic.FootprintPreview, len(groups))
+							for _, group := range groups {
+								byPath[group.SourcePath] = group
+							}
+							orderedGroups := make([]mosaic.FootprintPreview, 0, len(selected))
+							for _, request := range selected {
+								group, ok := byPath[request.path]
+								if !loaded[request.path] || !ok {
+									group = mosaic.FootprintPreview{SourcePath: request.path, Status: "warning: metadata unavailable", Error: "unable to read WCS metadata"}
+								}
+								group.SourceNumber = request.sourceNumber
+								orderedGroups = append(orderedGroups, group)
+							}
+							fyne.Do(func() {
+								if generation == previewGeneration {
+									footprintPreview.show(orderedGroups, width, height)
+								}
+							})
+						}()
+					}
+
 					updateSelectedFiles := func() {
 						if updating {
 							return
 						}
 						paths := mosaic.MatchFiles(files, criteria())
-						fileChecks = make([]fileCheck, len(paths))
+						fileChecks = make([]mosaicFilterBatchFileCheck, len(paths))
 						checkBoxes = make([]*widget.Check, len(paths))
 						checkContainer.Objects = nil
 						for i, path := range paths {
 							i, path := i, path
-							fileChecks[i] = fileCheck{path: path, checked: true}
-							label := filepath.Base(path)
+							fileChecks[i] = mosaicFilterBatchFileCheck{path: path, checked: true}
+							label := fmt.Sprintf("%d. %s", i+1, filepath.Base(path))
 							if date := dateByPath[path]; date != "" {
 								label += "  —  " + date
 							}
 							chk := widget.NewCheck(label, func(v bool) {
 								fileChecks[i].checked = v
+								if !updatingChecks && filterPreviewRefreshRequests(previewWindow != nil, false, 1) > 0 && refreshPreview != nil {
+									refreshPreview()
+								}
 							})
 							chk.SetChecked(true)
 							checkBoxes[i] = chk
 							checkContainer.Add(chk)
 						}
 						checkContainer.Refresh()
+						requests := make([]mosaicFilterBatchPreviewRequest, len(paths))
+						for i, path := range paths {
+							requests[i] = mosaicFilterBatchPreviewRequest{path: path, sourceNumber: i + 1}
+						}
+						planPreview(requests)
+					}
+
+					refreshPreview = func() {
+						// Re-run metadata planning for the current list without rebuilding
+						// checkboxes, preserving the user's load selection.
+						selected := snapshotCheckedPaths(fileChecks)
+						planPreview(selected)
 					}
 
 					filterSelect.OnChanged = func(string) {
@@ -812,12 +865,17 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					updateSelectedFiles()
 
 					setAllFilesChecked := func(checked bool) {
+						updatingChecks = true
 						for i, chk := range checkBoxes {
 							if chk == nil {
 								continue
 							}
 							fileChecks[i].checked = checked
 							chk.SetChecked(checked)
+						}
+						updatingChecks = false
+						if filterPreviewRefreshRequests(previewWindow != nil, true, len(checkBoxes)) > 0 && refreshPreview != nil {
+							refreshPreview()
 						}
 					}
 
@@ -835,16 +893,41 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						)
 					}
 
-					content := container.NewVBox(
+					openPreviewBtn := widget.NewButton("Open Footprint Preview", func() {
+						if previewWindow == nil {
+							previewWindow = app.NewWindow("Drizzle Footprint Preview")
+							refreshBtn := widget.NewButton("Refresh Preview", func() {
+								if refreshPreview != nil {
+									refreshPreview()
+								}
+							})
+							previewWindow.SetContent(container.NewBorder(refreshBtn, nil, nil, nil, footprintPreview.root))
+							previewWindow.Resize(fyne.NewSize(900, 700))
+							previewWindow.SetOnClosed(func() { previewWindow = nil })
+						}
+						previewWindow.Show()
+						if refreshPreview != nil {
+							refreshPreview()
+						}
+					})
+
+					body := container.NewVBox(
 						widget.NewLabel("Filter the discovered calibrated _flc/_flt inputs (each facet is optional):"),
 						widget.NewForm(formItems...),
 						container.NewGridWithColumns(2,
 							widget.NewButton("Check All", func() { setAllFilesChecked(true) }),
 							widget.NewButton("Uncheck All", func() { setAllFilesChecked(false) }),
 						),
+						openPreviewBtn,
 						filesScroll,
 					)
+					// Scroll the complete form/body; the modal's native action row remains
+					// outside this scroller and is therefore always visible below it.
+					content := container.NewVScroll(body)
 					confirm := dialog.NewCustomConfirm("Load Filter Batch", "Load Files", "Cancel", content, func(ok bool) {
+						if previewWindow != nil {
+							previewWindow.Close()
+						}
 						if !ok {
 							return
 						}
@@ -866,7 +949,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						}
 						ws.loadPaths(paths, "Loading Filter Batch")
 					}, win)
-					confirm.Resize(fyne.NewSize(540, 480))
+					// Fit both 300px panes plus dialog padding without horizontal
+					// clipping; the body scrolls vertically below the native actions.
+					confirm.Resize(fyne.NewSize(720, 480))
 					confirm.Show()
 				})
 			}()

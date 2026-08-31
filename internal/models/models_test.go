@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
@@ -27,6 +28,32 @@ func TestComposeProjectBlinkChannelsRoundTrip(t *testing.T) {
 	}
 	if string(data) == "{}" {
 		t.Fatal("explicit empty blink selection was omitted")
+	}
+}
+
+func TestComposeMixSettingsRoundTripAndLegacyResolution(t *testing.T) {
+	project := ComposeProject{CompositionMode: ComposeModeWeighted, MixWeights: []ComposeMixWeight{{BlinkID: "overlay-7", Red: .2, Green: .5, Blue: 1}}}
+	var decoded ComposeProject
+	roundTripJSON(t, project, &decoded)
+	if decoded.CompositionMode != ComposeModeWeighted || len(decoded.MixWeights) != 1 || decoded.MixWeights[0].BlinkID != "overlay-7" {
+		t.Fatalf("mix settings = %+v, want weighted identity-preserving settings", decoded)
+	}
+	if (ComposeProject{}).ResolveComposeMode(5) != ComposeModeArtistic || (ComposeProject{CompositionMode: ComposeModeAuto}).ResolveComposeMode(3) != ComposeModeArtistic || (ComposeProject{CompositionMode: ComposeModeAuto}).ResolveComposeMode(4) != ComposeModeWeighted {
+		t.Fatal("legacy and auto composition mode resolution is incorrect")
+	}
+}
+
+func TestComposeMixWeightValidation(t *testing.T) {
+	for _, weight := range []ComposeMixWeight{{Red: -1}, {Green: math.NaN()}, {Blue: math.Inf(1)}, {}} {
+		if err := weight.Validate(); err == nil {
+			t.Fatalf("Validate(%+v) succeeded, want error", weight)
+		}
+	}
+	if err := (ComposeProject{MixWeights: []ComposeMixWeight{{BlinkID: "x", Red: 1}, {BlinkID: "x", Blue: 1}}}).ValidateMixWeights(); err == nil {
+		t.Fatal("duplicate BlinkID validation succeeded")
+	}
+	if err := (ComposeProject{MixWeights: []ComposeMixWeight{{Red: 1}}}).ValidateMixWeights(); err == nil {
+		t.Fatal("missing BlinkID validation succeeded")
 	}
 }
 

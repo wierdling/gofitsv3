@@ -156,3 +156,25 @@ func TestParseSIPPolyBoundsInvalidOrderAndCoefficients(t *testing.T) {
 		t.Fatalf("non-finite coefficient should be skipped, got %d", len(p.coeffs))
 	}
 }
+
+type testNativeGWCS struct{}
+
+func (testNativeGWCS) PixelToICRS(x, y float64) (float64, float64, error) {
+	return 10 + x*1e-3, 20 + y*2e-3, nil
+}
+
+func TestNewNativeGWCSMapperUsesNativePixels(t *testing.T) {
+	h := fitsio.Header{Cards: map[string]string{
+		"CRPIX1": "1", "CRPIX2": "1", "CRVAL1": "10", "CRVAL2": "20",
+		"CDELT1": "0.001", "CDELT2": "0.002", "CTYPE1": "RA---TAN", "CTYPE2": "DEC--TAN",
+	}}
+	m, err := NewNativeGWCSMapper(testNativeGWCS{}, h)
+	if err != nil {
+		t.Fatalf("NewNativeGWCSMapper: %v", err)
+	}
+	x, y := m.MapPixel(3, 4)
+	wantX := 3 * math.Cos(20*math.Pi/180)
+	if math.Abs(x-wantX) > 1e-8 || math.Abs(y-4) > 1e-8 {
+		t.Fatalf("native output=(%v,%v), want (%v,4)", x, y, wantX)
+	}
+}

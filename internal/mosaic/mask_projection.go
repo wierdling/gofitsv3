@@ -43,7 +43,10 @@ func NewDetectorOutputMapper(input, reference Input, geom MaskOutputGeometry) (*
 	if geom.Width <= 0 || geom.Height <= 0 {
 		return nil, fmt.Errorf("mask output geometry has invalid dimensions %dx%d", geom.Width, geom.Height)
 	}
-	mapper, err := processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, reference.HDU.Header)
+	// Keep mask projection on the same placement boundary as drizzle.  In
+	// particular, ASDF inputs must be evaluated through their native GWCS;
+	// flattening them to the FITS-like header silently loses field distortion.
+	mapper, err := newInputMapper(input, reference)
 	if err != nil {
 		return nil, err
 	}

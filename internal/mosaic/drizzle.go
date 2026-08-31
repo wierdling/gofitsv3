@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"gofitsv3/internal/astroio"
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/instrument"
@@ -69,6 +70,11 @@ type Input struct {
 	// decide automatically whether the pixels are total counts that must be
 	// divided by exposure time. Empty when the header has no BUNIT.
 	BUnit string
+	// NativeGWCS carries the calibrated detector-to-sky transform for ASDF
+	// inputs. It is intentionally separate from the FITS-like header used for
+	// the output TAN grid; nil means this is a normal FITS input.
+	NativeGWCS        astroio.PixelToICRS
+	NativeGWCSProfile string
 	// NormalizeExposure, when true, causes prepareFramePixels to convert this
 	// frame's SCI (and ERR) pixels to a rate (per-second) by multiplying by
 	// ExposureScale before any drizzle weighting. This is independent of
@@ -78,6 +84,58 @@ type Input struct {
 	// NormalizeExposure is set. Zero or non-finite disables normalization for the
 	// frame even when NormalizeExposure is true.
 	ExposureScale float64
+}
+
+// newInputMapper is the single placement boundary for Mosaic. Native GWCS is
+// evaluated directly; only FITS inputs use the header-based mapper.
+func newInputMapper(input, reference Input) (*processing.WCSMapper, error) {
+	if input.NativeGWCS != nil {
+		return processing.NewNativeGWCSMapper(input.NativeGWCS, reference.HDU.Header)
+	}
+	if reference.NativeGWCS != nil {
+		return nil, fmt.Errorf("cannot project FITS input onto a native GWCS reference")
+	}
+	return processing.NewWCSMapper(input.HDU.Header, input.D2IX, input.D2IY,
+		reference.HDU.Header, reference.D2IX, reference.D2IY)
+}
+
+func affineApproximationFromMapper(mapper *processing.WCSMapper) (processing.AffineTransform, error) {
+	if mapper == nil {
+		return processing.AffineTransform{}, fmt.Errorf("nil native mapper")
+	}
+	x00, y00 := mapper.MapPixel(0, 0)
+	x10, y10 := mapper.MapPixel(1, 0)
+	x01, y01 := mapper.MapPixel(0, 1)
+	for _, v := range []float64{x00, y00, x10, y10, x01, y01} {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return processing.AffineTransform{}, fmt.Errorf("native GWCS returned non-finite control point")
+		}
+	}
+	return processing.AffineTransform{A: x10 - x00, B: x01 - x00, C: x00, D: y10 - y00, E: y01 - y00, F: y00}, nil
+}
+
+// referenceAffinePair derives the compact transforms used only to move a
+// refinement solved in one reference frame into the primary reference frame.
+// Native inputs must be sampled through GWCS in both directions; header-only
+// ComputeWCSTransform would discard their nonlinear detector mapping.
+func referenceAffinePair(source, target Input) (processing.AffineTransform, processing.AffineTransform, error) {
+	forward, err := newInputMapper(source, target)
+	if err != nil {
+		return processing.AffineTransform{}, processing.AffineTransform{}, err
+	}
+	backward, err := newInputMapper(target, source)
+	if err != nil {
+		return processing.AffineTransform{}, processing.AffineTransform{}, err
+	}
+	w0toR, err := affineApproximationFromMapper(forward)
+	if err != nil {
+		return processing.AffineTransform{}, processing.AffineTransform{}, err
+	}
+	wRto0, err := affineApproximationFromMapper(backward)
+	if err != nil {
+		return processing.AffineTransform{}, processing.AffineTransform{}, err
+	}
+	return w0toR, wRto0, nil
 }
 
 // buildSeamMap replays accepted source samples one frame at a time and compares
@@ -1155,7 +1213,7 @@ func SortInputsByWCSDistance(inputs []Input, statuses []InputStatus) {
 			continue
 		}
 		rep := inputs[groups[g].indices[0]]
-		mapper, err := processing.NewWCSMapper(rep.HDU.Header, nil, nil, ref.HDU.Header, nil, nil)
+		mapper, err := newInputMapper(rep, ref)
 		if err == nil {
 			groups[g].x, groups[g].y = mapper.MapPixel(float64(rep.HDU.Data.Width)/2, float64(rep.HDU.Data.Height)/2)
 			groups[g].hasPos = true
@@ -1447,9 +1505,29 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	if isTweakReg {
 		catalogCap = 2000
 	}
-	candidateCatalogs := extractStarCatalogsForAlignment(inputs, catalogCap)
+	externalReference := isTweakReg && inputs[0].ReferenceOnly
+	caps := make([]int, len(inputs))
+	for i := range caps {
+		caps[i] = catalogCap
+	}
+	if externalReference {
+		// The external baseline is a multi-tile image. Keep its complete catalog
+		// once; each target below selects only its mapped local footprint.
+		caps[0] = 0
+	}
+	candidateCatalogs, _ := extractStarCatalogsForAlignmentCapsCtx(context.Background(), inputs, caps)
 	catalogs := candidateCatalogs
 	if isTweakReg {
+		// Keep target consensus selection unchanged. For an external multi-tile
+		// baseline, use a bounded voting view of the reference, but preserve its
+		// full catalog for the per-target footprint match below.
+		votingCatalogs := candidateCatalogs
+		if externalReference {
+			votingCatalogs = append([][]processing.Star(nil), candidateCatalogs...)
+			if len(votingCatalogs[0]) > catalogCap {
+				votingCatalogs[0] = processing.SelectSpatiallyDistributedStars(votingCatalogs[0], inputs[0].HDU.Data.Width, inputs[0].HDU.Data.Height, catalogCap)
+			}
+		}
 		projected := make([][]projectedCatalogDetection, len(inputs))
 		exposures := make([]string, len(inputs))
 		for i := range inputs {
@@ -1457,16 +1535,13 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			if exposures[i] == "" {
 				exposures[i] = inputs[i].Path
 			}
-			mapper, err := processing.NewWCSMapper(
-				inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
-				inputs[0].HDU.Header, inputs[0].D2IX, inputs[0].D2IY,
-			)
+			mapper, err := newInputMapper(inputs[i], inputs[0])
 			if err != nil {
 				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: consensus projection input[%d] %s failed: %v; using fallback catalog", i, InputKey(inputs[i]), err))
 				continue
 			}
-			projected[i] = make([]projectedCatalogDetection, 0, len(candidateCatalogs[i]))
-			for j, star := range candidateCatalogs[i] {
+			projected[i] = make([]projectedCatalogDetection, 0, len(votingCatalogs[i]))
+			for j, star := range votingCatalogs[i] {
 				x, y := mapper.MapPixel(star.X, star.Y)
 				if !finite(x) || !finite(y) {
 					continue
@@ -1475,7 +1550,10 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			}
 		}
 		var stats []alignmentConsensusStats
-		catalogs, stats = selectCrossFrameConsensusCatalogs(candidateCatalogs, projected, exposures, processing.TweakRegCatalogMaxStars, consensusMatchRadius)
+		catalogs, stats = selectCrossFrameConsensusCatalogs(votingCatalogs, projected, exposures, processing.TweakRegCatalogMaxStars, consensusMatchRadius)
+		if externalReference {
+			catalogs[0] = candidateCatalogs[0]
+		}
 		for i := range stats {
 			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: consensus input[%d] %s raw=%d corroborated=%d strong=%d selected=%d fallback=%t", i, InputKey(inputs[i]), stats[i].Candidates, stats[i].Corroborated, stats[i].Strong, stats[i].Selected, stats[i].Fallback))
 		}
@@ -1499,8 +1577,15 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			refCaches[r] = refCache{input: inputs[r]}
 			continue
 		}
-		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
-		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
+		var w0toR, wRto0 processing.AffineTransform
+		var err0, err1 error
+		if inputs[r].NativeGWCS != nil || inputs[0].NativeGWCS != nil {
+			w0toR, wRto0, err0 = referenceAffinePair(inputs[0], inputs[r])
+			err1 = err0
+		} else {
+			w0toR, err0 = processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
+			wRto0, err1 = processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
+		}
 		if err0 != nil || err1 != nil {
 			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: reference=%s WCS error: %v / %v", InputKey(inputs[r]), err0, err1))
 			refCaches[r] = refCache{input: inputs[r]}
@@ -1534,6 +1619,25 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				continue
 			}
 			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: matching source=%s reference=%s mode=%s", InputKey(inputs[i]), InputKey(rc.input), fitgeom))
+			var mapper *processing.WCSMapper
+			if isTweakReg {
+				var mapErr error
+				mapper, mapErr = newInputMapper(inputs[i], rc.input)
+				if mapErr != nil {
+					attemptErrors = append(attemptErrors, fmt.Sprintf("reference %s: WCSMapper: %v", InputKey(rc.input), mapErr))
+					continue
+				}
+			}
+			referenceStars := rc.stars
+			if externalReference && r == 0 {
+				local, footprintErr := referenceStarsForTarget(inputs[i], rc.input, mapper, rc.stars, searchRadiusArcsec)
+				if footprintErr != nil {
+					attemptErrors = append(attemptErrors, fmt.Sprintf("reference %s: %v", InputKey(rc.input), footprintErr))
+					continue
+				}
+				referenceStars = local
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: target=%s local reference stars=%d", InputKey(inputs[i]), len(referenceStars)))
+			}
 			var (
 				refinement processing.AffineTransform
 				stats      processing.AlignStats
@@ -1541,14 +1645,6 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			)
 			switch mode {
 			case AlignmentModeTweakRegRScale, AlignmentModeTweakRegGeneral:
-				mapper, mapErr := processing.NewWCSMapper(
-					inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
-					rc.input.HDU.Header, rc.input.D2IX, rc.input.D2IY,
-				)
-				if mapErr != nil {
-					err = fmt.Errorf("WCSMapper: %v", mapErr)
-					break
-				}
 				if processing.AlignmentDebugHook != nil {
 					// Debug visualization needs the actual pixels; reload the pair
 					// on demand so the common (non-debug) path stays pixel-free.
@@ -1564,7 +1660,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 						inputs[i].HDU.Data.Height,
 						mapper,
 						refPix,
-						rc.stars,
+						referenceStars,
 						rc.input.HDU.Data.Width,
 						rc.input.HDU.Data.Height,
 						rc.input.HDU.Header,
@@ -1575,7 +1671,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 					refinement, stats, err = processing.EstimateTweakRegAlignmentFromCatalogs(
 						catalogs[i],
 						mapper,
-						rc.stars,
+						referenceStars,
 						rc.input.HDU.Data.Width,
 						rc.input.HDU.Data.Height,
 						rc.input.HDU.Header,
@@ -1628,10 +1724,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		if e, seen := mapperCache[idx]; seen {
 			return e.m, e.ok
 		}
-		m, err := processing.NewWCSMapper(
-			inputs[idx].HDU.Header, inputs[idx].D2IX, inputs[idx].D2IY,
-			inputs[0].HDU.Header, inputs[0].D2IX, inputs[0].D2IY,
-		)
+		m, err := newInputMapper(inputs[idx], inputs[0])
 		e := mapperEntry{m: m, ok: err == nil}
 		mapperCache[idx] = e
 		return e.m, e.ok
@@ -2052,8 +2145,15 @@ func AlignInputsBySelectedStarsWithModeCtx(ctx context.Context, inputs []Input, 
 			refs[r] = refEntry{input: inputs[r]}
 			continue
 		}
-		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
-		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
+		var w0toR, wRto0 processing.AffineTransform
+		var err0, err1 error
+		if inputs[r].NativeGWCS != nil || inputs[0].NativeGWCS != nil {
+			w0toR, wRto0, err0 = referenceAffinePair(inputs[0], inputs[r])
+			err1 = err0
+		} else {
+			w0toR, err0 = processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
+			wRto0, err1 = processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
+		}
 		if err0 != nil || err1 != nil {
 			debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: reference=%s WCS error: %v / %v", InputKey(inputs[r]), err0, err1))
 			refs[r] = refEntry{input: inputs[r]}
@@ -2110,10 +2210,7 @@ func AlignInputsBySelectedStarsWithModeCtx(ctx context.Context, inputs []Input, 
 			)
 			switch mode {
 			case AlignmentModeTweakRegRScale, AlignmentModeTweakRegGeneral:
-				mapper, mapErr := processing.NewWCSMapper(
-					inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
-					ref.input.HDU.Header, ref.input.D2IX, ref.input.D2IY,
-				)
+				mapper, mapErr := newInputMapper(inputs[i], ref.input)
 				if mapErr != nil {
 					err = fmt.Errorf("WCSMapper: %v", mapErr)
 					break
@@ -2345,7 +2442,11 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 			// land undistorted, so a single multi-chip exposure's chips no
 			// longer line up (non-uniform chip gap, mismatched outer edges).
 			var mapperErr error
-			mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
+			if input.NativeGWCS != nil {
+				mapper, mapperErr = processing.NewNativeGWCSMapper(input.NativeGWCS, ref.HDU.Header)
+			} else {
+				mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
+			}
 			if mapperErr != nil {
 				statuses[idx].Status = "failed"
 				statuses[idx].Error = mapperErr.Error()
@@ -2358,7 +2459,11 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 			// This replaces the old chipPlacementTransform hack which stripped
 			// inter-chip rotation and produced a rotational offset in SCI[2].
 			var mapperErr error
-			mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
+			if input.NativeGWCS != nil {
+				mapper, mapperErr = processing.NewNativeGWCSMapper(input.NativeGWCS, ref.HDU.Header)
+			} else {
+				mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
+			}
 			if mapperErr != nil {
 				statuses[idx].Status = "failed"
 				statuses[idx].Error = mapperErr.Error()
@@ -2366,21 +2471,32 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 				continue
 			}
 
-			// Also compute a linear affine approximation for CR detection.
-			refToSource, wcsErr := processing.ComputeWCSTransform(input.HDU.Header, ref.HDU.Header)
+			// CR detection needs an affine only as a compact working coordinate
+			// hint; native inputs derive it from native mapper control points.
+			var refToSource processing.AffineTransform
+			var wcsErr error
+			if input.NativeGWCS != nil {
+				refToSource, wcsErr = affineApproximationFromMapper(mapper)
+			} else {
+				refToSource, wcsErr = processing.ComputeWCSTransform(input.HDU.Header, ref.HDU.Header)
+			}
 			if wcsErr != nil {
 				statuses[idx].Status = "failed"
 				statuses[idx].Error = wcsErr.Error()
 				debuglog.Log(fmt.Sprintf("planInputs: FAILED %s - WCSTransform: %v", InputKey(input), wcsErr))
 				continue
 			}
-			var invertErr error
-			transform, invertErr = processing.InvertAffineTransform(refToSource)
-			if invertErr != nil {
-				statuses[idx].Status = "failed"
-				statuses[idx].Error = invertErr.Error()
-				debuglog.Log(fmt.Sprintf("planInputs: FAILED %s - InvertAffine: %v", InputKey(input), invertErr))
-				continue
+			if input.NativeGWCS != nil {
+				transform = refToSource
+			} else {
+				var invertErr error
+				transform, invertErr = processing.InvertAffineTransform(refToSource)
+				if invertErr != nil {
+					statuses[idx].Status = "failed"
+					statuses[idx].Error = invertErr.Error()
+					debuglog.Log(fmt.Sprintf("planInputs: FAILED %s - InvertAffine: %v", InputKey(input), invertErr))
+					continue
+				}
 			}
 			statuses[idx].Status = "aligned"
 		}
@@ -2476,6 +2592,9 @@ func buildOutputHeader(ref, metaSource Input, width, height int, originX, origin
 	for _, key := range []string{
 		"END", "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "XTENSION", "PCOUNT", "GCOUNT", "EXTNAME", "EXTVER",
 		"CHECKSUM", "DATASUM", "BSCALE", "BZERO", "LTV1", "LTV2", "LTM1_1", "LTM2_2",
+		// GWCSMODEL is an input-loader marker for native ASDF transforms, not
+		// a valid description of the linear TAN output written by drizzle.
+		"GWCSMODEL",
 	} {
 		delete(cards, key)
 	}
@@ -3259,7 +3378,7 @@ func LooksLikeCal(path string) bool {
 // LooksLikeCalibratedInput reports whether path is a supported calibrated
 // science exposure: HST _flc/_flt or JWST _cal.
 func LooksLikeCalibratedInput(path string) bool {
-	return LooksLikeFLC(path) || LooksLikeCal(path)
+	return LooksLikeFLC(path) || LooksLikeCal(path) || strings.EqualFold(filepath.Ext(path), ".asdf")
 }
 
 func formatFloat(v float64) string {

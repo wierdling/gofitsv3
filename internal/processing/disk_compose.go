@@ -39,11 +39,14 @@ type DiskOverlay struct {
 // DiskComposeRequest describes a disk-backed RGB render. Output paths are
 // replaced atomically and are never retained by processing.
 type DiskComposeRequest struct {
-	Channels   [3]DiskChannel // B, G, R, matching Compose's channel ordering
-	Overlays   []DiskOverlay
-	Output     [3]string // R, G, B artifact paths
-	PreviewMax int
-	RGBLevels  *models.RgbLevels
+	Channels        [3]DiskChannel // B, G, R, matching Compose's channel ordering
+	Overlays        []DiskOverlay
+	Output          [3]string // R, G, B artifact paths
+	PreviewMax      int
+	RGBLevels       *models.RgbLevels
+	CompositionMode models.ComposeMode
+	MixWeights      []models.ComposeMixWeight
+	LRGB            models.LRGBSettings
 }
 
 type DiskComposeResult struct {
@@ -80,6 +83,9 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 	if w <= 0 || h <= 0 {
 		return DiskComposeResult{}, errors.New("invalid reference dimensions")
 	}
+	if req.LRGB.Enabled {
+		return DiskComposeResult{}, errors.New("disk-backed Compose does not support LRGB; disable LRGB or use normal Compose")
+	}
 	for i := range req.Output {
 		if req.Output[i] == "" {
 			return DiskComposeResult{}, fmt.Errorf("missing output path %d", i)
@@ -99,6 +105,15 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 				return DiskComposeResult{}, errors.New("disk Compose output overlaps an overlay artifact")
 			}
 		}
+	}
+	weightedSources := 3
+	for _, ov := range req.Overlays {
+		if ov.Channel.ArtifactPath != "" {
+			weightedSources++
+		}
+	}
+	if (models.ComposeProject{CompositionMode: req.CompositionMode}).ResolveComposeMode(weightedSources) == models.ComposeModeWeighted {
+		return composeDiskWeighted(ctx, req, w, h)
 	}
 	prepared := [3]string{}
 	stretchMeta := req.Channels[1].Image
@@ -195,7 +210,7 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 	if err := combineDiskChannels(ctx, prepared, staged, w, h); err != nil {
 		return DiskComposeResult{}, err
 	}
-	preview, stats, err := diskCompositePreviewForCompose(ctx, staged, w, h, req.PreviewMax, req.RGBLevels)
+	preview, stats, err := diskCompositePreviewForCompose(ctx, staged, w, h, req.PreviewMax, nil)
 	if err != nil {
 		return DiskComposeResult{}, err
 	}
@@ -226,6 +241,267 @@ func sameDiskPath(a, b string) bool {
 		return filepath.Clean(a) == filepath.Clean(b)
 	}
 	return strings.EqualFold(filepath.Clean(aa), filepath.Clean(bb))
+}
+
+// composeDiskWeighted accumulates every source directly into three bounded
+// float32 planes. Sources are opened and streamed one at a time; the output
+// destinations are not touched until all accumulation and preview work has
+// completed.
+func composeDiskWeighted(ctx context.Context, req DiskComposeRequest, w, h int) (DiskComposeResult, error) {
+	acc := [3]string{}
+	txs := [3]*fitsio.Float32ArtifactTransaction{}
+	cleanup := func() {
+		for i, tx := range txs {
+			if tx != nil {
+				_ = tx.Abort()
+			} else if acc[i] != "" {
+				_ = os.Remove(acc[i])
+			}
+		}
+	}
+	for c := range acc {
+		acc[c] = req.Output[c] + fmt.Sprintf(".weighted-%d", c)
+		var err error
+		txs[c], err = fitsio.BeginFloat32ArtifactTransaction(acc[c], w, h)
+		if err != nil {
+			cleanup()
+			return DiskComposeResult{}, err
+		}
+	}
+	zero := make([]float32, w)
+	for _, tx := range txs {
+		for y := 0; y < h; y++ {
+			if err := tx.Artifact().WriteRow(y, zero); err != nil {
+				cleanup()
+				return DiskComposeResult{}, err
+			}
+		}
+	}
+	for _, tx := range txs {
+		if err := tx.Commit(); err != nil {
+			cleanup()
+			return DiskComposeResult{}, err
+		}
+	}
+	defer func() {
+		for _, p := range acc {
+			_ = os.Remove(p)
+		}
+	}()
+
+	type weightedDiskSource struct {
+		channel  DiskChannel
+		id       string
+		settings models.OrangeLayerState
+	}
+	sources := make([]weightedDiskSource, 0, 3+len(req.Overlays))
+	ids := []string{models.ComposeChannel1BlinkID, models.ComposeChannel2BlinkID, models.ComposeChannel3BlinkID}
+	for i, channel := range req.Channels {
+		sources = append(sources, weightedDiskSource{channel: channel, id: ids[i]})
+	}
+	for _, ov := range req.Overlays {
+		if ov.Channel.ArtifactPath != "" {
+			id := ov.Settings.BlinkID
+			if id == "" {
+				id = fmt.Sprintf("overlay-%d", len(sources)-2)
+			}
+			sources = append(sources, weightedDiskSource{channel: ov.Channel, id: id, settings: ov.Settings})
+		}
+	}
+	lookup := make(map[string]models.ComposeMixWeight, len(req.MixWeights))
+	for _, weight := range req.MixWeights {
+		if err := weight.Validate(); err != nil {
+			return DiskComposeResult{}, err
+		}
+		if weight.BlinkID == "" {
+			return DiskComposeResult{}, errors.New("compose mix weight BlinkID is required")
+		}
+		lookup[weight.BlinkID] = weight
+	}
+	defaults := [][3]float64{{0, 0, 1}, {0, 1, 0}, {1, 0, 0}}
+	for i, source := range sources {
+		id := source.id
+		weight, ok := lookup[id]
+		if !ok {
+			if i < 3 {
+				weight = models.ComposeMixWeight{BlinkID: id, Red: defaults[i][0], Green: defaults[i][1], Blue: defaults[i][2]}
+			} else {
+				settings := source.settings
+				opacity := math.Max(0, math.Min(1, settings.Opacity))
+				weight = models.ComposeMixWeight{BlinkID: id, Red: float64(settings.ColorR) / 255 * opacity, Green: float64(settings.ColorG) / 255 * opacity, Blue: float64(settings.ColorB) / 255 * opacity}
+			}
+		}
+		if err := streamWeightedDiskSource(ctx, source.channel, req.Channels[1].Image, acc, weight, w, h); err != nil {
+			return DiskComposeResult{}, fmt.Errorf("weighted source %s: %w", id, err)
+		}
+	}
+	if err := compressDiskRGB(ctx, acc, w, h); err != nil {
+		return DiskComposeResult{}, fmt.Errorf("weighted compression: %w", err)
+	}
+	preview, stats, err := diskCompositePreviewForCompose(ctx, [3]string{acc[0], acc[1], acc[2]}, w, h, req.PreviewMax, nil)
+	if err != nil {
+		return DiskComposeResult{}, fmt.Errorf("weighted preview: %w", err)
+	}
+	if err := combineDiskChannels(ctx, [3]string{acc[2], acc[1], acc[0]}, req.Output, w, h); err != nil {
+		return DiskComposeResult{}, fmt.Errorf("weighted publish: %w", err)
+	}
+	step := 1
+	if w > req.PreviewMax || h > req.PreviewMax {
+		if w > h {
+			step = (w + req.PreviewMax - 1) / req.PreviewMax
+		} else {
+			step = (h + req.PreviewMax - 1) / req.PreviewMax
+		}
+	}
+	return DiskComposeResult{Preview: preview, PreviewWidth: (w + step - 1) / step, PreviewHeight: (h + step - 1) / step, Width: w, Height: h, Stats: stats}, nil
+}
+
+func streamWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.LoadedImage, acc [3]string, weight models.ComposeMixWeight, w, h int) error {
+	a, err := fitsio.OpenFloat32ArtifactReadOnly(src.ArtifactPath)
+	if err != nil {
+		return err
+	}
+	defer a.Close()
+	peak, cdf, err := calibrateWeightedDiskSource(ctx, src, ref, a, w, h)
+	if err != nil {
+		return err
+	}
+	outs := [3]*fitsio.Float32Artifact{}
+	for c, p := range acc {
+		outs[c], err = fitsio.OpenFloat32Artifact(p)
+		if err != nil {
+			for _, out := range outs {
+				if out != nil {
+					_ = out.Close()
+				}
+			}
+			return err
+		}
+		defer outs[c].Close()
+	}
+	sampler := newArtifactSampler(a)
+	rows := [3][]float32{make([]float32, w), make([]float32, w), make([]float32, w)}
+	weights := [3]float64{weight.Red, weight.Green, weight.Blue}
+	for y := 0; y < h; y++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for c := range rows {
+			if err := outs[c].ReadRow(y, rows[c]); err != nil {
+				return err
+			}
+		}
+		for x := 0; x < w; x++ {
+			fx, fy := mapDiskCoordinate(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, x, y, w, h, a.Width, a.Height)
+			v := float64(stretchDiskValue(sampler.sample(fx, fy), src.Image))
+			if peak > 0 {
+				v /= peak
+			}
+			if len(cdf) == 256 {
+				v = float64(cdf[int(clamp01(v)*255)])
+			}
+			for c := range rows {
+				rows[c][x] += float32(v * weights[c])
+			}
+		}
+		for c := range rows {
+			if err := outs[c].WriteRow(y, rows[c]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func calibrateWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.LoadedImage, a *fitsio.Float32Artifact, w, h int) (float64, []float32, error) {
+	sampler := newArtifactSampler(a)
+	peak := 0.0
+	hist := make([]int, 256)
+	for y := 0; y < h; y++ {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
+		for x := 0; x < w; x++ {
+			fx, fy := mapDiskCoordinate(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, x, y, w, h, a.Width, a.Height)
+			v := float64(stretchDiskValue(sampler.sample(fx, fy), src.Image))
+			if v > peak {
+				peak = v
+			}
+		}
+	}
+	if peak == 0 {
+		return 0, nil, nil
+	}
+	if src.Image.Mode != stretch.HistEq {
+		return peak, nil, nil
+	}
+	// HistEq's CDF is defined over the raw stretched samples. WeightedCompose
+	// then normalizes the CDF output by its own finite peak (normally 1).
+	sampler = newArtifactSampler(a)
+	for y := 0; y < h; y++ {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
+		for x := 0; x < w; x++ {
+			fx, fy := mapDiskCoordinate(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, x, y, w, h, a.Width, a.Height)
+			v := float64(stretchDiskValue(sampler.sample(fx, fy), src.Image))
+			hist[int(clamp01(v)*255)]++
+		}
+	}
+	cdf := make([]float32, 256)
+	total, sum := 0, 0
+	for _, n := range hist {
+		total += n
+	}
+	for i, n := range hist {
+		sum += n
+		if total > 0 {
+			cdf[i] = float32(float64(sum) / float64(total))
+		}
+	}
+	return 1, cdf, nil
+}
+
+func compressDiskRGB(ctx context.Context, paths [3]string, w, h int) error {
+	a := [3]*fitsio.Float32Artifact{}
+	for i, p := range paths {
+		var err error
+		a[i], err = fitsio.OpenFloat32Artifact(p)
+		if err != nil {
+			for _, x := range a {
+				if x != nil {
+					_ = x.Close()
+				}
+			}
+			return err
+		}
+		defer a[i].Close()
+	}
+	rows := [3][]float32{make([]float32, w), make([]float32, w), make([]float32, w)}
+	for y := 0; y < h; y++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for c := range a {
+			if err := a[c].ReadRow(y, rows[c]); err != nil {
+				return err
+			}
+		}
+		for x := 0; x < w; x++ {
+			m := math.Max(float64(rows[0][x]), math.Max(float64(rows[1][x]), float64(rows[2][x])))
+			if m > 1 {
+				for c := range rows {
+					rows[c][x] /= float32(m)
+				}
+			}
+		}
+		for c := range a {
+			if err := a[c].WriteRow(y, rows[c]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func prepareDiskChannel(ctx context.Context, src DiskChannel, ref, stretchMeta models.LoadedImage, dw, dh int, dst string, applyStretch bool) error {

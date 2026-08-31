@@ -21,6 +21,47 @@ type composeOverlayPreviewData struct {
 	filterText string
 }
 
+type composeGlobalMagicTarget struct {
+	index       int
+	image       models.LoadedImage
+	independent bool
+}
+
+type composeGlobalMagicResult struct {
+	index   int
+	image   models.LoadedImage
+	preview *composeOverlayPreviewData
+}
+
+func composeLoadRequestCurrent(currentSession, requestSession, currentRequest, request uint64) bool {
+	return currentSession == requestSession && currentRequest == request
+}
+
+// prepareComposeGlobalMagic applies the shared Magic operation to every loaded
+// channel and also prepares the independently displayed channel previews. The
+// caller publishes the complete result atomically on the UI thread.
+func prepareComposeGlobalMagic(ctx context.Context, targets []composeGlobalMagicTarget, preset processing.MagicPreset) ([]composeGlobalMagicResult, error) {
+	results := make([]composeGlobalMagicResult, len(targets))
+	for i, target := range targets {
+		if err := composeMagicCanceled(ctx); err != nil {
+			return nil, err
+		}
+		img := target.image
+		processing.ApplyMagicLevels(&img, preset)
+		processing.AutoMTFMidtone(&img)
+		result := composeGlobalMagicResult{index: target.index, image: img}
+		if target.independent {
+			preview, err := buildComposeOverlayPreviewData(ctx, &img)
+			if err != nil {
+				return nil, err
+			}
+			result.preview = preview
+		}
+		results[i] = result
+	}
+	return results, nil
+}
+
 func buildComposeOverlayPreviewData(ctx context.Context, img *models.LoadedImage) (*composeOverlayPreviewData, error) {
 	if err := composeMagicCanceled(ctx); err != nil {
 		return nil, err

@@ -184,7 +184,7 @@ func TestComposeDiskPreviewUsesRGBOutputOrderAndByteScaleLevels(t *testing.T) {
 		diskComposeTestChannel(paths[2]), // R
 	}
 	out := [3]string{filepath.Join(dir, "out-r.bin"), filepath.Join(dir, "out-g.bin"), filepath.Join(dir, "out-b.bin")}
-	levels := &models.RgbLevels{Max: [3]float64{255, 255, 255}}
+	levels := &models.RgbLevels{Min: [3]float64{0, 64, 128}, Max: [3]float64{255, 192, 255}}
 	got, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: channels, Output: out, PreviewMax: 1600, RGBLevels: levels})
 	if err != nil {
 		t.Fatal(err)
@@ -197,6 +197,43 @@ func TestComposeDiskPreviewUsesRGBOutputOrderAndByteScaleLevels(t *testing.T) {
 		if delta := int(got.Preview[c]) - int(want[c]); delta < -1 || delta > 1 {
 			t.Fatalf("preview channel %d = %d, want about %d", c, got.Preview[c], want[c])
 		}
+	}
+}
+
+func TestComposeDiskWeightedRejectsLRGB(t *testing.T) {
+	dir := t.TempDir()
+	paths := [3]string{filepath.Join(dir, "b.bin"), filepath.Join(dir, "g.bin"), filepath.Join(dir, "r.bin")}
+	for _, p := range paths {
+		writeDiskComposeFixture(t, p, .5)
+	}
+	out := [3]string{filepath.Join(dir, "r-out.bin"), filepath.Join(dir, "g-out.bin"), filepath.Join(dir, "b-out.bin")}
+	channels := [3]DiskChannel{diskComposeTestChannel(paths[0]), diskComposeTestChannel(paths[1]), diskComposeTestChannel(paths[2])}
+	for _, mode := range []models.ComposeMode{"", models.ComposeModeAuto, models.ComposeModeWeighted, models.ComposeModeArtistic} {
+		_, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: channels, CompositionMode: mode, LRGB: models.LRGBSettings{Enabled: true}, Output: out})
+		if err == nil || !strings.Contains(err.Error(), "does not support LRGB") {
+			t.Fatalf("mode %q error = %v, want actionable LRGB rejection", mode, err)
+		}
+	}
+}
+
+func TestComposeDiskWeightedKeepsDuplicateArtifactIdentities(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.bin")
+	dup := filepath.Join(dir, "duplicate.bin")
+	writeDiskComposeFixture(t, base, .2)
+	writeDiskComposeFixture(t, dup, .4)
+	ch := [3]DiskChannel{diskComposeTestChannel(base), diskComposeTestChannel(base), diskComposeTestChannel(base)}
+	out := [3]string{filepath.Join(dir, "r.bin"), filepath.Join(dir, "g.bin"), filepath.Join(dir, "b.bin")}
+	ovs := []DiskOverlay{{Channel: diskComposeTestChannel(dup), Settings: models.OrangeLayerState{BlinkID: "first"}}, {Channel: diskComposeTestChannel(dup), Settings: models.OrangeLayerState{BlinkID: "second"}}}
+	weights := []models.ComposeMixWeight{{BlinkID: models.ComposeChannel1BlinkID, Blue: 1}, {BlinkID: models.ComposeChannel2BlinkID, Green: 1}, {BlinkID: models.ComposeChannel3BlinkID, Red: 1}, {BlinkID: "first", Red: .25}, {BlinkID: "second", Green: .5}}
+	if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Overlays: ovs, CompositionMode: models.ComposeModeWeighted, MixWeights: weights, Output: out}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readDiskComposePixel(t, out[0]); math.Abs(float64(got-(1.25/1.5))) > 1e-5 {
+		t.Fatalf("red = %v, want normalized duplicate contribution", got)
+	}
+	if got := readDiskComposePixel(t, out[1]); math.Abs(float64(got-1)) > 1e-5 {
+		t.Fatalf("green = %v, want normalized duplicate contribution", got)
 	}
 }
 
@@ -277,5 +314,137 @@ func TestComposeDiskHistEqUsesSharedCDFAfterCalibratedAccumulation(t *testing.T)
 	}
 	if math.Abs(float64(row[0]-1)) > .02 || math.Abs(float64(row[1]-1)) > .02 {
 		t.Fatalf("shared HistEq row = %v, want [1 1] for edge-clipped fixture", row)
+	}
+}
+
+func TestComposeDiskWeightedStreamsAllSources(t *testing.T) {
+	dir := t.TempDir()
+	paths := [4]string{filepath.Join(dir, "b.bin"), filepath.Join(dir, "g.bin"), filepath.Join(dir, "r.bin"), filepath.Join(dir, "o.bin")}
+	for i, value := range []float32{.2, .4, .6, .8} {
+		writeDiskComposeFixture(t, paths[i], value)
+	}
+	channels := [3]DiskChannel{diskComposeTestChannel(paths[0]), diskComposeTestChannel(paths[1]), diskComposeTestChannel(paths[2])}
+	out := [3]string{filepath.Join(dir, "r-out.bin"), filepath.Join(dir, "g-out.bin"), filepath.Join(dir, "b-out.bin")}
+	result, err := ComposeDisk(context.Background(), DiskComposeRequest{
+		Channels: channels, CompositionMode: models.ComposeModeWeighted,
+		Overlays: []DiskOverlay{{Channel: diskComposeTestChannel(paths[3]), Settings: models.OrangeLayerState{BlinkID: "overlay-1"}}},
+		MixWeights: []models.ComposeMixWeight{
+			{BlinkID: models.ComposeChannel1BlinkID, Blue: 1},
+			{BlinkID: models.ComposeChannel2BlinkID, Green: 1},
+			{BlinkID: models.ComposeChannel3BlinkID, Red: 1},
+			{BlinkID: "overlay-1", Red: .25, Green: .5, Blue: .75},
+		},
+		Output: out, PreviewMax: 1600,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Width != 2 || result.Height != 2 {
+		t.Fatalf("weighted result dimensions = %dx%d", result.Width, result.Height)
+	}
+	for i, want := range []float32{float32(1.25 / 1.75), float32(1.5 / 1.75), 1} {
+		if got := readDiskComposePixel(t, out[[3]int{0, 1, 2}[i]]); math.Abs(float64(got-want)) > 1e-5 {
+			t.Errorf("weighted output channel %d = %v, want %v", i, got, want)
+		}
+	}
+}
+
+func TestComposeDiskWeightedMatchesNormalForThreeFourFiveSources(t *testing.T) {
+	dir := t.TempDir()
+	values := [][]float32{{.1, .8, .3, .6}, {.2, .7, .4, .9}, {.3, .6, .5, .8}, {.4, .5, .6, .7}, {.5, .4, .7, .6}}
+	weights := []models.ComposeMixWeight{{BlinkID: models.ComposeChannel1BlinkID, Blue: .7, Red: .2}, {BlinkID: models.ComposeChannel2BlinkID, Green: .8, Red: .1}, {BlinkID: models.ComposeChannel3BlinkID, Red: .9, Blue: .1}, {BlinkID: "overlay-1", Red: .3, Green: .6, Blue: .2}, {BlinkID: "overlay-2", Red: .5, Green: .1, Blue: .4}}
+	imgs := make([]*models.LoadedImage, 5)
+	channels := [3]DiskChannel{}
+	for i := range values {
+		path := filepath.Join(dir, fmt.Sprintf("source-%d.bin", i))
+		a, err := fitsio.CreateFloat32Artifact(path, 2, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.WriteRow(0, values[i][:2]); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.WriteRow(1, values[i][2:]); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Close(); err != nil {
+			t.Fatal(err)
+		}
+		imgs[i] = &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: append([]float32(nil), values[i]...)}}, Mode: stretch.Linear, Black: 0, White: 1, Background: 0, Peak: 1, ScaledPeak: 1}
+		if i < 3 {
+			channels[i] = DiskChannel{ArtifactPath: path, Image: *imgs[i]}
+			continue
+		}
+	}
+	for count := 3; count <= 5; count++ {
+		overlays := make([]OverlayLayer, 0, count-3)
+		diskOverlays := make([]DiskOverlay, 0, count-3)
+		for i := 3; i < count; i++ {
+			id := fmt.Sprintf("overlay-%d", i-2)
+			overlays = append(overlays, OverlayLayer{Image: imgs[i], Settings: models.OrangeLayerState{BlinkID: id}})
+			diskOverlays = append(diskOverlays, DiskOverlay{Channel: DiskChannel{ArtifactPath: filepath.Join(dir, fmt.Sprintf("source-%d.bin", i)), Image: *imgs[i]}, Settings: models.OrangeLayerState{BlinkID: id}})
+		}
+		normal, w, _, err := ComposeWeightedRGBPlanes(context.Background(), imgs[:3], overlays, weights)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := [3]string{filepath.Join(dir, fmt.Sprintf("r-%d.bin", count)), filepath.Join(dir, fmt.Sprintf("g-%d.bin", count)), filepath.Join(dir, fmt.Sprintf("b-%d.bin", count))}
+		if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: channels, Overlays: diskOverlays, CompositionMode: models.ComposeModeWeighted, MixWeights: weights, Output: out}); err != nil {
+			t.Fatal(err)
+		}
+		for c := 0; c < 3; c++ {
+			a, err := fitsio.OpenFloat32ArtifactReadOnly(out[c])
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := make([]float32, w)
+			if err := a.ReadRow(0, row); err != nil {
+				t.Fatal(err)
+			}
+			_ = a.Close()
+			if math.Abs(float64(row[0]-normal[c][0])) > 1e-5 {
+				t.Fatalf("%d-source channel %d = %v, normal %v", count, c, row[0], normal[c][0])
+			}
+		}
+	}
+}
+
+func TestComposeDiskWeightedHistEqMatchesNormal(t *testing.T) {
+	dir := t.TempDir()
+	vals := [][]float32{{.1, .8, .3, .6}, {.2, .7, .4, .9}, {.3, .6, .5, .8}}
+	imgs := make([]*models.LoadedImage, 3)
+	var channels [3]DiskChannel
+	weights := []models.ComposeMixWeight{{BlinkID: models.ComposeChannel1BlinkID, Blue: 1}, {BlinkID: models.ComposeChannel2BlinkID, Green: 1}, {BlinkID: models.ComposeChannel3BlinkID, Red: 1}}
+	for i := range vals {
+		p := filepath.Join(dir, fmt.Sprintf("hist-%d.bin", i))
+		a, err := fitsio.CreateFloat32Artifact(p, 2, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = a.WriteRow(0, vals[i][:2])
+		_ = a.WriteRow(1, vals[i][2:])
+		_ = a.Close()
+		imgs[i] = &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: append([]float32(nil), vals[i]...)}}, Mode: stretch.HistEq, Black: 0, White: 1, Background: 0, Peak: 1, ScaledPeak: 1}
+		channels[i] = DiskChannel{ArtifactPath: p, Image: *imgs[i]}
+	}
+	normal, _, _, err := ComposeWeightedRGBPlanes(context.Background(), imgs, nil, weights)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := [3]string{filepath.Join(dir, "hr.bin"), filepath.Join(dir, "hg.bin"), filepath.Join(dir, "hb.bin")}
+	if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: channels, CompositionMode: models.ComposeModeWeighted, MixWeights: weights, Output: out}); err != nil {
+		t.Fatal(err)
+	}
+	for c := range out {
+		a, err := fitsio.OpenFloat32ArtifactReadOnly(out[c])
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := make([]float32, 2)
+		_ = a.ReadRow(0, row)
+		_ = a.Close()
+		if math.Abs(float64(row[0]-normal[c][0])) > 1e-5 {
+			t.Fatalf("HistEq channel %d = %v, normal %v", c, row[0], normal[c][0])
+		}
 	}
 }

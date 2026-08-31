@@ -2,6 +2,7 @@ package processing
 
 import (
 	"context"
+	"fmt"
 	"image"
 	"math"
 	"runtime"
@@ -297,6 +298,100 @@ func ComposeRGBWithOverlays(ctx context.Context, imgs []*models.LoadedImage, ove
 		blendOverlayCtx(ctx, buf, ov.Image, ref, ov.Settings)
 	}
 	return buf, w, h, HistogramRGB(buf)
+}
+
+// ComposeWeightedRGBPlanes aligns and stretches all supplied sources to the
+// Channel 2 reference grid, then mixes them simultaneously in float32. The
+// standard channels use their stable channel identities; overlays use their
+// persisted BlinkID. This path is deliberately separate from the artistic
+// compositor so legacy output remains byte-for-byte compatible.
+func ComposeWeightedRGBPlanes(ctx context.Context, imgs []*models.LoadedImage, overlays []OverlayLayer, weights []models.ComposeMixWeight) ([3][]float32, int, int, error) {
+	var empty [3][]float32
+	if len(imgs) < 3 || imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+		return empty, 0, 0, fmt.Errorf("all three channels are required")
+	}
+	ref := imgs[1]
+	w, h := ref.HDU.Data.Width, ref.HDU.Data.Height
+	lookup := make(map[string]models.ComposeMixWeight, len(weights))
+	for _, weight := range weights {
+		if err := weight.Validate(); err != nil {
+			return empty, 0, 0, err
+		}
+		if weight.BlinkID == "" {
+			return empty, 0, 0, fmt.Errorf("compose mix weight BlinkID is required")
+		}
+		lookup[weight.BlinkID] = weight
+	}
+	standard := []struct {
+		image *models.LoadedImage
+		id    string
+		color [3]float64
+	}{
+		{imgs[2], models.ComposeChannel3BlinkID, [3]float64{1, 0, 0}},
+		{imgs[1], models.ComposeChannel2BlinkID, [3]float64{0, 1, 0}},
+		{imgs[0], models.ComposeChannel1BlinkID, [3]float64{0, 0, 1}},
+	}
+	sources := make([]WeightedComposeSource, 0, 3+len(overlays))
+	for _, item := range standard {
+		data := stretchForReferenceGrid(ctx, item.image, ref)
+		if err := ctx.Err(); err != nil {
+			return empty, 0, 0, err
+		}
+		weight, ok := lookup[item.id]
+		if !ok {
+			weight = models.ComposeMixWeight{BlinkID: item.id, Red: item.color[0], Green: item.color[1], Blue: item.color[2]}
+		}
+		sources = append(sources, WeightedComposeSource{BlinkID: item.id, Pixels: data.Pixels, Weights: weight})
+	}
+	for i, overlay := range overlays {
+		if overlay.Image == nil {
+			continue
+		}
+		id := overlay.Settings.BlinkID
+		if id == "" {
+			id = fmt.Sprintf("overlay-%d", i+1)
+		}
+		data := stretchForReferenceGrid(ctx, overlay.Image, ref)
+		if err := ctx.Err(); err != nil {
+			return empty, 0, 0, err
+		}
+		weight, ok := lookup[id]
+		if !ok {
+			opacity := overlay.Settings.Opacity
+			if opacity < 0 {
+				opacity = 0
+			} else if opacity > 1 {
+				opacity = 1
+			}
+			weight = models.ComposeMixWeight{BlinkID: id,
+				Red:   float64(overlay.Settings.ColorR) / 255 * opacity,
+				Green: float64(overlay.Settings.ColorG) / 255 * opacity,
+				Blue:  float64(overlay.Settings.ColorB) / 255 * opacity}
+			if weight.Red == 0 && weight.Green == 0 && weight.Blue == 0 {
+				continue
+			}
+		}
+		sources = append(sources, WeightedComposeSource{BlinkID: id, Pixels: data.Pixels, Weights: weight})
+	}
+	result, err := WeightedComposeRGB(ctx, sources, w, h)
+	return result, w, h, err
+}
+
+// Float32RGBToRGBA converts planar normalized RGB data to RGBA only after all
+// float-domain composition and luminance operations have completed.
+func Float32RGBToRGBA(rgb [3][]float32, width, height int) ([]byte, error) {
+	n := width * height
+	if width <= 0 || height <= 0 || len(rgb[0]) < n || len(rgb[1]) < n || len(rgb[2]) < n {
+		return nil, fmt.Errorf("invalid RGB dimensions")
+	}
+	out := make([]byte, n*4)
+	for i := 0; i < n; i++ {
+		out[i*4] = byte(utils.Clamp01(float64(rgb[0][i]))*255 + .5)
+		out[i*4+1] = byte(utils.Clamp01(float64(rgb[1][i]))*255 + .5)
+		out[i*4+2] = byte(utils.Clamp01(float64(rgb[2][i]))*255 + .5)
+		out[i*4+3] = 255
+	}
+	return out, nil
 }
 
 // blendOverlay combines a single tinted overlay image onto buf in place,

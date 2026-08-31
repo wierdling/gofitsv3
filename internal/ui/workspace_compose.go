@@ -29,6 +29,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"github.com/wierdling/gofiledialog"
 
+	"gofitsv3/internal/astroio"
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/export"
 	"gofitsv3/internal/fitsio"
@@ -55,6 +56,18 @@ var globalSelectComposeTab func()
 // globalComposeLargeCleanup is invoked by the application close handler.
 var globalComposeLargeCleanup func()
 var composeLargeModeActive func() bool
+
+type composeLRGBContextKey struct{}
+
+type composeLRGBSnapshot struct {
+	settings   models.LRGBSettings
+	dedicated  *models.LoadedImage
+	generation uint64
+}
+
+func composeLRGBPublishAllowed(currentGeneration, requestedGeneration uint64, currentPath, requestedPath string) bool {
+	return currentGeneration == requestedGeneration && currentPath == requestedPath
+}
 
 // maxOverlayLayers bounds how many colored overlay layers can exist at once.
 // imgs/origPixels are pre-allocated with room for the 3 RGB base channels plus
@@ -86,6 +99,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	viewports[3].histColor = [4]uint8{255, 255, 255, 255} // white (compose)
 	headerWins := make([]fyne.Window, 3)
 	levels := defaultRGBLevels()
+	psfSettings := models.PSFSettings{}
+	lrgbSettings := models.LRGBSettings{}
+	compositionMode := models.ComposeModeAuto
+	var mixWeights []models.ComposeMixWeight
+	var dedicatedL *models.LoadedImage
+	var lrgbMu sync.RWMutex
+	var lrgbGeneration uint64
 	var levelsWin *rgbLevelsWindow
 	var overlayLayers []*overlayLayer
 
@@ -96,6 +116,17 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var latestRGBStats [3]histogram.Stats
 	suspendRefresh := false
 	var composeRGB func(context.Context) ([]byte, int, int, [3]histogram.Stats, error)
+	applyDedicatedL := func(b []byte, w, h int, settings models.LRGBSettings, dedicated *models.LoadedImage) ([]byte, error) {
+		if !settings.Enabled || dedicated == nil || settings.LuminanceWeight <= 0 {
+			return b, nil
+		}
+		ld, _ := processing.ApplyStretchParallel(dedicated)
+		return processing.ApplyDedicatedLToRGBA(b, ld.Pixels, ld.Width, ld.Height, w, h, processing.LRGBConfig{
+			LuminanceWeight:      settings.LuminanceWeight,
+			ChrominanceSmoothing: settings.ChrominanceSmoothing,
+			SyntheticWeights:     settings.SyntheticWeights,
+		})
+	}
 	var composeChannelOffsetFields func(int) (float64, float64, float64, bool)
 	var previewMu sync.Mutex
 	previewSeq := 0
@@ -128,6 +159,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		defer largeMu.Unlock()
 		largeLoadGenerations[slot]++
 		return largeLoadGenerations[slot], largeSessionGeneration, largeStore
+	}
+	loadRequestStillCurrent := func(slot string, request, session uint64) bool {
+		largeMu.RLock()
+		defer largeMu.RUnlock()
+		return composeLoadRequestCurrent(largeSessionGeneration, session, largeLoadGenerations[slot], request)
 	}
 	largeLoadStillCurrent := func(slot string, request, session uint64, d composeArtifactDescriptor) bool {
 		largeMu.RLock()
@@ -231,6 +267,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		blinkPrepared = nil
 		blinkMu.Unlock()
 		previewMu.Unlock()
+		lrgbMu.RLock()
+		lrgbSnapshot := composeLRGBSnapshot{settings: lrgbSettings, dedicated: dedicatedL, generation: lrgbGeneration}
+		lrgbMu.RUnlock()
+		ctx = context.WithValue(ctx, composeLRGBContextKey{}, lrgbSnapshot)
 		imgSnapshot := append([]*models.LoadedImage(nil), imgs...)
 		if !largeMode {
 			imgSnapshot = renderImages()
@@ -552,11 +592,16 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					continue
 				}
 				if d, ok := largeArtifacts[l.idx]; ok {
-					ovs = append(ovs, processing.DiskOverlay{Channel: processing.DiskChannel{ArtifactPath: d.Path, Image: *imgs[l.idx]}, Settings: l.settings})
+					dx, dy, rot, _ := composeChannelOffsetFields(l.idx)
+					ovs = append(ovs, processing.DiskOverlay{Channel: processing.DiskChannel{ArtifactPath: d.Path, Image: *imgs[l.idx], OffsetX: dx, OffsetY: dy, OffsetRot: rot}, Settings: l.settings})
 				}
 			}
 			largeMu.RUnlock()
-			result, err := processing.ComposeDisk(ctx, processing.DiskComposeRequest{Channels: channels, Overlays: ovs, Output: outs, PreviewMax: 1600, RGBLevels: levels})
+			lrgbSnapshot := composeLRGBSnapshot{}
+			lrgbMu.RLock()
+			lrgbSnapshot.settings = lrgbSettings
+			lrgbMu.RUnlock()
+			result, err := processing.ComposeDisk(ctx, processing.DiskComposeRequest{Channels: channels, Overlays: ovs, Output: outs, PreviewMax: 1600, RGBLevels: levels, CompositionMode: compositionMode, MixWeights: append([]models.ComposeMixWeight(nil), mixWeights...), LRGB: lrgbSnapshot.settings})
 			if err != nil {
 				for _, p := range outs {
 					_ = os.Remove(p)
@@ -571,17 +616,99 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			}
 			return result.Preview, result.Width, result.Height, result.Stats, nil
 		}
-		var overlays []processing.OverlayLayer
+		lrgbMu.RLock()
+		lrgbSnapshot, hasLRGBSnapshot := ctx.Value(composeLRGBContextKey{}).(composeLRGBSnapshot)
+		if !hasLRGBSnapshot {
+			lrgbSnapshot = composeLRGBSnapshot{settings: lrgbSettings, dedicated: dedicatedL, generation: lrgbGeneration}
+		}
+		lrgbMu.RUnlock()
+		var weightedOverlays []processing.OverlayLayer
+		var artisticOverlays []processing.OverlayLayer
+		dedicated := lrgbSnapshot.dedicated
+		if dedicated == nil && lrgbSnapshot.settings.DedicatedLPath != "" {
+			img, err := loadImageFromPath(lrgbSnapshot.settings.DedicatedLPath)
+			if err != nil {
+				return nil, 0, 0, [3]histogram.Stats{}, fmt.Errorf("load dedicated luminance: %w", err)
+			}
+			applyChannelStateToImage(img, lrgbSnapshot.settings.DedicatedLState)
+			dedicated = img
+			lrgbMu.Lock()
+			if composeLRGBPublishAllowed(lrgbGeneration, lrgbSnapshot.generation, lrgbSettings.DedicatedLPath, lrgbSnapshot.settings.DedicatedLPath) {
+				dedicatedL = img
+			}
+			lrgbMu.Unlock()
+		}
+		composeSources := renderImages()
+		if psfSettings.Enabled {
+			composeSources = processing.ApplyPSFMatching(composeSources, processing.PSFTarget{FWHMX: psfSettings.TargetFWHMX, FWHMY: psfSettings.TargetFWHMY}, psfSettings.ProtectSaturated, psfSettings.Saturation)
+		}
 		for _, l := range overlayLayers {
-			if l.win != nil && l.idx < len(imgs) && imgs[l.idx] != nil {
-				overlays = append(overlays, processing.OverlayLayer{Image: imgs[l.idx], Settings: l.settings})
+			if l.win != nil {
+				if overlay, ok := transformedComposeOverlaySource(composeSources, l); ok {
+					weightedOverlays = append(weightedOverlays, overlay)
+				}
+				if overlay, ok := artisticComposeOverlaySource(imgs, l); ok {
+					artisticOverlays = append(artisticOverlays, overlay)
+				}
 			}
 		}
-		if len(overlays) > 0 {
-			b, w, h, s := processing.ComposeRGBWithOverlays(ctx, renderImages(), overlays)
+		weightedCount := 0
+		for i := 0; i < 3 && i < len(composeSources); i++ {
+			if composeSources[i] != nil {
+				weightedCount++
+			}
+		}
+		for _, overlay := range weightedOverlays {
+			if overlay.Image != nil {
+				weightedCount++
+			}
+		}
+		if (models.ComposeProject{CompositionMode: compositionMode}).ResolveComposeMode(weightedCount) == models.ComposeModeWeighted {
+			rgb, w, h, err := processing.ComposeWeightedRGBPlanes(ctx, composeSources, weightedOverlays, mixWeights)
+			if err != nil {
+				return nil, 0, 0, [3]histogram.Stats{}, err
+			}
+			if dedicated != nil && lrgbSnapshot.settings.Enabled && lrgbSnapshot.settings.LuminanceWeight > 0 {
+				ld := processing.StretchedImageDataForReferenceGrid(dedicated, composeSources[1])
+				planes, err := processing.ComposeLRGB(ctx, rgb[0], rgb[1], rgb[2], ld.Pixels, w, h, processing.LRGBConfig{
+					LuminanceWeight: lrgbSnapshot.settings.LuminanceWeight, ChrominanceSmoothing: lrgbSnapshot.settings.ChrominanceSmoothing,
+					SyntheticWeights: lrgbSnapshot.settings.SyntheticWeights, UseDedicatedLuminance: true,
+				})
+				if err != nil {
+					return nil, 0, 0, [3]histogram.Stats{}, err
+				}
+				rgb = [3][]float32{planes[:w*h], planes[w*h : 2*w*h], planes[2*w*h:]}
+			} else if lrgbSnapshot.settings.Enabled {
+				planes, err := processing.ComposeLRGB(ctx, rgb[0], rgb[1], rgb[2], nil, w, h, processing.LRGBConfig{
+					LuminanceWeight: lrgbSnapshot.settings.LuminanceWeight, ChrominanceSmoothing: lrgbSnapshot.settings.ChrominanceSmoothing,
+					SyntheticWeights: lrgbSnapshot.settings.SyntheticWeights,
+				})
+				if err != nil {
+					return nil, 0, 0, [3]histogram.Stats{}, err
+				}
+				rgb = [3][]float32{planes[:w*h], planes[w*h : 2*w*h], planes[2*w*h:]}
+			}
+			b, err := processing.Float32RGBToRGBA(rgb, w, h)
+			if err != nil {
+				return nil, 0, 0, [3]histogram.Stats{}, err
+			}
+			return b, w, h, processing.HistogramRGB(b), nil
+		}
+		if len(artisticOverlays) > 0 {
+			b, w, h, s := processing.ComposeRGBWithOverlays(ctx, composeSources, artisticOverlays)
+			if dedicated != nil {
+				b, _ = applyDedicatedL(b, w, h, lrgbSnapshot.settings, dedicated)
+			} else if lrgbSnapshot.settings.Enabled {
+				b = processing.ApplyLRGBToRGBA(b, w, h, processing.LRGBConfig{LuminanceWeight: lrgbSnapshot.settings.LuminanceWeight, ChrominanceSmoothing: lrgbSnapshot.settings.ChrominanceSmoothing, SyntheticWeights: lrgbSnapshot.settings.SyntheticWeights})
+			}
 			return b, w, h, s, nil
 		}
-		b, w, h, s := processing.ComposeRGB(ctx, renderImages())
+		b, w, h, s := processing.ComposeRGB(ctx, composeSources)
+		if dedicated != nil {
+			b, _ = applyDedicatedL(b, w, h, lrgbSnapshot.settings, dedicated)
+		} else if lrgbSnapshot.settings.Enabled {
+			b = processing.ApplyLRGBToRGBA(b, w, h, processing.LRGBConfig{LuminanceWeight: lrgbSnapshot.settings.LuminanceWeight, ChrominanceSmoothing: lrgbSnapshot.settings.ChrominanceSmoothing, SyntheticWeights: lrgbSnapshot.settings.SyntheticWeights})
+		}
 		return b, w, h, s, nil
 	}
 
@@ -812,13 +939,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var controlSets []*models.ChannelControl
 
 	loadChannel := func(idx int) {
-		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-			if err != nil || r == nil {
-				return
-			}
-
-			path := r.URI().Path()
-			app.Preferences().SetString("lastDir", filepath.Dir(path))
+		showSingleFITSOpenDialog(app, win, func(path string) {
 
 			progressDialog := dialog.NewCustom(
 				fmt.Sprintf("Loading Channel %d", idx+1),
@@ -891,18 +1012,82 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				})
 			}()
 
-		}, win)
+		})
+	}
 
+	// Dedicated L is intentionally an in-memory Compose input for now. Keeping
+	// it separate from the three color slots avoids treating it as an overlay
+	// while still giving it the same persisted ChannelState metadata.
+	loadDedicatedL := func() {
+		if largeMode {
+			dialog.ShowInformation("Dedicated L unavailable", "Dedicated luminance loading is not available in disk-backed Compose yet.", win)
+			return
+		}
+		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+			if err != nil || r == nil {
+				return
+			}
+			path := r.URI().Path()
+			app.Preferences().SetString("lastDir", filepath.Dir(path))
+			lrgbMu.Lock()
+			lrgbGeneration++
+			requestGeneration := lrgbGeneration
+			lrgbMu.Unlock()
+			progressDialog := dialog.NewCustom("Loading Dedicated L", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
+			progressDialog.Show()
+			go func() {
+				img, loadErr := loadImageFromPath(path)
+				if loadErr == nil && img.HDU.Data.Width <= 0 || loadErr == nil && img.HDU.Data.Height <= 0 {
+					loadErr = errors.New("dedicated luminance image has invalid dimensions")
+				}
+				if loadErr != nil {
+					fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(loadErr, win) })
+					return
+				}
+				fyne.Do(func() {
+					lrgbMu.Lock()
+					if lrgbGeneration != requestGeneration {
+						lrgbMu.Unlock()
+						progressDialog.Hide()
+						return
+					}
+					dedicatedL = img
+					lrgbSettings.DedicatedLPath = path
+					lrgbSettings.DedicatedLState = channelStateFromImage(img)
+					lrgbGeneration++
+					lrgbMu.Unlock()
+					if controlSets != nil {
+						refresh()
+					}
+					progressDialog.Hide()
+					if updateMenus != nil {
+						updateMenus()
+					}
+					refresh()
+				})
+			}()
+		}, win)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
 		if last := app.Preferences().String("lastDir"); last != "" {
-			uri := storage.NewFileURI(last)
-			if l, err := storage.ListerForURI(uri); err == nil {
+			if l, err := storage.ListerForURI(storage.NewFileURI(last)); err == nil {
 				fd.SetLocation(l)
 			}
 		}
 		fd.SetView(dialog.ListView)
 		sizeFileDialog(fd)
 		fd.Show()
+	}
+	clearDedicatedL := func() {
+		lrgbMu.Lock()
+		dedicatedL = nil
+		lrgbSettings.DedicatedLPath = ""
+		lrgbSettings.DedicatedLState = models.ChannelState{}
+		lrgbGeneration++
+		lrgbMu.Unlock()
+		refresh()
+		if updateMenus != nil {
+			updateMenus()
+		}
 	}
 
 	nextLayerNumber := 0
@@ -1034,12 +1219,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	loadLayer := func(l *overlayLayer) {
-		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-			if err != nil || r == nil {
-				return
-			}
-			path := r.URI().Path()
-			app.Preferences().SetString("lastDir", filepath.Dir(path))
+		showSingleFITSOpenDialog(app, win, func(path string) {
 			progressDialog := dialog.NewCustom("Loading Layer Image", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
 			progressDialog.Show()
 			diskLoad := largeMode
@@ -1060,12 +1240,20 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					img, loadErr = loadImageFromPath(path)
 				}
 				if loadErr != nil {
-					progressDialog.Hide()
-					dialog.ShowError(loadErr, win)
+					fyne.Do(func() {
+						progressDialog.Hide()
+						if loadRequestStillCurrent(slot, request, session) {
+							dialog.ShowError(loadErr, win)
+						}
+					})
 					return
 				}
 				if diskLoad && !largeLoadStillCurrent(slot, request, session, artifact) {
 					cleanupLargeArtifactIfCurrent(artifact)
+					return
+				}
+				if !diskLoad && !loadRequestStillCurrent(slot, request, session) {
+					fyne.Do(func() { progressDialog.Hide() })
 					return
 				}
 				if diskLoad {
@@ -1080,11 +1268,16 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					largeArtifacts[l.idx] = artifact
 					imgs[l.idx] = img
 					largeMu.Unlock()
-				} else {
-					imgs[l.idx] = img
 				}
-				clearComposeOrigPixels(&origPixels, l.idx)
 				fyne.Do(func() {
+					if !diskLoad {
+						if !loadRequestStillCurrent(slot, request, session) {
+							progressDialog.Hide()
+							return
+						}
+						imgs[l.idx] = img
+					}
+					clearComposeOrigPixels(&origPixels, l.idx)
 					if l.control != nil {
 						applyChannelState(l.idx, channelStateFromImage(img), imgs, layerViews(l), layerControls(l))
 					}
@@ -1095,17 +1288,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					}
 				})
 			}()
-		}, win)
-		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
-		if last := app.Preferences().String("lastDir"); last != "" {
-			uri := storage.NewFileURI(last)
-			if l, err := storage.ListerForURI(uri); err == nil {
-				fd.SetLocation(l)
-			}
-		}
-		fd.SetView(dialog.ListView)
-		sizeFileDialog(fd)
-		fd.Show()
+		})
 	}
 
 	removeLayer := func(l *overlayLayer) {
@@ -1117,9 +1300,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			}
 		}
 		if l.idx < len(imgs) {
+			// Invalidate every pending load, including normal in-memory loads,
+			// before removing the slot so a late completion cannot restore it.
+			invalidateLargeSlot(l.idx)
 			imgs[l.idx] = nil
 			if largeMode && largeStore != nil {
-				invalidateLargeSlot(l.idx)
 				largeMu.Lock()
 				store := largeStore
 				d := largeArtifacts[l.idx]
@@ -1414,12 +1599,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	addColoredLayer := func() {
-		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-			if err != nil || r == nil {
-				return
-			}
-			path := r.URI().Path()
-			app.Preferences().SetString("lastDir", filepath.Dir(path))
+		showSingleFITSOpenDialog(app, win, func(path string) {
 			progressDialog := dialog.NewCustom("Loading Layer Image", "Reading FITS data...", widget.NewProgressBarInfinite(), win)
 			progressDialog.Show()
 			diskLoad := largeMode
@@ -1480,17 +1660,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					}
 				})
 			}()
-		}, win)
-		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
-		if last := app.Preferences().String("lastDir"); last != "" {
-			uri := storage.NewFileURI(last)
-			if l, err := storage.ListerForURI(uri); err == nil {
-				fd.SetLocation(l)
-			}
-		}
-		fd.SetView(dialog.ListView)
-		sizeFileDialog(fd)
-		fd.Show()
+		})
 	}
 
 	// gatherLegendEntries snapshots the currently loaded base channels and the
@@ -1983,6 +2153,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			MeasureComposite:     measureEnabled,
 			BlinkFilters:         blinkCheck.Checked,
 			BlinkExcludedFilter:  blinkExcludedIdx,
+			PSF:                  psfSettings,
+			LRGB:                 lrgbSettings,
+			CompositionMode:      compositionMode,
+			MixWeights:           append([]models.ComposeMixWeight(nil), mixWeights...),
 		}
 		if blinkChannels != nil {
 			selection := append([]int(nil), blinkChannels...)
@@ -2091,6 +2265,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			var project models.ComposeProject
 			if err := json.Unmarshal(data, &project); err != nil {
 				dialog.ShowError(err, win)
+				return
+			}
+			if err := project.ValidateMixWeights(); err != nil {
+				dialog.ShowError(fmt.Errorf("invalid Compose mix weights: %w", err), win)
 				return
 			}
 
@@ -2325,6 +2503,14 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						}
 						sharedHistCheck.SetChecked(project.SharedHistogramScale)
 						buildCompositeCheck.SetChecked(!project.DisableComposite)
+						psfSettings = project.PSF
+						compositionMode = project.CompositionMode
+						mixWeights = append([]models.ComposeMixWeight(nil), project.MixWeights...)
+						lrgbMu.Lock()
+						dedicatedL = nil
+						lrgbSettings = project.LRGB
+						lrgbGeneration++
+						lrgbMu.Unlock()
 						if stopBlink != nil {
 							stopBlink()
 						}
@@ -4069,6 +4255,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 								return
 							}
 							layer := createOverlayLayerAt(slot, settings)
+							upsertComposeMixWeight(&mixWeights, composeWeightForColor(settings.BlinkID, color.NRGBA{R: settings.ColorR, G: settings.ColorG, B: settings.ColorB, A: 255}, settings.Opacity))
 							imgs[layer.idx] = x.img
 							largeArtifacts[layer.idx] = x.artifact
 							largePreviews[layer.idx] = x.preview
@@ -4145,6 +4332,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 							settings.ColorB = channel.Row.Color.B
 							settings.Open = true
 							layer := createOverlayLayerAt(custom.Slot, settings)
+							upsertComposeMixWeight(&mixWeights, composeWeightForColor(settings.BlinkID, color.NRGBA{R: settings.ColorR, G: settings.ColorG, B: settings.ColorB, A: 255}, settings.Opacity))
 							imgs[layer.idx] = channel.Image
 							clearComposeOrigPixels(&origPixels, layer.idx)
 							openOverlayLayerWindowWithPreview(layer, previews[channel.Image])
@@ -4300,6 +4488,35 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	}
 
 	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 Settings to 2 & 3", copySettings)
+	composeWeightSources := func() []composeWeightSource {
+		sources := make([]composeWeightSource, 0, 3+len(overlayLayers))
+		if imgs[0] != nil {
+			sources = append(sources, composeWeightSource{ID: models.ComposeChannel1BlinkID, Label: "Channel 1 (Blue)", Defaults: models.ComposeMixWeight{Blue: 1}})
+		}
+		if imgs[1] != nil {
+			sources = append(sources, composeWeightSource{ID: models.ComposeChannel2BlinkID, Label: "Channel 2 (Green)", Defaults: models.ComposeMixWeight{Green: 1}})
+		}
+		if imgs[2] != nil {
+			sources = append(sources, composeWeightSource{ID: models.ComposeChannel3BlinkID, Label: "Channel 3 (Red)", Defaults: models.ComposeMixWeight{Red: 1}})
+		}
+		for _, layer := range overlayLayers {
+			if layer == nil || layer.idx >= len(imgs) || imgs[layer.idx] == nil {
+				continue
+			}
+			id := layer.settings.BlinkID
+			if id == "" {
+				id = fmt.Sprintf("overlay-%d", layer.idx-2)
+			}
+			defaults := composeWeightForColor(id, color.NRGBA{R: layer.settings.ColorR, G: layer.settings.ColorG, B: layer.settings.ColorB, A: 255}, layer.settings.Opacity)
+			sources = append(sources, composeWeightSource{ID: id, Label: layer.name, Defaults: defaults})
+		}
+		return sources
+	}
+	showComposeWeights := func() {
+		sources := composeWeightSources()
+		showComposeWeightsDialog(win, &compositionMode, &mixWeights, sources, refresh)
+	}
+	composeWeightsItem := fyne.NewMenuItem("Color Mixing...", showComposeWeights)
 	matchStretchItem := fyne.NewMenuItem("Match Channel Stretch...", showMatchStretchDialog)
 	addLayerItem := fyne.NewMenuItem("Add Colored Layer...", addColoredLayer)
 	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
@@ -4307,6 +4524,17 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
 	cleanChannelsItem := fyne.NewMenuItem("Cross-Channel Clean", crossChannelClean)
 	resetDataItem := fyne.NewMenuItem("Reset Data (Undo Align & Clean)", resetData)
+	psfItem := fyne.NewMenuItem("Match Channel PSF...", func() { showComposePSFDialog(win, imgs, refresh, largeMode, &psfSettings) })
+	lrgbItem := fyne.NewMenuItem("LRGB Combination...", func() {
+		showComposeLRGBDialog(win, &lrgbSettings, func() {
+			lrgbMu.Lock()
+			lrgbGeneration++
+			lrgbMu.Unlock()
+			refresh()
+		}, &lrgbMu)
+	})
+	loadDedicatedLItem := fyne.NewMenuItem("Load Dedicated L...", loadDedicatedL)
+	clearDedicatedLItem := fyne.NewMenuItem("Clear Dedicated L", clearDedicatedL)
 
 	openLevels := func() {
 		if levelsWin == nil {
@@ -4337,6 +4565,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		copySettingsItem,
 		matchStretchItem,
 		normalizeScaleItem,
+		psfItem,
+		lrgbItem,
+		composeWeightsItem,
+		loadDedicatedLItem,
+		clearDedicatedLItem,
 		fyne.NewMenuItemSeparator(),
 		addLayerItem,
 	)
@@ -4605,6 +4838,27 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				targets = append(targets, target{idx: i, identity: img, image: snapshotLargeLoadedImage(img), d: d})
 			}
 			largeRuntime.mu.RUnlock()
+			ctx, cancel := context.WithCancel(context.Background())
+			finished := false
+			var progressDialog *dialog.CustomDialog
+			progressLabel := widget.NewLabel("Applying Magic + Auto MTF to loaded channels…")
+			cancelButton := widget.NewButton("Cancel", func() {
+				cancel()
+				if progressDialog != nil {
+					progressDialog.Hide()
+				}
+			})
+			progressDialog = dialog.NewCustomWithoutButtons("Magic", container.NewVBox(
+				progressLabel,
+				widget.NewProgressBarInfinite(), cancelButton,
+			), win)
+			progressDialog.SetOnClosed(func() {
+				if !finished {
+					cancel()
+				}
+			})
+			progressDialog.Show()
+			magicAll.Disable()
 			go func() {
 				largeRuntime.jobMu.Lock()
 				defer largeRuntime.jobMu.Unlock()
@@ -4617,9 +4871,23 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}
 				results := make([]result, 0, len(targets))
 				for _, target := range targets {
+					if err := composeMagicCanceled(ctx); err != nil {
+						fyne.Do(func() {
+							finished = true
+							progressDialog.Hide()
+							magicAll.Enable()
+						})
+						return
+					}
 					d := target.d
 					lease, err := fitsio.MaterializeFloat32ArtifactLease(d.Path)
 					if err != nil {
+						fyne.Do(func() {
+							finished = true
+							progressDialog.Hide()
+							magicAll.Enable()
+							dialog.ShowError(fmt.Errorf("prepare channel %d for Magic: %w", target.idx+1, err), win)
+						})
 						return
 					}
 					clone := target.image
@@ -4627,13 +4895,34 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					processing.ApplyMagicLevels(&clone, preset)
 					processing.AutoMTFMidtone(&clone)
 					lease.Release()
+					if err := composeMagicCanceled(ctx); err != nil {
+						fyne.Do(func() {
+							finished = true
+							progressDialog.Hide()
+							magicAll.Enable()
+						})
+						return
+					}
 					preview, _, _, err := composeLargeStretchedPreview(d.Path, &clone)
 					if err != nil {
+						fyne.Do(func() {
+							finished = true
+							progressDialog.Hide()
+							magicAll.Enable()
+							dialog.ShowError(fmt.Errorf("build channel %d Magic preview: %w", target.idx+1, err), win)
+						})
 						return
 					}
 					results = append(results, result{target.idx, target.identity, clone, preview, d})
 				}
 				fyne.Do(func() {
+					defer cancel()
+					if ctx.Err() != nil {
+						finished = true
+						progressDialog.Hide()
+						magicAll.Enable()
+						return
+					}
 					largeRuntime.mu.Lock()
 					for _, r := range results {
 						cur, ok := largeRuntime.artifacts[r.idx]
@@ -4645,6 +4934,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						identityOK := r.idx < len(imgs) && imgs[r.idx] == r.identity
 						if !ok || !storeOK || !identityOK || cur.Generation != r.d.Generation || cur.Path != r.d.Path || storeCur.Generation != r.d.Generation || storeCur.Path != r.d.Path {
 							largeRuntime.mu.Unlock()
+							finished = true
+							progressDialog.Hide()
+							magicAll.Enable()
 							return
 						}
 					}
@@ -4665,7 +4957,22 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					for _, item := range syncFns {
 						item.fn(item.img)
 					}
+					for _, r := range results {
+						if r.idx < len(controlSets) {
+							continue
+						}
+						for _, layer := range overlayLayers {
+							if layer != nil && layer.idx == r.idx && layer.viewport != nil {
+								layer.viewport.image.Image = r.preview
+								layer.viewport.image.Refresh()
+								break
+							}
+						}
+					}
 					refresh()
+					finished = true
+					progressDialog.Hide()
+					magicAll.Enable()
 				})
 			}()
 			return
@@ -4709,9 +5016,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		progressDialog.Show()
 		magicAll.Disable()
 		go func() {
-			results := make([]models.LoadedImage, len(targets))
-			for j, target := range targets {
-				if composeMagicCanceled(ctx) != nil {
+			prepared := make([]composeGlobalMagicTarget, len(targets))
+			for i, target := range targets {
+				prepared[i] = composeGlobalMagicTarget{index: target.idx, image: target.prepared, independent: target.idx >= len(controlSets)}
+			}
+			results, prepareErr := prepareComposeGlobalMagic(ctx, prepared, preset)
+			if prepareErr != nil {
+				if errors.Is(prepareErr, context.Canceled) {
 					fyne.Do(func() {
 						finished = true
 						if progressDialog != nil {
@@ -4721,10 +5032,15 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					})
 					return
 				}
-				clone := target.prepared
-				processing.ApplyMagicLevels(&clone, preset)
-				processing.AutoMTFMidtone(&clone)
-				results[j] = clone
+				fyne.Do(func() {
+					finished = true
+					if progressDialog != nil {
+						progressDialog.Hide()
+					}
+					magicAll.Enable()
+					dialog.ShowError(fmt.Errorf("prepare independent channel preview: %w", prepareErr), win)
+				})
+				return
 			}
 			fyne.Do(func() {
 				defer cancel()
@@ -4748,7 +5064,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}
 				withSuspendedRefresh(func() {
 					for j, target := range targets {
-						installMagicStretch(target.img, results[j])
+						result := results[j]
+						installMagicStretch(target.img, result.image)
 						if target.idx < len(controlSets) {
 							applyChannelState(target.idx, channelStateFromImage(target.img), imgs, viewports, controlSets)
 							continue
@@ -4756,6 +5073,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						for _, layer := range overlayLayers {
 							if layer != nil && layer.idx == target.idx && layer.control != nil && layer.viewport != nil {
 								applyChannelState(target.idx, channelStateFromImage(target.img), imgs, layerViews(layer), layerControls(layer))
+								if result.preview != nil {
+									applyLayerPreview(layer, result.preview)
+								}
 								break
 							}
 						}
@@ -4893,6 +5213,11 @@ func loadImagesFromPath(path string) (results []*models.LoadedImage, err error) 
 		}
 	}()
 
+	if decoder, matched, probeErr := astroio.DefaultRegistry.Probe(path); probeErr != nil {
+		return nil, probeErr
+	} else if matched && decoder.Name() == "ASDF" {
+		return loadASDFImages(path)
+	}
 	file, loadErr := fitsio.LoadFile(path)
 	if loadErr != nil {
 		return nil, loadErr
@@ -4928,6 +5253,40 @@ func loadImagesFromPath(path string) (results []*models.LoadedImage, err error) 
 		})
 	}
 	return results, nil
+}
+
+func loadASDFImages(path string) ([]*models.LoadedImage, error) {
+	source, err := astroio.Open(context.Background(), path)
+	if err != nil {
+		return nil, err
+	}
+	meta, err := source.Metadata(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	var info astroio.PlaneInfo
+	for _, candidate := range meta.Planes {
+		if candidate.ID == astroio.PlaneID("asdf:data") {
+			info = candidate
+			break
+		}
+	}
+	if info.ID == "" {
+		return nil, fmt.Errorf("ASDF file has no data plane")
+	}
+	plane, err := source.ReadPlane(context.Background(), info.ID, astroio.ReadOptions{})
+	if err != nil {
+		return nil, err
+	}
+	primary := fitsio.Header{Cards: meta.Cards}
+	data := fitsio.ImageData{Width: plane.Width, Height: plane.Height, Pixels: plane.Data}
+	minV, maxV := processing.AutoLevels(data.Pixels)
+	median, sigma := processing.EstimateBackground(data.Pixels)
+	peak := median + 10*sigma
+	if peak > maxV {
+		peak = maxV
+	}
+	return []*models.LoadedImage{{Path: path, HDU: fitsio.HDU{Header: primary, Data: data, ExtName: "data"}, Primary: primary, Mode: stretch.Linear, Black: minV, White: maxV, Background: median, Peak: peak, ScaledPeak: 10, ShowClip: true}}, nil
 }
 
 func loadImageFromPath(path string) (*models.LoadedImage, error) {
@@ -6707,6 +7066,20 @@ func defaultRGBLevels() *models.RgbLevels {
 
 func composeHasAllBaseChannels(imgs []*models.LoadedImage) bool {
 	return len(imgs) >= 3 && imgs[0] != nil && imgs[1] != nil && imgs[2] != nil
+}
+
+func transformedComposeOverlaySource(sources []*models.LoadedImage, layer *overlayLayer) (processing.OverlayLayer, bool) {
+	if layer == nil || layer.idx < 0 || layer.idx >= len(sources) || sources[layer.idx] == nil {
+		return processing.OverlayLayer{}, false
+	}
+	return processing.OverlayLayer{Image: sources[layer.idx], Settings: layer.settings}, true
+}
+
+func artisticComposeOverlaySource(sources []*models.LoadedImage, layer *overlayLayer) (processing.OverlayLayer, bool) {
+	if layer == nil || layer.idx < 0 || layer.idx >= len(sources) || sources[layer.idx] == nil {
+		return processing.OverlayLayer{}, false
+	}
+	return processing.OverlayLayer{Image: sources[layer.idx], Settings: layer.settings}, true
 }
 
 func composeCompositeDisabledStatus(buildComposite bool, imgs []*models.LoadedImage) string {

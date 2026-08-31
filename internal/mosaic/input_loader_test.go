@@ -6,8 +6,113 @@ import (
 	"path/filepath"
 	"testing"
 
+	"context"
+	"gofitsv3/internal/astroio"
 	"gofitsv3/internal/fitsio"
 )
+
+func TestLoadRealMIRIAsdfUsesNativeGWCS(t *testing.T) {
+	path := filepath.Join("..", "..", "TestImages", "asdf", "jw09548001001_02101_00001_mirimage_cal.asdf")
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("real ASDF fixture unavailable: %v", err)
+	}
+	inputs, err := LoadInputsMetadataFromPath(path)
+	if err != nil {
+		t.Fatalf("LoadInputsMetadataFromPath: %v", err)
+	}
+	if len(inputs) != 1 || inputs[0].NativeGWCS == nil {
+		t.Fatalf("inputs=%d native=%v, want one native GWCS input", len(inputs), len(inputs) == 1 && inputs[0].NativeGWCS != nil)
+	}
+	if inputs[0].HDU.Data.Width != 1032 || inputs[0].HDU.Data.Height != 1024 {
+		t.Fatalf("dimensions=%dx%d, want 1032x1024", inputs[0].HDU.Data.Width, inputs[0].HDU.Data.Height)
+	}
+	if inputs[0].NativeGWCSProfile != "MIRI/MIRIMAGE" || inputs[0].HDU.Header.Cards["GWCSMODEL"] != "MIRI_NATIVE_GWCS" {
+		t.Fatalf("native GWCS profile/marker = %q/%q, want MIRI/MIRIMAGE/MIRI_NATIVE_GWCS", inputs[0].NativeGWCSProfile, inputs[0].HDU.Header.Cards["GWCSMODEL"])
+	}
+	source, err := astroio.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("astroio.Open: %v", err)
+	}
+	meta, err := source.Metadata(context.Background())
+	if err != nil {
+		t.Fatalf("Metadata: %v", err)
+	}
+	mapper, err := newInputMapper(inputs[0], inputs[0])
+	if err != nil {
+		t.Fatalf("newInputMapper: %v", err)
+	}
+	if meta.NativeGWCS == nil || inputs[0].NativeGWCS == nil {
+		t.Fatal("native GWCS evaluator was not retained")
+	}
+	points := [][2]float64{{0, 0}, {512, 512}, {1031, 1023}}
+	mapped := make([][2]float64, len(points))
+	for i, point := range points {
+		x, y := mapper.MapPixel(point[0], point[1])
+		if math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
+			t.Fatalf("native map returned non-finite coordinates for pixel (%v,%v): (%v,%v)", point[0], point[1], x, y)
+		}
+		mapped[i] = [2]float64{x, y}
+	}
+	if mapped[0] == mapped[1] || mapped[1] == mapped[2] {
+		t.Fatalf("native map did not produce useful spatial variation: %#v", mapped)
+	}
+}
+
+func TestLoadRealNIRCamAsdfUsesNativeGWCS(t *testing.T) {
+	path := filepath.Join("..", "..", "TestImages", "asdf", "nircam", "jw09548002001_02101_00001_nrcb1_cal.asdf")
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("real ASDF fixture unavailable: %v", err)
+	}
+	inputs, err := LoadInputsMetadataFromPath(path)
+	if err != nil {
+		t.Fatalf("LoadInputsMetadataFromPath: %v", err)
+	}
+	if len(inputs) != 1 || inputs[0].NativeGWCS == nil || inputs[0].NativeGWCSProfile == "" {
+		t.Fatalf("inputs=%d native=%v profile=%q", len(inputs), len(inputs) == 1 && inputs[0].NativeGWCS != nil, inputs[0].NativeGWCSProfile)
+	}
+	if inputs[0].PrimaryHeader.Cards["GWCSMODEL"] != "NIRCAM_NATIVE_GWCS" || inputs[0].PrimaryHeader.Cards["DETECTOR"] != "NRCB1" {
+		t.Fatalf("NIRCam profile/header not retained: %+v", inputs[0].PrimaryHeader.Cards)
+	}
+}
+
+func TestASDFMosaicHeaderRequiresLinearWCS(t *testing.T) {
+	if _, err := asdfMosaicHeader(map[string]string{"CRPIX1": "1", "CRPIX2": "1", "CRVAL1": "1", "CRVAL2": "2", "CDELT1": "-0.00001"}); err == nil {
+		t.Fatal("asdfMosaicHeader accepted incomplete WCS")
+	}
+	h, err := asdfMosaicHeader(map[string]string{"CRPIX1": "1", "CRPIX2": "2", "CRVAL1": "10", "CRVAL2": "20", "CDELT1": "-0.00001", "CDELT2": "0.00001", "FILTER": "F200W"})
+	if err != nil {
+		t.Fatalf("asdfMosaicHeader: %v", err)
+	}
+	if h.Cards["CRVAL1"] != "10" || h.Cards["FILTER"] != "F200W" {
+		t.Fatalf("unexpected ASDF WCS header: %#v", h.Cards)
+	}
+}
+
+func TestASDFMosaicHeaderRejectsInvalidGeometryAndCarriesCTYPE(t *testing.T) {
+	base := map[string]string{"CRPIX1": "1", "CRPIX2": "2", "CRVAL1": "10", "CRVAL2": "20", "CDELT1": "-0.00001", "CDELT2": "0.00001", "CTYPE1": "RA---TAN", "CTYPE2": "DEC--TAN"}
+	h, err := asdfMosaicHeader(base)
+	if err != nil || h.Cards["CTYPE1"] != "RA---TAN" || h.Cards["CTYPE2"] != "DEC--TAN" {
+		t.Fatalf("header=%#v err=%v, want valid CTYPE cards", h.Cards, err)
+	}
+	for _, key := range []string{"CDELT1", "CRPIX1"} {
+		bad := map[string]string{}
+		for k, v := range base {
+			bad[k] = v
+		}
+		bad[key] = "NaN"
+		if _, err := asdfMosaicHeader(bad); err == nil {
+			t.Fatalf("accepted invalid %s", key)
+		}
+	}
+	singular := map[string]string{}
+	for k, v := range base {
+		singular[k] = v
+	}
+	singular["PC1_1"], singular["PC1_2"], singular["PC2_1"], singular["PC2_2"] = "1", "2", "2", "4"
+	if _, err := asdfMosaicHeader(singular); err == nil {
+		t.Fatal("accepted singular PC geometry")
+	}
+}
 
 func TestLoadInputsFromPathWFPC2FLTRealFiles(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join("..", "..", "TestImages", "WFPC2", "*_flt.fits"))

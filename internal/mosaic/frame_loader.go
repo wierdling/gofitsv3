@@ -37,11 +37,19 @@ func extractStarCatalogsForAlignment(inputs []Input, maxStars int) [][]processin
 }
 
 func extractStarCatalogsForAlignmentCtx(ctx context.Context, inputs []Input, maxStars int) ([][]processing.Star, error) {
+	caps := make([]int, len(inputs))
+	for i := range caps {
+		caps[i] = maxStars
+	}
+	return extractStarCatalogsForAlignmentCapsCtx(ctx, inputs, caps)
+}
+
+// extractStarCatalogsForAlignmentCapsCtx is the per-input variant used when a
+// ReferenceOnly baseline must retain every detected source. A zero cap means
+// uncapped; positive caps retain the existing bounded behavior.
+func extractStarCatalogsForAlignmentCapsCtx(ctx context.Context, inputs []Input, caps []int) ([][]processing.Star, error) {
 	if ctx == nil {
 		ctx = context.Background()
-	}
-	if maxStars <= 0 {
-		maxStars = processing.TweakRegCatalogMaxStars
 	}
 	catalogs := make([][]processing.Star, len(inputs))
 	workers := alignExtractionWorkers(inputs)
@@ -98,8 +106,12 @@ func extractStarCatalogsForAlignmentCtx(ctx context.Context, inputs []Input, max
 					errMu.Unlock()
 					return
 				}
-				catalogs[i] = processing.ExtractAndLimitStars(
-					sci, w, h, alignStarThresholdSigma, alignStarMinArea, maxStars)
+				maxStars := processing.TweakRegCatalogMaxStars
+				if i < len(caps) {
+					maxStars = caps[i]
+				}
+				catalogs[i] = processing.ExtractAndLimitStars(sci, w, h,
+					alignStarThresholdSigma, alignStarMinArea, maxStars)
 			}
 		}()
 	}

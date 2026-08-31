@@ -208,6 +208,12 @@ func selectSpatiallyDistributedStars(stars []Star, width, height, maxStars int) 
 	return selected
 }
 
+// SelectSpatiallyDistributedStars exposes the deterministic spatial cap used
+// by alignment callers that first select a local footprint.
+func SelectSpatiallyDistributedStars(stars []Star, width, height, maxStars int) []Star {
+	return selectSpatiallyDistributedStars(stars, width, height, maxStars)
+}
+
 func ExtractStars(pixels []float32, width, height int, thresholdSigma float64, minArea int) []Star {
 	median, sigma := EstimateBackground(pixels)
 	threshold := median + (thresholdSigma * sigma)

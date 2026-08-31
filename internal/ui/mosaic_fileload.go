@@ -28,6 +28,36 @@ import (
 // layouts allow content to grow and are used for different UI behavior.
 type mosaicFixedWidthLayout struct{ w float32 }
 
+type mosaicFilterBatchFileCheck struct {
+	path    string
+	checked bool
+}
+
+type mosaicFilterBatchPreviewRequest struct {
+	path         string
+	sourceNumber int
+}
+
+func snapshotCheckedPaths(checks []mosaicFilterBatchFileCheck) []mosaicFilterBatchPreviewRequest {
+	paths := make([]mosaicFilterBatchPreviewRequest, 0, len(checks))
+	for index, check := range checks {
+		if check.checked {
+			paths = append(paths, mosaicFilterBatchPreviewRequest{path: check.path, sourceNumber: index + 1})
+		}
+	}
+	return paths
+}
+
+func filterPreviewRefreshRequests(previewOpen, bulkUpdate bool, changed int) int {
+	if !previewOpen || changed <= 0 {
+		return 0
+	}
+	if bulkUpdate {
+		return 1
+	}
+	return changed
+}
+
 const mosaicInputNameColumnWidth = 320
 
 func (l *mosaicFixedWidthLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {

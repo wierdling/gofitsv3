@@ -110,6 +110,47 @@ func clampInt(v, lo, hi int) int {
 type WCSMapper struct {
 	sourceWCS linearWCS
 	refWCS    linearWCS
+	native    PixelToICRS
+}
+
+// PixelToICRS is the small format-neutral contract required to place a native
+// detector pixel on a sky-referenced output grid.  ASDF/GWCS implementations
+// may retain arbitrary calibrated distortion; callers must not flatten them
+// into a FITS header before mapping.
+type PixelToICRS interface {
+	PixelToICRS(x, y float64) (ra, dec float64, err error)
+}
+
+// NewNativeGWCSMapper constructs a mapper that evaluates the supplied native
+// detector-to-ICRS transform for every source pixel and projects the result
+// onto the reference image's linear TAN grid. The reference grid is only an
+// output coordinate system; the source transform is never approximated.
+func NewNativeGWCSMapper(native PixelToICRS, refHeader fitsio.Header) (*WCSMapper, error) {
+	if native == nil {
+		return nil, fmt.Errorf("native GWCS mapper is nil")
+	}
+	ref, err := parseLinearWCS(refHeader)
+	if err != nil {
+		return nil, err
+	}
+	ref.a, ref.b, ref.ap, ref.bp = sipPoly{}, sipPoly{}, sipPoly{}, sipPoly{}
+	ref.d2iX, ref.d2iY = nil, nil
+	return &WCSMapper{refWCS: ref, native: native}, nil
+}
+
+// NewNativeMIRIGWCSMapper compiles the observed JWST MIRI GWCS forward model
+// into a per-pixel detector-to-reference evaluator. The ASDF decoder supplies
+// the complete calibrated SIP coefficient surface from meta.wcsinfo; this
+// constructor is deliberately gated by the native marker so callers cannot
+// accidentally use a flattened header as an approximation for unknown GWCS.
+func NewNativeMIRIGWCSMapper(srcHeader, refHeader fitsio.Header) (*WCSMapper, error) {
+	if strings.TrimSpace(srcHeader.Cards["GWCSMODEL"]) != "MIRI_NATIVE_GWCS" {
+		return nil, fmt.Errorf("input does not contain the supported native MIRI GWCS model")
+	}
+	if !strings.Contains(strings.ToUpper(fitsio.HeaderString(srcHeader, "CTYPE1")), "TAN-SIP") || !strings.Contains(strings.ToUpper(fitsio.HeaderString(srcHeader, "CTYPE2")), "TAN-SIP") {
+		return nil, fmt.Errorf("native MIRI GWCS requires TAN-SIP celestial output terms")
+	}
+	return NewWCSMapperToLinearRef(srcHeader, nil, nil, refHeader)
 }
 
 // NewWCSMapper constructs a WCSMapper from headers and optional D2I tables.
@@ -154,6 +195,17 @@ func NewWCSMapperToLinearRef(srcHeader fitsio.Header, srcD2IX, srcD2IY *D2ITable
 // MapPixel maps a 0-indexed source pixel (x, y) to a 0-indexed reference
 // pixel using the full SIP + D2I pipeline.
 func (m *WCSMapper) MapPixel(x, y float64) (float64, float64) {
+	if m.native != nil {
+		ra, dec, err := m.native.PixelToICRS(x, y)
+		if err != nil || !isFinite64(ra) || !isFinite64(dec) {
+			return math.NaN(), math.NaN()
+		}
+		rx, ry, err := worldToPixelLinear(ra, dec, m.refWCS)
+		if err != nil {
+			return math.NaN(), math.NaN()
+		}
+		return rx, ry
+	}
 	ra, dec := pixelToWorldLinear(x, y, m.sourceWCS)
 	rx, ry, _ := worldToPixelLinear(ra, dec, m.refWCS)
 	return rx, ry
@@ -163,6 +215,17 @@ func (m *WCSMapper) MapPixel(x, y float64) (float64, float64) {
 // intermediate value through the full WCS pipeline. Useful for debugging
 // extreme or NaN outputs.
 func (m *WCSMapper) MapPixelDiag(x, y float64) (float64, float64, string) {
+	if m.native != nil {
+		ra, dec, err := m.native.PixelToICRS(x, y)
+		if err != nil {
+			return math.NaN(), math.NaN(), fmt.Sprintf("native GWCS pixel(%.1f,%.1f): %v", x, y, err)
+		}
+		rx, ry, mapErr := worldToPixelLinear(ra, dec, m.refWCS)
+		if mapErr != nil {
+			return math.NaN(), math.NaN(), fmt.Sprintf("native GWCS pixel(%.1f,%.1f) ICRS(%.9f,%.9f): %v", x, y, ra, dec, mapErr)
+		}
+		return rx, ry, fmt.Sprintf("native GWCS pixel(%.1f,%.1f) ICRS(%.9f,%.9f) output(%.6f,%.6f)", x, y, ra, dec, rx, ry)
+	}
 	src := m.sourceWCS
 	ref := m.refWCS
 

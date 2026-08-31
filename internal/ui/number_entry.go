@@ -88,8 +88,21 @@ func NewNumberEntry(step float64, decimals int) *NumberEntry {
 
 	n.entry = widget.NewEntry()
 	n.entry.OnChanged = func(s string) {
-		v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+		text := strings.TrimSpace(s)
+		v, err := strconv.ParseFloat(text, 64)
 		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			return
+		}
+		// Keep a typed negative zero intact while the user continues entering a
+		// negative fractional value (for example, "-0.001"). Canonicalizing it
+		// immediately would replace the text with "0.0000" and lose the minus.
+		if v == 0 && strings.HasPrefix(text, "-") && n.Min <= 0 && n.Max >= 0 {
+			if n.value != 0 {
+				n.value = 0
+				if n.OnChanged != nil {
+					n.OnChanged(0)
+				}
+			}
 			return
 		}
 		n.setValue(v, true)

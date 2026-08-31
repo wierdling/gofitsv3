@@ -15,6 +15,37 @@ func TestComposeCompositeDisabledStatusExplainsDisabledToggle(t *testing.T) {
 	}
 }
 
+func TestTransformedComposeOverlaySourceUsesRenderedImageAndSettings(t *testing.T) {
+	original := &models.LoadedImage{}
+	transformed := &models.LoadedImage{}
+	layer := &overlayLayer{idx: 3, settings: models.OrangeLayerState{BlinkID: "overlay-7", Opacity: .4}}
+	sources := []*models.LoadedImage{nil, nil, nil, transformed}
+	got, ok := transformedComposeOverlaySource(sources, layer)
+	if !ok || got.Image != transformed || got.Settings.BlinkID != "overlay-7" || got.Settings.Opacity != .4 {
+		t.Fatalf("overlay source = %#v, ok=%v; want transformed source and settings", got, ok)
+	}
+	if original == got.Image {
+		t.Fatal("overlay source unexpectedly used original image")
+	}
+	if _, ok := transformedComposeOverlaySource(sources, &overlayLayer{idx: 4}); ok {
+		t.Fatal("out-of-range overlay source succeeded")
+	}
+}
+
+func TestArtisticComposeOverlaySourceUsesRawImage(t *testing.T) {
+	raw := &models.LoadedImage{}
+	transformed := &models.LoadedImage{}
+	layer := &overlayLayer{idx: 3, settings: models.OrangeLayerState{BlinkID: "overlay-raw"}}
+	got, ok := artisticComposeOverlaySource([]*models.LoadedImage{nil, nil, nil, raw}, layer)
+	if !ok || got.Image != raw {
+		t.Fatal("artistic overlay source did not use raw image")
+	}
+	weighted, ok := transformedComposeOverlaySource([]*models.LoadedImage{nil, nil, nil, transformed}, layer)
+	if !ok || weighted.Image != transformed || weighted.Image == got.Image {
+		t.Fatal("weighted and artistic overlay source collections were not separated")
+	}
+}
+
 func TestApplyCrossChannelReplacementRowReplacesOnlyMarkedPixels(t *testing.T) {
 	row := []float32{1, 2, 3}
 	replacements := make([]byte, 12)

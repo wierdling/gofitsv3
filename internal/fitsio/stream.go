@@ -2,6 +2,7 @@ package fitsio
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,6 +14,114 @@ import (
 	"sync"
 	"sync/atomic"
 )
+
+// StreamHDUByIndex reads exactly one image HDU using a reusable row buffer.
+// The index is the physical HDU index, avoiding ambiguous extension names.
+func StreamHDUByIndex(ctx context.Context, path string, index int, each func(y int, values []float32, exactInt32 []int32) error) (Header, HDU, error) {
+	if index < 0 || each == nil {
+		return Header{}, HDU{}, fmt.Errorf("invalid HDU index %d", index)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return Header{}, HDU{}, err
+	}
+	defer f.Close()
+	var primary Header
+	var pos int64
+	for current := 0; ; current++ {
+		if err := ctx.Err(); err != nil {
+			return Header{}, HDU{}, err
+		}
+		if _, err := f.Seek(pos, io.SeekStart); err != nil {
+			return Header{}, HDU{}, err
+		}
+		hdr, n, err := readHeader(bufio.NewReaderSize(f, 64*1024))
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return Header{}, HDU{}, err
+		}
+		if current == 0 {
+			primary = hdr
+		}
+		dataOffset := pos + int64(n)
+		dataBytes, err := checkedImageDataBytes(hdr)
+		if err != nil {
+			return Header{}, HDU{}, err
+		}
+		if current == index {
+			if dataBytes == 0 {
+				return Header{}, HDU{}, fmt.Errorf("HDU index %d is not a supported image (NAXIS=%d BITPIX=%d)", index, parseInt(hdr.Cards["NAXIS"]), parseInt(hdr.Cards["BITPIX"]))
+			}
+			width, height := parseInt(hdr.Cards["NAXIS1"]), parseInt(hdr.Cards["NAXIS2"])
+			if _, err := f.Seek(dataOffset, io.SeekStart); err != nil {
+				return Header{}, HDU{}, err
+			}
+			reader := bufio.NewReaderSize(f, 64*1024)
+			bpp := dataBytes / (width * height)
+			raw, values, exact := make([]byte, width*bpp), make([]float32, width), make([]int32, 0)
+			if parseInt(hdr.Cards["BITPIX"]) == 32 {
+				exact = make([]int32, width)
+			}
+			for y := 0; y < height; y++ {
+				if err := ctx.Err(); err != nil {
+					return Header{}, HDU{}, err
+				}
+				if _, err := io.ReadFull(reader, raw); err != nil {
+					return Header{}, HDU{}, err
+				}
+				decodeRow(values, raw, parseInt(hdr.Cards["BITPIX"]))
+				if len(exact) > 0 {
+					for x := range exact {
+						exact[x] = int32(binary.BigEndian.Uint32(raw[x*4:]))
+					}
+				}
+				if err := each(y, values, exact); err != nil {
+					return Header{}, HDU{}, err
+				}
+			}
+			return primary, HDU{Header: hdr, ExtName: HeaderString(hdr, "EXTNAME"), Data: ImageData{Width: width, Height: height}}, nil
+		}
+		pos = dataOffset + int64(dataBytes+padding(dataBytes))
+	}
+	return primary, HDU{}, fmt.Errorf("HDU index %d not found in %s", index, path)
+}
+
+// LoadHDUByIndex decodes exactly one physical HDU, preserving its identity.
+func LoadHDUByIndex(path string, index int) (Header, HDU, error) {
+	var rows [][]float32
+	var exactRows [][]int32
+	primary, hdu, err := StreamHDUByIndex(context.Background(), path, index, func(y int, values []float32, exact []int32) error {
+		for len(rows) <= y {
+			rows = append(rows, nil)
+		}
+		rows[y] = append([]float32(nil), values...)
+		if len(exact) > 0 {
+			for len(exactRows) <= y {
+				exactRows = append(exactRows, nil)
+			}
+			exactRows[y] = append([]int32(nil), exact...)
+		}
+		return nil
+	})
+	if err != nil {
+		return primary, hdu, err
+	}
+	if hdu.Data.Width > 0 && hdu.Data.Height > 0 {
+		hdu.Data.Pixels = make([]float32, hdu.Data.Width*hdu.Data.Height)
+		for y := range rows {
+			copy(hdu.Data.Pixels[y*hdu.Data.Width:], rows[y])
+		}
+	}
+	if len(exactRows) > 0 {
+		hdu.Data.Int32Pixels = make([]int32, hdu.Data.Width*hdu.Data.Height)
+		for y := range exactRows {
+			copy(hdu.Data.Int32Pixels[y*hdu.Data.Width:], exactRows[y])
+		}
+	}
+	return primary, hdu, nil
+}
 
 // LoadSelectedHDU loads one image HDU and the primary header. An empty name
 // selects the primary HDU; otherwise name and (when non-empty) EXTVER must

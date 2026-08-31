@@ -1,12 +1,54 @@
 package fitsio
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 )
+
+func TestStreamHDUByIndexRejectsUnsupportedAndShortData(t *testing.T) {
+	unsupported := filepath.Join(t.TempDir(), "unsupported.fits")
+	bad := fitsHDU("SCI", "1", 1, 1, []float32{1}, nil)
+	// Replace BITPIX while retaining the valid header/data shape.
+	bad[80+10] = '9'
+	if err := os.WriteFile(unsupported, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := StreamHDUByIndex(context.Background(), unsupported, 0, func(int, []float32, []int32) error { return nil }); err == nil {
+		t.Fatal("unsupported BITPIX accepted")
+	}
+	short := fitsHDU("SCI", "1", 2, 1, []float32{1, 2}, nil)
+	short = short[:len(short)-2880+2]
+	path := filepath.Join(t.TempDir(), "short.fits")
+	if err := os.WriteFile(path, short, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := StreamHDUByIndex(context.Background(), path, 0, func(int, []float32, []int32) error { return nil }); err == nil {
+		t.Fatal("short payload accepted")
+	}
+}
+
+func TestStreamHDUByIndexHonorsMidStreamCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cancel.fits")
+	data := fitsHDU("SCI", "1", 1, 3, []float32{1, 2, 3}, nil)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, _, err := StreamHDUByIndex(ctx, path, 0, func(y int, _ []float32, _ []int32) error {
+		if y == 0 {
+			cancel()
+		}
+		return nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stream cancellation error = %v", err)
+	}
+}
 
 func TestCreateFloat32ArtifactOversizedPreservesDestination(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oversized.bin")
