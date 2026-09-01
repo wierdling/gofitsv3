@@ -212,6 +212,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
   - MTF, with midtone control.
   - GHS (Generalised Hyperbolic Stretch), with strength, local parameter, and symmetry/stretch-point controls.
 - Independent background, peak, scaled peak, black point, and white point.
+- Numeric level fields support precise decimal entry and reject malformed values while typing.
 - Optional lock between black/background and between white/peak controls.
 - Optional clipped-pixel display.
 - Per-channel Auto Scaling, Auto MTF, and Magic (Balanced, Nebula, Galaxy).
@@ -232,6 +233,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Builds a live RGB color composite from the three base channels, with optional simultaneous multi-channel mixing when additional filters are loaded.
 - Offers Auto, Weighted multi-channel, and Artistic overlays composition modes; Auto uses weighted mixing when four or more sources are loaded while retaining artistic behavior for three-filter sets.
 - Provides editable non-negative RGB contribution weights for every loaded base channel and overlay. Weights persist by stable overlay identity and filter-set custom colors seed their initial values.
+- Provides an editable wideband cross-mix preset (default 8%, bounded to 0–50%) that blends each blue/green/red base filter into neighboring color outputs while preserving overlay weights and selecting explicit Weighted mode.
 - Applies per-channel RGB output levels in a separate levels window.
 - Supports optional LRGB-style combination with a dedicated luminance FITS input or synthetic luminance from selected RGB filters, adjustable luminance contribution, and chrominance-only smoothing that preserves luminance detail. Dedicated-L and LRGB settings persist in Compose projects. Disk-backed Compose rejects enabled LRGB with an actionable error until bounded LRGB processing is available, preventing a silently different render.
 - Adds custom-colored layers with independently adjustable RGB tint, opacity, and highlight protection; overlays are blended into the composite.

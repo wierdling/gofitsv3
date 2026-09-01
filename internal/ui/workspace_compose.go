@@ -6078,7 +6078,7 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 
 	backgroundEntry := NewNumberEntry(0.001, 4)
 	peakEntry := NewNumberEntry(0.001, 4)
-	scaledPeakEntry := NewNumberEntry(1, 1)
+	scaledPeakEntry := NewNumberEntry(0.001, 4)
 
 	backgroundEntry.SetValue(0)
 	peakEntry.SetValue(1)

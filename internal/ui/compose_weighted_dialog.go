@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"image/color"
+	"math"
 	"strconv"
 	"strings"
 
@@ -100,6 +101,32 @@ func composeModeLabel(mode models.ComposeMode, sourceCount int) string {
 	return fmt.Sprintf("Effective mode: %s", label)
 }
 
+const defaultWidebandMixPercent = 8
+
+// applyWidebandComposeMixPreset applies a symmetric cross-channel mix to the
+// three standard channels. Overlay weights are intentionally left unchanged.
+func applyWidebandComposeMixPreset(mode *models.ComposeMode, weights []models.ComposeMixWeight, percent float64) ([]models.ComposeMixWeight, error) {
+	if math.IsNaN(percent) || math.IsInf(percent, 0) || percent < 0 || percent > 50 {
+		return nil, fmt.Errorf("wideband cross-mix percentage must be between 0 and 50")
+	}
+	s := percent / 100
+	preset := map[string]models.ComposeMixWeight{
+		models.ComposeChannel1BlinkID: {BlinkID: models.ComposeChannel1BlinkID, Green: s, Blue: 1 - s},
+		models.ComposeChannel2BlinkID: {BlinkID: models.ComposeChannel2BlinkID, Red: s, Green: 1 - 2*s, Blue: s},
+		models.ComposeChannel3BlinkID: {BlinkID: models.ComposeChannel3BlinkID, Red: 1 - s, Green: s},
+	}
+	updated := append([]models.ComposeMixWeight(nil), weights...)
+	for i := range updated {
+		if weight, ok := preset[updated[i].BlinkID]; ok {
+			updated[i] = weight
+		}
+	}
+	if mode != nil {
+		*mode = models.ComposeModeWeighted
+	}
+	return updated, nil
+}
+
 func showComposeWeightsDialog(win fyne.Window, mode *models.ComposeMode, weights *[]models.ComposeMixWeight, sources []composeWeightSource, onApply func()) {
 	if mode == nil || weights == nil {
 		return
@@ -118,6 +145,13 @@ func showComposeWeightsDialog(win fyne.Window, mode *models.ComposeMode, weights
 	effective := widget.NewLabel(composeModeLabel(currentMode, len(sources)))
 	rows := container.NewVBox()
 	entries := make([][3]*widget.Entry, len(sources))
+	refreshEntries := func() {
+		for i := range entries {
+			for c, entry := range entries[i] {
+				entry.SetText(strconv.FormatFloat([]float64{currentWeights[i].Red, currentWeights[i].Green, currentWeights[i].Blue}[c], 'g', 6, 64))
+			}
+		}
+	}
 	for i, source := range sources {
 		row := container.NewGridWithColumns(4, widget.NewLabel(source.Label))
 		for c, value := range []float64{currentWeights[i].Red, currentWeights[i].Green, currentWeights[i].Blue} {
@@ -146,14 +180,30 @@ func showComposeWeightsDialog(win fyne.Window, mode *models.ComposeMode, weights
 			disabled[weight.BlinkID] = composeMixWeightDisabled(weight)
 		}
 		currentWeights = defaultComposeMixWeights(sources)
-		for i := range entries {
+		for i := range currentWeights {
 			if disabled[currentWeights[i].BlinkID] {
 				currentWeights[i].Red, currentWeights[i].Green, currentWeights[i].Blue = 0, 0, 0
 			}
-			for c := range entries[i] {
-				entries[i][c].SetText(strconv.FormatFloat([]float64{currentWeights[i].Red, currentWeights[i].Green, currentWeights[i].Blue}[c], 'g', 6, 64))
-			}
 		}
+		refreshEntries()
+	})
+	widebandPercent := widget.NewEntry()
+	widebandPercent.SetText(strconv.Itoa(defaultWidebandMixPercent))
+	wideband := widget.NewButton("Apply wideband preset", func() {
+		percent, err := strconv.ParseFloat(strings.TrimSpace(widebandPercent.Text), 64)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("wideband cross-mix percentage must be between 0 and 50"), win)
+			return
+		}
+		updated, err := applyWidebandComposeMixPreset(&currentMode, currentWeights, percent)
+		if err != nil {
+			dialog.ShowError(err, win)
+			return
+		}
+		currentWeights = updated
+		modeSelect.SetSelected("Weighted multi-channel")
+		refreshEntries()
+		effective.SetText(composeModeLabel(currentMode, len(sources)))
 	})
 	var d *dialog.CustomDialog
 	apply := widget.NewButton("Apply", func() {
@@ -189,7 +239,8 @@ func showComposeWeightsDialog(win fyne.Window, mode *models.ComposeMode, weights
 	})
 	cancel := widget.NewButton("Cancel", func() { d.Hide() })
 	header := container.NewGridWithColumns(4, widget.NewLabel("Source"), widget.NewLabel("Red"), widget.NewLabel("Green"), widget.NewLabel("Blue"))
-	content := container.NewBorder(container.NewVBox(widget.NewForm(widget.NewFormItem("Mode", modeSelect)), effective, header), container.NewGridWithColumns(3, reset, cancel, apply), nil, nil, container.NewVScroll(rows))
+	widebandForm := widget.NewForm(widget.NewFormItem("Cross-mix % (s)", widebandPercent), widget.NewFormItem("Preset", wideband))
+	content := container.NewBorder(container.NewVBox(widget.NewForm(widget.NewFormItem("Mode", modeSelect)), effective, widebandForm, header), container.NewGridWithColumns(3, reset, cancel, apply), nil, nil, container.NewVScroll(rows))
 	d = dialog.NewCustomWithoutButtons("Compose color mixing", content, win)
 	d.Resize(fyne.NewSize(640, 420))
 	d.Show()

@@ -68,12 +68,14 @@ type NumberEntry struct {
 	Min float64
 	Max float64
 
-	value    float64
-	entry    *widget.Entry
-	upBtn    *chevronBtn
-	downBtn  *chevronBtn
-	clearBtn *widget.Button
-	content  *fyne.Container
+	value       float64
+	lastText    string
+	settingText bool
+	entry       *widget.Entry
+	upBtn       *chevronBtn
+	downBtn     *chevronBtn
+	clearBtn    *widget.Button
+	content     *fyne.Container
 }
 
 // NewNumberEntry creates a NumberEntry with the given step size and decimal places.
@@ -89,10 +91,25 @@ func NewNumberEntry(step float64, decimals int) *NumberEntry {
 	n.entry = widget.NewEntry()
 	n.entry.OnChanged = func(s string) {
 		text := strings.TrimSpace(s)
-		v, err := strconv.ParseFloat(text, 64)
-		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		if n.settingText {
 			return
 		}
+		if !validNumberText(text) {
+			n.setEntryText(n.lastText)
+			return
+		}
+		// Keep syntactically valid intermediate input (such as "-", ".", or
+		// "1.") visible while the user is still typing.
+		if isIntermediateNumberText(text) {
+			n.lastText = text
+			return
+		}
+		v, err := strconv.ParseFloat(text, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			n.setEntryText(n.lastText)
+			return
+		}
+		n.lastText = text
 		// Keep a typed negative zero intact while the user continues entering a
 		// negative fractional value (for example, "-0.001"). Canonicalizing it
 		// immediately would replace the text with "0.0000" and lose the minus.
@@ -105,7 +122,7 @@ func NewNumberEntry(step float64, decimals int) *NumberEntry {
 			}
 			return
 		}
-		n.setValue(v, true)
+		n.setManualValue(v, true)
 	}
 
 	// Chevron size: 45% of entry height each, width proportional to the SVG aspect (12:8).
@@ -133,6 +150,68 @@ func NewNumberEntry(step float64, decimals int) *NumberEntry {
 
 	n.syncText()
 	return n
+}
+
+func validNumberText(text string) bool {
+	if text == "" {
+		return true
+	}
+	if text[0] == '+' || text[0] == '-' {
+		text = text[1:]
+	}
+	if text == "" {
+		return true
+	}
+	e := strings.IndexAny(text, "eE")
+	if e >= 0 {
+		if strings.IndexAny(text[e+1:], "eE") >= 0 {
+			return false
+		}
+		exponent := text[e+1:]
+		if len(exponent) > 0 && (exponent[0] == '+' || exponent[0] == '-') {
+			exponent = exponent[1:]
+		}
+		if exponent != "" {
+			for _, r := range exponent {
+				if r < '0' || r > '9' {
+					return false
+				}
+			}
+		}
+		text = text[:e]
+	}
+	digits, dots := 0, 0
+	for _, r := range text {
+		switch {
+		case r >= '0' && r <= '9':
+			digits++
+		case r == '.':
+			dots++
+		default:
+			return false
+		}
+	}
+	return dots <= 1 && (digits > 0 || dots == 1)
+}
+
+func isIntermediateNumberText(text string) bool {
+	if text == "" || text == "+" || text == "-" || text == "." || text == "+." || text == "-." {
+		return true
+	}
+	signless := text
+	if signless[0] == '+' || signless[0] == '-' {
+		signless = signless[1:]
+	}
+	e := strings.IndexAny(signless, "eE")
+	if e < 0 {
+		return false
+	}
+	exponent := signless[e+1:]
+	mantissa := signless[:e]
+	if !validNumberText(mantissa) || exponent == "" {
+		return true
+	}
+	return (exponent == "+" || exponent == "-")
 }
 
 // Value returns the current numeric value.
@@ -175,6 +254,31 @@ func (n *NumberEntry) setValue(v float64, notify bool) {
 	}
 }
 
+func (n *NumberEntry) setManualValue(v float64, notify bool) {
+	original := v
+	if v < n.Min {
+		v = n.Min
+	} else if v > n.Max {
+		v = n.Max
+	}
+	if v == 0 {
+		v = 0
+	}
+	if n.value == v {
+		if original != v {
+			n.syncText()
+		}
+		return
+	}
+	n.value = v
+	if original != v {
+		n.syncText()
+	}
+	if notify && n.OnChanged != nil {
+		n.OnChanged(v)
+	}
+}
+
 // Disable prevents user interaction.
 func (n *NumberEntry) Disable() {
 	n.entry.Disable()
@@ -193,11 +297,19 @@ func (n *NumberEntry) Enable() {
 
 func (n *NumberEntry) syncText() {
 	text := fmt.Sprintf("%.*f", n.Decimals, n.value)
-	if n.entry.Text != text {
-		fyne.Do(func() {
-			n.entry.SetText(text)
-		})
+	n.setEntryText(text)
+}
+
+func (n *NumberEntry) setEntryText(text string) {
+	n.lastText = text
+	if n.entry.Text == text {
+		return
 	}
+	n.settingText = true
+	fyne.Do(func() {
+		n.entry.SetText(text)
+		n.settingText = false
+	})
 }
 
 func (n *NumberEntry) MinSize() fyne.Size {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"gofitsv3/internal/fitsio"
@@ -54,6 +55,164 @@ func TestCombineDiskChannelsRenameFailureRestoresDestinations(t *testing.T) {
 		if !bytes.Equal(got, []byte{byte('A' + i)}) {
 			t.Fatalf("destination %d changed after rollback: %q", i, got)
 		}
+	}
+}
+
+func TestPublishDiskArtifactsRenameFailureRestoresMissingDestinations(t *testing.T) {
+	d := t.TempDir()
+	var src, dst [3]string
+	for i := range src {
+		src[i] = filepath.Join(d, fmt.Sprintf("publish-src%d.bin", i))
+		dst[i] = filepath.Join(d, fmt.Sprintf("publish-dst%d.bin", i))
+		if err := os.WriteFile(src[i], []byte{byte('a' + i)}, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldRename := diskComposeRename
+	diskComposeRename = func(old, new string) error {
+		if old == src[1] && new == dst[1] {
+			return errors.New("injected publish rename failure")
+		}
+		return oldRename(old, new)
+	}
+	t.Cleanup(func() { diskComposeRename = oldRename })
+	if err := publishDiskArtifacts(context.Background(), src, dst); err == nil {
+		t.Fatal("expected injected rename failure")
+	}
+	for i := range dst {
+		if _, err := os.Stat(dst[i]); !os.IsNotExist(err) {
+			t.Fatalf("destination %d was not restored to absent state: %v", i, err)
+		}
+	}
+	if _, err := os.Stat(src[0]); !os.IsNotExist(err) {
+		t.Fatalf("published source remained after rollback: %v", err)
+	}
+	if got, err := os.ReadFile(src[1]); err != nil || !bytes.Equal(got, []byte{'b'}) {
+		t.Fatalf("failed source was not preserved: %q, %v", got, err)
+	}
+}
+
+func TestPublishDiskArtifactsPublishesSourcesDirectly(t *testing.T) {
+	d := t.TempDir()
+	var src, dst [3]string
+	for i := range src {
+		src[i] = filepath.Join(d, fmt.Sprintf("direct-src%d.bin", i))
+		dst[i] = filepath.Join(d, fmt.Sprintf("direct-dst%d.bin", i))
+		if err := os.WriteFile(src[i], []byte{byte('a' + i)}, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := publishDiskArtifacts(context.Background(), src, dst); err != nil {
+		t.Fatal(err)
+	}
+	for i := range dst {
+		got, err := os.ReadFile(dst[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, []byte{byte('a' + i)}) {
+			t.Fatalf("destination %d contents = %q", i, got)
+		}
+		if _, err := os.Stat(src[i]); !os.IsNotExist(err) {
+			t.Fatalf("source %d was not consumed: %v", i, err)
+		}
+		backups, err := filepath.Glob(dst[i] + ".render-backup-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(backups) != 0 {
+			t.Fatalf("backup %d was not cleaned: %v", i, backups)
+		}
+	}
+}
+
+func TestPublishDiskArtifactsBackupNamesCannotAliasOutputs(t *testing.T) {
+	d := t.TempDir()
+	var src, dst [3]string
+	dst[0] = filepath.Join(d, "a")
+	dst[1] = dst[0] + ".render-backup"
+	dst[2] = filepath.Join(d, "c")
+	for i := range src {
+		src[i] = filepath.Join(d, fmt.Sprintf("alias-src%d", i))
+		if err := os.WriteFile(src[i], []byte{byte('x' + i)}, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst[i], []byte{byte('A' + i)}, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldRename := diskComposeRename
+	diskComposeRename = func(old, new string) error {
+		if old == src[1] && new == dst[1] {
+			return errors.New("injected publish rename failure")
+		}
+		return oldRename(old, new)
+	}
+	t.Cleanup(func() { diskComposeRename = oldRename })
+	if err := publishDiskArtifacts(context.Background(), src, dst); err == nil {
+		t.Fatal("expected injected publish rename failure")
+	}
+	for i := range dst {
+		got, err := os.ReadFile(dst[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, []byte{byte('A' + i)}) {
+			t.Fatalf("destination %d changed after rollback: %q", i, got)
+		}
+	}
+	if got, err := os.ReadFile(dst[1]); err != nil || !bytes.Equal(got, []byte{'B'}) {
+		t.Fatalf("aliased output was not preserved: %q, %v", got, err)
+	}
+	backups, err := filepath.Glob(filepath.Join(d, "*.render-backup-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 0 {
+		t.Fatalf("transaction backup leaked: %v", backups)
+	}
+}
+
+func TestPublishDiskArtifactsPreflightsAbsentBackupCollisions(t *testing.T) {
+	d := t.TempDir()
+	var src, dst [3]string
+	src[0] = filepath.Join(d, "src0")
+	src[1] = filepath.Join(d, "src1")
+	src[2] = filepath.Join(d, "src2")
+	dst[1] = filepath.Join(d, "a")
+	dst[0] = fmt.Sprintf("%s.render-backup-%d-2", dst[1], os.Getpid())
+	dst[2] = filepath.Join(d, "c")
+	for i := range src {
+		if err := os.WriteFile(src[i], []byte{byte('x' + i)}, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldRename := diskComposeRename
+	diskComposeRename = func(old, new string) error {
+		if old == src[1] && new == dst[1] {
+			return errors.New("injected publish rename failure")
+		}
+		return oldRename(old, new)
+	}
+	t.Cleanup(func() { diskComposeRename = oldRename })
+	atomic.StoreUint64(&diskComposeTxnID, 0)
+	if err := publishDiskArtifacts(context.Background(), src, dst); err == nil {
+		t.Fatal("expected injected publish rename failure")
+	}
+	for i := range dst {
+		if _, err := os.Stat(dst[i]); !os.IsNotExist(err) {
+			t.Fatalf("destination %d was not restored to absent state: %v", i, err)
+		}
+	}
+	if _, err := os.Stat(src[1]); err != nil {
+		t.Fatalf("failed source was not preserved: %v", err)
+	}
+	backups, err := filepath.Glob(filepath.Join(d, "*.render-backup-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 0 {
+		t.Fatalf("transaction backup leaked: %v", backups)
 	}
 }
 
@@ -137,6 +296,152 @@ func TestArtifactSamplerPreservesInBoundsEdges(t *testing.T) {
 	}
 	if got := s.sample(2, 1); got != 0 {
 		t.Fatalf("out-of-footprint sample = %v, want 0", got)
+	}
+}
+
+func TestDiskCoordinateMapperResizeAndRotation(t *testing.T) {
+	img := models.LoadedImage{}
+	ref := models.LoadedImage{}
+	mapper := newDiskCoordinateMapper(img, ref, 0, 0, 0, 2, 1, 4, 2)
+	if x, y := mapper.mapCoordinate(0, 0); x != 0.5 || y != 0.5 {
+		t.Fatalf("resize mapping = (%v, %v), want (0.5, 0.5)", x, y)
+	}
+	if x, y := mapper.mapCoordinate(1, 0); x != 2.5 || y != 0.5 {
+		t.Fatalf("resize mapping = (%v, %v), want (2.5, 0.5)", x, y)
+	}
+
+	mapper = newDiskCoordinateMapper(img, ref, 0, 0, 90, 2, 1, 4, 2)
+	if x, y := mapper.mapCoordinate(0, 0); math.Abs(x-1.5) > 1e-12 || math.Abs(y-2.5) > 1e-12 {
+		t.Fatalf("rotation mapping = (%v, %v), want (1.5, 2.5)", x, y)
+	}
+}
+
+func TestDiskCoordinateMapperUsesFittedAffineBeforeOffsets(t *testing.T) {
+	img := models.LoadedImage{HasAlignTransform: true, AlignA: 2, AlignE: 3, AlignC: 1, AlignF: -2}
+	mapper := newDiskCoordinateMapper(img, models.LoadedImage{}, 0.5, 1.5, 0, 4, 4, 8, 8)
+	x, y := mapper.mapCoordinate(2, 1)
+	if x != 4.5 || y != -0.5 {
+		t.Fatalf("affine mapping = (%v, %v), want (4.5, -0.5)", x, y)
+	}
+}
+
+func TestDiskCoordinateMapperUsesValidWCSOnce(t *testing.T) {
+	header := func(crpix1, crpix2 string) fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": crpix1, "CRPIX2": crpix2, "CRVAL1": "100", "CRVAL2": "20",
+			"CD1_1": "1", "CD1_2": "0", "CD2_1": "0", "CD2_2": "1",
+		}}
+	}
+	img := models.LoadedImage{HDU: fitsio.HDU{Header: header("12", "8")}}
+	ref := models.LoadedImage{HDU: fitsio.HDU{Header: header("10", "5")}}
+	mapper := newDiskCoordinateMapper(img, ref, 0, 0, 0, 20, 20, 20, 20)
+	if !mapper.useWCS {
+		t.Fatal("expected valid WCS mapper")
+	}
+	want, err := ComputeWCSTransform(img.HDU.Header, ref.HDU.Header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, point := range [][2]int{{0, 0}, {7, 11}, {19, 19}} {
+		gotX, gotY := mapper.mapCoordinate(point[0], point[1])
+		wantX, wantY := ApplyAffineTransform(want, float64(point[0]), float64(point[1]))
+		if math.Abs(gotX-wantX) > 1e-10 || math.Abs(gotY-wantY) > 1e-10 {
+			t.Fatalf("WCS mapping at %v = (%v,%v), want (%v,%v)", point, gotX, gotY, wantX, wantY)
+		}
+	}
+}
+
+func TestDiskCoordinateMapperFallsBackAndSkipsWCS(t *testing.T) {
+	bad := models.LoadedImage{HDU: fitsio.HDU{Header: fitsio.Header{Cards: map[string]string{"CRPIX1": "bad"}}}}
+	ref := models.LoadedImage{}
+	mapper := newDiskCoordinateMapper(bad, ref, 0, 0, 0, 2, 1, 4, 2)
+	if mapper.useWCS {
+		t.Fatal("malformed WCS should use resize fallback")
+	}
+	if x, y := mapper.mapCoordinate(1, 0); x != 2.5 || y != 0.5 {
+		t.Fatalf("malformed WCS mapping = (%v,%v), want resize mapping (2.5,0.5)", x, y)
+	}
+
+	gridHeader := func(crpix1 string) fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"DRIZSCAL": "2", "ORIGOFFX": "1", "ORIGOFFY": "3",
+			"CRPIX1": crpix1, "CRPIX2": "1", "CRVAL1": "0", "CRVAL2": "0",
+			"CD1_1": "1", "CD1_2": "0", "CD2_1": "0", "CD2_2": "1",
+		}}
+	}
+	grid := models.LoadedImage{HDU: fitsio.HDU{Header: gridHeader("1"), Data: fitsio.ImageData{Width: 2, Height: 2}}}
+	mapper = newDiskCoordinateMapper(grid, grid, 0, 0, 0, 2, 2, 2, 2)
+	if mapper.useWCS {
+		t.Fatal("shared drizzle grid should skip WCS")
+	}
+	rotated := grid
+	rotated.HDU.Header = gridHeader("2")
+	rotated.HDU.Header.Cards["DRIZSCAL"] = "3"
+	rotated.HDU.Header.Cards["ORIGOFFX"] = "9"
+	rotated.HDU.Header.Cards["ORIGOFFY"] = "8"
+	rotated.Rotation90 = 1
+	mapper = newDiskCoordinateMapper(rotated, grid, 0, 0, 0, 2, 2, 2, 2)
+	if mapper.useWCS {
+		t.Fatal("rotated channel should skip WCS")
+	}
+	mapper = newDiskCoordinateMapper(rotated, grid, 0, 0, 0, 1, 1, 2, 2)
+	if x, y := mapper.mapCoordinate(0, 0); x != 0.5 || y != 0.5 {
+		t.Fatalf("suppressed WCS mapping = (%v,%v), want resize mapping (0.5,0.5)", x, y)
+	}
+}
+
+func TestStreamWeightedDiskSourceUsesPrecomputedWCSMapping(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.bin")
+	source, err := fitsio.CreateFloat32Artifact(sourcePath, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for y, row := range [][]float32{{0, 4}, {0, 0}} {
+		if err := source.WriteRow(y, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	acc := [3]string{filepath.Join(dir, "r.acc"), filepath.Join(dir, "g.acc"), filepath.Join(dir, "b.acc")}
+	for _, path := range acc {
+		a, err := fitsio.CreateFloat32Artifact(path, 2, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for y := 0; y < 2; y++ {
+			if err := a.WriteRow(y, []float32{0, 0}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := a.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	header := func(crpix1 string) fitsio.Header {
+		return fitsio.Header{Cards: map[string]string{
+			"CRPIX1": crpix1, "CRPIX2": "1", "CRVAL1": "0", "CRVAL2": "0",
+			"CD1_1": "1", "CD1_2": "0", "CD2_1": "0", "CD2_2": "1",
+		}}
+	}
+	img := models.LoadedImage{HDU: fitsio.HDU{Header: header("2"), Data: fitsio.ImageData{Width: 2, Height: 2}}, Background: 0, Peak: 4, ScaledPeak: 1, Mode: stretch.Linear}
+	ref := models.LoadedImage{HDU: fitsio.HDU{Header: header("1"), Data: fitsio.ImageData{Width: 2, Height: 2}}}
+	if err := streamWeightedDiskSource(context.Background(), DiskChannel{ArtifactPath: sourcePath, Image: img}, ref, acc, models.ComposeMixWeight{Red: 1}, 2, 2); err != nil {
+		t.Fatal(err)
+	}
+	r, err := fitsio.OpenFloat32ArtifactReadOnly(acc[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	row := make([]float32, 2)
+	if err := r.ReadRow(0, row); err != nil {
+		t.Fatal(err)
+	}
+	if row[0] != 1 {
+		t.Fatalf("WCS-shifted weighted sample = %v, want 1", row[0])
 	}
 }
 
@@ -274,6 +579,80 @@ func TestComposeDiskArtisticOverlayUsesItsOwnNonlinearStretch(t *testing.T) {
 	// the overlay would produce a different result, guarding ownership/order.
 	if v := readDiskComposePixel(t, out[0]); math.Abs(float64(v-.725)) > .02 {
 		t.Fatalf("artistic nonlinear red pixel = %v, want approximately 0.725", v)
+	}
+}
+
+func TestPrepareDiskChannelFusesNonHistEqStretch(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "source.bin")
+	dstPath := filepath.Join(dir, "prepared.bin")
+	writeDiskComposeFixture(t, srcPath, .4)
+
+	src := diskComposeTestChannel(srcPath)
+	meta := src.Image
+	meta.Mode = stretch.Linear
+	meta.Background, meta.Peak, meta.ScaledPeak = .2, .6, 1
+	if err := prepareDiskChannel(context.Background(), src, meta, meta, 2, 2, dstPath, true); err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := fitsio.OpenFloat32ArtifactReadOnly(dstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	row := make([]float32, 2)
+	if err := a.ReadRow(0, row); err != nil {
+		t.Fatal(err)
+	}
+	for i, got := range row {
+		if math.Abs(float64(got-.5)) > 1e-5 {
+			t.Fatalf("prepared pixel %d = %v, want fused linear stretch 0.5", i, got)
+		}
+	}
+}
+
+func TestComposeDiskHistEqOverlayRetainsStructureWithScalarBase(t *testing.T) {
+	dir := t.TempDir()
+	basePath, overlayPath := filepath.Join(dir, "base.bin"), filepath.Join(dir, "overlay.bin")
+	writeDiskComposeFixture(t, basePath, .2)
+	overlay, err := fitsio.CreateFloat32Artifact(overlayPath, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for y, row := range [][]float32{{.1, .2}, {.3, .4}} {
+		if err := overlay.WriteRow(y, row); err != nil {
+			overlay.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := overlay.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	base := diskComposeTestChannel(basePath)
+	overlayChannel := diskComposeTestChannel(overlayPath)
+	overlayChannel.Image.Mode = stretch.HistEq
+	out := [3]string{filepath.Join(dir, "r.bin"), filepath.Join(dir, "g.bin"), filepath.Join(dir, "b.bin")}
+	if _, err := ComposeDisk(context.Background(), DiskComposeRequest{
+		Channels: [3]DiskChannel{base, base, base},
+		Overlays: []DiskOverlay{{Channel: overlayChannel, Settings: models.OrangeLayerState{ColorR: 255, Opacity: 1}}},
+		Output:   out,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := fitsio.OpenFloat32ArtifactReadOnly(out[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	row := make([]float32, 2)
+	if err := a.ReadRow(0, row); err != nil {
+		t.Fatal(err)
+	}
+	if row[0] <= 0 || row[1] <= 0 || math.Abs(float64(row[0]-row[1])) < 1e-5 {
+		t.Fatalf("HistEq overlay red row = %v, want positive nonuniform values", row)
 	}
 }
 

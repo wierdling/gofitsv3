@@ -76,3 +76,51 @@ func TestMagicBlackCustomColorDoesNotPersistInvalidWeight(t *testing.T) {
 		t.Fatalf("black custom color left invalid project weights: %v", err)
 	}
 }
+
+func TestApplyWidebandComposeMixPresetUsesSymmetricBaseFormulaAndPreservesOverlays(t *testing.T) {
+	mode := models.ComposeModeArtistic
+	overlay := models.ComposeMixWeight{BlinkID: "overlay-7", Red: .2, Green: .3, Blue: .4}
+	got, err := applyWidebandComposeMixPreset(&mode, []models.ComposeMixWeight{
+		{BlinkID: models.ComposeChannel1BlinkID, Red: 1},
+		{BlinkID: models.ComposeChannel2BlinkID, Blue: 1},
+		{BlinkID: models.ComposeChannel3BlinkID, Green: 1},
+		overlay,
+	}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]models.ComposeMixWeight{
+		models.ComposeChannel1BlinkID: {Green: .08, Blue: .92},
+		models.ComposeChannel2BlinkID: {Red: .08, Green: .84, Blue: .08},
+		models.ComposeChannel3BlinkID: {Red: .92, Green: .08},
+	}
+	for _, weight := range got {
+		if expected, ok := want[weight.BlinkID]; ok {
+			if weight.Red != expected.Red || weight.Green != expected.Green || weight.Blue != expected.Blue {
+				t.Errorf("%s = %#v, want %#v", weight.BlinkID, weight, expected)
+			}
+		}
+	}
+	if got[3] != overlay {
+		t.Fatalf("overlay weight = %#v, want %#v", got[3], overlay)
+	}
+	if mode != models.ComposeModeWeighted {
+		t.Fatalf("mode = %q, want explicit weighted mode", mode)
+	}
+}
+
+func TestApplyWidebandComposeMixPresetValidatesPercentage(t *testing.T) {
+	for _, percent := range []float64{-0.01, 50.01} {
+		mode := models.ComposeModeArtistic
+		original := []models.ComposeMixWeight{{BlinkID: models.ComposeChannel1BlinkID, Blue: 1}}
+		if _, err := applyWidebandComposeMixPreset(&mode, original, percent); err == nil {
+			t.Errorf("percentage %v succeeded, want validation error", percent)
+		}
+		if mode != models.ComposeModeArtistic {
+			t.Errorf("invalid percentage %v changed mode to %q", percent, mode)
+		}
+	}
+	if _, err := applyWidebandComposeMixPreset(nil, nil, 50); err != nil {
+		t.Fatalf("50%% should be accepted: %v", err)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
@@ -18,6 +19,7 @@ import (
 // diskComposeRename is isolated for deterministic transaction-failure tests.
 // Production uses os.Rename unchanged.
 var diskComposeRename = os.Rename
+var diskComposeTxnID uint64
 
 // DiskChannel is the small immutable description consumed by DiskCompose. The
 // raster remains in ArtifactPath; Image contains only render metadata.
@@ -145,7 +147,11 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 			prepared[i] = req.Channels[i].ArtifactPath + fmt.Sprintf(".prepared-%d", i)
 		}
 		intermediates = append(intermediates, prepared[i])
-		if err := prepareDiskChannel(ctx, req.Channels[i], req.Channels[1].Image, stretchMeta, w, h, prepared[i], false); err != nil {
+		// Non-HistEq stretches are scalar and can be fused into the mapping
+		// pass. HistEq intentionally remains a separate multi-pass operation
+		// because its CDF is calculated from the complete prepared raster.
+		applyStretch := stretchMeta.Mode != stretch.HistEq
+		if err := prepareDiskChannel(ctx, req.Channels[i], req.Channels[1].Image, stretchMeta, w, h, prepared[i], applyStretch); err != nil {
 			for _, p := range prepared {
 				if p != "" {
 					_ = os.Remove(p)
@@ -163,7 +169,17 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 		}
 		p := ov.Channel.ArtifactPath + fmt.Sprintf(".overlay-prepared-%d", oi)
 		intermediates = append(intermediates, p)
-		if err := prepareDiskChannel(ctx, ov.Channel, req.Channels[1].Image, stretchMeta, w, h, p, false); err != nil {
+		// Artistic overlays own their stretch metadata; preserve that
+		// ownership while fusing only non-HistEq scalar modes.
+		applyStretch := ov.Channel.Image.Mode != stretch.HistEq
+		prepareMeta := ov.Channel.Image
+		if !applyStretch {
+			// HistEq is applied by the caller-owned CDF pass below. Keep the
+			// preparation pass purely calibrated/mapped so prepareDiskChannel's
+			// legacy internal HistEq pass does not consume the overlay.
+			prepareMeta.Mode = stretch.Linear
+		}
+		if err := prepareDiskChannel(ctx, ov.Channel, req.Channels[1].Image, prepareMeta, w, h, p, applyStretch); err != nil {
 			return DiskComposeResult{}, err
 		}
 		artistic = append(artistic, artisticDiskOverlay{path: p, settings: ov.Settings, meta: ov.Channel.Image})
@@ -176,9 +192,11 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 			return DiskComposeResult{}, histErr
 		}
 	}
-	for _, p := range prepared {
-		if err := stretchDiskArtifact(ctx, p, stretchMeta, cdf); err != nil {
-			return DiskComposeResult{}, err
+	if stretchMeta.Mode == stretch.HistEq {
+		for _, p := range prepared {
+			if err := stretchDiskArtifact(ctx, p, stretchMeta, cdf); err != nil {
+				return DiskComposeResult{}, err
+			}
 		}
 	}
 	for _, ov := range artistic {
@@ -190,34 +208,25 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 				return DiskComposeResult{}, histErr
 			}
 		}
-		if err := stretchDiskArtifact(ctx, ov.path, ov.meta, overlayCDF); err != nil {
-			return DiskComposeResult{}, err
+		if ov.meta.Mode == stretch.HistEq {
+			if err := stretchDiskArtifact(ctx, ov.path, ov.meta, overlayCDF); err != nil {
+				return DiskComposeResult{}, err
+			}
 		}
 		if err := blendDiskOverlay(ctx, prepared, ov.path, ov.settings, w, h); err != nil {
 			return DiskComposeResult{}, err
 		}
 		_ = os.Remove(ov.path)
 	}
-	// Keep the existing destinations untouched until the complete render,
-	// including preview generation, has succeeded. The first combine publishes
-	// only to staging paths; the second combine performs the final atomic swap.
-	staged := [3]string{}
-	for i := range staged {
-		staged[i] = req.Output[i] + fmt.Sprintf(".compose-staged-%d", i)
-		_ = os.Remove(staged[i])
-		intermediates = append(intermediates, staged[i])
-	}
-	if err := combineDiskChannels(ctx, prepared, staged, w, h); err != nil {
-		return DiskComposeResult{}, err
-	}
-	preview, stats, err := diskCompositePreviewForCompose(ctx, staged, w, h, req.PreviewMax, nil)
+	// The prepared artifacts are already complete output planes in historical
+	// B,G,R order. Preview them before publication, then rename them directly
+	// into the R,G,B destinations to avoid another pair of full-plane copies.
+	previewPaths := [3]string{prepared[2], prepared[1], prepared[0]}
+	preview, stats, err := diskCompositePreviewForCompose(ctx, previewPaths, w, h, req.PreviewMax, nil)
 	if err != nil {
 		return DiskComposeResult{}, err
 	}
-	// combineDiskChannels consumes historical B,G,R source ordering. Staged
-	// artifacts are already in output R,G,B order, so reverse the source tuple
-	// for this final transactional copy.
-	if err := combineDiskChannels(ctx, [3]string{staged[2], staged[1], staged[0]}, req.Output, w, h); err != nil {
+	if err := publishDiskArtifacts(ctx, previewPaths, req.Output); err != nil {
 		return DiskComposeResult{}, err
 	}
 	step := 1
@@ -342,7 +351,7 @@ func composeDiskWeighted(ctx context.Context, req DiskComposeRequest, w, h int) 
 	if err != nil {
 		return DiskComposeResult{}, fmt.Errorf("weighted preview: %w", err)
 	}
-	if err := combineDiskChannels(ctx, [3]string{acc[2], acc[1], acc[0]}, req.Output, w, h); err != nil {
+	if err := publishDiskArtifacts(ctx, acc, req.Output); err != nil {
 		return DiskComposeResult{}, fmt.Errorf("weighted publish: %w", err)
 	}
 	step := 1
@@ -362,7 +371,8 @@ func streamWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.L
 		return err
 	}
 	defer a.Close()
-	peak, cdf, err := calibrateWeightedDiskSource(ctx, src, ref, a, w, h)
+	mapper := newDiskCoordinateMapper(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, w, h, a.Width, a.Height)
+	peak, cdf, err := calibrateWeightedDiskSource(ctx, src, ref, a, w, h, mapper)
 	if err != nil {
 		return err
 	}
@@ -392,7 +402,7 @@ func streamWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.L
 			}
 		}
 		for x := 0; x < w; x++ {
-			fx, fy := mapDiskCoordinate(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, x, y, w, h, a.Width, a.Height)
+			fx, fy := mapper.mapCoordinate(x, y)
 			v := float64(stretchDiskValue(sampler.sample(fx, fy), src.Image))
 			if peak > 0 {
 				v /= peak
@@ -413,7 +423,7 @@ func streamWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.L
 	return nil
 }
 
-func calibrateWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.LoadedImage, a *fitsio.Float32Artifact, w, h int) (float64, []float32, error) {
+func calibrateWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.LoadedImage, a *fitsio.Float32Artifact, w, h int, mapper *diskCoordinateMapper) (float64, []float32, error) {
 	sampler := newArtifactSampler(a)
 	peak := 0.0
 	hist := make([]int, 256)
@@ -422,10 +432,13 @@ func calibrateWeightedDiskSource(ctx context.Context, src DiskChannel, ref model
 			return 0, nil, err
 		}
 		for x := 0; x < w; x++ {
-			fx, fy := mapDiskCoordinate(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, x, y, w, h, a.Width, a.Height)
+			fx, fy := mapper.mapCoordinate(x, y)
 			v := float64(stretchDiskValue(sampler.sample(fx, fy), src.Image))
 			if v > peak {
 				peak = v
+			}
+			if src.Image.Mode == stretch.HistEq {
+				hist[int(clamp01(v)*255)]++
 			}
 		}
 	}
@@ -437,17 +450,6 @@ func calibrateWeightedDiskSource(ctx context.Context, src DiskChannel, ref model
 	}
 	// HistEq's CDF is defined over the raw stretched samples. WeightedCompose
 	// then normalizes the CDF output by its own finite peak (normally 1).
-	sampler = newArtifactSampler(a)
-	for y := 0; y < h; y++ {
-		if err := ctx.Err(); err != nil {
-			return 0, nil, err
-		}
-		for x := 0; x < w; x++ {
-			fx, fy := mapDiskCoordinate(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, x, y, w, h, a.Width, a.Height)
-			v := float64(stretchDiskValue(sampler.sample(fx, fy), src.Image))
-			hist[int(clamp01(v)*255)]++
-		}
-	}
 	cdf := make([]float32, 256)
 	total, sum := 0, 0
 	for _, n := range hist {
@@ -516,6 +518,7 @@ func prepareDiskChannel(ctx context.Context, src DiskChannel, ref, stretchMeta m
 	}
 	out, row := tx.Artifact(), make([]float32, dw)
 	sampler := newArtifactSampler(a)
+	mapper := newDiskCoordinateMapper(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, dw, dh, a.Width, a.Height)
 	hist := make([]int, 256)
 	for y := 0; y < dh; y++ {
 		if err := ctx.Err(); err != nil {
@@ -523,7 +526,7 @@ func prepareDiskChannel(ctx context.Context, src DiskChannel, ref, stretchMeta m
 			return err
 		}
 		for x := 0; x < dw; x++ {
-			fx, fy := mapDiskCoordinate(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, x, y, dw, dh, a.Width, a.Height)
+			fx, fy := mapper.mapCoordinate(x, y)
 			row[x] = sampler.sample(fx, fy)
 			if applyStretch {
 				row[x] = stretchDiskValue(row[x], stretchMeta)
@@ -657,41 +660,68 @@ func diskHistEqCDF(ctx context.Context, path string, meta models.LoadedImage) ([
 	return cdf, nil
 }
 
-func mapDiskCoordinate(img, ref models.LoadedImage, offsetX, offsetY, offsetRot float64, x, y, dw, dh, sw, sh int) (float64, float64) {
-	if img.HasAlignTransform {
+// diskCoordinateMapper is an immutable output-to-source mapping for one
+// source/render. Constructing it once avoids rediscovering WCS transforms and
+// recalculating rotation constants for every sampled pixel.
+type diskCoordinateMapper struct {
+	aligned          bool
+	affine           AffineTransform
+	useWCS           bool
+	wcs              AffineTransform
+	dw, dh           int
+	sw, sh           int
+	offsetX, offsetY float64
+	rotate           bool
+	cosRot, sinRot   float64
+}
+
+func newDiskCoordinateMapper(img, ref models.LoadedImage, offsetX, offsetY, offsetRot float64, dw, dh, sw, sh int) *diskCoordinateMapper {
+	m := &diskCoordinateMapper{
+		aligned: img.HasAlignTransform,
+		affine:  AffineTransform{A: img.AlignA, B: img.AlignB, C: img.AlignC, D: img.AlignD, E: img.AlignE, F: img.AlignF},
+		dw:      dw, dh: dh, sw: sw, sh: sh,
+		offsetX: offsetX, offsetY: offsetY,
+	}
+	if !m.aligned && img.Rotation90 == 0 && ref.Rotation90 == 0 && !sharedDrizzleGrid(&img, &ref) {
+		if tr, err := ComputeWCSTransform(img.HDU.Header, ref.HDU.Header); err == nil {
+			m.useWCS = true
+			m.wcs = tr
+		}
+	}
+	if offsetRot != 0 {
+		rad := -offsetRot * math.Pi / 180
+		m.rotate = true
+		m.cosRot, m.sinRot = math.Cos(rad), math.Sin(rad)
+	}
+	return m
+}
+
+func (m *diskCoordinateMapper) mapCoordinate(x, y int) (float64, float64) {
+	var fx, fy float64
+	if m.aligned {
 		// Stored alignment transforms are backward (reference/output -> source)
 		// mappings. Apply them directly in the reference grid; composing them
 		// after resize/WCS mapping would interpret the affine in the wrong frame.
-		fx := img.AlignA*float64(x) + img.AlignB*float64(y) + img.AlignC
-		fy := img.AlignD*float64(x) + img.AlignE*float64(y) + img.AlignF
-		fx -= offsetX
-		fy -= offsetY
-		if offsetRot != 0 {
-			cx, cy := float64(sw)/2, float64(sh)/2
-			rad := -offsetRot * math.Pi / 180
-			xc, yc := fx-cx, fy-cy
-			fx, fy = math.Cos(rad)*xc-math.Sin(rad)*yc+cx, math.Sin(rad)*xc+math.Cos(rad)*yc+cy
-		}
-		return fx, fy
-	}
-	fx := (float64(x)+0.5)*float64(sw)/float64(dw) - 0.5
-	fy := (float64(y)+0.5)*float64(sh)/float64(dh) - 0.5
-	if img.Rotation90 == 0 && ref.Rotation90 == 0 && !sharedDrizzleGrid(&img, &ref) {
-		if tr, err := ComputeWCSTransform(img.HDU.Header, ref.HDU.Header); err == nil {
-			fx, fy = ApplyAffineTransform(tr, float64(x), float64(y))
+		fx, fy = ApplyAffineTransform(m.affine, float64(x), float64(y))
+	} else {
+		fx = (float64(x)+0.5)*float64(m.sw)/float64(m.dw) - 0.5
+		fy = (float64(y)+0.5)*float64(m.sh)/float64(m.dh) - 0.5
+		if m.useWCS {
+			fx, fy = ApplyAffineTransform(m.wcs, float64(x), float64(y))
 		}
 	}
-	fx -= offsetX
-	fy -= offsetY
-	if offsetRot != 0 {
-		cx, cy := float64(sw)/2, float64(sh)/2
-		rad := -offsetRot * math.Pi / 180
+	fx -= m.offsetX
+	fy -= m.offsetY
+	if m.rotate {
+		cx, cy := float64(m.sw)/2, float64(m.sh)/2
 		xc, yc := fx-cx, fy-cy
-		fx, fy = math.Cos(rad)*xc-math.Sin(rad)*yc+cx, math.Sin(rad)*xc+math.Cos(rad)*yc+cy
+		fx, fy = m.cosRot*xc-m.sinRot*yc+cx, m.sinRot*xc+m.cosRot*yc+cy
 	}
-	// Rotation90 is physical artifact state. RotateArtifact90CW rewrites the
-	// raster and dimensions, so sampling must not apply the quarter-turn again.
 	return fx, fy
+}
+
+func mapDiskCoordinate(img, ref models.LoadedImage, offsetX, offsetY, offsetRot float64, x, y, dw, dh, sw, sh int) (float64, float64) {
+	return newDiskCoordinateMapper(img, ref, offsetX, offsetY, offsetRot, dw, dh, sw, sh).mapCoordinate(x, y)
 }
 
 type artifactSampler struct {
@@ -856,6 +886,95 @@ func blendDiskOverlayScaled(ctx context.Context, bases [3]string, overlay string
 	return nil
 }
 
+// publishDiskArtifacts atomically publishes a complete R,G,B artifact set.
+// Sources are consumed by the successful renames. Existing destinations are
+// first moved aside so any failure can restore the exact prior set.
+func publishDiskArtifacts(ctx context.Context, src, dst [3]string) (err error) {
+	backups := [3]string{}
+	backedUp := 0
+	published := 0
+	committed := false
+	defer func() {
+		if committed {
+			for _, p := range backups {
+				if p != "" {
+					_ = os.Remove(p)
+				}
+			}
+			return
+		}
+		// Remove newly published destinations first, including a destination
+		// whose source rename may have succeeded immediately before an error.
+		for i := published - 1; i >= 0; i-- {
+			_ = os.Remove(dst[i])
+		}
+		for i := backedUp - 1; i >= 0; i-- {
+			if backups[i] != "" {
+				_ = diskComposeRename(backups[i], dst[i])
+			}
+		}
+	}()
+	reserved := make([]string, 0, 9)
+	reserved = append(reserved, src[:]...)
+	reserved = append(reserved, dst[:]...)
+	for i := range backups {
+		backups[i] = diskComposeBackupPath(dst[i], reserved...)
+		reserved = append(reserved, backups[i])
+	}
+	for i := range src {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if src[i] == "" || dst[i] == "" {
+			return fmt.Errorf("missing artifact path %d", i)
+		}
+		if sameDiskPath(src[i], dst[i]) {
+			return fmt.Errorf("artifact source overlaps destination %d", i)
+		}
+		if e := diskComposeRename(dst[i], backups[i]); e != nil {
+			if !os.IsNotExist(e) {
+				return e
+			}
+			backups[i] = ""
+		} else {
+			backedUp = i + 1
+		}
+	}
+	for i := range src {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := diskComposeRename(src[i], dst[i]); err != nil {
+			return err
+		}
+		published = i + 1
+	}
+	committed = true
+	return nil
+}
+
+func diskComposeBackupPath(dst string, reserved ...string) string {
+	for {
+		id := atomic.AddUint64(&diskComposeTxnID, 1)
+		path := fmt.Sprintf("%s.render-backup-%d-%d", dst, os.Getpid(), id)
+		collision := false
+		for _, other := range reserved {
+			if sameDiskPath(path, other) {
+				collision = true
+				break
+			}
+		}
+		if collision {
+			continue
+		}
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return path
+		} else if err != nil {
+			return path
+		}
+	}
+}
+
 func combineDiskChannels(ctx context.Context, src, dst [3]string, w, h int) error {
 	tmps := [3]string{}
 	txs := [3]*fitsio.Float32ArtifactTransaction{}
@@ -888,6 +1007,13 @@ func combineDiskChannels(ctx context.Context, src, dst [3]string, w, h int) erro
 			}
 		}
 	}()
+	reserved := make([]string, 0, 9)
+	reserved = append(reserved, src[:]...)
+	reserved = append(reserved, dst[:]...)
+	for i := range backups {
+		backups[i] = diskComposeBackupPath(dst[i], reserved...)
+		reserved = append(reserved, backups[i])
+	}
 	for c := 0; c < 3; c++ {
 		tmps[c] = dst[c] + fmt.Sprintf(".render-%d", os.Getpid())
 		tx, e := fitsio.BeginFloat32ArtifactTransaction(tmps[c], w, h)
@@ -946,8 +1072,6 @@ func combineDiskChannels(ctx context.Context, src, dst [3]string, w, h int) erro
 	// Replace the three destinations only after every source pass has
 	// completed. A failed rename restores the originals from backups.
 	for c := 0; c < 3; c++ {
-		backups[c] = dst[c] + ".render-backup"
-		_ = os.Remove(backups[c])
 		if err := diskComposeRename(dst[c], backups[c]); err != nil && !os.IsNotExist(err) {
 			return err
 		}
