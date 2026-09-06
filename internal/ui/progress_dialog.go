@@ -42,15 +42,16 @@ func newProgressTrackerWithContext(title, initialMessage string, win fyne.Window
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	fyne.DoAndWait(func() {
-		cancelBtn := widget.NewButton("Cancel", func() {
-			pt.cancel()
-			pt.label.SetText("Cancelling...")
-		})
-		content := container.NewVBox(pt.label, pt.bar, cancelBtn)
-		pt.dialog = dialog.NewCustomWithoutButtons(title, content, win)
-		pt.dialog.Show()
+	// Callers create a tracker from their UI event handler. Creating the dialog
+	// directly is required here: Fyne rejects DoAndWait when it is invoked from
+	// that same UI goroutine.
+	cancelBtn := widget.NewButton("Cancel", func() {
+		pt.cancel()
+		pt.label.SetText("Cancelling...")
 	})
+	content := container.NewVBox(pt.label, pt.bar, cancelBtn)
+	pt.dialog = dialog.NewCustomWithoutButtons(title, content, win)
+	pt.dialog.Show()
 	return pt
 }
 

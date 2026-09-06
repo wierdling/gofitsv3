@@ -28,7 +28,7 @@ func LoadPrimaryHeader(path string) (Header, error) {
 // stripping the trailing "/ comment". For quoted string values it respects the
 // closing quote before looking for the comment delimiter, so a "/" inside the
 // string (e.g. BUNIT = 'MJy/sr') is preserved, and it unescapes the FITS
-// double-single-quote ('') convention. Unquoted values are cut at the first "/".
+// double-single-quote (”) convention. Unquoted values are cut at the first "/".
 func parseCardValue(raw string) string {
 	v := strings.TrimLeft(raw, " ")
 	if !strings.HasPrefix(v, "'") {
@@ -104,10 +104,22 @@ func looksLikeFilterName(v string) bool {
 
 func isBlankFilterValue(val string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(val))
-	if upper == "" || strings.Contains(upper, "CLEAR") {
+	if upper == "" || strings.Contains(upper, "CLEAR") || upper == "OPEN" || upper == "NONE" || strings.HasPrefix(upper, "OPEN") && (allDigits(upper[4:]) || (len(upper) == 7 && upper[4] >= '1' && upper[4] <= '6' && upper[5] == '-' && upper[6] >= '1' && upper[6] <= '6')) {
 		return true
 	}
 	for _, r := range upper {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
 		if r < '0' || r > '9' {
 			return false
 		}

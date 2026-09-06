@@ -20,7 +20,8 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"golang.org/x/image/font"
-	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/font/gofont/goregular"
+	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
 )
 
@@ -82,15 +83,39 @@ func sortLegendEntriesByHue(entries []legendEntry) {
 // entry: a color swatch followed by "<name> — <file>". Kept compact so the PNG
 // is readable but not large.
 func renderColorLegend(entries []legendEntry) *image.RGBA {
+	return renderColorLegendScale(entries, 1)
+}
+
+// renderColorLegendScale lays out and rasterizes legend semantics at the requested
+// scale. It intentionally creates a fresh raster; the source preview is never
+// enlarged or resampled.
+func renderColorLegendScale(entries []legendEntry, scale float64) *image.RGBA {
+	if scale <= 0 {
+		scale = 1
+	}
 	const (
-		padX    = 14
-		padY    = 12
-		swatchW = 46
-		swatchH = 20
-		gap     = 14
-		rowH    = 30
+		basePadX    = 14
+		basePadY    = 12
+		baseSwatchW = 46
+		baseSwatchH = 20
+		baseGap     = 14
+		baseRowH    = 30
 	)
-	face := basicfont.Face7x13
+	fontSize := float64(13 * scale)
+	parsedFont, err := opentype.Parse(goregular.TTF)
+	if err != nil {
+		return image.NewRGBA(image.Rect(0, 0, 1, 1))
+	}
+	face, err := opentype.NewFace(parsedFont, &opentype.FaceOptions{Size: fontSize, DPI: 72, Hinting: font.HintingFull})
+	if err != nil {
+		return image.NewRGBA(image.Rect(0, 0, 1, 1))
+	}
+	padX := int(math.Round(float64(basePadX) * scale))
+	padY := int(math.Round(float64(basePadY) * scale))
+	swatchW := int(math.Round(float64(baseSwatchW) * scale))
+	swatchH := int(math.Round(float64(baseSwatchH) * scale))
+	gap := int(math.Round(float64(baseGap) * scale))
+	rowH := int(math.Round(float64(baseRowH) * scale))
 	ascent := face.Metrics().Ascent.Ceil()
 
 	labels := make([]string, len(entries))
@@ -227,11 +252,18 @@ func showColorLegendWindow(app fyne.App, parent fyne.Window, entries []legendEnt
 		save.SetFileName("color_legend.png")
 		save.Show()
 	})
+	addBtn := widget.NewButton("Add to Edit", func() {
+		if globalAddLegendToEdit == nil {
+			dialog.ShowInformation("Edit", "Open an image in Edit first.", parent)
+			return
+		}
+		globalAddLegendToEdit(entries)
+	})
 
 	w := app.NewWindow("Color Legend")
 	w.SetContent(container.NewBorder(
 		nil,
-		container.NewHBox(layout.NewSpacer(), saveBtn),
+		container.NewHBox(layout.NewSpacer(), addBtn, saveBtn),
 		nil, nil,
 		container.NewCenter(pic),
 	))

@@ -82,6 +82,7 @@ func buildCRMasksDrizzle(
 	defer os.RemoveAll(tmpDir)
 
 	paths := make([]string, n)
+	progressStage := crPreparationProgressStage(planned, dataPlanned)
 
 	// ---- Phase 1: separate drizzle to temp files ----
 	logMemStats("CR sep-drizzle start")
@@ -116,7 +117,7 @@ func buildCRMasksDrizzle(
 			}
 			paths[slot] = path
 			done := atomic.AddInt32(&sepDone, 1)
-			opts.reportProgress("Cleaning cosmic rays", int(done), n)
+			opts.reportProgress(progressStage, int(done), n)
 		}(slot, pi)
 	}
 	sepWG.Wait()
@@ -220,6 +221,21 @@ func buildCRMasksDrizzle(
 	}
 	logMemStats("CR mask done")
 	return masks, nil
+}
+
+// crPreparationProgressStage avoids implying that Gemini/GMOS inputs contain
+// cosmic rays. The same separate-drizzle pass is still used to prepare the
+// multi-frame model, but its user-facing label is instrument-appropriate.
+func crPreparationProgressStage(planned []plannedInput, dataPlanned []int) string {
+	if len(dataPlanned) == 0 {
+		return "Cleaning cosmic rays"
+	}
+	for _, pi := range dataPlanned {
+		if pi < 0 || pi >= len(planned) || !IsGeminiHeader(planned[pi].input.PrimaryHeader) {
+			return "Cleaning cosmic rays"
+		}
+	}
+	return "Preparing Gemini frames"
 }
 
 // crTempBaseDir picks the directory that holds the CR scratch files. It uses the

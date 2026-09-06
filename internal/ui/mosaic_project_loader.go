@@ -16,12 +16,13 @@ import (
 // metadata-only until an alignment mode requires resident pixels; Build loads
 // frame pixels on demand.
 type loadedMosaicProject struct {
-	Project        models.MosaicProject
-	ProjectPath    string
-	Inputs         []mosaic.Input
-	Statuses       []mosaic.InputStatus
-	ReferenceInput *mosaic.Input
-	MigratedCount  int
+	Project         models.MosaicProject
+	ProjectPath     string
+	Inputs          []mosaic.Input
+	Statuses        []mosaic.InputStatus
+	ReferenceInput  *mosaic.Input
+	MigratedCount   int
+	GMOSCalibration *mosaic.GMOSCalibrationSelection
 }
 
 func readMosaicProject(path string) (models.MosaicProject, string, error) {
@@ -56,6 +57,11 @@ func loadMosaicProjectData(ctx context.Context, projectPath string, progress fun
 	}
 
 	loaded := &loadedMosaicProject{Project: project, ProjectPath: absPath}
+	calibration, calErr := restoreGMOSCalibrationForProject(project, absPath)
+	if calErr != nil {
+		return nil, calErr
+	}
+	loaded.GMOSCalibration = calibration
 	var order []string
 	groups := map[string][]models.MosaicInputState{}
 	for _, state := range project.Inputs {
@@ -75,14 +81,18 @@ func loadMosaicProjectData(ctx context.Context, projectPath string, progress fun
 		progress(fmt.Sprintf("Loading: %s", filepath.Base(path)), i+1, len(order))
 		states := groups[path]
 		representative := lowestSCIExtState(states)
-		inputs, combined, _, loadErr := mosaic.LoadInputsForPipeline(path, mosaic.CombineOptions{
-			Ctx: ctx,
+		inputs, combined, fallbackErr, loadErr := mosaic.LoadInputsForPipeline(path, mosaic.CombineOptions{
+			Ctx:             ctx,
+			GMOSCalibration: calibration,
 			Progress: func(stage string, done, total int) {
 				progress(fmt.Sprintf("%s: %s", filepath.Base(path), stage), done, total)
 			},
 		})
 		if loadErr != nil {
 			return nil, fmt.Errorf("load %s: %w", filepath.Base(path), loadErr)
+		}
+		if calibration != nil && fallbackErr != nil {
+			return nil, fmt.Errorf("calibrated load %s: %w", filepath.Base(path), fallbackErr)
 		}
 		if len(inputs) == 0 {
 			return nil, fmt.Errorf("no inputs loaded from %s", filepath.Base(path))
@@ -108,9 +118,12 @@ func loadMosaicProjectData(ctx context.Context, projectPath string, progress fun
 			return nil, mosaic.ErrCancelled
 		}
 		project.ReferencePath = resolveProjectRelativePath(absPath, project.ReferencePath)
-		refInputs, combined, _, refErr := mosaic.LoadInputsForPipeline(project.ReferencePath, mosaic.CombineOptions{Ctx: ctx})
+		refInputs, combined, refFallbackErr, refErr := mosaic.LoadInputsForPipeline(project.ReferencePath, mosaic.CombineOptions{Ctx: ctx, GMOSCalibration: calibration})
 		if refErr != nil {
 			return nil, fmt.Errorf("load reference %s: %w", filepath.Base(project.ReferencePath), refErr)
+		}
+		if calibration != nil && refFallbackErr != nil {
+			return nil, fmt.Errorf("calibrated load reference %s: %w", filepath.Base(project.ReferencePath), refFallbackErr)
 		}
 		if len(refInputs) == 0 {
 			return nil, fmt.Errorf("no inputs loaded from reference %s", filepath.Base(project.ReferencePath))

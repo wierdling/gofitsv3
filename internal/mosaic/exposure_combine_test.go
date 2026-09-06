@@ -1,6 +1,7 @@
 package mosaic
 
 import (
+	"context"
 	"errors"
 	"math"
 	"os"
@@ -10,6 +11,111 @@ import (
 
 	"gofitsv3/internal/fitsio"
 )
+
+func TestEnsureCombinedExposureGMOSCalibrationHookAndCacheGuards(t *testing.T) {
+	d := t.TempDir()
+	source := filepath.Join(d, "gmos.fits")
+	bias := filepath.Join(d, "bias.fits")
+	flat := filepath.Join(d, "flat.fits")
+	writeGMOSMEF(t, source, "OBJECT", "r_G0303", 45, false)
+	writeGMOSMEF(t, bias, "BIAS", "", 5, false)
+	writeGMOSMEF(t, flat, "FLAT", "r_G0303", 7, false)
+	selection := &GMOSCalibrationSelection{Bias: &GMOSCalibrationFrame{Path: bias}, Flat: &GMOSCalibrationFrame{Path: flat}, BiasFrames: []GMOSCalibrationFrame{{Path: bias}}, FlatFrames: []GMOSCalibrationFrame{{Path: flat}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	_, _, err := EnsureCombinedExposure(source, CombineOptions{Ctx: ctx, GMOSCalibration: selection, GMOSCalibrationProgress: cancel})
+	if err != ErrCancelled {
+		t.Fatalf("GMOS calibration cancellation = %v, want ErrCancelled", err)
+	}
+	if _, statErr := os.Stat(WorkingPathFor(source)); !os.IsNotExist(statErr) {
+		t.Fatalf("canceled calibration published combined file")
+	}
+	progressCalls := 0
+	if _, cached, err := EnsureCombinedExposure(source, CombineOptions{GMOSCalibration: selection, GMOSCalibrationProgress: func() { progressCalls++ }}); err != nil || cached {
+		t.Fatalf("uncanceled retry did not perform a fresh build: cached=%v err=%v", cached, err)
+	}
+	if progressCalls == 0 {
+		t.Fatal("uncanceled retry reused a canceled master cache")
+	}
+	// These cards are the cache contract asserted by the production hook.
+	_ = "CALEN"
+	_ = "CALFP"
+}
+
+func TestEnsureCombinedExposureNonGMOSBypassesCalibrationSelection(t *testing.T) {
+	d := t.TempDir()
+	source := filepath.Join(d, "hst_flc.fits")
+	writeSyntheticExposure(t, source, 4, 4, 1, "F606W", twoOverlappingChips(12))
+	selection := &GMOSCalibrationSelection{RecipeFingerprint: "recipe-a"}
+	work, cached, err := EnsureCombinedExposure(source, CombineOptions{GMOSCalibration: selection})
+	if err != nil || cached {
+		t.Fatalf("non-GMOS ensure=%s,%v,%v", work, cached, err)
+	}
+	f, e := fitsio.LoadFile(work)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if fitsio.HeaderString(f.HDUs[0].Header, "CALEN") != "" || fitsio.HeaderString(f.HDUs[0].Header, "CALFP") != "" {
+		t.Fatal("non-GMOS output contains calibration cache cards")
+	}
+	if _, cached, err := EnsureCombinedExposure(source, CombineOptions{GMOSCalibration: selection}); err != nil || !cached {
+		t.Fatalf("non-GMOS repeated ensure cached=%v err=%v, want cached=true", cached, err)
+	}
+}
+
+func writeGMOSMEF(t *testing.T, path, obstype, filter string, value float32, bpm bool) {
+	t.Helper()
+	p := fitsio.Header{Cards: map[string]string{"INSTRUME": "GMOS-N", "DETECTOR": "EEV", "CCDSUM": "2 2", "OBSTYPE": quotedString(obstype), "FILTER": quotedString(filter), "EXPTIME": "1"}}
+	var exts []fitsio.ImageExtension
+	for i := 0; i < 3; i++ {
+		pix := []float32{value, value, 0, 0, value, value}
+		if bpm {
+			pix = []float32{0, 1, 0, 0, 0, 0}
+		}
+		eh := fitsio.Header{Cards: map[string]string{"DATASEC": "'[1:2,1:2]'", "BIASSEC": "'[3:3,1:2]'", "CRPIX1": "1", "CRPIX2": "1", "CRVAL1": "100", "CRVAL2": "22", "CTYPE1": quotedString("RA---TAN"), "CTYPE2": quotedString("DEC--TAN"), "CD1_1": "1", "CD1_2": "0", "CD2_1": "0", "CD2_2": "1"}}
+		exts = append(exts, fitsio.ImageExtension{Header: eh, Data: fitsio.ImageData{Width: 3, Height: 2, Pixels: pix}})
+	}
+	if err := fitsio.WriteFloat32ImageWithExtensions(path, p, fitsio.ImageData{}, exts...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnsureCombinedExposureGMOSCalibrationEndToEnd(t *testing.T) {
+	d := t.TempDir()
+	science := filepath.Join(d, "science.fits")
+	bias := filepath.Join(d, "bias.fits")
+	flat := filepath.Join(d, "flat.fits")
+	bpm := filepath.Join(d, "bpm.fits")
+	writeGMOSMEF(t, science, "OBJECT", "r_G0303", 45, false)
+	writeGMOSMEF(t, bias, "BIAS", "", 5, false)
+	writeGMOSMEF(t, flat, "FLAT", "r_G0303", 7, false)
+	writeGMOSMEF(t, bpm, "BPM", "", 0, true)
+	s := &GMOSCalibrationSelection{Bias: &GMOSCalibrationFrame{Path: bias}, Flat: &GMOSCalibrationFrame{Path: flat}, BPM: &GMOSCalibrationFrame{Path: bpm}, BiasFrames: []GMOSCalibrationFrame{{Path: bias}}, FlatFrames: []GMOSCalibrationFrame{{Path: flat}}, BPMFrames: []GMOSCalibrationFrame{{Path: bpm}}}
+	work, cached, err := EnsureCombinedExposure(science, CombineOptions{GMOSCalibration: s})
+	if err != nil || cached {
+		t.Fatalf("first ensure=%q,%v,%v", work, cached, err)
+	}
+	got, e := fitsio.LoadFile(work)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(got.HDUs) == 0 || len(got.HDUs[0].Data.Pixels) == 0 {
+		t.Fatal("missing combined output")
+	}
+	if got.HDUs[0].Data.Pixels[0] != 40 || !math.IsNaN(float64(got.HDUs[0].Data.Pixels[1])) {
+		t.Fatalf("calibrated output=%v", got.HDUs[0].Data.Pixels[:2])
+	}
+	if fitsio.HeaderString(got.HDUs[0].Header, "CALEN") != "1" || fitsio.HeaderString(got.HDUs[0].Header, "CALFP") == "" {
+		t.Fatal("calibration cache cards missing")
+	}
+	if _, cached, err = EnsureCombinedExposure(science, CombineOptions{GMOSCalibration: s}); err != nil || !cached {
+		t.Fatalf("identical recipe cache=%v,%v", cached, err)
+	}
+	s2 := *s
+	s2.BiasFrames = append(append([]GMOSCalibrationFrame(nil), s.BiasFrames...), GMOSCalibrationFrame{Path: bias, Date: "2005-03-31"})
+	if _, cached, err = EnsureCombinedExposure(science, CombineOptions{GMOSCalibration: &s2}); err != nil || cached {
+		t.Fatalf("changed recipe cache=%v,%v", cached, err)
+	}
+}
 
 func TestEnsureCombinedExposureFinalizationFailurePreservesCache(t *testing.T) {
 	dir := t.TempDir()
@@ -217,6 +323,32 @@ func TestEnsureCombinedExposureCache(t *testing.T) {
 	})
 	if _, cached, err := EnsureCombinedExposure(src, CombineOptions{}); err != nil || cached {
 		t.Fatalf("after source change cached=%v err=%v, want cached=false", cached, err)
+	}
+}
+
+func TestEnsureCombinedExposureRejectsLegacyCombineFormatCache(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "exp_flc.fits")
+	writeSyntheticExposure(t, src, 4, 4, 100, "F502N", twoOverlappingChips(50))
+	working, _, err := EnsureCombinedExposure(src, CombineOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := fitsio.LoadFile(working)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.HDUs[0].Header.Cards["COMBVER"] = "1"
+	if err := fitsio.WriteFloat32ImageWithExtensions(working, f.HDUs[0].Header, f.HDUs[0].Data, fitsio.ImageExtension{ExtName: "WHT", Data: f.HDUs[1].Data}); err != nil {
+		t.Fatal(err)
+	}
+	if _, cached, err := EnsureCombinedExposure(src, CombineOptions{}); err != nil || cached {
+		t.Fatalf("legacy cache result cached=%v err=%v, want rebuild", cached, err)
+	}
+	if hdr, err := fitsio.LoadPrimaryHeader(working); err != nil {
+		t.Fatal(err)
+	} else if got, _ := fitsio.HeaderFloat(hdr, "COMBVER"); int(got) != combineFormatVersion {
+		t.Fatalf("rebuilt COMBVER=%v, want %d", got, combineFormatVersion)
 	}
 }
 

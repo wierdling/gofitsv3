@@ -80,6 +80,8 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/wierdling/gofiledialog v0.1.3 h1:3Xk2iAKNhMeNklHKy3L30q9YGZ2oRxPkicq0BE2fBEU=
 github.com/wierdling/gofiledialog v0.1.3/go.mod h1:D6mQUdTd6hhcQ/Vi6LnCjCleEbVHWko071xKis/J64c=
+github.com/wierdling/gofiledialog v0.1.5 h1:reFCLCfXC9gdsF/cSukOJtoHSBtovv2MhsS+O+NrmR0=
+github.com/wierdling/gofiledialog v0.1.5/go.mod h1:D6mQUdTd6hhcQ/Vi6LnCjCleEbVHWko071xKis/J64c=
 github.com/yuin/goldmark v1.7.8 h1:iERMLn0/QJeHFhxSt3p6PeN9mGnvIKSpG9YYorDMnic=
 github.com/yuin/goldmark v1.7.8/go.mod h1:uzxRWxtg69N339t3louHJ7+O03ezfj6PlliRlaOzY1E=
 golang.org/x/exp v0.0.0-20230315142452-642cacee5cc0 h1:pVgRXcIictcr+lBQIFeiwuwtDIs4eL21OuM9nyAADmo=

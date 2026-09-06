@@ -11,13 +11,108 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
+	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/models"
+	"gofitsv3/internal/processing"
 )
 
 type composeWeightSource struct {
-	ID       string
-	Label    string
-	Defaults models.ComposeMixWeight
+	ID               string
+	Label            string
+	Defaults         models.ComposeMixWeight
+	FilterName       string
+	WavelengthNm     float64
+	BandClass        fitsio.FilterBandClass
+	Origin           string
+	Confidence       string
+	UnresolvedReason string
+}
+
+// composeWeightSourceFromImage builds the dialog's metadata snapshot without
+// opening the source or retaining any pixel data.
+func composeWeightSourceFromImage(id, label string, defaults models.ComposeMixWeight, img *models.LoadedImage) composeWeightSource {
+	source := composeWeightSource{ID: id, Label: label, Defaults: defaults, BandClass: fitsio.FilterBandUnknown}
+	if img == nil {
+		return source
+	}
+	bandpass := fitsio.ResolveFilterBandpass(img.Primary, img.HDU.Header)
+	source.FilterName = bandpass.Name
+	source.WavelengthNm = bandpass.WavelengthNm
+	source.BandClass = bandpass.Class
+	source.Origin = bandpass.Origin
+	source.Confidence = bandpass.Confidence
+	source.UnresolvedReason = bandpass.UnresolvedReason
+	if source.FilterName != "" {
+		source.Label += " — " + source.FilterName
+	}
+	return source
+}
+
+func wavelengthBandClassLabel(class fitsio.FilterBandClass) string {
+	switch class {
+	case fitsio.FilterBandWide:
+		return "W"
+	case fitsio.FilterBandMedium:
+		return "M"
+	case fitsio.FilterBandNarrow:
+		return "N"
+	case fitsio.FilterBandLongpass:
+		return "L/LP"
+	default:
+		return "Unknown"
+	}
+}
+
+func parseWavelengthBandClass(value string) fitsio.FilterBandClass {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "W":
+		return fitsio.FilterBandWide
+	case "M":
+		return fitsio.FilterBandMedium
+	case "N":
+		return fitsio.FilterBandNarrow
+	case "L/LP", "L", "LP":
+		return fitsio.FilterBandLongpass
+	default:
+		return fitsio.FilterBandUnknown
+	}
+}
+
+// composeWavelengthCandidates validates the dialog snapshot and includes only
+// rows that currently contribute RGB signal. It is independent of widgets so
+// the transactional behavior can be tested without constructing a dialog.
+func composeWavelengthCandidates(sources []composeWeightSource, weights []models.ComposeMixWeight, wavelengths []float64, classes []fitsio.FilterBandClass) ([]processing.WavelengthMixSource, error) {
+	if len(sources) != len(weights) || len(sources) != len(wavelengths) || len(sources) != len(classes) {
+		return nil, fmt.Errorf("wavelength mapping source snapshot is inconsistent")
+	}
+	candidates := make([]processing.WavelengthMixSource, 0, len(sources))
+	for i, source := range sources {
+		if composeMixWeightDisabled(weights[i]) {
+			continue
+		}
+		if !finiteComposeNumber(wavelengths[i]) || wavelengths[i] <= 0 {
+			if source.UnresolvedReason != "" {
+				return nil, fmt.Errorf("%s: %s", source.Label, source.UnresolvedReason)
+			}
+			return nil, fmt.Errorf("%s: enter a positive wavelength in nm", source.Label)
+		}
+		candidates = append(candidates, processing.WavelengthMixSource{BlinkID: source.ID, WavelengthNm: wavelengths[i], BandClass: classes[i]})
+	}
+	return candidates, nil
+}
+
+func applyGeneratedWavelengthWeights(current, generated []models.ComposeMixWeight) []models.ComposeMixWeight {
+	updated := append([]models.ComposeMixWeight(nil), current...)
+	byID := make(map[string]models.ComposeMixWeight, len(generated))
+	for _, weight := range generated {
+		byID[weight.BlinkID] = weight
+	}
+	for i := range updated {
+		if weight, ok := byID[updated[i].BlinkID]; ok {
+			updated[i] = weight
+		}
+	}
+	return updated
 }
 
 func composeWeightForColor(id string, c color.NRGBA, opacity float64) models.ComposeMixWeight {
@@ -57,10 +152,6 @@ func normalizeComposeMixWeights(existing []models.ComposeMixWeight, sources []co
 			weight = source.Defaults
 		}
 		weight.BlinkID = source.ID
-		if weight.Red == 0 && weight.Green == 0 && weight.Blue == 0 {
-			weight = source.Defaults
-			weight.BlinkID = source.ID
-		}
 		result = append(result, weight)
 	}
 	return result
@@ -72,15 +163,6 @@ func composeMixWeightDisabled(weight models.ComposeMixWeight) bool {
 
 func upsertComposeMixWeight(weights *[]models.ComposeMixWeight, weight models.ComposeMixWeight) {
 	if weights == nil || weight.BlinkID == "" {
-		return
-	}
-	if composeMixWeightDisabled(weight) {
-		for i := range *weights {
-			if (*weights)[i].BlinkID == weight.BlinkID {
-				*weights = append((*weights)[:i], (*weights)[i+1:]...)
-				return
-			}
-		}
 		return
 	}
 	for i := range *weights {
@@ -145,6 +227,8 @@ func showComposeWeightsDialog(win fyne.Window, mode *models.ComposeMode, weights
 	effective := widget.NewLabel(composeModeLabel(currentMode, len(sources)))
 	rows := container.NewVBox()
 	entries := make([][3]*widget.Entry, len(sources))
+	wavelengthEntries := make([]*widget.Entry, len(sources))
+	bandSelects := make([]*widget.Select, len(sources))
 	refreshEntries := func() {
 		for i := range entries {
 			for c, entry := range entries[i] {
@@ -161,6 +245,14 @@ func showComposeWeightsDialog(win fyne.Window, mode *models.ComposeMode, weights
 			row.Add(entry)
 		}
 		rows.Add(row)
+		wavelength := widget.NewEntry()
+		if source.WavelengthNm > 0 {
+			wavelength.SetText(strconv.FormatFloat(source.WavelengthNm, 'g', 8, 64))
+		}
+		wavelengthEntries[i] = wavelength
+		class := widget.NewSelect([]string{"W", "M", "N", "L/LP", "Unknown"}, nil)
+		class.SetSelected(wavelengthBandClassLabel(source.BandClass))
+		bandSelects[i] = class
 	}
 	modeSelect.OnChanged = func(selected string) {
 		switch selected {
@@ -205,6 +297,79 @@ func showComposeWeightsDialog(win fyne.Window, mode *models.ComposeMode, weights
 		refreshEntries()
 		effective.SetText(composeModeLabel(currentMode, len(sources)))
 	})
+	wavelengthCrossMix := widget.NewEntry()
+	wavelengthCrossMix.SetText(strconv.Itoa(defaultWidebandMixPercent))
+	accentPercent := widget.NewEntry()
+	accentPercent.SetText("25")
+	wavelengthStatus := widget.NewLabel("Enter or verify filter metadata before applying.")
+	wavelengthRows := container.NewVBox()
+	for i, source := range sources {
+		wavelengthRows.Add(container.NewGridWithColumns(4,
+			widget.NewLabel(source.Label), wavelengthEntries[i], bandSelects[i],
+			widget.NewLabel(source.Origin)))
+	}
+	wavelengthPreset := widget.NewButton("Apply wavelength-aware preset", func() {
+		// Snapshot edits first; no mode or weight state is changed on failure.
+		temporaryWeights := append([]models.ComposeMixWeight(nil), currentWeights...)
+		for i := range entries {
+			values := []*float64{&temporaryWeights[i].Red, &temporaryWeights[i].Green, &temporaryWeights[i].Blue}
+			for c, entry := range entries[i] {
+				value, parseErr := strconv.ParseFloat(strings.TrimSpace(entry.Text), 64)
+				if parseErr != nil || value < 0 || !finiteComposeNumber(value) {
+					wavelengthStatus.SetText(fmt.Sprintf("%s RGB weight must be a non-negative number", sources[i].Label))
+					return
+				}
+				*values[c] = value
+			}
+		}
+		wavelengths := make([]float64, len(sources))
+		classes := make([]fitsio.FilterBandClass, len(sources))
+		for i, source := range sources {
+			// Disabled rows are intentionally excluded from the wavelength
+			// recipe. Their metadata may be blank or unresolved, and their
+			// existing zero weights must remain untouched.
+			if composeMixWeightDisabled(temporaryWeights[i]) {
+				continue
+			}
+			value, err := strconv.ParseFloat(strings.TrimSpace(wavelengthEntries[i].Text), 64)
+			if err != nil {
+				wavelengthStatus.SetText(fmt.Sprintf("%s: enter a positive wavelength in nm", source.Label))
+				return
+			}
+			wavelengths[i] = value
+			classes[i] = parseWavelengthBandClass(bandSelects[i].Selected)
+		}
+		candidate, err := composeWavelengthCandidates(sources, temporaryWeights, wavelengths, classes)
+		if err != nil {
+			wavelengthStatus.SetText(err.Error())
+			return
+		}
+		crossMix, err := strconv.ParseFloat(strings.TrimSpace(wavelengthCrossMix.Text), 64)
+		if err != nil {
+			wavelengthStatus.SetText("Cross-mix must be between 0 and 50 percent")
+			return
+		}
+		accent, err := strconv.ParseFloat(strings.TrimSpace(accentPercent.Text), 64)
+		if err != nil {
+			wavelengthStatus.SetText("Narrowband accent must be between 1 and 100 percent")
+			return
+		}
+		result, err := processing.GenerateWavelengthMixWeights(candidate, processing.WavelengthMixOptions{CrossMixPercent: crossMix, NarrowbandAccentPercent: accent})
+		if err != nil {
+			wavelengthStatus.SetText(err.Error())
+			return
+		}
+		currentWeights = applyGeneratedWavelengthWeights(temporaryWeights, result.Weights)
+		currentMode = models.ComposeModeWeighted
+		modeSelect.SetSelected("Weighted multi-channel")
+		refreshEntries()
+		effective.SetText(composeModeLabel(currentMode, len(sources)))
+		if len(result.Warnings) > 0 {
+			wavelengthStatus.SetText(strings.Join(result.Warnings, " "))
+		} else {
+			wavelengthStatus.SetText("Wavelength-aware weights generated.")
+		}
+	})
 	var d *dialog.CustomDialog
 	apply := widget.NewButton("Apply", func() {
 		for i := range entries {
@@ -225,13 +390,7 @@ func showComposeWeightsDialog(win fyne.Window, mode *models.ComposeMode, weights
 				return
 			}
 		}
-		activeWeights := make([]models.ComposeMixWeight, 0, len(currentWeights))
-		for _, weight := range currentWeights {
-			if !composeMixWeightDisabled(weight) {
-				activeWeights = append(activeWeights, weight)
-			}
-		}
-		*mode, *weights = currentMode, activeWeights
+		*mode, *weights = currentMode, append([]models.ComposeMixWeight(nil), currentWeights...)
 		if onApply != nil {
 			onApply()
 		}
@@ -240,8 +399,13 @@ func showComposeWeightsDialog(win fyne.Window, mode *models.ComposeMode, weights
 	cancel := widget.NewButton("Cancel", func() { d.Hide() })
 	header := container.NewGridWithColumns(4, widget.NewLabel("Source"), widget.NewLabel("Red"), widget.NewLabel("Green"), widget.NewLabel("Blue"))
 	widebandForm := widget.NewForm(widget.NewFormItem("Cross-mix % (s)", widebandPercent), widget.NewFormItem("Preset", wideband))
-	content := container.NewBorder(container.NewVBox(widget.NewForm(widget.NewFormItem("Mode", modeSelect)), effective, widebandForm, header), container.NewGridWithColumns(3, reset, cancel, apply), nil, nil, container.NewVScroll(rows))
+	wavelengthForm := widget.NewForm(widget.NewFormItem("Cross-mix % (0–50)", wavelengthCrossMix), widget.NewFormItem("Narrowband accent % (1–100)", accentPercent), widget.NewFormItem("Preset", wavelengthPreset))
+	wavelengthHeader := container.NewGridWithColumns(4, widget.NewLabel("Filter"), widget.NewLabel("Wavelength nm"), widget.NewLabel("Class"), widget.NewLabel("Detected origin"))
+	allRows := container.NewVBox(header, rows, wavelengthForm, wavelengthStatus, wavelengthHeader, wavelengthRows)
+	content := container.NewBorder(container.NewVBox(widget.NewForm(widget.NewFormItem("Mode", modeSelect)), effective, widebandForm), container.NewGridWithColumns(3, reset, cancel, apply), nil, nil, container.NewVScroll(allRows))
 	d = dialog.NewCustomWithoutButtons("Compose color mixing", content, win)
 	d.Resize(fyne.NewSize(640, 420))
 	d.Show()
 }
+
+func finiteComposeNumber(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }

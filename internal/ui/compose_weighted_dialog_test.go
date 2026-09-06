@@ -4,8 +4,65 @@ import (
 	"image/color"
 	"testing"
 
+	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/models"
 )
+
+func TestComposeWeightSourceFromImageUsesLoadedHeadersAndNilPixels(t *testing.T) {
+	img := &models.LoadedImage{
+		Primary: fitsio.Header{Cards: map[string]string{"TELESCOP": "'JWST'", "INSTRUME": "'NIRCam'", "FILTER": "'F150W'"}},
+		HDU:     fitsio.HDU{Header: fitsio.Header{Cards: map[string]string{"PUPIL": "'F162M'"}}},
+	}
+	got := composeWeightSourceFromImage("overlay-7", "Narrow", models.ComposeMixWeight{Red: 1}, img)
+	if got.ID != "overlay-7" || got.FilterName != "F162M" || got.WavelengthNm != 1620 || got.BandClass != fitsio.FilterBandMedium {
+		t.Fatalf("source metadata = %#v", got)
+	}
+	if got.Label != "Narrow — F162M" || got.Origin != "filter name" {
+		t.Fatalf("source presentation = %#v", got)
+	}
+	if img.HDU.Data.Pixels != nil {
+		t.Fatal("metadata source builder retained pixels")
+	}
+}
+
+func TestComposeWeightSourceFromImageAllowsManualLongpassRecovery(t *testing.T) {
+	img := &models.LoadedImage{Primary: fitsio.Header{Cards: map[string]string{"TELESCOP": "'JWST'", "FILTER": "'F100LP'"}}}
+	got := composeWeightSourceFromImage("channel-1", "Channel 1", models.ComposeMixWeight{Blue: 1}, img)
+	if got.BandClass != fitsio.FilterBandLongpass || got.WavelengthNm != 0 || got.UnresolvedReason == "" {
+		t.Fatalf("long-pass metadata = %#v", got)
+	}
+	if parseWavelengthBandClass("l/lp") != fitsio.FilterBandLongpass || wavelengthBandClassLabel(fitsio.FilterBandUnknown) != "Unknown" {
+		t.Fatal("manual band class conversion failed")
+	}
+}
+
+func TestComposeWavelengthCandidatesUsesTemporaryRGBSnapshot(t *testing.T) {
+	sources := []composeWeightSource{{ID: "blue"}, {ID: "green"}, {ID: "excluded"}}
+	weights := []models.ComposeMixWeight{{BlinkID: "blue", Blue: 1}, {BlinkID: "green", Green: 1}, {BlinkID: "excluded"}}
+	candidates, err := composeWavelengthCandidates(sources, weights, []float64{445, 550, 0}, []fitsio.FilterBandClass{fitsio.FilterBandWide, fitsio.FilterBandWide, fitsio.FilterBandUnknown})
+	if err != nil || len(candidates) != 2 {
+		t.Fatalf("candidates = %#v, err = %v", candidates, err)
+	}
+	weights[0] = models.ComposeMixWeight{BlinkID: "blue"}
+	if candidates, err = composeWavelengthCandidates(sources, weights, []float64{0, 550, 600}, []fitsio.FilterBandClass{fitsio.FilterBandUnknown, fitsio.FilterBandWide, fitsio.FilterBandWide}); err != nil || len(candidates) != 1 || candidates[0].BlinkID != "green" {
+		t.Fatalf("zeroed exclusion candidates = %#v, err = %v", candidates, err)
+	}
+	if _, err := composeWavelengthCandidates(sources, weights, []float64{0, 550, 600}, []fitsio.FilterBandClass{fitsio.FilterBandUnknown, fitsio.FilterBandWide, fitsio.FilterBandWide}); err != nil {
+		t.Fatalf("excluded invalid metadata should not fail: %v", err)
+	}
+}
+
+func TestApplyGeneratedWavelengthWeightsPreservesExcludedRows(t *testing.T) {
+	current := []models.ComposeMixWeight{{BlinkID: "blue", Blue: 1}, {BlinkID: "excluded"}}
+	generated := []models.ComposeMixWeight{{BlinkID: "blue", Red: .2, Blue: .8}}
+	got := applyGeneratedWavelengthWeights(current, generated)
+	if len(got) != 2 || got[0].Red != .2 || !composeMixWeightDisabled(got[1]) {
+		t.Fatalf("applied weights = %#v, want generated active and excluded zero", got)
+	}
+	if current[0].Red != 0 {
+		t.Fatal("weight application mutated the source snapshot")
+	}
+}
 
 func TestNormalizeComposeMixWeightsUsesStableIDsAndDefaults(t *testing.T) {
 	sources := []composeWeightSource{
@@ -59,14 +116,18 @@ func TestUpsertComposeMixWeightReplacesByIdentity(t *testing.T) {
 	if len(weights) != 2 || weights[0].Red != 0 || weights[0].Green != 1 || weights[1].BlinkID != "overlay-2" {
 		t.Fatalf("upserted weights = %#v", weights)
 	}
+	upsertComposeMixWeight(&weights, models.ComposeMixWeight{BlinkID: "overlay-1"})
+	if len(weights) != 2 || !composeMixWeightDisabled(weights[0]) {
+		t.Fatalf("explicit disabled weight = %#v", weights)
+	}
 }
 
 func TestMagicBlackCustomColorDoesNotPersistInvalidWeight(t *testing.T) {
 	weights := []models.ComposeMixWeight{{BlinkID: "overlay-1", Red: 1}}
 	black := composeWeightForColor("overlay-1", color.NRGBA{A: 255}, 1)
 	upsertComposeMixWeight(&weights, black)
-	if len(weights) != 0 {
-		t.Fatalf("black custom color persisted weights = %#v, want omitted", weights)
+	if len(weights) != 1 || !composeMixWeightDisabled(weights[0]) {
+		t.Fatalf("black custom color weights = %#v, want explicit disabled row", weights)
 	}
 	project := models.ComposeProject{CompositionMode: models.ComposeModeAuto, MixWeights: weights}
 	if got := project.ResolveComposeMode(4); got != models.ComposeModeWeighted {

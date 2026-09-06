@@ -47,6 +47,19 @@ type composeAlignmentMatcher func(target, reference composeAlignmentChannel) (co
 
 type composeAlignmentFallbackEligibility func(target, reference composeAlignmentChannel) (bool, error)
 
+// composeAlignmentSlots returns the RGB slots plus each loaded, active extra
+// layer. Slot numbers are zero-based runtime indexes; the coordinator uses the
+// corresponding one-based channel numbers.
+func composeAlignmentSlots(images []*models.LoadedImage, extraSlots []int) []int {
+	slots := []int{0, 1, 2}
+	for _, index := range extraSlots {
+		if index >= 3 && index < len(images) && images[index] != nil {
+			slots = append(slots, index)
+		}
+	}
+	return slots
+}
+
 // composeAlignmentMatchFromFittedAffine converts the matcher affine, which is
 // fitted against a target resized to the reference dimensions, back to the
 // target's original pixel frame.

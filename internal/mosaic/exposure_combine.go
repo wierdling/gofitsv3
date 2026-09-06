@@ -3,6 +3,7 @@ package mosaic
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,7 +14,7 @@ import (
 
 // combineFormatVersion is stamped into each working file's COMBVER card. Bump it
 // when the combine output format changes so stale caches are rejected.
-const combineFormatVersion = 1
+const combineFormatVersion = 2
 
 // WorkingDirName is the subdirectory (next to the source images) that holds the
 // per-exposure combined working files.
@@ -28,6 +29,11 @@ type CombineOptions struct {
 	// Ctx, when non-nil, cancels the combine; EnsureCombinedExposure then returns
 	// ErrCancelled.
 	Ctx context.Context
+	// GMOSCalibration, when non-nil, applies the selected GMOS calibration
+	// recipe to raw GMOS chips before they are combined. Nil preserves legacy
+	// behavior for HST, JWST, and uncalibrated loads.
+	GMOSCalibration         *GMOSCalibrationSelection
+	GMOSCalibrationProgress func()
 }
 
 // WorkingPathFor returns the working-file path for a source exposure:
@@ -46,7 +52,16 @@ func WorkingPathFor(srcPath string) string {
 // were exposed simultaneously and share a rigid geometry.
 func EnsureCombinedExposure(srcPath string, opts CombineOptions) (workingPath string, cached bool, err error) {
 	workingPath = WorkingPathFor(srcPath)
-	if combinedWorkingFileValid(srcPath, workingPath) {
+	calibrationSelection := opts.GMOSCalibration
+	if calibrationSelection != nil {
+		// A calibration option may be carried by a shared pipeline invocation;
+		// it only changes cache identity for raw GMOS sources.
+		primary, primaryErr := fitsio.LoadPrimaryHeader(srcPath)
+		if primaryErr != nil || !IsGeminiHeader(primary) {
+			calibrationSelection = nil
+		}
+	}
+	if combinedWorkingFileValid(srcPath, workingPath) && combinedCalibrationCacheValid(workingPath, calibrationSelection) {
 		return workingPath, true, nil
 	}
 	if opts.Ctx != nil && opts.Ctx.Err() != nil {
@@ -60,6 +75,55 @@ func EnsureCombinedExposure(srcPath string, opts CombineOptions) (workingPath st
 	chips, err := LoadInputsFromPath(srcPath)
 	if err != nil {
 		return "", false, fmt.Errorf("combine %s: %w", filepath.Base(srcPath), err)
+	}
+	calibrated := false
+	if opts.GMOSCalibration != nil && IsGeminiHeader(chips[0].PrimaryHeader) {
+		if opts.Ctx != nil && opts.Ctx.Err() != nil {
+			return "", false, ErrCancelled
+		}
+		bias, flat, calErr := cachedGMOSMasters(opts.Ctx, *opts.GMOSCalibration, opts.GMOSCalibrationProgress)
+		if calErr != nil {
+			if opts.Ctx != nil && opts.Ctx.Err() != nil {
+				return "", false, ErrCancelled
+			}
+			return "", false, fmt.Errorf("combine %s calibration: %w", filepath.Base(srcPath), calErr)
+		}
+		var bpm [][]bool
+		for _, frame := range opts.GMOSCalibration.BPMFrames {
+			if opts.Ctx != nil && opts.Ctx.Err() != nil {
+				return "", false, ErrCancelled
+			}
+			loaded, e := loadGMOSBPMInputs(frame.Path)
+			if e != nil {
+				return "", false, e
+			}
+			if len(loaded) != len(chips) {
+				return "", false, fmt.Errorf("GMOS BPM chip count mismatch")
+			}
+			if bpm == nil {
+				bpm = make([][]bool, len(chips))
+			}
+			for i, in := range loaded {
+				if in.HDU.Data.Width != chips[i].HDU.Data.Width || in.HDU.Data.Height != chips[i].HDU.Data.Height || len(in.HDU.Data.Pixels) != len(chips[i].HDU.Data.Pixels) {
+					return "", false, fmt.Errorf("GMOS BPM geometry mismatch")
+				}
+				if bpm[i] == nil {
+					bpm[i] = make([]bool, len(in.HDU.Data.Pixels))
+				}
+				for j, v := range in.HDU.Data.Pixels {
+					if opts.Ctx != nil && opts.Ctx.Err() != nil {
+						return "", false, ErrCancelled
+					}
+					if v != 0 && !math.IsNaN(float64(v)) {
+						bpm[i][j] = true
+					}
+				}
+			}
+		}
+		if calErr = ApplyGMOSMastersToInputs(chips, bias, flat, bpm); calErr != nil {
+			return "", false, fmt.Errorf("combine %s calibration: %w", filepath.Base(srcPath), calErr)
+		}
+		calibrated = true
 	}
 
 	result, err := Build(chips, Options{
@@ -89,6 +153,10 @@ func EnsureCombinedExposure(srcPath string, opts CombineOptions) (workingPath st
 	}
 
 	stampCombinedHeader(&result.OutputHeader, srcPath, srcInfo, len(chips))
+	if calibrated {
+		result.OutputHeader.Cards["CALEN"] = "1"
+		result.OutputHeader.Cards["CALFP"] = quotedString(GMOSCalibrationFingerprint(*opts.GMOSCalibration))
+	}
 
 	if err := writeCombinedWorkingFile(workingPath, result); err != nil {
 		return "", false, err
@@ -152,6 +220,18 @@ func combinedWorkingFileValid(srcPath, workingPath string) bool {
 		return false
 	}
 	return true
+}
+
+func combinedCalibrationCacheValid(path string, selection *GMOSCalibrationSelection) bool {
+	h, err := fitsio.LoadPrimaryHeader(path)
+	if err != nil {
+		return false
+	}
+	enabled := fitsio.HeaderString(h, "CALEN") == "1"
+	if selection == nil {
+		return !enabled
+	}
+	return enabled && fitsio.HeaderString(h, "CALFP") == GMOSCalibrationFingerprint(*selection)
 }
 
 // stampCombinedHeader records the combined-file marker and source-identity cards

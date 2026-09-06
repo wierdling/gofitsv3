@@ -209,3 +209,231 @@ Keep lane ownership separate. Route cross-package findings to the owning lane ra
 - After each implementation pass, run its narrow tests before reviewer verification.
 - At the end, check ownership boundaries, rerun reviewer verification for each lane, then run `go test ./internal/fitsio ./internal/processing ./internal/mosaic ./internal/export ./internal/ui` followed by `go test ./...`.
 - Record any manual-only UI/file-dialog smoke checks separately; they are not substitutes for unit tests.
+
+# Wavelength-Aware Compose Color Mapping Plan
+
+## Purpose and v1 scope
+
+Add an explicit **Wavelength-aware** preset to `Compose > Color Mixing...` that
+derives editable RGB weights from the relative spacing and band class of every
+included filter. The first version supports arbitrary sets of two or more
+sources, including W/W/W, W/W/W/N, multiple wide and narrow JWST filters,
+W/W/M, and L/W/W.
+
+The preset is a weight generator, not a new renderer or composition mode. It
+must write the existing stable-ID `ComposeMixWeight` values and select explicit
+Weighted mode, so normal and disk-backed Compose continue to share the current
+mixing engines and saved projects retain their existing compatibility.
+
+Version 1 resolves wavelength only from a valid FITS `PHOTPLAM` value or from
+an instrument-aware filter-name parser. It uses linear wavelength spacing,
+which directly models comparisons such as the 105 nm F445W-to-F550W gap versus
+the 50 nm F550W-to-F600W gap. Unknown, ambiguous, or long-pass filters without
+a reliable effective wavelength require an editable manual value. Do not add
+unverified FITS wavelength keywords, logarithmic spacing, online catalog
+lookups, throughput downloads, or new dependencies in this version.
+
+## Architecture and formula constraints
+
+- Preserve the current balanced wideband preset, Auto/Weighted/Artistic mode
+  resolution, artistic overlay behavior, LRGB ordering, RGB Levels behavior,
+  stable overlay identities, and legacy project semantics.
+- Keep filter metadata resolution in `internal/fitsio`, pure wavelength-to-RGB
+  math in `internal/processing`, and dialog/source wiring in `internal/ui`.
+  Neither normal nor disk compositors may duplicate or independently calculate
+  wavelength weights.
+- Use both `LoadedImage.Primary` and the selected `LoadedImage.HDU.Header`
+  already retained by normal and large-file loads. Applying the preset must not
+  reopen a FITS file, mutate headers, or retain additional image data.
+- Treat W, W2, M, and L/LP sources as continuum/base filters. Treat N sources
+  as line-detail accents only when at least two non-narrow base sources exist.
+  If fewer than two base sources exist, promote all included sources to the
+  base palette and present a warning so N/N and W/N sets remain usable.
+- For each included source, normalize its wavelength position as
+  `t=(lambda-min)/(max-min)`. With `s=crossMixPercent/100`, use RGB anchors
+  `blue=(0,s,1-s)`, `green=(s,1-2s,s)`, and `red=(1-s,s,0)`, linearly
+  interpolating blue-to-green for `t<=0.5` and green-to-red for `t>0.5`.
+- Column-normalize the base filters' raw RGB vectors. This makes equal,
+  independently normalized continuum inputs produce equal supported RGB
+  totals and prevents a dense cluster of nearby filters from creating a cast.
+  Do not row-normalize afterward because that would undo neutral-density
+  compensation.
+- Scale all narrowband raw vectors together by
+  `accent/maxRGB(sum(narrowVectors))`. Thus one or many narrow filters add no
+  more than the selected aggregate accent to any output channel; adding more
+  narrow filters redistributes the accent budget instead of multiplying it.
+- Do not multiply weights by filter bandwidth, exposure, or FITS signal units.
+  Compose already stretches and peak-normalizes sources independently, and
+  those metadata values are not consistently comparable across instruments.
+- Generated weights must remain finite, non-negative, deterministic under
+  source permutation, keyed by BlinkID, and valid under
+  `ComposeMixWeight.Validate`. Zero-weight/excluded rows remain excluded unless
+  the user explicitly includes them.
+
+## Ordered implementation steps
+
+1. [x] Resolve filter wavelength and band class without guessing ambiguous metadata.
+   - Files: new `internal/fitsio/filter_bandpass.go` and
+     `internal/fitsio/filter_bandpass_test.go`; reuse `FilterString` from
+     `internal/fitsio/header_only.go` and `HeaderFloat` from
+     `internal/fitsio/write.go` without changing FITS loading.
+   - Add a small general metadata contract such as `FilterBandClass` with
+     `wide`, `medium`, `narrow`, `long-pass`, and `unknown`, plus
+     `FilterBandpass` fields for name, wavelength in nanometers, class,
+     resolution origin/confidence, and an unresolved reason. Add
+     `ResolveFilterBandpass(primary, selectedHDU Header)`.
+   - Resolve the operative filter name with the existing PUPIL-aware
+     `FilterString` behavior, checking primary metadata first and the selected
+     HDU when primary metadata is absent. A finite positive `PHOTPLAM` is the
+     authoritative wavelength and is converted from angstroms to nanometers;
+     a valid primary value wins over a selected-HDU value.
+   - Otherwise parse filter names case-insensitively with the constrained
+     mission pattern `F<digits><W|W2|M|N|L|LP>`. JWST names use hundredths of a
+     micron (`digits * 10` nm). HST WFC3/IR and NICMOS names use the same IR
+     convention; other recognized HST optical/UV filters use nanometers.
+     Determine telescope/instrument/detector from the two headers using
+     existing header-string helpers.
+   - Classify W/W2 as wide, M as medium, N as narrow, and L/LP as long-pass.
+     A name-only long-pass value is a cutoff, not an effective wavelength, so
+     leave it unresolved until the user enters a manual wavelength. For an
+     unknown instrument where the numeric convention is ambiguous, also leave
+     wavelength unresolved rather than silently choosing a scale.
+   - Tests: primary and selected-HDU `PHOTPLAM` precedence and angstrom-to-nm
+     conversion; malformed/non-finite/non-positive `PHOTPLAM`; JWST PUPIL
+     F162M overriding its wide blocker; JWST F770W; HST F445W/F550W/F600W;
+     WFC3/IR F160W; W, W2, M, N, L, and LP classification; lower-case names;
+     unknown instruments; malformed names; and unresolved name-only long-pass
+     filters.
+   - Done when: supported filters resolve deterministically from already-loaded
+     headers, every unresolved result explains the required manual correction,
+     no file/network access or dependency is added, and
+     `go test ./internal/fitsio` passes.
+
+2. [x] Implement and verify the pure arbitrary-source wavelength-weight formula.
+   - Files: new `internal/processing/wavelength_mix.go` and
+     `internal/processing/wavelength_mix_test.go`; reuse
+     `models.ComposeMixWeight` as the output contract.
+   - Define narrow input/options types containing BlinkID, wavelength nm, band
+     class, cross-mix percentage, and aggregate narrowband-accent percentage.
+     Return generated weights plus non-fatal warnings needed by the UI, without
+     importing Fyne or referencing Compose workspace state.
+   - Validate at least two included sources, unique non-empty identities,
+     finite positive wavelengths, at least two distinct wavelengths,
+     cross-mix in 0-50%, and narrowband accent in 1-100%. Sort by wavelength
+     and then BlinkID for deterministic calculation while retaining identity
+     ownership in the returned values.
+   - Implement the linear position, three-anchor interpolation, base-column
+     normalization, aggregate narrowband cap, and insufficient-base promotion
+     exactly as specified in the architecture constraints. If cross-mix is
+     zero and a sparse set cannot support an output color, leave that output
+     contribution at zero and return a warning; never divide by zero or emit
+     NaN/Inf.
+   - Tests: evenly spaced W/W/W at 8% reproduces 92/8, 8/84/8, and 8/92 before
+     any density adjustment changes the already-neutral columns; unequal
+     F445W/F550W/F600W places F550W nearer red and makes each supported base RGB
+     column sum to one; W/W/W/N caps total narrow red accent; multiple JWST
+     W/N sources remain permutation invariant and collectively respect one
+     accent budget; W/W/M and L/W/W treat every source as a base; all-N and W/N
+     promotion warnings; two-source behavior; equal/missing/NaN wavelengths;
+     duplicate IDs; option bounds; and zero-cross-mix sparse output.
+   - Done when: arbitrary valid two-or-more-source inputs produce finite,
+     non-negative, stable-ID weights accepted by `ComposeMixWeight.Validate`,
+     crowded filters do not bias a constant continuum, narrow-filter count
+     cannot multiply the configured accent, and
+     `go test ./internal/processing -run Wavelength` passes.
+
+3. [x] Add the editable Wavelength-aware preset to Compose Color Mixing.
+   - Files: `internal/ui/compose_weighted_dialog.go`,
+     `internal/ui/compose_weighted_dialog_test.go`, and
+     `internal/ui/workspace_compose.go`; add a focused workspace test only if
+     extracting a pure source-builder seam requires it.
+   - Extend `composeWeightSource` with detected filter name, wavelength,
+     band class, origin/confidence, and unresolved reason. Add a small pure
+     source-builder helper that calls `fitsio.ResolveFilterBandpass` with
+     `LoadedImage.Primary` and `LoadedImage.HDU.Header`.
+   - Update the existing `composeWeightSources` closure near the Color Mixing
+     menu wiring to populate this metadata for every loaded standard channel
+     and overlay. Preserve `channel-1`, `channel-2`, `channel-3`, and overlay
+     BlinkIDs exactly; include resolved filter names in user-facing row labels.
+   - Preserve the current mode selector, effective-mode label, Reset weights,
+     Apply wideband preset, editable R/G/B fields, Apply, and Cancel behavior.
+     Add a separate Wavelength-aware section with editable wavelength-nm and
+     W/M/N/L/Unknown values per source, cross-mix default 8%, narrowband accent
+     default 25%, a warning/status label, and an Apply wavelength-aware preset
+     button. Keep the dialog scrollable and large enough for multi-filter JWST
+     sets without moving expensive work off-thread because this calculation is
+     metadata-only and bounded by the existing layer limit.
+   - On preset application, parse only currently included/nonzero sources and
+     require at least two resolved, distinct wavelengths. Display a row-specific
+     error for missing, ambiguous, invalid, or name-only long-pass values and
+     allow the user to correct wavelength/class locally without changing FITS
+     headers. On success, replace only included weights by BlinkID, preserve
+     excluded rows as zero, select explicit Weighted mode, refresh R/G/B fields
+     and the effective-mode label, and display formula warnings.
+   - Keep changes transactional inside the dialog: detection, parsing, or math
+     failure must not alter current weights or mode; Cancel must discard all
+     edits. The generated `MixWeights` are the persisted setting through the
+     existing Compose project fields, so do not add wavelength recipe fields or
+     a project migration in v1. Manual R/G/B edits after generation remain
+     authoritative.
+   - Tests: source construction from primary and selected-HDU headers, including
+     disk-loaded `LoadedImage` values with nil pixels; stable standard and
+     overlay identities; W/W/W and W/W/W/N generation; excluded-source
+     preservation; manual recovery of an unknown or long-pass filter; all-N
+     warning propagation; invalid input leaves mode/weights unchanged; success
+     selects Weighted; and the existing wideband-preset tests remain unchanged.
+   - Done when: all loaded source filters can be inspected and corrected before
+     calculation, every requested W/M/N/L combination can generate editable
+     stable-ID weights, the balanced preset and legacy UI semantics are intact,
+     and focused `go test ./internal/ui -run "Test.*(Wavelength|ComposeWeight)"`
+     passes.
+
+4. [x] Validate renderer parity, compatibility, and user-facing documentation.
+   - Files: focused additions to
+     `internal/processing/weighted_compose_test.go` and
+     `internal/processing/disk_compose_test.go` only where current generic
+     weight tests do not cover the generated multi-filter shapes;
+     `internal/models/models_test.go` only if the existing MixWeights JSON
+     round-trip test does not cover generated/excluded values;
+     `docs/feature-list.md`; and the Compose color-combination section of
+     `docs/user-guide.md`.
+   - Feed a generated W/W/W/N set and a multiple-wide/multiple-narrow set into
+     tiny deterministic normal and disk requests. Assert that both paths honor
+     the same identities and contributions within the existing numeric
+     tolerance, without changing either pixel engine or duplicating formula
+     tests. Retain current order-independence and hue-preserving gamut behavior.
+   - Confirm a saved/reloaded project preserves the calculated MixWeights and
+     explicit Weighted mode while old projects with no new action retain their
+     existing artistic/Auto behavior. Do not persist detected wavelength,
+     temporary warnings, manual dialog metadata, or artifact paths.
+   - Update `docs/feature-list.md` as required for a user-visible feature.
+     Document in `docs/user-guide.md` that wavelength-aware output is a
+     creative false-color starting point rather than a physical photometric
+     reconstruction; explain metadata/manual precedence, unequal spacing,
+     continuum neutrality, the aggregate narrowband accent, editable results,
+     and examples for W/W/W, W/W/W/N, multi-W/multi-N, W/W/M, and L/W/W.
+   - Validation: run `go test ./internal/fitsio`, then the focused wavelength
+     processing and UI tests, then `go test ./internal/processing`,
+     `go test ./internal/ui`, and finally `go test ./...` because the completed
+     feature crosses FITS metadata, processing, project, and UI boundaries.
+   - Done when: calculated weights render equivalently in normal and disk-backed
+     Compose; legacy artistic, Auto, balanced-wideband, project, and output
+     behavior are unchanged unless the new preset is invoked; documentation
+     states the formula and limitations; and all focused and full tests pass.
+
+## Overall completion criteria
+
+- F445W/F550W/F600W produces a spacing-aware starting palette in which F550W
+  is mapped closer to red than blue while a flat normalized continuum remains
+  neutral rather than red-biased.
+- W/W/W/N permits one narrow filter to accent its wavelength-appropriate color
+  without overwhelming the continuum, and adding more narrow filters shares
+  one aggregate accent budget.
+- Multiple W/N JWST sets, W/W/M, L/W/W, all-N, and two-source sets either
+  produce deterministic valid weights or present an actionable manual metadata
+  requirement; no ambiguous wavelength is silently guessed.
+- Users can inspect and edit wavelength, class, and final RGB weights before
+  committing. Generated settings persist through existing stable-ID weights.
+- Normal and disk-backed composition consume the same generated values;
+  no rendering, large-file boundedness, LRGB, RGB Levels, or legacy mode
+  semantics regress.

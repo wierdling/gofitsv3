@@ -5,7 +5,7 @@ go 1.26.1
 require (
 	fyne.io/fyne/v2 v2.7.4
 	github.com/dweymouth/fyne-tooltip v0.4.0
-	github.com/wierdling/gofiledialog v0.1.3
+	github.com/wierdling/gofiledialog v0.1.5
 	golang.org/x/image v0.25.0
 	gonum.org/v1/gonum v0.17.0
 )

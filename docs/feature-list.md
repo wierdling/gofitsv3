@@ -195,7 +195,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Loads one FITS image into each of three base channels labeled Blue, Green, and Red, and uses the same custom FITS file picker for added colored channels.
 - Accepts a handoff from Examine into any base channel.
 - Loads a filter set from a directory by discovering named `_drz.fits`, `_driz.fits`, and `_drizzle.fits` products.
-- In filter-set loading, assigns each discovered filter to Blue, Green, Red, or a custom-colored overlay, and applies a selected Magic preset plus Auto MTF.
+- In filter-set loading, assigns each discovered filter to Blue, Green, Red, or a custom-colored overlay, and applies a selected Magic preset plus a shared robust-background Auto MTF stretch.
 - Supports up to 16 additional custom-colored FITS overlay layers beyond the three base channels.
 - Saves any base channel or overlay as a stretched grayscale image.
 - Views each base channel's FITS headers and saves those headers as text.
@@ -216,7 +216,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Optional lock between black/background and between white/peak controls.
 - Optional clipped-pixel display.
 - Per-channel Auto Scaling, Auto MTF, and Magic (Balanced, Nebula, Galaxy).
-- Applies Magic plus Auto MTF to all currently loaded base and overlay channels in one operation.
+- Applies Magic plus a shared robust-background Auto MTF stretch to all currently loaded base and overlay channels in one operation, keeping representative fields from whitening.
 - Copies Channel 1 stretch/position settings to Channels 2 and 3.
 - Matches one channel's stretch to a selected reference channel, optionally using star-core anchors while ignoring saturated cores.
 - Supports manual X/Y translation and rotation for each base channel.
@@ -226,7 +226,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 
 ### Registration, cleaning, and color combination
 
-- Aligns Channels 1 and 3 to Channel 2 using pixel-space star detection/matching and a full affine fit; it does not trust cross-filter WCS agreement for this operation.
+- Aligns Channels 1 and 3, plus every loaded extra colored layer, to Channel 2 using pixel-space star detection/matching and a full affine fit; it does not trust cross-filter WCS agreement for this operation.
 - Applies manual X/Y/rotation adjustments on top of automatic alignment.
 - Normalizes channel scales relative to Channel 2 for a balanced starting point.
 - Cross-channel cleaning identifies defects present in only one color channel, builds a protective star mask, and replaces isolated cosmic-ray/hot-pixel remnants while preserving real stars.
@@ -234,10 +234,12 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Offers Auto, Weighted multi-channel, and Artistic overlays composition modes; Auto uses weighted mixing when four or more sources are loaded while retaining artistic behavior for three-filter sets.
 - Provides editable non-negative RGB contribution weights for every loaded base channel and overlay. Weights persist by stable overlay identity and filter-set custom colors seed their initial values.
 - Provides an editable wideband cross-mix preset (default 8%, bounded to 0–50%) that blends each blue/green/red base filter into neighboring color outputs while preserving overlay weights and selecting explicit Weighted mode.
+- Provides a wavelength-aware Compose color-mapping preset for arbitrary two-or-more filter sets. It uses valid FITS `PHOTPLAM` metadata or supported filter-name detection, accounts for unequal wavelength spacing, keeps continuum columns neutral, and shares one editable aggregate accent budget across narrowband sources. Resolved wavelengths and RGB weights are shown for manual correction; the generated values are persisted as stable-ID Weighted mix settings.
 - Applies per-channel RGB output levels in a separate levels window.
 - Supports optional LRGB-style combination with a dedicated luminance FITS input or synthetic luminance from selected RGB filters, adjustable luminance contribution, and chrominance-only smoothing that preserves luminance detail. Dedicated-L and LRGB settings persist in Compose projects. Disk-backed Compose rejects enabled LRGB with an actionable error until bounded LRGB processing is available, preventing a silently different render.
 - Adds custom-colored layers with independently adjustable RGB tint, opacity, and highlight protection; overlays are blended into the composite.
 - Displays a color legend describing base filters and active overlay colors.
+- Color legends can be added to Edit as one draggable overlay, resized from 100–600%, and flattened into every export format.
 - Measures the composite with a two-point pixel ruler.
 
 ### Comparison and large-data workflow
@@ -257,7 +259,8 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Sends the composite directly to Edit.
 - Direct Compose and Edit exports support:
   - PNG at 8-bit or 16-bit depth.
-  - JPEG with quality from 1–100.
+- JPEG with quality from 1–100.
+- JPEG export shows an estimated encoded size that updates with quality.
   - Deflate-compressed TIFF.
   - Lossless WebP.
 - Disk-backed Compose can stream full-resolution RGB output to export without first materializing the complete image in RAM.
@@ -300,7 +303,9 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 
 ## Important comparison boundaries
 
-- The primary processing inputs are calibrated FITS products; GoFitsV3 does not claim to perform raw detector calibration such as bias, dark, flat-field, ramp fitting, or a complete HST/JWST calibration pipeline.
+- The primary processing inputs are calibrated FITS products; raw detector calibration remains limited to the explicitly documented Gemini GMOS overscan, bias, flat-field, and BPM workflow. GoFitsV3 does not claim to replace a complete HST/JWST calibration pipeline.
+- Gemini GMOS raw imaging is recognized and grouped by effective filter. The loader handles unnamed three-chip extensions, trims DATASEC after row-wise BIASSEC overscan subtraction, and adjusts CRPIX. Complete selections of compatible master bias/flat calibration and BPM files are applied before chip combination; three-chip twilight flats share one focal-plane normalization so relative chip response is retained. Dark, fringe, and illumination corrections are not provided.
+- Mosaic includes a cancellable Gemini GMOS Calibration action that discovers compatible bias, twilight-flat, and BPM files, rejects incomplete selections, and atomically reloads the current GMOS science workspace. An external reference baseline remains geometry-only and is preserved unchanged during calibration. Saved Mosaic projects and Drizzle Queue jobs restore and apply the same validated recipe before combining inputs.
 - The program is optimized for aesthetic image production. Some options, especially disconnected-background equalization and manual/artifact cleanup, are intentionally non-photometric.
 - Cosmic-ray rejection is a multi-exposure drizzle feature and works best with comparable overlapping frames; it is not a general single-image cosmic-ray removal pipeline.
 - Explicit detector support is concentrated on the HST and JWST imagers listed above. Generic FITS files may load, but instrument-specific scale, chip, distortion, and DQ behavior is not guaranteed.

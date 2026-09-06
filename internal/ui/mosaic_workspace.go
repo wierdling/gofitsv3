@@ -35,6 +35,9 @@ type mosaicWorkspace struct {
 	buildMu             sync.Mutex
 	buildGeneration     uint64
 	buildCancel         context.CancelFunc
+	gmosMu              sync.Mutex
+	gmosGeneration      uint64
+	gmosCancel          context.CancelFunc
 	// inputMu guards replacement/reload of inputs and the generation map. Long
 	// running exports take short read snapshots so a project reload cannot race
 	// their validation or final publication.
@@ -42,16 +45,18 @@ type mosaicWorkspace struct {
 	// inputGenerations advances whenever an input is reloaded/replaced. It is
 	// keyed by the stable source identity so an editor cannot export a mask for
 	// a same-path, same-dimensions replacement.
-	inputGenerations  map[string]uint64
-	queueWindow       fyne.Window
-	zoomLevel         float64
-	zoomFitMode       bool
-	levelsSet         bool
-	stretchMode       stretch.Mode
-	mtfMidtone        float64
-	mosaicBins        [256]int
-	zoomCustomOption  string
-	zoomSelectSyncing bool
+	inputGenerations    map[string]uint64
+	queueWindow         fyne.Window
+	zoomLevel           float64
+	zoomFitMode         bool
+	levelsSet           bool
+	stretchMode         stretch.Mode
+	mtfMidtone          float64
+	mosaicBins          [256]int
+	zoomCustomOption    string
+	zoomSelectSyncing   bool
+	gmosCalibrationItem *fyne.MenuItem
+	gmosMenu            *fyne.Menu
 
 	// --- mode pointers (non-nil only while in star/measure mode) ---
 	activePicker      *starPickerWidget
@@ -140,6 +145,38 @@ func (ws *mosaicWorkspace) cancelMosaicBuild() {
 	}
 	ws.buildGeneration++
 	ws.buildMu.Unlock()
+}
+
+func (ws *mosaicWorkspace) beginGMOSCalibration() (context.Context, uint64, bool) {
+	ws.gmosMu.Lock()
+	defer ws.gmosMu.Unlock()
+	if ws.gmosCancel != nil {
+		return nil, 0, false
+	}
+	ws.gmosGeneration++
+	ctx, cancel := context.WithCancel(context.Background())
+	ws.gmosCancel = cancel
+	return ctx, ws.gmosGeneration, true
+}
+
+func (ws *mosaicWorkspace) finishGMOSCalibration(generation uint64) bool {
+	ws.gmosMu.Lock()
+	defer ws.gmosMu.Unlock()
+	if generation != ws.gmosGeneration {
+		return false
+	}
+	ws.gmosCancel = nil
+	return true
+}
+
+func (ws *mosaicWorkspace) cancelGMOSCalibration() {
+	ws.gmosMu.Lock()
+	if ws.gmosCancel != nil {
+		ws.gmosCancel()
+		ws.gmosCancel = nil
+	}
+	ws.gmosGeneration++
+	ws.gmosMu.Unlock()
 }
 
 func (ws *mosaicWorkspace) beginMosaicAlignment() (context.Context, uint64, bool) {

@@ -63,19 +63,34 @@ func (ws *mosaicWorkspace) saveMosaicProject() {
 		return
 	}
 	proj := models.MosaicProject{
-		DrizzleSettings:      ws.state.drizzleSettings,
-		DrizzleSettingsSet:   ws.state.drizzleSettingsSet,
-		AlignmentSettings:    ws.state.alignmentSettings,
-		AlignmentSettingsSet: ws.state.alignmentSettingsSet,
-		SkysubSettings:       ws.state.skysubSettings,
-		SkysubSettingsSet:    ws.state.skysubSettingsSet,
-		ActiveFilter:         ws.activeFilter,
-		ArtifactMasks:        ws.state.artifactMasks,
-		ExposureNormMode:     int(ws.state.exposureNormMode),
+		DrizzleSettings:        ws.state.drizzleSettings,
+		DrizzleSettingsSet:     ws.state.drizzleSettingsSet,
+		AlignmentSettings:      ws.state.alignmentSettings,
+		AlignmentSettingsSet:   ws.state.alignmentSettingsSet,
+		SkysubSettings:         ws.state.skysubSettings,
+		SkysubSettingsSet:      ws.state.skysubSettingsSet,
+		ActiveFilter:           ws.activeFilter,
+		ArtifactMasks:          ws.state.artifactMasks,
+		ExposureNormMode:       int(ws.state.exposureNormMode),
+		GMOSCalibrationEnabled: ws.state.gmosCalibration != nil,
+	}
+	if ws.state.gmosCalibration != nil {
+		s := ws.state.gmosCalibration
+		proj.GMOSCalibrationFingerprint = mosaic.GMOSCalibrationFingerprint(*s)
+		for _, f := range s.BiasFrames {
+			proj.GMOSBiasPaths = append(proj.GMOSBiasPaths, f.Path)
+		}
+		for _, f := range s.FlatFrames {
+			proj.GMOSFlatPaths = append(proj.GMOSFlatPaths, f.Path)
+		}
+		for _, f := range s.BPMFrames {
+			proj.GMOSBPMPaths = append(proj.GMOSBPMPaths, f.Path)
+		}
 	}
 	for _, inp := range ws.state.inputs {
 		mis := models.MosaicInputState{
 			Path:              inp.Path,
+			SourcePath:        inp.SourcePath,
 			SCIExt:            inp.SCIExt,
 			OffsetX:           inp.OffsetX,
 			OffsetY:           inp.OffsetY,
@@ -195,12 +210,24 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 			dialog.ShowError(jsonErr, ws.win)
 			return
 		}
-
 		// Keep the live workspace untouched until every staged input has loaded.
 
 		// Reload input FITS files, combining multi-chip exposures on the way in.
 		go func() {
 			pt := newProgressTracker("Loading Project", "Reading FITS files...", ws.win)
+			pt.progress("Discovering GMOS calibration", 0, 1)
+			gmosCalibration, calibrationErr := restoreGMOSCalibrationForProject(proj, absPath)
+			if pt.ctx.Err() != nil {
+				fyne.Do(pt.hide)
+				return
+			}
+			if calibrationErr != nil {
+				fyne.Do(func() {
+					pt.hide()
+					dialog.ShowError(calibrationErr, ws.win)
+				})
+				return
+			}
 
 			// Group entries by source path, preserving first-seen order. Legacy
 			// per-chip projects list a multi-chip file once per SCI extension;
@@ -228,8 +255,9 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 				rep := lowestSCIExtState(group)
 				pt.progress(fmt.Sprintf("Loading: %s", filepath.Base(path)), gi+1, len(order))
 
-				inputs, combined, _, err := mosaic.LoadInputsForPipeline(path, mosaic.CombineOptions{
-					Ctx: pt.ctx,
+				inputs, combined, fallbackErr, err := mosaic.LoadInputsForPipeline(path, mosaic.CombineOptions{
+					Ctx:             pt.ctx,
+					GMOSCalibration: gmosCalibration,
 					Progress: func(stage string, done, total int) {
 						pt.progress(fmt.Sprintf("%s: %s", filepath.Base(path), stage), done, total)
 					},
@@ -240,6 +268,10 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 						break
 					}
 					loadFailure = fmt.Errorf("load %s: %w", filepath.Base(path), err)
+					break
+				}
+				if gmosCalibration != nil && fallbackErr != nil {
+					loadFailure = fmt.Errorf("calibrated load %s: %w", filepath.Base(path), fallbackErr)
 					break
 				}
 				if len(inputs) == 0 {
@@ -269,11 +301,13 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 
 			if !cancelled && loadFailure == nil && proj.ReferencePath != "" {
 				refPath := resolveProjectRelativePath(absPath, proj.ReferencePath)
-				refInputs, refCombined, _, refErr := mosaic.LoadInputsForPipeline(refPath, mosaic.CombineOptions{Ctx: pt.ctx})
+				refInputs, refCombined, refFallbackErr, refErr := mosaic.LoadInputsForPipeline(refPath, mosaic.CombineOptions{Ctx: pt.ctx, GMOSCalibration: gmosCalibration})
 				if refErr == mosaic.ErrCancelled {
 					cancelled = true
 				} else if refErr != nil {
 					loadFailure = fmt.Errorf("load reference: %w", refErr)
+				} else if gmosCalibration != nil && refFallbackErr != nil {
+					loadFailure = fmt.Errorf("calibrated load reference: %w", refFallbackErr)
 				} else if len(refInputs) > 0 {
 					chosen := refInputs[0]
 					if !refCombined && proj.ReferenceSCIExt != 0 {
@@ -324,6 +358,7 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 				ws.state.skysubSettingsSet = proj.SkysubSettingsSet
 				ws.state.artifactMasks = proj.ArtifactMasks
 				ws.state.exposureNormMode = mosaic.NormalizationMode(proj.ExposureNormMode)
+				ws.state.gmosCalibration = gmosCalibration
 				ws.activeFilter = proj.ActiveFilter
 				ws.resetMTFMidtone()
 				if proj.ActiveFilter != "" {
@@ -355,4 +390,144 @@ func (ws *mosaicWorkspace) loadMosaicProject() {
 	}, ws.win, opts...); err != nil {
 		dialog.ShowError(err, ws.win)
 	}
+}
+
+func restoreGMOSCalibration(proj models.MosaicProject, inputs []mosaic.Input) *mosaic.GMOSCalibrationSelection {
+	if !proj.GMOSCalibrationEnabled || len(inputs) == 0 || len(proj.GMOSBiasPaths) == 0 || len(proj.GMOSFlatPaths) == 0 {
+		return nil
+	}
+	m, err := mosaic.DiscoverGMOSCalibration(filepath.Dir(inputs[0].Path))
+	if err != nil {
+		return nil
+	}
+	by := map[string]mosaic.GMOSCalibrationFrame{}
+	for _, f := range append(append(m.Bias, m.Twilight...), m.BPM...) {
+		by[filepath.Clean(f.Path)] = f
+	}
+	s := &mosaic.GMOSCalibrationSelection{}
+	for _, p := range proj.GMOSBiasPaths {
+		f, ok := by[filepath.Clean(resolveProjectRelativePath(filepath.Dir(inputs[0].Path), p))]
+		if !ok {
+			return nil
+		}
+		s.BiasFrames = append(s.BiasFrames, f)
+	}
+	for _, p := range proj.GMOSFlatPaths {
+		f, ok := by[filepath.Clean(resolveProjectRelativePath(filepath.Dir(inputs[0].Path), p))]
+		if !ok {
+			return nil
+		}
+		s.FlatFrames = append(s.FlatFrames, f)
+	}
+	for _, p := range proj.GMOSBPMPaths {
+		if f, ok := by[filepath.Clean(resolveProjectRelativePath(filepath.Dir(inputs[0].Path), p))]; ok {
+			s.BPMFrames = append(s.BPMFrames, f)
+		}
+	}
+	if len(s.BiasFrames) == 0 || len(s.FlatFrames) == 0 || mosaic.GMOSCalibrationFingerprint(*s) != proj.GMOSCalibrationFingerprint {
+		return nil
+	}
+	s.Bias = &s.BiasFrames[0]
+	s.Flat = &s.FlatFrames[0]
+	if len(s.BPMFrames) > 0 {
+		s.BPM = &s.BPMFrames[0]
+	}
+	return s
+}
+
+// restoreGMOSCalibrationForProject resolves and validates persisted calibration
+// inputs before any science exposure is combined. Missing or incomplete
+// recipes are fatal so a project cannot silently revert to uncalibrated data.
+func restoreGMOSCalibrationForProject(proj models.MosaicProject, projectPath string) (*mosaic.GMOSCalibrationSelection, error) {
+	if !proj.GMOSCalibrationEnabled {
+		return nil, nil
+	}
+	if len(proj.Inputs) == 0 || len(proj.GMOSBiasPaths) == 0 || len(proj.GMOSFlatPaths) == 0 {
+		return nil, fmt.Errorf("project contains an incomplete GMOS calibration selection")
+	}
+	source := resolveProjectRelativePath(projectPath, proj.Inputs[0].Path)
+	var selected mosaic.Input
+	var selectedFilter, selectedKey string
+	seenSources := map[string]bool{}
+	for _, state := range proj.Inputs {
+		path := resolveProjectRelativePath(projectPath, state.Path)
+		if seenSources[path] {
+			continue
+		}
+		seenSources[path] = true
+		meta, loadErr := mosaic.LoadInputsMetadataFromPath(path)
+		if loadErr != nil || len(meta) == 0 {
+			if loadErr == nil {
+				loadErr = fmt.Errorf("no inputs found")
+			}
+			return nil, fmt.Errorf("validate GMOS project input %s: %w", filepath.Base(path), loadErr)
+		}
+		if selected.Path == "" {
+			selected = meta[0]
+			selectedFilter = mosaic.FilterStringForInput(selected)
+			selectedKey = mosaic.GMOSCompatibilityKeyForPath(path)
+		}
+		if !mosaic.IsGeminiHeader(meta[0].PrimaryHeader) {
+			return nil, fmt.Errorf("GMOS calibration requires a workspace containing only GMOS inputs")
+		}
+		if got := mosaic.FilterStringForInput(meta[0]); got != selectedFilter {
+			return nil, fmt.Errorf("GMOS calibration cannot apply to mixed filters (%s and %s)", selectedFilter, got)
+		}
+		if got := mosaic.GMOSCompatibilityKeyForPath(path); got == "" || got != selectedKey {
+			return nil, fmt.Errorf("GMOS calibration cannot apply to mixed detector/readout configurations")
+		}
+	}
+	m, err := mosaic.DiscoverGMOSCalibration(filepath.Dir(source))
+	if err != nil {
+		return nil, fmt.Errorf("discover GMOS calibration: %w", err)
+	}
+	by := map[string]mosaic.GMOSCalibrationFrame{}
+	for _, f := range append(append(m.Bias, m.Twilight...), m.BPM...) {
+		by[filepath.Clean(f.Path)] = f
+	}
+	s := &mosaic.GMOSCalibrationSelection{}
+	for _, p := range proj.GMOSBiasPaths {
+		f, ok := by[filepath.Clean(resolveProjectRelativePath(projectPath, p))]
+		if !ok {
+			return nil, fmt.Errorf("GMOS bias calibration is missing: %s", p)
+		}
+		s.BiasFrames = append(s.BiasFrames, f)
+	}
+	for _, p := range proj.GMOSFlatPaths {
+		f, ok := by[filepath.Clean(resolveProjectRelativePath(projectPath, p))]
+		if !ok {
+			return nil, fmt.Errorf("GMOS twilight flat calibration is missing: %s", p)
+		}
+		s.FlatFrames = append(s.FlatFrames, f)
+	}
+	for _, p := range proj.GMOSBPMPaths {
+		if f, ok := by[filepath.Clean(resolveProjectRelativePath(projectPath, p))]; ok {
+			s.BPMFrames = append(s.BPMFrames, f)
+		}
+	}
+	s.Bias, s.Flat = &s.BiasFrames[0], &s.FlatFrames[0]
+	if len(s.BPMFrames) > 0 {
+		s.BPM = &s.BPMFrames[0]
+	}
+	s.RecipeFingerprint = mosaic.GMOSCalibrationFingerprint(*s)
+	if err := validateGMOSRecipeForScience(selectedFilter, selectedKey, *s); err != nil {
+		return nil, err
+	}
+	if proj.GMOSCalibrationFingerprint != "" && s.RecipeFingerprint != proj.GMOSCalibrationFingerprint {
+		return nil, fmt.Errorf("GMOS calibration recipe has changed since the project was saved")
+	}
+	if err := mosaic.ValidateGMOSSelection(*s); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func validateGMOSRecipeForScience(scienceFilter, scienceKey string, selection mosaic.GMOSCalibrationSelection) error {
+	if scienceKey == "" || selection.Flat == nil || selection.Flat.Key != scienceKey {
+		return fmt.Errorf("saved GMOS calibration recipe does not match the raw science detector/readout configuration")
+	}
+	if scienceFilter == "" || selection.Flat.Filter != scienceFilter {
+		return fmt.Errorf("saved GMOS calibration recipe filter %q does not match raw science filter %q", selection.Flat.Filter, scienceFilter)
+	}
+	return nil
 }

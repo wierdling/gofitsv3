@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 
+	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
 )
 
@@ -44,6 +45,19 @@ func TestComposeAlignmentDirectMatchesDoNotFallback(t *testing.T) {
 	}
 	if len(result.Attempts) != 2 {
 		t.Fatalf("attempt count = %d, want 2", len(result.Attempts))
+	}
+}
+
+func TestComposeAlignmentSlotsIncludesLoadedExtraLayers(t *testing.T) {
+	images := make([]*models.LoadedImage, 7)
+	for _, index := range []int{0, 1, 2, 4, 6} {
+		images[index] = &models.LoadedImage{}
+	}
+
+	got := composeAlignmentSlots(images, []int{4, 5, 6})
+	want := []int{0, 1, 2, 4, 6}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("alignment slots = %v, want RGB plus loaded extras %v", got, want)
 	}
 }
 

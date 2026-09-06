@@ -32,17 +32,33 @@ func TestTransformedComposeOverlaySourceUsesRenderedImageAndSettings(t *testing.
 	}
 }
 
-func TestArtisticComposeOverlaySourceUsesRawImage(t *testing.T) {
-	raw := &models.LoadedImage{}
+func TestArtisticComposeOverlaySourceUsesRenderedImage(t *testing.T) {
+	rendered := &models.LoadedImage{}
 	transformed := &models.LoadedImage{}
-	layer := &overlayLayer{idx: 3, settings: models.OrangeLayerState{BlinkID: "overlay-raw"}}
-	got, ok := artisticComposeOverlaySource([]*models.LoadedImage{nil, nil, nil, raw}, layer)
-	if !ok || got.Image != raw {
-		t.Fatal("artistic overlay source did not use raw image")
+	layer := &overlayLayer{idx: 3, settings: models.OrangeLayerState{BlinkID: "overlay-rendered"}}
+	got, ok := artisticComposeOverlaySource([]*models.LoadedImage{nil, nil, nil, rendered}, layer)
+	if !ok || got.Image != rendered {
+		t.Fatal("artistic overlay source did not use the rendered image")
 	}
 	weighted, ok := transformedComposeOverlaySource([]*models.LoadedImage{nil, nil, nil, transformed}, layer)
 	if !ok || weighted.Image != transformed || weighted.Image == got.Image {
 		t.Fatal("weighted and artistic overlay source collections were not separated")
+	}
+}
+
+func TestComposeOverlaySourcesKeepsArtisticOverlaysOnRenderedGrid(t *testing.T) {
+	rendered := &models.LoadedImage{}
+	weighted := &models.LoadedImage{}
+	layer := &overlayLayer{idx: 3}
+	renderedSources := []*models.LoadedImage{nil, nil, nil, rendered}
+	weightedSources := []*models.LoadedImage{nil, nil, nil, weighted}
+
+	gotWeighted, gotArtistic := composeOverlaySources(renderedSources, weightedSources, []*overlayLayer{layer}, func(*overlayLayer) bool { return true })
+	if len(gotWeighted) != 1 || gotWeighted[0].Image != weighted {
+		t.Fatalf("weighted overlays = %#v, want PSF-matched source", gotWeighted)
+	}
+	if len(gotArtistic) != 1 || gotArtistic[0].Image != rendered {
+		t.Fatalf("artistic overlays = %#v, want rendered aligned source", gotArtistic)
 	}
 }
 

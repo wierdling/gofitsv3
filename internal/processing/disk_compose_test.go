@@ -542,6 +542,47 @@ func TestComposeDiskWeightedKeepsDuplicateArtifactIdentities(t *testing.T) {
 	}
 }
 
+func TestComposeDiskWeightedDistinguishesMissingAndExplicitZeroWeights(t *testing.T) {
+	dir := t.TempDir()
+	paths := [3]string{filepath.Join(dir, "blue.bin"), filepath.Join(dir, "green.bin"), filepath.Join(dir, "red.bin")}
+	for _, path := range paths {
+		writeDiskComposeFixture(t, path, 1)
+	}
+	channels := [3]DiskChannel{diskComposeTestChannel(paths[0]), diskComposeTestChannel(paths[1]), diskComposeTestChannel(paths[2])}
+	render := func(name string, weights []models.ComposeMixWeight) [3]float32 {
+		out := [3]string{filepath.Join(dir, name+"-r.bin"), filepath.Join(dir, name+"-g.bin"), filepath.Join(dir, name+"-b.bin")}
+		if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: channels, CompositionMode: models.ComposeModeWeighted, MixWeights: weights, Output: out}); err != nil {
+			t.Fatal(err)
+		}
+		return [3]float32{readDiskComposePixel(t, out[0]), readDiskComposePixel(t, out[1]), readDiskComposePixel(t, out[2])}
+	}
+	missing := render("missing", nil)
+	if missing != [3]float32{1, 1, 1} {
+		t.Fatalf("missing standard weights = %v, want white", missing)
+	}
+	disabled := render("disabled", []models.ComposeMixWeight{{BlinkID: models.ComposeChannel1BlinkID}})
+	if disabled != [3]float32{1, 1, 0} {
+		t.Fatalf("explicit zero standard weight = %v, want blue disabled", disabled)
+	}
+	overlayPath := filepath.Join(dir, "overlay.bin")
+	writeDiskComposeFixture(t, overlayPath, 1)
+	overlay := []DiskOverlay{{Channel: diskComposeTestChannel(overlayPath), Settings: models.OrangeLayerState{BlinkID: "overlay-1", ColorR: 255, Opacity: 1}}}
+	baseWeights := []models.ComposeMixWeight{{BlinkID: models.ComposeChannel3BlinkID}}
+	renderOverlay := func(name string, weights []models.ComposeMixWeight) [3]float32 {
+		out := [3]string{filepath.Join(dir, name+"-r.bin"), filepath.Join(dir, name+"-g.bin"), filepath.Join(dir, name+"-b.bin")}
+		if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: channels, Overlays: overlay, CompositionMode: models.ComposeModeWeighted, MixWeights: weights, Output: out}); err != nil {
+			t.Fatal(err)
+		}
+		return [3]float32{readDiskComposePixel(t, out[0]), readDiskComposePixel(t, out[1]), readDiskComposePixel(t, out[2])}
+	}
+	if got := renderOverlay("overlay-missing", baseWeights); got[0] != 1 {
+		t.Fatalf("missing overlay weight = %v, want red default", got)
+	}
+	if got := renderOverlay("overlay-disabled", append(baseWeights, models.ComposeMixWeight{BlinkID: "overlay-1"})); got[0] != 0 {
+		t.Fatalf("explicit zero overlay weight = %v, want overlay disabled", got)
+	}
+}
+
 func TestComposeDiskArtisticOverlayRemainsPostStretchBlend(t *testing.T) {
 	dir := t.TempDir()
 	base, overlay := filepath.Join(dir, "base.bin"), filepath.Join(dir, "overlay.bin")
@@ -785,6 +826,89 @@ func TestComposeDiskWeightedMatchesNormalForThreeFourFiveSources(t *testing.T) {
 				t.Fatalf("%d-source channel %d = %v, normal %v", count, c, row[0], normal[c][0])
 			}
 		}
+	}
+}
+
+func TestComposeDiskGeneratedWavelengthMixMatchesNormalForWideAndNarrowSets(t *testing.T) {
+	tests := []struct {
+		name    string
+		sources []WavelengthMixSource
+		values  []float32
+		accent  float64
+	}{
+		{name: "wide-wide-wide-narrow", sources: []WavelengthMixSource{
+			{BlinkID: models.ComposeChannel1BlinkID, WavelengthNm: 445, BandClass: fitsio.FilterBandWide},
+			{BlinkID: models.ComposeChannel2BlinkID, WavelengthNm: 550, BandClass: fitsio.FilterBandWide},
+			{BlinkID: models.ComposeChannel3BlinkID, WavelengthNm: 600, BandClass: fitsio.FilterBandWide},
+			{BlinkID: "overlay-1", WavelengthNm: 656, BandClass: fitsio.FilterBandNarrow},
+		}, values: []float32{.2, .4, .6, .8}, accent: 25},
+		{name: "multiple-wide-narrow", sources: []WavelengthMixSource{
+			{BlinkID: models.ComposeChannel1BlinkID, WavelengthNm: 770, BandClass: fitsio.FilterBandWide},
+			{BlinkID: models.ComposeChannel2BlinkID, WavelengthNm: 1500, BandClass: fitsio.FilterBandWide},
+			{BlinkID: models.ComposeChannel3BlinkID, WavelengthNm: 2000, BandClass: fitsio.FilterBandWide},
+			{BlinkID: "overlay-1", WavelengthNm: 1870, BandClass: fitsio.FilterBandNarrow},
+			{BlinkID: "overlay-2", WavelengthNm: 2120, BandClass: fitsio.FilterBandNarrow},
+		}, values: []float32{.15, .35, .55, .75, .95}, accent: 25},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			generated, err := GenerateWavelengthMixWeights(tc.sources, WavelengthMixOptions{CrossMixPercent: 8, NarrowbandAccentPercent: tc.accent})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(generated.Weights) != len(tc.sources) {
+				t.Fatalf("generated %d weights, want %d", len(generated.Weights), len(tc.sources))
+			}
+			dir := t.TempDir()
+			imgs := make([]*models.LoadedImage, len(tc.sources))
+			channels := [3]DiskChannel{}
+			for i := range tc.sources {
+				path := filepath.Join(dir, fmt.Sprintf("source-%d.bin", i))
+				writeDiskComposeFixture(t, path, tc.values[i])
+				imgs[i] = &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{tc.values[i], tc.values[i], tc.values[i], tc.values[i]}}}, Mode: stretch.Linear, Black: 0, White: 1, Peak: 1, ScaledPeak: 1}
+				if i < 3 {
+					channels[i] = DiskChannel{ArtifactPath: path, Image: *imgs[i]}
+				}
+			}
+			overlays := make([]OverlayLayer, 0, len(tc.sources)-3)
+			diskOverlays := make([]DiskOverlay, 0, len(tc.sources)-3)
+			for i := 3; i < len(tc.sources); i++ {
+				settings := models.OrangeLayerState{BlinkID: tc.sources[i].BlinkID}
+				overlays = append(overlays, OverlayLayer{Image: imgs[i], Settings: settings})
+				diskOverlays = append(diskOverlays, DiskOverlay{Channel: DiskChannel{ArtifactPath: filepath.Join(dir, fmt.Sprintf("source-%d.bin", i)), Image: *imgs[i]}, Settings: settings})
+			}
+			normal, width, height, err := ComposeWeightedRGBPlanes(context.Background(), imgs[:3], overlays, generated.Weights)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := [3]string{filepath.Join(dir, "red.bin"), filepath.Join(dir, "green.bin"), filepath.Join(dir, "blue.bin")}
+			if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: channels, Overlays: diskOverlays, CompositionMode: models.ComposeModeWeighted, MixWeights: generated.Weights, Output: out}); err != nil {
+				t.Fatal(err)
+			}
+			for c := range out {
+				a, err := fitsio.OpenFloat32ArtifactReadOnly(out[c])
+				if err != nil {
+					t.Fatal(err)
+				}
+				row := make([]float32, width)
+				for y := 0; y < height; y++ {
+					if err := a.ReadRow(y, row); err != nil {
+						_ = a.Close()
+						t.Fatal(err)
+					}
+					for x, got := range row {
+						want := normal[c][y*width+x]
+						if math.Abs(float64(got-want)) > 1e-5 {
+							_ = a.Close()
+							t.Fatalf("channel %d pixel %d = %v, normal %v", c, y*width+x, got, want)
+						}
+					}
+				}
+				if err := a.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

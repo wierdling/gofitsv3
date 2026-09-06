@@ -145,7 +145,8 @@ func (p ComposeProject) ResolveComposeMode(sourceCount int) ComposeMode {
 }
 
 // ComposeMixWeight assigns a non-negative RGB contribution to one stable
-// overlay identity. BlinkID is empty only for the three standard channels.
+// overlay identity. An all-zero value with a BlinkID is an explicit persisted
+// disable; an absent row retains the caller's legacy default fallback.
 type ComposeMixWeight struct {
 	BlinkID string  `json:"blinkId,omitempty"`
 	Red     float64 `json:"red"`
@@ -159,9 +160,6 @@ func (w ComposeMixWeight) Validate() error {
 	}
 	if w.Red < 0 || w.Green < 0 || w.Blue < 0 {
 		return fmt.Errorf("compose mix weights must be non-negative")
-	}
-	if w.Red == 0 && w.Green == 0 && w.Blue == 0 {
-		return fmt.Errorf("compose mix weight must contribute to at least one RGB channel")
 	}
 	return nil
 }
@@ -401,8 +399,9 @@ type ArtifactMaskProject struct {
 }
 
 type MosaicInputState struct {
-	Path   string `json:"path"`
-	SCIExt int    `json:"sciExt,omitempty"`
+	Path       string `json:"path"`
+	SourcePath string `json:"sourcePath,omitempty"`
+	SCIExt     int    `json:"sciExt,omitempty"`
 	// Combined marks an entry whose Path is the original multi-chip source file
 	// that gets drizzled into a single working image on load. Absent (false) for
 	// ordinary single-chip inputs and for pre-combine legacy projects.
@@ -423,18 +422,24 @@ type MosaicInputState struct {
 }
 
 type MosaicProject struct {
-	Inputs               []MosaicInputState   `json:"inputs"`
-	ReferencePath        string               `json:"referencePath,omitempty"`
-	ReferenceSCIExt      int                  `json:"referenceSciExt,omitempty"`
-	DrizzleSettings      DrizzleSettings      `json:"drizzleSettings"`
-	DrizzleSettingsSet   bool                 `json:"drizzleSettingsSet"`
-	AlignmentSettings    AlignmentSettings    `json:"alignmentSettings"`
-	AlignmentSettingsSet bool                 `json:"alignmentSettingsSet"`
-	SkysubSettings       SkysubSettings       `json:"skysubSettings"`
-	SkysubSettingsSet    bool                 `json:"skysubSettingsSet"`
-	ActiveFilter         string               `json:"activeFilter,omitempty"`
-	ArtifactMasks        *ArtifactMaskProject `json:"artifactMasks,omitempty"`
-	ExposureNormMode     int                  `json:"exposureNormMode,omitempty"`
+	Inputs                     []MosaicInputState   `json:"inputs"`
+	ReferencePath              string               `json:"referencePath,omitempty"`
+	ReferenceSCIExt            int                  `json:"referenceSciExt,omitempty"`
+	DrizzleSettings            DrizzleSettings      `json:"drizzleSettings"`
+	DrizzleSettingsSet         bool                 `json:"drizzleSettingsSet"`
+	AlignmentSettings          AlignmentSettings    `json:"alignmentSettings"`
+	AlignmentSettingsSet       bool                 `json:"alignmentSettingsSet"`
+	SkysubSettings             SkysubSettings       `json:"skysubSettings"`
+	SkysubSettingsSet          bool                 `json:"skysubSettingsSet"`
+	ActiveFilter               string               `json:"activeFilter,omitempty"`
+	ArtifactMasks              *ArtifactMaskProject `json:"artifactMasks,omitempty"`
+	ExposureNormMode           int                  `json:"exposureNormMode,omitempty"`
+	GMOSCalibrationEnabled     bool                 `json:"gmosCalibrationEnabled,omitempty"`
+	GMOSPartialCalibration     bool                 `json:"gmosPartialCalibration,omitempty"`
+	GMOSCalibrationFingerprint string               `json:"gmosCalibrationFingerprint,omitempty"`
+	GMOSBiasPaths              []string             `json:"gmosBiasPaths,omitempty"`
+	GMOSFlatPaths              []string             `json:"gmosFlatPaths,omitempty"`
+	GMOSBPMPaths               []string             `json:"gmosBPMPaths,omitempty"`
 }
 
 type ChannelControl struct {

@@ -31,11 +31,29 @@ func TestComposeProjectBlinkChannelsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMosaicProjectGMOSCalibrationRoundTrip(t *testing.T) {
+	p := MosaicProject{GMOSCalibrationEnabled: true, GMOSPartialCalibration: false, GMOSCalibrationFingerprint: "abc", GMOSBiasPaths: []string{"bias.fits"}, GMOSFlatPaths: []string{"flat.fits"}, GMOSBPMPaths: []string{"bpm.fits"}}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got MosaicProject
+	if err = json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.GMOSCalibrationEnabled || got.GMOSCalibrationFingerprint != "abc" || len(got.GMOSBiasPaths) != 1 || len(got.GMOSFlatPaths) != 1 || len(got.GMOSBPMPaths) != 1 {
+		t.Fatalf("round trip=%+v", got)
+	}
+}
+
 func TestComposeMixSettingsRoundTripAndLegacyResolution(t *testing.T) {
-	project := ComposeProject{CompositionMode: ComposeModeWeighted, MixWeights: []ComposeMixWeight{{BlinkID: "overlay-7", Red: .2, Green: .5, Blue: 1}}}
+	project := ComposeProject{CompositionMode: ComposeModeWeighted, MixWeights: []ComposeMixWeight{
+		{BlinkID: "overlay-7", Red: .2, Green: .5, Blue: 1},
+		{BlinkID: "overlay-disabled", Red: 0, Green: 0, Blue: 0},
+	}}
 	var decoded ComposeProject
 	roundTripJSON(t, project, &decoded)
-	if decoded.CompositionMode != ComposeModeWeighted || len(decoded.MixWeights) != 1 || decoded.MixWeights[0].BlinkID != "overlay-7" {
+	if decoded.CompositionMode != ComposeModeWeighted || len(decoded.MixWeights) != 2 || decoded.MixWeights[0].BlinkID != "overlay-7" || decoded.MixWeights[1].BlinkID != "overlay-disabled" || decoded.MixWeights[1].Red != 0 {
 		t.Fatalf("mix settings = %+v, want weighted identity-preserving settings", decoded)
 	}
 	if (ComposeProject{}).ResolveComposeMode(5) != ComposeModeArtistic || (ComposeProject{CompositionMode: ComposeModeAuto}).ResolveComposeMode(3) != ComposeModeArtistic || (ComposeProject{CompositionMode: ComposeModeAuto}).ResolveComposeMode(4) != ComposeModeWeighted {
@@ -44,10 +62,13 @@ func TestComposeMixSettingsRoundTripAndLegacyResolution(t *testing.T) {
 }
 
 func TestComposeMixWeightValidation(t *testing.T) {
-	for _, weight := range []ComposeMixWeight{{Red: -1}, {Green: math.NaN()}, {Blue: math.Inf(1)}, {}} {
+	for _, weight := range []ComposeMixWeight{{Red: -1}, {Green: math.NaN()}, {Blue: math.Inf(1)}} {
 		if err := weight.Validate(); err == nil {
 			t.Fatalf("Validate(%+v) succeeded, want error", weight)
 		}
+	}
+	if err := (ComposeMixWeight{BlinkID: "disabled"}).Validate(); err != nil {
+		t.Fatalf("explicit zero weight should validate: %v", err)
 	}
 	if err := (ComposeProject{MixWeights: []ComposeMixWeight{{BlinkID: "x", Red: 1}, {BlinkID: "x", Blue: 1}}}).ValidateMixWeights(); err == nil {
 		t.Fatal("duplicate BlinkID validation succeeded")

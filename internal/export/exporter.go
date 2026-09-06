@@ -4,6 +4,7 @@ import (
 	"errors"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/jpeg"
 	"image/png"
 	"os"
@@ -26,6 +27,13 @@ const (
 type Options struct {
 	Quality  int // for JPEG
 	BitDepth int // 8 (default) or 16; only meaningful for PNG
+	// Overlays are composited at export time in image pixel coordinates.
+	Overlays []Overlay
+}
+
+type Overlay struct {
+	Image image.Image
+	X, Y  int
 }
 
 // FromRGBABytes saves an RGBA byte buffer (len = w*h*4).
@@ -40,7 +48,26 @@ func FromRGBABytes(path string, buf []byte, width, height int, format Format, op
 
 // FromImage saves any Go image using the requested format.
 func FromImage(path string, img image.Image, format Format, opt Options) error {
+	if len(opt.Overlays) > 0 {
+		img = OverlayImage(img, opt.Overlays)
+	}
 	return saveImage(path, img, format, opt)
+}
+
+// OverlayImage returns a flattened copy of img with the supplied alpha images.
+func OverlayImage(img image.Image, overlays []Overlay) image.Image {
+	if img == nil || len(overlays) == 0 {
+		return img
+	}
+	b := img.Bounds()
+	out := image.NewRGBA(b)
+	draw.Draw(out, b, img, b.Min, draw.Src)
+	for _, o := range overlays {
+		if o.Image != nil {
+			draw.Draw(out, o.Image.Bounds().Add(image.Pt(o.X, o.Y)), o.Image, o.Image.Bounds().Min, draw.Over)
+		}
+	}
+	return out
 }
 
 // FromFloat32Channels saves per-channel float32 pixel data (values in [0,1]).

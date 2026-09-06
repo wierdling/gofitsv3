@@ -49,6 +49,7 @@ type mosaicState struct {
 	// exposureNormMode controls per-frame exposure-time normalization applied
 	// before drizzle. Defaults to Off so existing behavior is preserved.
 	exposureNormMode mosaic.NormalizationMode
+	gmosCalibration  *mosaic.GMOSCalibrationSelection
 }
 
 func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu, *fyne.MenuItem, *fyne.MenuItem) {
@@ -1550,6 +1551,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	loadMosaicItem := fyne.NewMenuItem("Load Mosaic Project", ws.loadMosaicProject)
 	saveMosaicItem := fyne.NewMenuItem("Save Mosaic Project", ws.saveMosaicProject)
 
+	ws.gmosCalibrationItem = fyne.NewMenuItem("Gemini GMOS Calibration...", ws.configureGMOSCalibration)
 	settingsMenu := fyne.NewMenu("Mosaic",
 		fyne.NewMenuItem("Drizzle Queue...", ws.openDrizzleQueue),
 		fyne.NewMenuItemSeparator(),
@@ -1557,9 +1559,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		fyne.NewMenuItem("Alignment Settings", ws.openAlignmentSettings),
 		fyne.NewMenuItem("Skysub Settings", ws.openSkysubSettings),
 		fyne.NewMenuItem("Exposure Normalization", ws.openExposureReview),
+		ws.gmosCalibrationItem,
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Create Artifact Masks...", ws.openArtifactMaskEditor),
 	)
+	ws.gmosMenu = settingsMenu
 	footerBottomPad := canvas.NewRectangle(color.Transparent)
 	footerBottomPad.SetMinSize(fyne.NewSize(1, 20))
 	previewPane := container.NewBorder(previewHeader, container.NewVBox(previewFooter, footerBottomPad), nil, nil, ws.previewSwap)

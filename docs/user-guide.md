@@ -263,6 +263,42 @@ Assign your FITS files to the channel slots using the custom FITS file picker:
 * **Red Channel**: Load your longest-wavelength filter (e.g., `F814W` or `SII`).
 * *Tip: If you do not have three filters, you can load the same file into multiple channels, or use the "Copy Settings" menu item to help balance them.*
 
+#### Wavelength-aware color mapping
+
+Open **Compose -> Color Mixing...** and choose **Wavelength-aware** to derive a
+creative starting palette from the filters' relative wavelengths. The mapping
+uses linear spacing: a filter that is closer to its red neighbor receives more
+red contribution than one equally close to blue. For example, with F445W,
+F550W, and F600W, the 50 nm F550W-to-F600W gap makes F550W sit closer to red
+than the 105 nm F445W-to-F550W gap would suggest in an evenly spaced palette.
+
+The dialog shows each included source's detected name, wavelength, band class,
+and metadata origin. A finite positive FITS `PHOTPLAM` value takes precedence;
+otherwise a supported filter name is parsed. Unknown, ambiguous, and
+name-only long-pass filters are left unresolved rather than guessed. Edit the
+wavelength and class in the dialog to recover those sources; these manual
+values affect the generated weights only and do not change FITS headers.
+
+The **Cross-mix** control sets neighboring-color blending (8% by default).
+Continuum filters (W/W2, M, and L/LP when a wavelength is supplied) are
+column-normalized so adding nearby wide filters does not create a color cast.
+Narrow filters are treated as detail accents: all narrow sources share one
+**Narrowband accent** budget (25% by default), so adding several narrow JWST
+filters redistributes that accent instead of multiplying it. If fewer than two
+continuum filters are present, narrow sources are promoted to the base palette
+and the dialog warns you.
+
+The result is a false-color, non-photometric starting point—not a physical
+throughput or flux reconstruction. Review and edit the generated R/G/B values
+before applying; manual RGB edits are authoritative. Examples supported by
+the preset include W/W/W, W/W/W/N (such as a red H-alpha accent), multiple-W
+and multiple-N JWST sets, W/W/M, and L/W/W. At least two included sources with
+distinct resolved wavelengths are required. The preset selects explicit
+**Weighted** mode and saves only the resulting stable per-source weights;
+wavelength metadata, warnings, and temporary disk artifact paths are not saved
+in projects. Existing projects and the legacy Artistic/Auto behavior are
+unchanged until this preset is applied.
+
 ![SCREENSHOT: Compose Workspace showing loaded color channels](images/screenshots/compose_channels.png)
 
 #### Aligning the Channels
@@ -324,7 +360,14 @@ The Edit tab is where you perform traditional photography adjustments before sav
   * **Click and drag** over a scratch, hot pixel, or bloated artifact (the destination) to stamp the clean background texture over it.
 * **Exporting**: Click `File -> Export...` to save your image. Choose between:
   * **PNG** (8-bit or high-fidelity 16-bit)
-  * **JPEG** (with quality controls)
+  * **JPEG** (with quality controls and a live estimated output size)
+
+In Compose, open **Color Legend...**, enter any desired labels, then choose
+**Add to Edit** to place the legend on the Edit canvas. The single legend can
+be dragged within the image, resized with the Legend size control (100–600%),
+reset to the lower-right corner, or removed. Its current position and size are
+included when saving any supported image format; cropping translates and clips
+the legend to the cropped image.
   * **TIFF**
   * **WebP** (lossless compression)
 
@@ -388,3 +431,17 @@ Let's walk through the creation of a color image of the **Whirlpool Galaxy (M51)
 * **GHS (Generalised Hyperbolic Stretch)**: A mathematical stretch algorithm that allows non-linear boosting of midtones or shadows without clipping bright highlights.
 * **MAST**: Mikulski Archive for Space Telescopes. The central online repository for all NASA space telescope data, including Hubble, Kepler, and James Webb.
 * **WCS (World Coordinate System)**: A coordinate mapping system stored inside FITS headers that links pixel positions (X, Y) directly to physical celestial coordinates (Right Ascension, Declination).
+### Gemini GMOS calibration
+
+For raw GMOS imaging, open **Mosaic > Gemini GMOS Calibration...** after loading
+the science directory. GoFitsV3 groups the science by effective filter, ignores
+open filter-wheel positions, and selects compatible detector calibration files.
+Full calibration requires both a compatible bias ensemble and a twilight flat
+for the active filter; a missing flat is reported and blocks full calibration.
+The current reduction performs overscan subtraction and trim, master-bias
+subtraction, normalized flat division, and BPM exclusion before chip
+combination. Accepting a complete selection atomically recombines already
+loaded GMOS exposures; incomplete selections are rejected. The same validated
+recipe is restored before input combination when loading a Mosaic project or
+running a Drizzle Queue job. It does not provide dark, fringe, or illumination
+correction, and DRAGONS remains recommended for scientific-grade reduction.

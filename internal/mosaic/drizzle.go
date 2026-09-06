@@ -3456,7 +3456,36 @@ func LooksLikeCal(path string) bool {
 // LooksLikeCalibratedInput reports whether path is a supported calibrated
 // science exposure: HST _flc/_flt or JWST _cal.
 func LooksLikeCalibratedInput(path string) bool {
-	return LooksLikeFLC(path) || LooksLikeCal(path) || strings.EqualFold(filepath.Ext(path), ".asdf")
+	return LooksLikeFLC(path) || LooksLikeCal(path) || LooksLikeGemini(path) || strings.EqualFold(filepath.Ext(path), ".asdf")
+}
+
+// LooksLikeGemini identifies FITS files from the Gemini Multi-Object
+// Spectrograph. Raw GMOS files are admitted so the loader can apply the
+// detector-section preparation before drizzle.
+func LooksLikeGemini(path string) bool {
+	if strings.EqualFold(filepath.Ext(path), ".asdf") {
+		return false
+	}
+	h, err := fitsio.LoadPrimaryHeader(path)
+	return err == nil && IsGeminiHeader(h)
+}
+
+func IsGeminiHeader(h fitsio.Header) bool {
+	inst := strings.ToUpper(fitsio.HeaderString(h, "INSTRUME", "INSTRUMENT"))
+	return strings.Contains(inst, "GMOS")
+}
+
+func IsGeminiCalibrationHeader(h fitsio.Header) bool {
+	if !IsGeminiHeader(h) {
+		return false
+	}
+	for _, key := range []string{"OBSTYPE", "IMAGETYP", "OBJECT"} {
+		t := strings.ToUpper(strings.TrimSpace(fitsio.HeaderString(h, key)))
+		if strings.Contains(t, "BIAS") || strings.Contains(t, "FLAT") || strings.Contains(t, "TWILIGHT") || strings.Contains(t, "DARK") || strings.Contains(t, "MASK") || strings.Contains(t, "MDF") || strings.Contains(t, "BAD PIXEL") || t == "BPM" || strings.Contains(t, "BAD PIXEL MASK") {
+			return true
+		}
+	}
+	return false
 }
 
 func formatFloat(v float64) string {

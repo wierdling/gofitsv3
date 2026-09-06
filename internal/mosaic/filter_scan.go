@@ -36,6 +36,9 @@ type FilterFile struct {
 	// DateObs is the observation calendar date ("YYYY-MM-DD") parsed from the
 	// DATE-OBS header, or "" when absent. Used for range filtering.
 	DateObs string
+	// Product identifies the source family: flc, flt, cal, or gemini-science.
+	// Gemini calibration frames are intentionally never returned by discovery.
+	Product string
 }
 
 func IsPipelineProductFLC(path string) bool {
@@ -169,6 +172,9 @@ func scanFilterHeaders(paths []string) []FilterFile {
 				if filter == "" {
 					filter = "Unknown"
 				}
+				if IsGeminiCalibrationHeader(header) {
+					continue
+				}
 				proposalID := fitsio.HeaderString(header, "PROPOSID", "PROPOSAL", "PROPOSALID", "PROGRAM")
 				if proposalID == "" {
 					proposalID = "Unknown"
@@ -184,6 +190,7 @@ func scanFilterHeaders(paths []string) []FilterFile {
 					Instrument:   instrument,
 					ExposureTime: formatExposure(loadExposureTime(header)),
 					DateObs:      parseDateObs(fitsio.HeaderString(header, "DATE-OBS", "DATEOBS")),
+					Product:      ProductType(paths[i]),
 				}
 				ok[i] = true
 			}
@@ -415,6 +422,8 @@ func ProductType(path string) string {
 		return "flt"
 	case strings.Contains(base, "_cal"):
 		return "cal"
+	case LooksLikeGemini(path):
+		return "gemini"
 	default:
 		return ""
 	}

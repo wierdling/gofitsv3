@@ -47,8 +47,7 @@ func prepareComposeGlobalMagic(ctx context.Context, targets []composeGlobalMagic
 			return nil, err
 		}
 		img := target.image
-		processing.ApplyMagicLevels(&img, preset)
-		processing.AutoMTFMidtone(&img)
+		processing.ApplyMagicLevelsAndMTF(&img, preset)
 		result := composeGlobalMagicResult{index: target.index, image: img}
 		if target.independent {
 			preview, err := buildComposeOverlayPreviewData(ctx, &img)

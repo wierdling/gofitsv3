@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+
+	"gofitsv3/internal/fitsio"
 )
 
 type testCRCustomError struct{ message string }
@@ -37,4 +39,18 @@ func TestFirstErrorConcurrentHeterogeneousErrors(t *testing.T) {
 		}
 	}
 	t.Fatalf("Load returned unexpected error %v", got)
+}
+
+func TestCRPreparationProgressStageUsesGeminiWordingForGMOSOnly(t *testing.T) {
+	planned := []plannedInput{{input: Input{PrimaryHeader: fitsio.Header{Cards: map[string]string{"INSTRUME": "GMOS-N"}}}}}
+	if got := crPreparationProgressStage(planned, []int{0}); got != "Preparing Gemini frames" {
+		t.Fatalf("stage = %q", got)
+	}
+}
+
+func TestCRPreparationProgressStageKeepsCosmicRayWordingForOtherInputs(t *testing.T) {
+	planned := []plannedInput{{input: Input{PrimaryHeader: fitsio.Header{Cards: map[string]string{"INSTRUME": "WFC3"}}}}}
+	if got := crPreparationProgressStage(planned, []int{0}); got != "Cleaning cosmic rays" {
+		t.Fatalf("stage = %q", got)
+	}
 }

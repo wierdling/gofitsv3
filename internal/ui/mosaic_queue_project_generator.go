@@ -66,21 +66,35 @@ func generatedProjectPath(dir, filter string) (string, error) {
 // template is deliberately not copied because it belongs to different frames.
 func buildGeneratedMosaicProject(template models.MosaicProject, templatePath, outputPath, filter string, paths []string) models.MosaicProject {
 	project := models.MosaicProject{
-		DrizzleSettings:      template.DrizzleSettings,
-		DrizzleSettingsSet:   template.DrizzleSettingsSet,
-		AlignmentSettings:    template.AlignmentSettings,
-		AlignmentSettingsSet: template.AlignmentSettingsSet,
-		SkysubSettings:       template.SkysubSettings,
-		SkysubSettingsSet:    template.SkysubSettingsSet,
-		ActiveFilter:         filter,
-		ExposureNormMode:     template.ExposureNormMode,
-		ReferenceSCIExt:      template.ReferenceSCIExt,
+		DrizzleSettings:            template.DrizzleSettings,
+		DrizzleSettingsSet:         template.DrizzleSettingsSet,
+		AlignmentSettings:          template.AlignmentSettings,
+		AlignmentSettingsSet:       template.AlignmentSettingsSet,
+		SkysubSettings:             template.SkysubSettings,
+		SkysubSettingsSet:          template.SkysubSettingsSet,
+		ActiveFilter:               filter,
+		ExposureNormMode:           template.ExposureNormMode,
+		ReferenceSCIExt:            template.ReferenceSCIExt,
+		GMOSCalibrationEnabled:     template.GMOSCalibrationEnabled,
+		GMOSCalibrationFingerprint: template.GMOSCalibrationFingerprint,
+		GMOSBiasPaths:              append([]string(nil), template.GMOSBiasPaths...),
+		GMOSFlatPaths:              append([]string(nil), template.GMOSFlatPaths...),
+		GMOSBPMPaths:               append([]string(nil), template.GMOSBPMPaths...),
 	}
 	if template.ReferencePath != "" {
 		project.ReferencePath = resolveProjectRelativePath(templatePath, template.ReferencePath)
 		if abs, err := filepath.Abs(project.ReferencePath); err == nil {
 			project.ReferencePath = abs
 		}
+	}
+	for i, p := range project.GMOSBiasPaths {
+		project.GMOSBiasPaths[i] = resolveProjectRelativePath(templatePath, p)
+	}
+	for i, p := range project.GMOSFlatPaths {
+		project.GMOSFlatPaths[i] = resolveProjectRelativePath(templatePath, p)
+	}
+	for i, p := range project.GMOSBPMPaths {
+		project.GMOSBPMPaths[i] = resolveProjectRelativePath(templatePath, p)
 	}
 	for _, path := range paths {
 		project.Inputs = append(project.Inputs, models.MosaicInputState{Path: path})

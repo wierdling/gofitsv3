@@ -638,20 +638,14 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			}
 			lrgbMu.Unlock()
 		}
-		composeSources := renderImages()
+		renderedSources := renderImages()
+		composeSources := renderedSources
 		if psfSettings.Enabled {
 			composeSources = processing.ApplyPSFMatching(composeSources, processing.PSFTarget{FWHMX: psfSettings.TargetFWHMX, FWHMY: psfSettings.TargetFWHMY}, psfSettings.ProtectSaturated, psfSettings.Saturation)
 		}
-		for _, l := range overlayLayers {
-			if l.win != nil {
-				if overlay, ok := transformedComposeOverlaySource(composeSources, l); ok {
-					weightedOverlays = append(weightedOverlays, overlay)
-				}
-				if overlay, ok := artisticComposeOverlaySource(imgs, l); ok {
-					artisticOverlays = append(artisticOverlays, overlay)
-				}
-			}
-		}
+		weightedOverlays, artisticOverlays = composeOverlaySources(renderedSources, composeSources, overlayLayers, func(layer *overlayLayer) bool {
+			return layer.win != nil
+		})
 		weightedCount := 0
 		for i := 0; i < 3 && i < len(composeSources); i++ {
 			if composeSources[i] != nil {
@@ -2790,14 +2784,26 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			dialog.ShowInformation("Missing Channels", "Load all three FITS channels before aligning.", win)
 			return
 		}
+		// Snapshot the active extra-layer slots and controls before starting the
+		// worker.  The alignment root is still Channel 2, but every loaded layer
+		// must be registered to that same grid as the RGB channels.
+		extraAlignSlots := make([]int, 0, len(overlayLayers))
+		alignControls := make(map[int]*models.ChannelControl, len(overlayLayers))
+		for _, layer := range overlayLayers {
+			if layer != nil {
+				extraAlignSlots = append(extraAlignSlots, layer.idx)
+				alignControls[layer.idx] = layer.control
+			}
+		}
+		alignSlots := composeAlignmentSlots(imgs, extraAlignSlots)
 		if largeMode && largeStore != nil {
 			progressDialog := dialog.NewCustom("Aligning", "Extracting star catalogs...", widget.NewProgressBarInfinite(), win)
 			progressDialog.Show()
 			go func() {
 				largeMu.RLock()
-				descs := make(map[int]composeArtifactDescriptor, 3)
-				channels := make([]composeAlignmentChannel, 0, 3)
-				for _, idx := range []int{0, 1, 2} {
+				descs := make(map[int]composeArtifactDescriptor, len(alignSlots))
+				channels := make([]composeAlignmentChannel, 0, len(alignSlots))
+				for _, idx := range alignSlots {
 					d, exists := largeArtifacts[idx]
 					if exists {
 						descs[idx] = d
@@ -2805,7 +2811,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				}
 				largeMu.RUnlock()
 				var err error
-				for _, idx := range []int{0, 1, 2} {
+				for _, idx := range alignSlots {
 					d, exists := descs[idx]
 					if !exists {
 						err = fmt.Errorf("missing disk artifact for Channel %d", idx+1)
@@ -2859,7 +2865,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					if !refOK || !composeLargeAlignmentReferenceCurrent(refCurrent, refExpected) {
 						return
 					}
-					for _, idx := range []int{0, 2} {
+					for _, idx := range alignSlots {
+						if idx == 1 {
+							continue
+						}
 						res := alignment.Channels[idx+1]
 						expected := descs[idx]
 						cur, current := largeStore.Descriptor(expected.Slot)
@@ -2869,9 +2878,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						setChannelAlignTransform(imgs[idx], res.Backward)
 						// The fitted affine supersedes the user nudge, matching the
 						// normal alignment path. Keep controls and metadata in sync.
+						control := alignControls[idx]
 						if idx < len(controlSets) {
-							resetComposeAlignmentOffsets(controlSets[idx])
+							control = controlSets[idx]
 						}
+						resetComposeAlignmentOffsets(control)
 					}
 					refresh()
 				})
@@ -2881,14 +2892,14 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 
 		savedStates := captureViewportStates()
 
-		// Reference is Channel 2 (green); align Channel 1 (blue) and Channel 3 (red)
-		// to it. imgs always holds the ORIGINAL pixels (offsets are applied only at
-		// render time), so the computed offset is absolute. Store it in the Manual
-		// Offset fields (the source of truth); the refresh below renders it.
-		channels := []composeAlignmentChannel{
-			{Index: 1, OriginalPixels: imgs[0].HDU.Data.Pixels, Width: imgs[0].HDU.Data.Width, Height: imgs[0].HDU.Data.Height},
-			{Index: 2, OriginalPixels: imgs[1].HDU.Data.Pixels, Width: imgs[1].HDU.Data.Width, Height: imgs[1].HDU.Data.Height},
-			{Index: 3, OriginalPixels: imgs[2].HDU.Data.Pixels, Width: imgs[2].HDU.Data.Width, Height: imgs[2].HDU.Data.Height},
+		// Reference is Channel 2 (green); align every other loaded channel to it.
+		// imgs always holds the ORIGINAL pixels (offsets are applied only at render
+		// time), so the computed offset is absolute. Store it in the Manual Offset
+		// fields (the source of truth); the refresh below renders it.
+		channels := make([]composeAlignmentChannel, 0, len(alignSlots))
+		for _, idx := range alignSlots {
+			img := imgs[idx]
+			channels = append(channels, composeAlignmentChannel{Index: idx + 1, OriginalPixels: img.HDU.Data.Pixels, Width: img.HDU.Data.Width, Height: img.HDU.Data.Height})
 		}
 
 		progressDialog := dialog.NewCustom("Aligning", "Please wait...", widget.NewProgressBarInfinite(), win)
@@ -2930,15 +2941,19 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					// the summary line only.
 					dx, dy, rot = extractManualOffset(back, w, h)
 					setChannelAlignTransform(imgs[idx], back)
-					if idx < len(controlSets) && controlSets[idx] != nil {
-						if controlSets[idx].XOffsetEntry != nil {
-							controlSets[idx].XOffsetEntry.SetValue(0)
+					control := alignControls[idx]
+					if idx < len(controlSets) {
+						control = controlSets[idx]
+					}
+					if control != nil {
+						if control.XOffsetEntry != nil {
+							control.XOffsetEntry.SetValue(0)
 						}
-						if controlSets[idx].YOffsetEntry != nil {
-							controlSets[idx].YOffsetEntry.SetValue(0)
+						if control.YOffsetEntry != nil {
+							control.YOffsetEntry.SetValue(0)
 						}
-						if controlSets[idx].RotOffsetEntry != nil {
-							controlSets[idx].RotOffsetEntry.SetValue(0)
+						if control.RotOffsetEntry != nil {
+							control.RotOffsetEntry.SetValue(0)
 						}
 					}
 					return dx, dy, rot
@@ -2951,36 +2966,32 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					}
 					return detail
 				}
-				blueResult := alignment.Channels[1]
-				redResult := alignment.Channels[3]
-				blueLine := resultDetail(blueResult)
-				var bdx, bdy, brot float64
-				var errBlue, errRed error
-				if blueResult.Applicable {
-					bdx, bdy, brot = setAndApply(0, blueResult.Backward)
-				} else {
-					errBlue = composeAlignmentResultError(alignment, 1, blueResult)
-					blueLine = "FAILED: " + errBlue.Error()
-				}
-				redLine := resultDetail(redResult)
-				var rdx, rdy, rrot float64
-				if redResult.Applicable {
-					rdx, rdy, rrot = setAndApply(2, redResult.Backward)
-				} else {
-					errRed = composeAlignmentResultError(alignment, 3, redResult)
-					redLine = "FAILED: " + errRed.Error()
+				lines := make([]string, 0, len(alignSlots)-1)
+				failures := make([]string, 0)
+				for _, idx := range alignSlots {
+					if idx == 1 {
+						continue
+					}
+					result := alignment.Channels[idx+1]
+					name := fmt.Sprintf("Channel %d", idx+1)
+					if result.Applicable {
+						dx, dy, rot := setAndApply(idx, result.Backward)
+						lines = append(lines, fmt.Sprintf("%s:\n  X: %+.2f  Y: %+.2f  Rot: %+.2f°\n  %s", name, dx, dy, rot, resultDetail(result)))
+						continue
+					}
+					err := composeAlignmentResultError(alignment, idx+1, result)
+					failures = append(failures, fmt.Sprintf("%s: %v", name, err))
+					lines = append(lines, fmt.Sprintf("%s:\n  FAILED: %v", name, err))
 				}
 
 				refresh()
 				restoreViewportStates(savedStates)
 
-				if errBlue != nil && errRed != nil {
-					dialog.ShowError(fmt.Errorf("Blue: %v\nRed: %v", errBlue, errRed), win)
+				if len(failures) == len(alignSlots)-1 {
+					dialog.ShowError(errors.New(strings.Join(failures, "\n")), win)
 					return
 				}
-				msg := fmt.Sprintf("Alignment Complete.\n\nBlue (Channel 1):\n  X: %+.2f  Y: %+.2f  Rot: %+.2f°\n  %s\n\nRed (Channel 3):\n  X: %+.2f  Y: %+.2f  Rot: %+.2f°\n  %s",
-					bdx, bdy, brot, blueLine,
-					rdx, rdy, rrot, redLine)
+				msg := "Alignment Complete.\n\n" + strings.Join(lines, "\n\n")
 				dialog.ShowInformation("Alignment Data", msg, win)
 			})
 		}()
@@ -4167,14 +4178,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						}
 						clone := *img
 						clone.HDU.Data.Pixels = lease.Pixels
-						magicResult := processing.ApplyMagicLevels(&clone, magicPresetValue)
+						magicResult := processing.ApplyMagicLevelsAndMTF(&clone, magicPresetValue)
 						if ctx.Err() != nil {
 							lease.Release()
 							cleanupLargeArtifactIfCurrent(artifact)
 							cleanup()
 							return
 						}
-						processing.AutoMTFMidtone(&clone)
 						lease.Release()
 						if ctx.Err() != nil {
 							cleanupLargeArtifactIfCurrent(artifact)
@@ -4491,13 +4501,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	composeWeightSources := func() []composeWeightSource {
 		sources := make([]composeWeightSource, 0, 3+len(overlayLayers))
 		if imgs[0] != nil {
-			sources = append(sources, composeWeightSource{ID: models.ComposeChannel1BlinkID, Label: "Channel 1 (Blue)", Defaults: models.ComposeMixWeight{Blue: 1}})
+			sources = append(sources, composeWeightSourceFromImage(models.ComposeChannel1BlinkID, "Channel 1 (Blue)", models.ComposeMixWeight{Blue: 1}, imgs[0]))
 		}
 		if imgs[1] != nil {
-			sources = append(sources, composeWeightSource{ID: models.ComposeChannel2BlinkID, Label: "Channel 2 (Green)", Defaults: models.ComposeMixWeight{Green: 1}})
+			sources = append(sources, composeWeightSourceFromImage(models.ComposeChannel2BlinkID, "Channel 2 (Green)", models.ComposeMixWeight{Green: 1}, imgs[1]))
 		}
 		if imgs[2] != nil {
-			sources = append(sources, composeWeightSource{ID: models.ComposeChannel3BlinkID, Label: "Channel 3 (Red)", Defaults: models.ComposeMixWeight{Red: 1}})
+			sources = append(sources, composeWeightSourceFromImage(models.ComposeChannel3BlinkID, "Channel 3 (Red)", models.ComposeMixWeight{Red: 1}, imgs[2]))
 		}
 		for _, layer := range overlayLayers {
 			if layer == nil || layer.idx >= len(imgs) || imgs[layer.idx] == nil {
@@ -4508,7 +4518,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				id = fmt.Sprintf("overlay-%d", layer.idx-2)
 			}
 			defaults := composeWeightForColor(id, color.NRGBA{R: layer.settings.ColorR, G: layer.settings.ColorG, B: layer.settings.ColorB, A: 255}, layer.settings.Opacity)
-			sources = append(sources, composeWeightSource{ID: id, Label: layer.name, Defaults: defaults})
+			sources = append(sources, composeWeightSourceFromImage(id, layer.name, defaults, imgs[layer.idx]))
 		}
 		return sources
 	}
@@ -4892,8 +4902,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 					}
 					clone := target.image
 					clone.HDU.Data.Pixels = lease.Pixels
-					processing.ApplyMagicLevels(&clone, preset)
-					processing.AutoMTFMidtone(&clone)
+					processing.ApplyMagicLevelsAndMTF(&clone, preset)
 					lease.Release()
 					if err := composeMagicCanceled(ctx); err != nil {
 						fyne.Do(func() {
@@ -6244,14 +6253,12 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
 		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
 			preset := processing.ParseMagicPreset(magicPreset.Selected)
 			largeJob("magic", func(img *models.LoadedImage) error {
-				processing.ApplyMagicLevels(img, preset)
-				processing.AutoMTFMidtone(img)
+				processing.ApplyMagicLevelsAndMTF(img, preset)
 				return nil
 			})
 			return
 		}
-		res := processing.ApplyMagicLevels(imgs[idx], processing.ParseMagicPreset(magicPreset.Selected))
-		processing.AutoMTFMidtone(imgs[idx])
+		res := processing.ApplyMagicLevelsAndMTF(imgs[idx], processing.ParseMagicPreset(magicPreset.Selected))
 		backgroundEntry.SetValue(imgs[idx].Background)
 		peakEntry.SetValue(imgs[idx].Peak)
 		views[idx].blackBox.SetValue(imgs[idx].Black)
@@ -7080,6 +7087,24 @@ func artisticComposeOverlaySource(sources []*models.LoadedImage, layer *overlayL
 		return processing.OverlayLayer{}, false
 	}
 	return processing.OverlayLayer{Image: sources[layer.idx], Settings: layer.settings}, true
+}
+
+// composeOverlaySources keeps Artistic overlays on the rendered (aligned and
+// manually offset) source grid, while weighted overlays retain their optional
+// PSF-matched source grid.
+func composeOverlaySources(renderedSources, weightedSources []*models.LoadedImage, layers []*overlayLayer, active func(*overlayLayer) bool) (weighted, artistic []processing.OverlayLayer) {
+	for _, layer := range layers {
+		if layer == nil || (active != nil && !active(layer)) {
+			continue
+		}
+		if overlay, ok := transformedComposeOverlaySource(weightedSources, layer); ok {
+			weighted = append(weighted, overlay)
+		}
+		if overlay, ok := artisticComposeOverlaySource(renderedSources, layer); ok {
+			artistic = append(artistic, overlay)
+		}
+	}
+	return weighted, artistic
 }
 
 func composeCompositeDisabledStatus(buildComposite bool, imgs []*models.LoadedImage) string {

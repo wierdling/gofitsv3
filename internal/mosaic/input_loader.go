@@ -31,7 +31,7 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 
 	primary := file.HDUs[0].Header
 	inst, _ := instrument.FromHeader(primary)
-	sci := file.SelectSCI()
+	sci := scienceHDUs(file, primary)
 	if len(sci) == 0 {
 		excluded, repaired := diagnosticDQMasks(file.HDUs[0], file, inst)
 		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst)
@@ -51,7 +51,17 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 	for i := range sci {
 		excluded, repaired := diagnosticDQMasks(sci[i], file, inst)
 		hdu := cleanSCIWithMatchingDQ(sci[i], file, inst)
-		extver := sciExtNumber(hdu.Header, i+1)
+		if IsGeminiHeader(primary) {
+			var prepErr error
+			hdu, prepErr = prepareGMOSHDU(hdu)
+			if prepErr != nil {
+				return nil, prepErr
+			}
+		}
+		extver := i + 1
+		if !IsGeminiHeader(primary) || strings.TrimSpace(hdu.ExtName) != "" {
+			extver = sciExtNumber(hdu.Header, i+1)
+		}
 		d2iX, d2iY := loadD2ITables(file, extver)
 		inputs = append(inputs, Input{
 			Path:          path,
@@ -94,7 +104,7 @@ func LoadInputsMetadataFromPath(path string) ([]Input, error) {
 	}
 
 	primary := file.HDUs[0].Header
-	sci := file.SelectSCI()
+	sci := scienceHDUs(file, primary)
 	if len(sci) == 0 {
 		hdu := file.HDUs[0]
 		return []Input{{
@@ -110,7 +120,17 @@ func LoadInputsMetadataFromPath(path string) ([]Input, error) {
 	inputs := make([]Input, 0, len(sci))
 	for i := range sci {
 		hdu := sci[i]
-		extver := sciExtNumber(hdu.Header, i+1)
+		if IsGeminiHeader(primary) {
+			var prepErr error
+			hdu, prepErr = prepareGMOSMetadata(hdu)
+			if prepErr != nil {
+				return nil, prepErr
+			}
+		}
+		extver := i + 1
+		if !IsGeminiHeader(primary) || strings.TrimSpace(hdu.ExtName) != "" {
+			extver = sciExtNumber(hdu.Header, i+1)
+		}
 		d2iX, d2iY := loadD2ITables(file, extver)
 		inputs = append(inputs, Input{
 			Path:          path,
@@ -134,7 +154,7 @@ func LoadInputsMetadataFromPath(path string) ([]Input, error) {
 // the WHT plane of a combined working file) when needAux is set, and the primary
 // image of a single-HDU file. Skipped extensions are not decoded, so multi-chip
 // exposures are not re-decoded in full per chip.
-func chipDecodePredicate(sciExtVer int, needAux bool) func(fitsio.Header) bool {
+func chipDecodePredicate(sciExtVer int, needAux bool, gemini ...bool) func(fitsio.Header) bool {
 	want := fmt.Sprintf("%d", sciExtVer)
 	matchesChip := func(hdr fitsio.Header) bool {
 		ev := fitsio.HeaderString(hdr, "EXTVER")
@@ -153,10 +173,28 @@ func chipDecodePredicate(sciExtVer int, needAux bool) func(fitsio.Header) bool {
 		case "":
 			// Primary image of a single-HDU file (multi-extension primaries have
 			// NAXIS=0 and are filtered out by the data-size guard in fitsio).
+			// Unnamed GMOS chips may all carry EXTVER=-1 (or no EXTVER), so
+			// decode all unnamed images and select the ordinal after parsing.
 			return true
 		}
 		return false
 	}
+}
+
+// scienceHDUs recognizes the unnamed image extensions emitted by raw GMOS
+// three-chip files. Other instruments retain the strict SCI convention.
+func scienceHDUs(file *fitsio.File, primary fitsio.Header) []fitsio.HDU {
+	if sci := file.SelectSCI(); len(sci) > 0 || !IsGeminiHeader(primary) {
+		return sci
+	}
+	result := make([]fitsio.HDU, 0, len(file.HDUs)-1)
+	for i := 1; i < len(file.HDUs); i++ {
+		h := file.HDUs[i]
+		if h.Data.Width > 0 && h.Data.Height > 0 && strings.TrimSpace(h.ExtName) == "" {
+			result = append(result, h)
+		}
+	}
+	return result
 }
 
 // loadChipFromDisk loads only the one SCI chip matching in.SCIExt (plus the DQ
@@ -174,7 +212,13 @@ func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w,
 		}
 		return sci, errPix, nil, in.HDU.Data.Width, in.HDU.Data.Height, nil
 	}
-	file, err := fitsio.LoadFileSelective(in.Path, chipDecodePredicate(in.SCIExt, needAux))
+	gemini := IsGeminiHeader(in.PrimaryHeader)
+	file, err := fitsio.LoadFileSelectiveIndexed(in.Path, func(index int, hdr fitsio.Header) bool {
+		if gemini && strings.TrimSpace(fitsio.HeaderString(hdr, "EXTNAME")) == "" {
+			return index == in.SCIExt
+		}
+		return chipDecodePredicate(in.SCIExt, needAux, gemini)(hdr)
+	})
 	if err != nil {
 		return nil, nil, nil, 0, 0, err
 	}
@@ -183,7 +227,7 @@ func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w,
 	}
 
 	inst, _ := instrument.FromHeader(file.HDUs[0].Header)
-	sciHDUs := file.SelectSCI()
+	sciHDUs := scienceHDUs(file, file.HDUs[0].Header)
 	if len(sciHDUs) == 0 {
 		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst)
 		if needAux {
@@ -195,7 +239,11 @@ func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w,
 	target := sciHDUs[0]
 	matched := false
 	for i := range sciHDUs {
-		if sciExtNumber(sciHDUs[i].Header, i+1) == in.SCIExt {
+		chipNumber := sciExtNumber(sciHDUs[i].Header, i+1)
+		if IsGeminiHeader(file.HDUs[0].Header) && strings.TrimSpace(sciHDUs[i].ExtName) == "" {
+			chipNumber = i + 1
+		}
+		if chipNumber == in.SCIExt {
 			target = sciHDUs[i]
 			matched = true
 			break
@@ -208,6 +256,13 @@ func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w,
 		return nil, nil, nil, 0, 0, fmt.Errorf("SCI ext %d not loaded from %s", in.SCIExt, in.Path)
 	}
 	hdu := cleanSCIWithMatchingDQ(target, file, inst)
+	if IsGeminiHeader(file.HDUs[0].Header) && strings.TrimSpace(target.ExtName) == "" {
+		var prepErr error
+		hdu, prepErr = prepareGMOSHDU(hdu)
+		if prepErr != nil {
+			return nil, nil, nil, 0, 0, prepErr
+		}
+	}
 	if needAux {
 		errPix = loadERRPixels(file, in.SCIExt, fitsio.HeaderString(target.Header, "EXTVER") == "")
 	}

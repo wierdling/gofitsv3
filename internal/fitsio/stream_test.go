@@ -149,6 +149,29 @@ func TestLoadSelectedHDUMatchesLoadFileAndSkipsOtherPixels(t *testing.T) {
 	}
 }
 
+func TestLoadFileSelectiveIndexedDecodesOnlyRequestedHDU(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "indexed.fits")
+	data := buildFITSFile(
+		fitsHDU("", "", 1, 1, []float32{0}, map[string]string{"INSTRUME": "GMOS-N"}),
+		fitsHDU("", "-1", 2, 1, []float32{1, 2}, nil),
+		fitsHDU("", "-1", 2, 1, []float32{3, 4}, nil),
+		fitsHDU("", "-1", 2, 1, []float32{5, 6}, nil),
+	)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadFileSelectiveIndexed(path, func(index int, _ Header) bool { return index == 2 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.HDUs) != 4 || got.HDUs[1].Data.Pixels != nil || got.HDUs[3].Data.Pixels != nil {
+		t.Fatal("sibling HDU pixels were decoded")
+	}
+	if !reflect.DeepEqual(got.HDUs[2].Data.Pixels, []float32{3, 4}) {
+		t.Fatalf("selected pixels = %v", got.HDUs[2].Data.Pixels)
+	}
+}
+
 func TestLoadSelectedHDUReportsShortSelectedData(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "short.fits")
 	data := fitsHDU("SCI", "1", 2, 1, []float32{1, 2}, nil)

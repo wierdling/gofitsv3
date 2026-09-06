@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,6 +15,33 @@ import (
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/stretch"
 )
+
+// EstimateFloat32ArtifactsJPEG encodes the full prepared artifact and returns its exact JPEG size.
+func EstimateFloat32ArtifactsJPEG(ctx context.Context, artifacts [3]string, width, height int, opt Options, levels *models.RgbLevels) (int64, error) {
+	img, err := newArtifactImage(ctx, artifacts, width, height, false, levels, opt.Overlays)
+	if err != nil {
+		return 0, err
+	}
+	defer img.close()
+	cw := countingWriter{ctx: ctx}
+	if err := jpeg.Encode(&cw, img, &jpeg.Options{Quality: opt.Quality}); err != nil {
+		return 0, err
+	}
+	return cw.n, nil
+}
+
+type countingWriter struct {
+	ctx context.Context
+	n   int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	w.n += int64(len(p))
+	return len(p), nil
+}
 
 // FromFloat32Artifacts exports three disk-backed float32 artifacts in RGB
 // order. Only one row per source is retained while the encoder runs.
@@ -223,7 +251,7 @@ func FromFloat32ArtifactsWithLevels(ctx context.Context, path string, artifacts 
 			return errors.New("missing artifact path")
 		}
 	}
-	img, err := newArtifactImage(ctx, artifacts, width, height, format == PNG && opt.BitDepth == 16, levels)
+	img, err := newArtifactImage(ctx, artifacts, width, height, format == PNG && opt.BitDepth == 16, levels, opt.Overlays)
 	if err != nil {
 		return err
 	}
@@ -295,17 +323,18 @@ func replaceExportFile(tmpPath, path string) error {
 }
 
 type artifactImage struct {
-	ctx    context.Context
-	arts   [3]*fitsio.Float32Artifact
-	bounds image.Rectangle
-	wide   bool
-	levels *models.RgbLevels
-	row    int
-	vals   [3][]float32
+	ctx      context.Context
+	arts     [3]*fitsio.Float32Artifact
+	bounds   image.Rectangle
+	wide     bool
+	levels   *models.RgbLevels
+	overlays []Overlay
+	row      int
+	vals     [3][]float32
 }
 
-func newArtifactImage(ctx context.Context, paths [3]string, width, height int, wide bool, levels *models.RgbLevels) (*artifactImage, error) {
-	a := &artifactImage{ctx: ctx, bounds: image.Rect(0, 0, width, height), wide: wide, row: -1, levels: levels}
+func newArtifactImage(ctx context.Context, paths [3]string, width, height int, wide bool, levels *models.RgbLevels, overlays []Overlay) (*artifactImage, error) {
+	a := &artifactImage{ctx: ctx, bounds: image.Rect(0, 0, width, height), wide: wide, row: -1, levels: levels, overlays: overlays}
 	for i, p := range paths {
 		f, err := fitsio.OpenFloat32ArtifactReadOnly(p)
 		if err != nil {
@@ -358,9 +387,30 @@ func (a *artifactImage) At(x, y int) color.Color {
 		b = applyLevel(b, a.levels.Min[2], a.levels.Max[2])
 	}
 	if a.wide {
-		return color.RGBA64{R: r, G: g, B: b, A: 0xffff}
+		base := color.RGBA64{R: r, G: g, B: b, A: 0xffff}
+		return a.overlayColor(x, y, base)
 	}
-	return color.NRGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: 0xff}
+	return a.overlayColor(x, y, color.NRGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: 0xff})
+}
+
+func (a *artifactImage) overlayColor(x, y int, base color.Color) color.Color {
+	r, g, b, al := base.RGBA()
+	for _, o := range a.overlays {
+		if o.Image == nil {
+			continue
+		}
+		c := o.Image.At(x-o.X+o.Image.Bounds().Min.X, y-o.Y+o.Image.Bounds().Min.Y)
+		cr, cg, cb, ca := c.RGBA()
+		if ca == 0 {
+			continue
+		}
+		inv := uint64(0xffff - ca)
+		r = uint32((uint64(cr)*uint64(ca) + uint64(r)*inv) / 0xffff)
+		g = uint32((uint64(cg)*uint64(ca) + uint64(g)*inv) / 0xffff)
+		b = uint32((uint64(cb)*uint64(ca) + uint64(b)*inv) / 0xffff)
+		al = 0xffff
+	}
+	return color.RGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: uint16(al)}
 }
 
 func applyLevel(v uint16, min, max float64) uint16 {

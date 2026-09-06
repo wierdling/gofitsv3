@@ -333,6 +333,13 @@ func (ws *mosaicWorkspace) updateOffsetButtons() {
 func (ws *mosaicWorkspace) updateActionButtons() {
 	hasInputs := len(ws.state.inputs) > 0
 	hasRef := ws.state.referenceInput != nil
+	hasGMOS := gmosCalibrationEligible(ws.state.inputs, ws.state.referenceInput, ws.queueRunning)
+	if ws.gmosCalibrationItem != nil {
+		ws.gmosCalibrationItem.Disabled = !hasGMOS
+		if ws.gmosMenu != nil && fyne.CurrentApp() != nil {
+			ws.gmosMenu.Refresh()
+		}
+	}
 
 	if ws.batchBtn != nil {
 		if ws.queueRunning {

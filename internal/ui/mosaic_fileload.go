@@ -581,6 +581,9 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 		dialog.ShowInformation("Already Added", "All selected files are already in the mosaic.", ws.win)
 		return
 	}
+	ws.inputMu.RLock()
+	calibration := ws.state.gmosCalibration
+	ws.inputMu.RUnlock()
 	skipped := len(paths) - len(filtered)
 	paths = filtered
 
@@ -682,10 +685,13 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 		}
 
 		combineOne := func(path string, meta []mosaic.Input) preparedInputs {
-			workingPath, cached, cerr := mosaic.EnsureCombinedExposure(path, mosaic.CombineOptions{Ctx: pt.ctx})
+			workingPath, cached, cerr := mosaic.EnsureCombinedExposure(path, mosaic.CombineOptions{Ctx: pt.ctx, GMOSCalibration: calibration})
 			if cerr != nil {
 				if cerr == mosaic.ErrCancelled {
 					return preparedInputs{}
+				}
+				if calibration != nil {
+					return preparedInputs{statuses: []mosaic.InputStatus{{Path: path, Status: "failed", Error: cerr.Error()}}, combineWarn: fmt.Sprintf("%s: %v", filepath.Base(path), cerr)}
 				}
 				debuglog.Log(fmt.Sprintf("loadPaths: combine %s failed, using per-chip mode: %v", filepath.Base(path), cerr))
 				p := buildPerChip(path, meta, "loaded (combine failed: per-chip mode)")

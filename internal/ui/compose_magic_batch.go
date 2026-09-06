@@ -67,9 +67,10 @@ type composeMagicInstallPlan struct {
 type composeMagicLoader func(string) (*models.LoadedImage, error)
 
 type composeMagicStages struct {
-	magic   func(*models.LoadedImage, processing.MagicPreset) processing.MagicLevelsResult
-	setMTF  func(*models.LoadedImage)
-	autoMTF func(*models.LoadedImage)
+	magic    func(*models.LoadedImage, processing.MagicPreset) processing.MagicLevelsResult
+	magicMTF func(*models.LoadedImage, processing.MagicPreset) processing.MagicLevelsResult
+	setMTF   func(*models.LoadedImage)
+	autoMTF  func(*models.LoadedImage)
 }
 
 var composeMagicFilenamePattern = regexp.MustCompile(`(?i)^(F([0-9]+)[A-Z]+[0-9]*)_(?:(.+)_)?(?:drz|driz|drizzle)\.fits$`)
@@ -268,9 +269,10 @@ func validateComposeMagicCapacity(rows []composeMagicRow, existingCustomChannels
 
 func prepareComposeMagicBatch(ctx context.Context, spec composeMagicSpec, loader composeMagicLoader) (*composeMagicBatch, error) {
 	stages := composeMagicStages{
-		magic:   processing.ApplyMagicLevels,
-		setMTF:  func(img *models.LoadedImage) { img.Mode = stretch.MTF },
-		autoMTF: processing.AutoMTFMidtone,
+		magic:    processing.ApplyMagicLevels,
+		magicMTF: processing.ApplyMagicLevelsAndMTF,
+		setMTF:   func(img *models.LoadedImage) { img.Mode = stretch.MTF },
+		autoMTF:  processing.AutoMTFMidtone,
 	}
 	return prepareComposeMagicBatchWithStages(ctx, spec, loader, stages)
 }
@@ -330,7 +332,12 @@ func prepareComposeMagicBatchWithStages(ctx context.Context, spec composeMagicSp
 		if err := composeMagicCanceled(ctx); err != nil {
 			return nil, err
 		}
-		res := stages.magic(channels[i].Image, preset)
+		var res processing.MagicLevelsResult
+		if stages.magicMTF != nil {
+			res = stages.magicMTF(channels[i].Image, preset)
+		} else {
+			res = stages.magic(channels[i].Image, preset)
+		}
 		if err := composeMagicCanceled(ctx); err != nil {
 			return nil, err
 		}
@@ -345,14 +352,13 @@ func prepareComposeMagicBatchWithStages(ctx context.Context, spec composeMagicSp
 		if err := composeMagicCanceled(ctx); err != nil {
 			return nil, err
 		}
-		stages.setMTF(channels[i].Image)
-		if err := composeMagicCanceled(ctx); err != nil {
-			return nil, err
+		if stages.magicMTF == nil {
+			stages.setMTF(channels[i].Image)
+			if err := composeMagicCanceled(ctx); err != nil {
+				return nil, err
+			}
+			stages.autoMTF(channels[i].Image)
 		}
-		if err := composeMagicCanceled(ctx); err != nil {
-			return nil, err
-		}
-		stages.autoMTF(channels[i].Image)
 		if err := composeMagicCanceled(ctx); err != nil {
 			return nil, err
 		}

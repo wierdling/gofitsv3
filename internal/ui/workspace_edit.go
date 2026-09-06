@@ -11,6 +11,7 @@ import (
 	_ "image/png"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
+	"github.com/wierdling/gofiledialog"
 
 	"gofitsv3/internal/export"
 	"gofitsv3/internal/fitsio"
@@ -43,14 +45,38 @@ type editDiskSource struct {
 type editImageHandoff struct {
 	memory image.Image
 	disk   *editDiskSource
+	legend *editLegendData
 }
 
 func (h editImageHandoff) valid() bool { return (h.memory != nil) != (h.disk != nil) }
 
 var globalExportToEdit func(editImageHandoff) error
+var globalAddLegendToEdit func([]legendEntry)
 var globalEditCleanup func()
 
 var editZoomPresets = []string{"fit", "10%", "25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%"}
+
+const (
+	editControlsMinWidth          float32 = 220
+	editControlsHorizontalPadding float32 = 10
+	editControlsSplitOffset               = 0.22
+)
+
+func newWrappedEditLabel(text string) *widget.Label {
+	label := widget.NewLabel(text)
+	label.Wrapping = fyne.TextWrapWord
+	return label
+}
+
+func newEditControlsSplit(controls, rightPanel fyne.CanvasObject) *container.Split {
+	paddedControls := container.New(layout.NewCustomPaddedLayout(0, 0, editControlsHorizontalPadding, editControlsHorizontalPadding), controls)
+	controlsScroll := container.NewVScroll(paddedControls)
+	controlsScroll.SetMinSize(fyne.NewSize(editControlsMinWidth, 200))
+
+	split := container.NewHSplit(controlsScroll, rightPanel)
+	split.SetOffset(editControlsSplitOffset)
+	return split
+}
 
 // editWorkspaceState holds all mutable state for the edit tab.
 type editWorkspaceState struct {
@@ -65,8 +91,11 @@ type editWorkspaceState struct {
 	origH      int
 	zoom       float64
 
-	canvasImg *canvas.Image
-	imgScroll *container.Scroll
+	canvasImg        *canvas.Image
+	imgScroll        *container.Scroll
+	legendLayer      *editLegendLayer
+	legend           *editLegendData
+	legendSizeSlider *widget.Slider
 
 	// per-channel histograms (drawn with min/max marker lines)
 	rgbHists [3]*canvas.Raster
@@ -117,6 +146,13 @@ type editWorkspaceState struct {
 	cropMax         image.Point // selection in image pixels (bottom-right)
 	cropHasSel      bool
 	jobGeneration   uint64
+}
+
+func (es *editWorkspaceState) exportOverlays() []export.Overlay {
+	if es.legend == nil {
+		return nil
+	}
+	return []export.Overlay{{Image: renderScaledLegend(es.legend.entries, es.legend.scale), X: es.legend.position.X, Y: es.legend.position.Y}}
 }
 
 func (es *editWorkspaceState) applyEdits() {
@@ -463,6 +499,7 @@ func (es *editWorkspaceState) applyCrop() {
 				}
 				planes, _, _, _ := disk.store.Source()
 				disk.planes, disk.width, disk.height = planes, w, h
+				es.translateLegendForCrop(rect.Min, w, h)
 				disk.levels = models.RgbLevels{Max: [3]float64{255, 255, 255}}
 				es.origW, es.origH = w, h
 				es.resetInteractionStateAfterCrop()
@@ -498,6 +535,7 @@ func (es *editWorkspaceState) applyCrop() {
 	// Crop works on the current working image, then bakes that operation into
 	// the base before clearing the non-destructive adjustment controls.
 	es.setImageOpts(cropped, false, false)
+	es.translateLegendForCrop(rect.Min, rect.Dx(), rect.Dy())
 	es.commitWorkingToBase()
 }
 
@@ -543,10 +581,20 @@ func (es *editWorkspaceState) installHandoff(h editImageHandoff) error {
 		return fmt.Errorf("invalid Edit image handoff")
 	}
 	if h.disk != nil {
-		return es.setDiskSource(h.disk)
+		if err := es.setDiskSource(h.disk); err != nil {
+			return err
+		}
+		es.setLegend(nil)
+		if h.legend != nil {
+			es.setLegend(h.legend.entries)
+		}
+		return nil
 	}
 	if h.memory != nil {
 		es.setImage(h.memory)
+		if h.legend != nil {
+			es.setLegend(h.legend.entries)
+		}
 	}
 	return nil
 }
@@ -773,6 +821,9 @@ func (es *editWorkspaceState) setImageOpts(img image.Image, keepZoomAndScroll, r
 		es.base = cloneEditRGBA(rgba)
 	}
 	es.working = rgba
+	if replaceBase {
+		es.setLegend(nil)
+	}
 	es.jobGeneration++
 	if es.editTabs != nil {
 		for i := range es.editTabs.Items {
@@ -944,6 +995,9 @@ func (es *editWorkspaceState) applyZoom() {
 	h := float32(es.origH) * float32(es.zoom)
 	es.canvasImg.SetMinSize(fyne.NewSize(w, h))
 	es.canvasImg.Refresh()
+	if es.legendLayer != nil {
+		es.legendLayer.SetZoom(es.zoom)
+	}
 	es.updateHealBrushScreenRadius()
 	// A zoom change invalidates the screen-space crop rectangle.
 	if es.cropOverlay != nil && es.cropHasSel {
@@ -1111,8 +1165,9 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 	es.healOverlay.Hide()
 	es.cropOverlay = newCropLayer()
 	es.cropOverlay.Hide()
+	es.legendLayer = newEditLegendLayer()
 	es.cropOverlay.onChange = es.onCropChange
-	es.imgScroll = container.NewScroll(container.NewMax(es.canvasImg, es.healOverlay, es.cropOverlay))
+	es.imgScroll = container.NewScroll(container.NewMax(es.canvasImg, es.legendLayer, es.healOverlay, es.cropOverlay))
 	es.imgScroll.SetMinSize(fyne.NewSize(400, 300))
 
 	// Zoom controls
@@ -1180,29 +1235,43 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 
 	// --- Load button ---
 	loadBtn := widget.NewButton("Load Image...", func() {
-		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-			if err != nil || r == nil {
-				return
+		opts := []gofiledialog.Option{
+			gofiledialog.WithTitle("Load Image"),
+			gofiledialog.WithFilters(gofiledialog.Filter{Name: "Image files", Extensions: []string{".png", ".jpg", ".jpeg", ".tif", ".tiff"}}),
+		}
+		if last := app.Preferences().String("editLastDir"); last != "" {
+			startDir := last
+			if info, err := os.Stat(last); err == nil && !info.IsDir() {
+				startDir = filepath.Dir(last)
 			}
-			defer r.Close()
-			img, _, err := image.Decode(r)
+			opts = append(opts, gofiledialog.WithStartDir(startDir))
+		}
+		if err := gofiledialog.ShowOpen(func(paths []string, err error) {
 			if err != nil {
 				dialog.ShowError(err, win)
 				return
 			}
-			app.Preferences().SetString("editLastDir", r.URI().Path())
-			es.loadedName = r.URI().Name()
-			es.setImage(img)
-		}, win)
-		fd.SetFilter(storage.NewExtensionFileFilter([]string{".png", ".jpg", ".jpeg", ".tif", ".tiff"}))
-		if last := app.Preferences().String("editLastDir"); last != "" {
-			if lister, err := storage.ListerForURI(storage.NewFileURI(last)); err == nil {
-				fd.SetLocation(lister)
+			if len(paths) == 0 {
+				return
 			}
+			path := paths[0]
+			file, err := os.Open(path)
+			if err != nil {
+				dialog.ShowError(err, win)
+				return
+			}
+			defer file.Close()
+			img, _, err := image.Decode(file)
+			if err != nil {
+				dialog.ShowError(err, win)
+				return
+			}
+			app.Preferences().SetString("editLastDir", filepath.Dir(path))
+			es.loadedName = filepath.Base(path)
+			es.setImage(img)
+		}, win, opts...); err != nil {
+			dialog.ShowError(err, win)
 		}
-		fd.SetView(dialog.ListView)
-		sizeFileDialog(fd)
-		fd.Show()
 	})
 
 	applyBtn := widget.NewButton("Apply", func() { es.applyEdits() })
@@ -1238,6 +1307,18 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 		es.canvasImg.Refresh()
 	})
 	es.resetButton = resetBtn
+	es.legendSizeSlider = widget.NewSlider(100, 600)
+	es.legendSizeSlider.SetValue(200)
+	es.legendSizeSlider.Step = 10
+	es.legendSizeSlider.OnChanged = es.setLegendScale
+	legendRemoveBtn := widget.NewButton("Remove Legend", func() { es.setLegend(nil) })
+	legendResetBtn := widget.NewButton("Reset Legend Position", func() {
+		if es.legend != nil {
+			img := renderScaledLegend(es.legend.entries, es.legend.scale)
+			es.legend.position = image.Pt(maxEditInt(0, es.origW-img.Bounds().Dx()-16), maxEditInt(0, es.origH-img.Bounds().Dy()-16))
+			es.legendLayer.SetLegend(es.legend)
+		}
+	})
 
 	saveBtn := widget.NewButton("Save Image...", func() {
 		if es.working == nil && es.diskSource == nil {
@@ -1262,7 +1343,38 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 			case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
 				format = export.JPEG
 			}
-			showExportOptionsDialog(format, win, func(opts export.Options) {
+			var estimateMu sync.Mutex
+			var estimateCancel context.CancelFunc
+			estimate := func(q int) int64 {
+				estimateMu.Lock()
+				if estimateCancel != nil {
+					estimateCancel()
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				estimateCancel = cancel
+				estimateMu.Unlock()
+				defer cancel()
+				if es.diskSource != nil && es.diskSource.store != nil {
+					s, err := es.diskSource.store.ExportSnapshot(ctx, es.diskEditRecipe())
+					if err != nil {
+						return 0
+					}
+					opts := export.Options{Quality: q, Overlays: es.exportOverlays()}
+					n, err := export.EstimateFloat32ArtifactsJPEG(ctx, s.planes, s.width, s.height, opts, nil)
+					s.cleanup()
+					if err != nil {
+						return 0
+					}
+					return n
+				}
+				img := image.Image(rgba)
+				if img == nil && es.canvasImg != nil {
+					img = es.canvasImg.Image
+				}
+				return jpegEstimate(export.OverlayImage(img, es.exportOverlays()), q)
+			}
+			saveWithOptions := func(opts export.Options) {
+				opts.Overlays = es.exportOverlays()
 				var err error
 				if es.diskSource != nil {
 					disk := es.diskSource
@@ -1297,7 +1409,12 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 					es.commitWorkingToBase()
 					es.resetAdjustmentControls()
 				}
-			})
+			}
+			if format == export.JPEG {
+				showExportOptionsDialog(format, win, saveWithOptions, estimate)
+			} else {
+				showExportOptionsDialog(format, win, saveWithOptions)
+			}
 		}, win)
 		saveName := "edited.png"
 		if es.loadedName != "" {
@@ -1317,7 +1434,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 		es.updateHealBrushScreenRadius()
 	}
 
-	es.healStatusLabel = widget.NewLabel("Click to set source point")
+	es.healStatusLabel = newWrappedEditLabel("Click to set source point")
 	es.healStatusLabel.TextStyle = fyne.TextStyle{Italic: true}
 
 	healToggleBtn := widget.NewButton("Heal Tool: OFF", nil)
@@ -1372,7 +1489,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 		es.undoHeal()
 	})
 
-	es.cleanStatusLabel = widget.NewLabel("Run this after cross-channel clean to remove tiny color specks and black dropout dots.")
+	es.cleanStatusLabel = newWrappedEditLabel("Run this after cross-channel clean to remove tiny color specks and black dropout dots.")
 	es.cleanBlobSlider = widget.NewSlider(1, 100)
 	es.cleanBlobSlider.Step = 1
 	es.cleanBlobSlider.SetValue(25)
@@ -1383,7 +1500,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 		es.runColorSpeckClean()
 	})
 
-	es.cropStatusLabel = widget.NewLabel("")
+	es.cropStatusLabel = newWrappedEditLabel("")
 	es.cropStatusLabel.TextStyle = fyne.TextStyle{Italic: true}
 	applyCropBtn := widget.NewButton("Apply Crop", func() {
 		es.applyCrop()
@@ -1437,7 +1554,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 		sliderRow("Radius", es.sharpRadiusSlider),
 	))
 	cleanTab := container.NewTabItem("Clean", container.NewVBox(
-		widget.NewLabel("Targets small red, green, or blue cosmic-ray leftovers and near-black dropout dots in the composed RGB image."),
+		newWrappedEditLabel("Targets small red, green, or blue cosmic-ray leftovers and near-black dropout dots in the composed RGB image."),
 		sliderRow("Max Blob Size", es.cleanBlobSlider),
 		sliderRow("Intensity", es.cleanIntensitySlider),
 		cleanBtn,
@@ -1450,7 +1567,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 		healUndoBtn,
 	))
 	cropTab := container.NewTabItem("Crop", container.NewVBox(
-		widget.NewLabel("Turn the tool on, drag a rectangle over the image, then apply. The cropped result becomes the new edit base."),
+		newWrappedEditLabel("Turn the tool on, drag a rectangle over the image, then apply. The cropped result becomes the new edit base."),
 		cropToggleBtn,
 		es.cropStatusLabel,
 		applyCropBtn,
@@ -1466,17 +1583,19 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 		widget.NewSeparator(),
 		container.NewHBox(applyBtn, resetBtn),
 		saveBtn,
+		widget.NewLabel("Legend size (100–600%)"), es.legendSizeSlider,
+		container.NewHBox(legendResetBtn, legendRemoveBtn),
 	)
 
-	paddedControls := container.New(layout.NewCustomPaddedLayout(0, 0, 20, 20), controls)
-	controlsScroll := container.NewVScroll(paddedControls)
-	controlsScroll.SetMinSize(fyne.NewSize(280, 200))
-
-	split := container.NewHSplit(controlsScroll, rightPanel)
-	split.SetOffset(0.28)
+	split := newEditControlsSplit(controls, rightPanel)
 
 	setter := func(h editImageHandoff) error {
 		return es.installHandoff(h)
+	}
+	globalAddLegendToEdit = func(entries []legendEntry) {
+		if es.origW > 0 && es.origH > 0 {
+			es.setLegend(entries)
+		}
 	}
 	globalEditCleanup = func() {
 		if es.diskSource != nil {

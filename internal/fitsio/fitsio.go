@@ -102,13 +102,25 @@ func LoadFileMetadata(path string) (*File, error) {
 // need (e.g. a single SCI chip and its DQ) without paying the memory or I/O cost
 // of the rest of the file.
 func LoadFileSelective(path string, decode func(hdr Header) bool) (*File, error) {
-	return loadFileFiltered(path, decode)
+	return LoadFileSelectiveIndexed(path, func(_ int, hdr Header) bool { return decode(hdr) })
+}
+
+// LoadFileSelectiveIndexed is the positional variant of LoadFileSelective.
+// index is the zero-based HDU number, allowing formats with repeated or
+// unusable EXTVER values (notably raw Gemini GMOS) to select one chip without
+// decoding sibling image arrays.
+func LoadFileSelectiveIndexed(path string, decode func(index int, hdr Header) bool) (*File, error) {
+	return loadFileFilteredIndexed(path, decode)
 }
 
 // loadFileFiltered walks every HDU header and decodes a data unit only when it
 // has image data (NAXIS>=2, supported BITPIX) and decode(hdr) returns true. It
 // underpins LoadFileMetadata and LoadFileSelective.
 func loadFileFiltered(path string, decode func(hdr Header) bool) (*File, error) {
+	return loadFileFilteredIndexed(path, func(_ int, hdr Header) bool { return decode(hdr) })
+}
+
+func loadFileFilteredIndexed(path string, decode func(index int, hdr Header) bool) (*File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -117,7 +129,7 @@ func loadFileFiltered(path string, decode func(hdr Header) bool) (*File, error) 
 
 	var hdus []HDU
 	var pos int64
-	for {
+	for index := 0; ; index++ {
 		if _, err := f.Seek(pos, io.SeekStart); err != nil {
 			return nil, err
 		}
@@ -134,7 +146,7 @@ func loadFileFiltered(path string, decode func(hdr Header) bool) (*File, error) 
 		if sizeErr != nil {
 			return nil, sizeErr
 		}
-		if dataBytes > 0 && decode(hdr) {
+		if dataBytes > 0 && decode(index, hdr) {
 			if _, err := f.Seek(pos, io.SeekStart); err != nil {
 				return nil, err
 			}
