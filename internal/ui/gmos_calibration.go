@@ -54,7 +54,7 @@ func (ws *mosaicWorkspace) configureGMOSCalibration() {
 	if !started {
 		return
 	}
-	pt := newProgressTrackerWithContext("Gemini GMOS Calibration", "Discovering calibration frames...", ws.win, ctx, ws.cancelGMOSCalibration)
+	pt := newProgressTrackerWithContextOnUI("Gemini GMOS Calibration", "Discovering calibration frames...", ws.win, ctx, ws.cancelGMOSCalibration)
 	go func() {
 		m, err := mosaic.DiscoverGMOSCalibration(filepath.Dir(rawSelected.Path))
 		if err == nil && ctx.Err() == nil {
