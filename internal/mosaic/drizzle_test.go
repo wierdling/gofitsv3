@@ -1036,25 +1036,110 @@ func TestBuildOutputHeaderUsesMetaSourceFilterNotWCSReference(t *testing.T) {
 	ref := Input{
 		Path:          "ref_astrometry.fits",
 		ReferenceOnly: true,
-		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F814W'", "INSTRUME": "'ACS'"}},
-		HDU:           fitsio.HDU{Header: headerWithCRPIX(3, 3)},
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{
+			"FILTER": "'F502N'", "INSTRUME": "'ACS'", "EXPTIME": "120", "SRCFILE": "'ref_astrometry.fits'",
+		}},
+		HDU: fitsio.HDU{Header: headerWithCRPIX(11, 13)},
 	}
 	sci := Input{
-		Path:          "sci_f656n.fits",
-		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F656N'", "INSTRUME": "'WFC3'"}},
-		HDU:           fitsio.HDU{Header: headerWithCRPIX(3, 3)},
+		Path: "ifrp11vvq_flc.fits",
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{
+			"FILTER": "'F673N'", "INSTRUME": "'WFC3'", "EXPTIME": "800", "SRCFILE": "'ifrp11vvq_flc.fits'",
+		}},
+		HDU: fitsio.HDU{Header: headerWithCRPIX(3, 3)},
 	}
 
 	hdr := buildOutputHeader(ref, sci, 4, 4, 0, 0, 1, 1)
 
-	if got := fitsio.HeaderString(hdr, "FILTER"); got != "F656N" {
-		t.Fatalf("FILTER = %q, want F656N (from science input, not WCS reference)", got)
+	if got := fitsio.HeaderString(hdr, "FILTER"); got != "F673N" {
+		t.Fatalf("FILTER = %q, want F673N (from science input, not WCS reference)", got)
 	}
 	if got := fitsio.HeaderString(hdr, "INSTRUME"); got != "WFC3" {
 		t.Fatalf("INSTRUME = %q, want WFC3 (from science input, not WCS reference)", got)
 	}
+	if got := fitsio.HeaderString(hdr, "EXPTIME"); got != "800" {
+		t.Fatalf("EXPTIME = %q, want 800 (from science input, not WCS reference)", got)
+	}
+	if got := fitsio.HeaderString(hdr, "SRCFILE"); got != "ifrp11vvq_flc.fits" {
+		t.Fatalf("SRCFILE = %q, want ifrp11vvq_flc.fits (from science input, not WCS reference)", got)
+	}
 	// WCS geometry still anchored to ref.
-	if _, ok := hdr.Cards["CRPIX1"]; !ok {
-		t.Fatal("expected CRPIX1 to be carried over from ref")
+	if got := fitsio.HeaderString(hdr, "CRPIX1"); got != "11" {
+		t.Fatalf("CRPIX1 = %q, want 11 from WCS reference", got)
+	}
+	if got := fitsio.HeaderString(hdr, "CRVAL1"); got != "100" {
+		t.Fatalf("CRVAL1 = %q, want 100 from WCS reference", got)
+	}
+}
+
+func TestBuildOutputHeaderUsesReferencePCCDELTGeometry(t *testing.T) {
+	refHeader := headerWithCRPIX(11, 13)
+	for _, key := range []string{"CD1_1", "CD1_2", "CD2_1", "CD2_2"} {
+		delete(refHeader.Cards, key)
+	}
+	refHeader.Cards["PC1_1"] = "0.9"
+	refHeader.Cards["PC1_2"] = "0.1"
+	refHeader.Cards["PC2_1"] = "-0.1"
+	refHeader.Cards["PC2_2"] = "0.9"
+	refHeader.Cards["CDELT1"] = "0.8"
+	refHeader.Cards["CDELT2"] = "-0.8"
+
+	scienceHeader := headerWithCRPIX(3, 3)
+	science := Input{
+		Path:          "ifrp11vvq_flc.fits",
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F673N'"}},
+		HDU:           fitsio.HDU{Header: scienceHeader},
+	}
+	hdr := buildOutputHeader(Input{HDU: fitsio.HDU{Header: refHeader}}, science, 4, 4, 0, 0, 2, 1)
+
+	if got := fitsio.HeaderString(hdr, "PC1_1"); got != "0.9" {
+		t.Fatalf("PC1_1 = %q, want 0.9 from WCS reference", got)
+	}
+	if got := fitsio.HeaderString(hdr, "CDELT1"); got != "0.4" {
+		t.Fatalf("CDELT1 = %q, want 0.4 after output scaling", got)
+	}
+	if got := fitsio.HeaderString(hdr, "CDELT2"); got != "-0.4" {
+		t.Fatalf("CDELT2 = %q, want -0.4 after output scaling", got)
+	}
+	if _, ok := hdr.Cards["CD1_1"]; ok {
+		t.Fatal("science CD1_1 leaked into PC+CDELT reference output")
+	}
+}
+
+func TestBuildUsesFirstSuccessfullyPlannedScienceMetadata(t *testing.T) {
+	ref := Input{
+		Path:          "reference.fits",
+		ReferenceOnly: true,
+		PrimaryHeader: fitsio.Header{Cards: map[string]string{"FILTER": "'F502N'", "EXPTIME": "120", "SRCFILE": "'reference.fits'"}},
+		HDU:           fitsio.HDU{Header: headerWithCRPIX(10, 10), Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: filledPixels(2, 2, 1)}},
+	}
+	invalid := makeInput("invalid_f673n.fits", 2, 2, filledPixels(2, 2, 2), headerWithCRPIX(10, 10))
+	invalid.PrimaryHeader.Cards["FILTER"] = "'F502N'"
+	invalid.PrimaryHeader.Cards["EXPTIME"] = "600"
+	invalid.PrimaryHeader.Cards["SRCFILE"] = "'invalid_f673n.fits'"
+	invalid.HDU.Header.Cards["CRPIX1"] = "not-a-number"
+	valid := makeInput("ifrp11vvq_flc.fits", 2, 2, filledPixels(2, 2, 3), headerWithCRPIX(10, 10))
+	valid.PrimaryHeader.Cards["FILTER"] = "'F673N'"
+	valid.PrimaryHeader.Cards["EXPTIME"] = "800"
+	valid.PrimaryHeader.Cards["SRCFILE"] = "'ifrp11vvq_flc.fits'"
+
+	result, err := Build([]Input{ref, invalid, valid}, Options{Scale: 1})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+	if got := fitsio.HeaderString(result.OutputHeader, "FILTER"); got != "F673N" {
+		t.Fatalf("FILTER = %q, want F673N from valid contributor", got)
+	}
+	if got := fitsio.HeaderString(result.OutputHeader, "EXPTIME"); got != "800" {
+		t.Fatalf("EXPTIME = %q, want 800 from valid contributor", got)
+	}
+	if got := fitsio.HeaderString(result.OutputHeader, "SRCFILE"); got != "ifrp11vvq_flc.fits" {
+		t.Fatalf("SRCFILE = %q, want valid contributor", got)
+	}
+	if got := fitsio.HeaderString(result.OutputHeader, "NCOMBINE"); got != "1" {
+		t.Fatalf("NCOMBINE = %q, want 1", got)
+	}
+	if result.Inputs[1].Status != "failed" || result.Inputs[1].Included {
+		t.Fatalf("invalid input status = %+v, want failed and excluded", result.Inputs[1])
 	}
 }

@@ -75,3 +75,5 @@ Prefer narrow, deliberate changes over broad exploration.
 - If one or two nearby files must be inspected to verify correctness, do that and explain why.
 - Ask before expanding into refactors, unrelated cleanup, or architecture changes.
 - If a workflow becomes repetitive or long, suggest creating a skill or subagent instead of enlarging this file.
+## Large files (read by range only)
+- `internal/ui/workspace_compose.go` (~7.7k lines) and `internal/mosaic/drizzle.go` (~3.5k lines): never Read whole. `Grep -n` for the func/symbol first, then Read with `offset`/`limit` (≤200 lines).

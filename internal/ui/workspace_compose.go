@@ -148,6 +148,52 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	var largeStore *composeLargeStore
 	largeMode := largeFilesCheck.Checked
 	composeLargeModeActive = func() bool { return largeMode }
+	starTreatments := newComposeStarTreatments(win, func() bool { return largeMode })
+	starWhitening := models.StarWhiteningState{Strength: .75, Level: models.StarWhiteningWhite, Red: true, Green: true, Blue: true}
+	// composeSourceBlinkIDs identifies every loaded source by its stable ID:
+	// channels by their fixed IDs, layers by their persisted BlinkID.
+	composeSourceBlinkIDs := func() []string {
+		ids := make([]string, len(imgs))
+		copy(ids, []string{models.ComposeChannel1BlinkID, models.ComposeChannel2BlinkID, models.ComposeChannel3BlinkID})
+		for _, l := range overlayLayers {
+			if l != nil && l.idx < len(ids) {
+				ids[l.idx] = l.settings.BlinkID
+			}
+		}
+		return ids
+	}
+	whiteningReference := func() *models.LoadedImage {
+		if !starWhitening.Enabled {
+			return nil
+		}
+		return whiteningReferenceImage(imgs, composeSourceBlinkIDs(), starWhitening.ReferenceBlinkID)
+	}
+	starTreatments.whiteningRef = whiteningReference
+	starGeometryBlinkID := ""
+	starTreatments.geometryRef = func() *models.LoadedImage {
+		return whiteningReferenceImage(imgs, composeSourceBlinkIDs(), starGeometryBlinkID)
+	}
+	// buildStarNeutralizer returns the whitening for a composite of size w x h,
+	// nil when whitening is off or its reference model is not prepared yet
+	// (the render then proceeds without it and refreshes when the model lands).
+	buildStarNeutralizer := func(w, h int) (*processing.StarNeutralizer, error) {
+		ref := whiteningReference()
+		if ref == nil || len(imgs) < 2 || imgs[1] == nil {
+			return nil, nil
+		}
+		model := starTreatments.modelFor(ref)
+		if model == nil {
+			return nil, nil
+		}
+		idx := -1
+		for i, img := range imgs {
+			if img == ref {
+				idx = i
+			}
+		}
+		dx, dy, rot, _ := composeChannelOffsetFields(idx)
+		return processing.NewStarNeutralizer(model, processing.DiskChannel{Image: *ref, OffsetX: dx, OffsetY: dy, OffsetRot: rot}, *imgs[1], w, h, starWhitening)
+	}
 	largePreviews := make(map[int]*image.RGBA)
 	largeArtifacts := make(map[int]composeArtifactDescriptor)
 	var largeMu sync.RWMutex
@@ -251,6 +297,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			}
 			return
 		}
+		// Attach each source's current gentler-star-stretch model (or none while
+		// one is being prepared) before the snapshot is taken.
+		starTreatments.sync(imgs, false)
 		previewMu.Lock()
 		if genCancel != nil {
 			genCancel()
@@ -415,6 +464,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	refresh = func() {
 		startGeneration(nil)
 	}
+	starTreatments.refresh = refresh
 	sharedHistCheck.OnChanged = func(bool) {
 		if updateHistScaleLabel != nil {
 			updateHistScaleLabel()
@@ -566,11 +616,15 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				expectedCompositeGeneration = currentComposite.Generation
 			}
 			var channels [3]processing.DiskChannel
+			outW, outH := 0, 0
 			for i := 0; i < 3; i++ {
 				d, ok := largeArtifacts[i]
 				if !ok || d.Path == "" {
 					largeMu.RUnlock()
 					return nil, 0, 0, [3]histogram.Stats{}, fmt.Errorf("missing disk artifact for channel %d", i)
+				}
+				if i == 1 {
+					outW, outH = d.Width, d.Height // Channel 2 defines the output grid
 				}
 				dx, dy, rot, _ := composeChannelOffsetFields(i)
 				channels[i] = processing.DiskChannel{ArtifactPath: d.Path, Image: *imgs[i], OffsetX: dx, OffsetY: dy, OffsetRot: rot}
@@ -601,7 +655,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			lrgbMu.RLock()
 			lrgbSnapshot.settings = lrgbSettings
 			lrgbMu.RUnlock()
-			result, err := processing.ComposeDisk(ctx, processing.DiskComposeRequest{Channels: channels, Overlays: ovs, Output: outs, PreviewMax: 1600, RGBLevels: levels, CompositionMode: compositionMode, MixWeights: append([]models.ComposeMixWeight(nil), mixWeights...), LRGB: lrgbSnapshot.settings})
+			whitening, err := buildStarNeutralizer(outW, outH)
+			if err != nil {
+				return nil, 0, 0, [3]histogram.Stats{}, err
+			}
+			result, err := processing.ComposeDisk(ctx, processing.DiskComposeRequest{Channels: channels, Overlays: ovs, Output: outs, PreviewMax: 1600, RGBLevels: levels, CompositionMode: compositionMode, MixWeights: append([]models.ComposeMixWeight(nil), mixWeights...), LRGB: lrgbSnapshot.settings, StarWhitening: whitening})
 			if err != nil {
 				for _, p := range outs {
 					_ = os.Remove(p)
@@ -662,6 +720,13 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			if err != nil {
 				return nil, 0, 0, [3]histogram.Stats{}, err
 			}
+			if whitening, err := buildStarNeutralizer(w, h); err != nil {
+				return nil, 0, 0, [3]histogram.Stats{}, err
+			} else if whitening != nil {
+				if err := whitening.Apply(ctx, rgb); err != nil {
+					return nil, 0, 0, [3]histogram.Stats{}, err
+				}
+			}
 			if dedicated != nil && lrgbSnapshot.settings.Enabled && lrgbSnapshot.settings.LuminanceWeight > 0 {
 				ld := processing.StretchedImageDataForReferenceGrid(dedicated, composeSources[1])
 				planes, err := processing.ComposeLRGB(ctx, rgb[0], rgb[1], rgb[2], ld.Pixels, w, h, processing.LRGBConfig{
@@ -690,6 +755,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		}
 		if len(artisticOverlays) > 0 {
 			b, w, h, s := processing.ComposeRGBWithOverlays(ctx, composeSources, artisticOverlays)
+			var err error
+			if b, s, err = whitenComposeRGBA(ctx, buildStarNeutralizer, b, w, h, s); err != nil {
+				return nil, 0, 0, [3]histogram.Stats{}, err
+			}
 			if dedicated != nil {
 				b, _ = applyDedicatedL(b, w, h, lrgbSnapshot.settings, dedicated)
 			} else if lrgbSnapshot.settings.Enabled {
@@ -698,6 +767,10 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			return b, w, h, s, nil
 		}
 		b, w, h, s := processing.ComposeRGB(ctx, composeSources)
+		var err error
+		if b, s, err = whitenComposeRGBA(ctx, buildStarNeutralizer, b, w, h, s); err != nil {
+			return nil, 0, 0, [3]histogram.Stats{}, err
+		}
 		if dedicated != nil {
 			b, _ = applyDedicatedL(b, w, h, lrgbSnapshot.settings, dedicated)
 		} else if lrgbSnapshot.settings.Enabled {
@@ -747,7 +820,7 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			_ = uc.Close()
 
 			format := detectExportFormat(path)
-			stretched, _ := processing.ApplyStretchParallel(imgs[idx])
+			stretched, _ := processing.StretchForDisplay(imgs[idx])
 			gray := processing.ToGrayRGBA(stretched, make([]byte, len(stretched.Pixels)))
 			showExportOptionsDialog(format, win, func(opts export.Options) {
 				if err := export.FromImage(path, gray, format, opts); err != nil {
@@ -1751,11 +1824,25 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			return imgs[idx]
 		}
 		src := imgs[idx].HDU.Data.Pixels
+		// A gentler star stretch is defined on the source grid, so a treated
+		// channel is stretched first and its stretched result is warped; the
+		// clone then carries an identity stretch so the compositor does not
+		// stretch it again. Untreated channels warp linear data as before.
+		treatment := imgs[idx].StarTreatment
+		treated := false
+		if treatment != nil {
+			if data, err := processing.TreatedStretchForSource(context.Background(), imgs[idx]); err == nil {
+				src, treated = data.Pixels, true
+			} else {
+				treatment = nil
+				debuglog.Log(fmt.Sprintf("renderImage: star treatment ignored: %v", err))
+			}
+		}
 		var warpedPixels []float32
 		if idx < len(renderCache) {
 			renderMu.Lock()
 			c := renderCache[idx]
-			if c.pixels != nil && c.dx == dx && c.dy == dy && c.rot == rot && c.hasAlign == hasAlign && c.align == align && sameFloatSlice(c.src, src) {
+			if c.pixels != nil && c.dx == dx && c.dy == dy && c.rot == rot && c.hasAlign == hasAlign && c.align == align && c.treatment == treatment && (treated || sameFloatSlice(c.src, src)) {
 				warpedPixels = c.pixels
 			}
 			renderMu.Unlock()
@@ -1771,12 +1858,16 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			warpedPixels = processing.WarpImage(src, w, h, t)
 			if idx < len(renderCache) {
 				renderMu.Lock()
-				renderCache[idx] = composeRenderCache{dx: dx, dy: dy, rot: rot, hasAlign: hasAlign, align: align, src: src, pixels: warpedPixels}
+				renderCache[idx] = composeRenderCache{dx: dx, dy: dy, rot: rot, hasAlign: hasAlign, align: align, src: src, pixels: warpedPixels, treatment: treatment}
 				renderMu.Unlock()
 			}
 		}
 		warped := *imgs[idx]
 		warped.HDU.Data.Pixels = warpedPixels
+		if treated {
+			warped.Mode, warped.Background, warped.Peak, warped.ScaledPeak = stretch.Linear, 0, 1, 1
+			warped.StarTreatment = nil
+		}
 		return &warped
 	}
 	renderImages = func() []*models.LoadedImage {
@@ -2152,6 +2243,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 			CompositionMode:      compositionMode,
 			MixWeights:           append([]models.ComposeMixWeight(nil), mixWeights...),
 		}
+		if starWhitening.Enabled {
+			whitening := starWhitening
+			project.StarWhitening = &whitening
+		}
+		project.StarStretchGeometryBlinkID = starGeometryBlinkID
 		if blinkChannels != nil {
 			selection := append([]int(nil), blinkChannels...)
 			project.BlinkChannels = &selection
@@ -2199,6 +2295,8 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 				GHSStretch:  imgs[i].GHSStretch,
 				GHSLocal:    imgs[i].GHSLocal,
 				GHSSymmetry: imgs[i].GHSSymmetry,
+
+				StarStretch: starStretchStateForProject(imgs[i].StarStretch),
 			}
 		}
 		for _, l := range overlayLayers {
@@ -2500,6 +2598,11 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 						psfSettings = project.PSF
 						compositionMode = project.CompositionMode
 						mixWeights = append([]models.ComposeMixWeight(nil), project.MixWeights...)
+						starWhitening = models.StarWhiteningState{Strength: .75, Level: models.StarWhiteningWhite, Red: true, Green: true, Blue: true}
+						if project.StarWhitening != nil {
+							starWhitening = *project.StarWhitening
+						}
+						starGeometryBlinkID = project.StarStretchGeometryBlinkID
 						lrgbMu.Lock()
 						dedicatedL = nil
 						lrgbSettings = project.LRGB
@@ -4527,6 +4630,30 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		showComposeWeightsDialog(win, &compositionMode, &mixWeights, sources, refresh)
 	}
 	composeWeightsItem := fyne.NewMenuItem("Color Mixing...", showComposeWeights)
+	starStretchPreviewItem := fyne.NewMenuItem("Gentler Star Stretch Preview...", func() { showComposeStarStretchPreviewDialog(win, imgs) })
+	whiteStarsItem := fyne.NewMenuItem("White Stars...", func() {
+		roles := []string{"Blue", "Green", "Red"}
+		for _, l := range overlayLayers {
+			for len(roles) <= l.idx {
+				roles = append(roles, "")
+			}
+			roles[l.idx] = "Layer " + l.name
+		}
+		showComposeWhiteStarsDialog(win, imgs, roles, composeSourceBlinkIDs(), &starWhitening, starTreatments, func() {
+			starTreatments.sync(imgs, true)
+			refresh()
+		})
+	})
+	starStretchItem := fyne.NewMenuItem("Gentler Star Stretch...", func() {
+		roles := []string{"Blue", "Green", "Red"}
+		for _, l := range overlayLayers {
+			for len(roles) <= l.idx {
+				roles = append(roles, "")
+			}
+			roles[l.idx] = "Layer " + l.name
+		}
+		showComposeStarTreatmentDialog(win, imgs, roles, composeSourceBlinkIDs(), &starGeometryBlinkID, starTreatments, refresh)
+	})
 	matchStretchItem := fyne.NewMenuItem("Match Channel Stretch...", showMatchStretchDialog)
 	addLayerItem := fyne.NewMenuItem("Add Colored Layer...", addColoredLayer)
 	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
@@ -4578,6 +4705,9 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 		psfItem,
 		lrgbItem,
 		composeWeightsItem,
+		starStretchItem,
+		whiteStarsItem,
+		starStretchPreviewItem,
 		loadDedicatedLItem,
 		clearDedicatedLItem,
 		fyne.NewMenuItemSeparator(),
@@ -5486,7 +5616,26 @@ func channelStateFromImage(img *models.LoadedImage) models.ChannelState {
 		GHSStretch:  img.GHSStretch,
 		GHSLocal:    img.GHSLocal,
 		GHSSymmetry: img.GHSSymmetry,
+
+		StarStretch: starStretchStateForProject(img.StarStretch),
 	}
+}
+
+// starStretchStateForProject persists the setting only when it is on, so
+// projects that never used it are unchanged.
+func starStretchStateForProject(s models.StarStretchState) *models.StarStretchState {
+	if !s.Enabled {
+		return nil
+	}
+	copy := s
+	return &copy
+}
+
+func starStretchStateFromProject(s *models.StarStretchState) models.StarStretchState {
+	if s == nil {
+		return models.StarStretchState{}
+	}
+	return *s
 }
 
 func applyChannelState(idx int, state models.ChannelState, imgs []*models.LoadedImage, views []*viewport, controls []*models.ChannelControl) {
@@ -5512,6 +5661,7 @@ func applyChannelState(idx int, state models.ChannelState, imgs []*models.Loaded
 	img.GHSStretch = state.GHSStretch
 	img.GHSLocal = state.GHSLocal
 	img.GHSSymmetry = state.GHSSymmetry
+	img.StarStretch = starStretchStateFromProject(state.StarStretch)
 
 	controls[idx].ModeSelect.SetSelected(modeToLabel(img.Mode))
 	controls[idx].BackgroundEntry.SetValue(img.Background)
@@ -5852,6 +6002,7 @@ func applyChannelStateToImage(img *models.LoadedImage, st models.ChannelState) {
 	img.Background, img.Peak, img.ScaledPeak, img.ShowClip = st.Background, st.Peak, st.ScaledPeak, st.ShowClip
 	img.AsinhScale, img.MTFMidtone = st.AsinhScale, st.MTFMidtone
 	img.GHSStretch, img.GHSLocal, img.GHSSymmetry = st.GHSStretch, st.GHSLocal, st.GHSSymmetry
+	img.StarStretch = starStretchStateFromProject(st.StarStretch)
 }
 
 // largeArtifactStars extracts a bounded catalog while materializing only this
@@ -6463,7 +6614,7 @@ func buildComposePreviewData(ctx context.Context, imgs []*models.LoadedImage, sh
 			continue
 		}
 		channelStart := time.Now()
-		stretched, mask := processing.ApplyStretchParallel(imgs[i])
+		stretched, mask := processing.StretchForDisplay(imgs[i])
 		stats := histogram.Compute(stretched.Pixels)
 		sky, _ := processing.EstimateBackground(stretched.Pixels)
 		channelPixels[i] = stretched.Pixels
@@ -7180,6 +7331,7 @@ type composeRenderCache struct {
 	align       processing.AffineTransform
 	src         []float32
 	pixels      []float32
+	treatment   models.StretchTreatment // pixels hold a treated, already stretched warp when set
 }
 
 // sameFloatSlice reports whether a and b share the same backing array (and

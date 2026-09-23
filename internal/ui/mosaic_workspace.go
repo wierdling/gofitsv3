@@ -25,19 +25,22 @@ type mosaicWorkspace struct {
 	state *mosaicState
 
 	// --- mutable value state (reassigned during the session) ---
-	activeFilter        string
-	lastProjectName     string
-	currentProjectPath  string
-	queueRunning        bool
-	alignmentMu         sync.Mutex
-	alignmentGeneration uint64
-	alignmentCancel     context.CancelFunc
-	buildMu             sync.Mutex
-	buildGeneration     uint64
-	buildCancel         context.CancelFunc
-	gmosMu              sync.Mutex
-	gmosGeneration      uint64
-	gmosCancel          context.CancelFunc
+	activeFilter         string
+	lastProjectName      string
+	currentProjectPath   string
+	queueRunning         bool
+	starMapRunning       bool
+	starMapBuildResult   *mosaic.Result
+	starMapBuildEvidence *mosaic.StarMapEvidence
+	alignmentMu          sync.Mutex
+	alignmentGeneration  uint64
+	alignmentCancel      context.CancelFunc
+	buildMu              sync.Mutex
+	buildGeneration      uint64
+	buildCancel          context.CancelFunc
+	gmosMu               sync.Mutex
+	gmosGeneration       uint64
+	gmosCancel           context.CancelFunc
 	// inputMu guards replacement/reload of inputs and the generation map. Long
 	// running exports take short read snapshots so a project reload cannot race
 	// their validation or final publication.

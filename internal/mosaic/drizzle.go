@@ -959,7 +959,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		if err := os.MkdirAll(options.DebugOutputDir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create debug output directory: %w", err)
 		}
-		debugBaseHeader = buildOutputHeader(wcsReferenceInput(inputs), firstDataInput(inputs), width, height, minX, minY, options.Scale, 1)
+		debugBaseHeader = buildOutputHeader(wcsReferenceInput(inputs), firstPlannedDataInput(planned), width, height, minX, minY, options.Scale, 1)
 	}
 
 	for i := range planned {
@@ -1131,7 +1131,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		OriginX:             minX,
 		OriginY:             minY,
 		Scale:               options.Scale,
-		OutputHeader:        buildOutputHeader(wcsReferenceInput(inputs), firstDataInput(inputs), width, height, minX, minY, options.Scale, includedCount),
+		OutputHeader:        buildOutputHeader(wcsReferenceInput(inputs), firstPlannedDataInput(planned), width, height, minX, minY, options.Scale, includedCount),
 		Inputs:              statuses,
 		InputFootprints:     footprints,
 		InputFootprintPaths: footprintPaths,
@@ -2655,12 +2655,16 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 // ref, so the output header describes what was drizzled rather than the WCS
 // anchor.
 func buildOutputHeader(ref, metaSource Input, width, height int, originX, originY, scale float64, includedCount int) fitsio.Header {
-	merged := mergeHeaders(ref.PrimaryHeader, ref.HDU.Header)
-	cards := fitsio.CloneHeader(merged).Cards
-
+	refMerged := mergeHeaders(ref.PrimaryHeader, ref.HDU.Header)
 	metaMerged := mergeHeaders(metaSource.PrimaryHeader, metaSource.HDU.Header)
-	for _, key := range []string{"FILTER", "FILTNAM1", "FILTNAM2", "FILTER1", "FILTER2", "PUPIL", "INSTRUME", "DETECTOR"} {
-		if v, ok := metaMerged.Cards[key]; ok {
+	cards := fitsio.CloneHeader(metaMerged).Cards
+
+	// A ReferenceOnly input supplies the output coordinate frame, but it is not
+	// a science contributor. Copy only WCS geometry from it so exposure and
+	// provenance metadata (for example EXPTIME and SRCFILE) describe the first
+	// actual science input instead of the reference image.
+	for _, key := range outputWCSHeaderCards {
+		if v, ok := refMerged.Cards[key]; ok {
 			cards[key] = v
 		} else {
 			delete(cards, key)
@@ -2687,7 +2691,7 @@ func buildOutputHeader(ref, metaSource Input, width, height int, originX, origin
 	cards["CTYPE1"] = stripSIPSuffix(cards["CTYPE1"])
 	cards["CTYPE2"] = stripSIPSuffix(cards["CTYPE2"])
 
-	cards["OBJECT"] = firstNonEmpty(cards["OBJECT"], quotedString(filepath.Base(ref.Path)))
+	cards["OBJECT"] = firstNonEmpty(cards["OBJECT"], quotedString(filepath.Base(metaSource.Path)))
 	cards["IMAGETYP"] = quotedString("DRIZZLE")
 	cards["NCOMBINE"] = strconv.Itoa(includedCount)
 	cards["DRIZSCAL"] = formatFloat(scale)
@@ -2725,6 +2729,13 @@ func buildOutputHeader(ref, metaSource Input, width, height int, originX, origin
 	}
 
 	return fitsio.Header{Cards: cards}
+}
+
+var outputWCSHeaderCards = []string{
+	"WCSAXES", "WCSNAME", "CTYPE1", "CTYPE2", "CUNIT1", "CUNIT2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2",
+	"CD1_1", "CD1_2", "CD2_1", "CD2_2", "CDELT1", "CDELT2",
+	"PC1_1", "PC1_2", "PC2_1", "PC2_2", "CROTA1", "CROTA2",
+	"RADESYS", "EQUINOX", "LONPOLE", "LATPOLE",
 }
 
 func isDistortionHeaderCard(key string) bool {
@@ -3510,6 +3521,15 @@ func firstDataInput(inputs []Input) Input {
 		}
 	}
 	return inputs[0]
+}
+
+func firstPlannedDataInput(planned []plannedInput) Input {
+	for _, p := range planned {
+		if !p.input.ReferenceOnly {
+			return p.input
+		}
+	}
+	return planned[0].input
 }
 
 // wcsReferenceInput returns the input whose WCS should anchor the output header.

@@ -49,6 +49,8 @@ type DiskComposeRequest struct {
 	CompositionMode models.ComposeMode
 	MixWeights      []models.ComposeMixWeight
 	LRGB            models.LRGBSettings
+	// StarWhitening, when set, whitens stars on the final R,G,B planes.
+	StarWhitening *StarNeutralizer
 }
 
 type DiskComposeResult struct {
@@ -118,7 +120,6 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 		return composeDiskWeighted(ctx, req, w, h)
 	}
 	prepared := [3]string{}
-	stretchMeta := req.Channels[1].Image
 	// Every intermediate is staging-owned and must disappear on all failure
 	// paths, including cancellation during preparation/calibration.
 	var intermediates []string
@@ -147,17 +148,28 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 			prepared[i] = req.Channels[i].ArtifactPath + fmt.Sprintf(".prepared-%d", i)
 		}
 		intermediates = append(intermediates, prepared[i])
-		// Non-HistEq stretches are scalar and can be fused into the mapping
-		// pass. HistEq intentionally remains a separate multi-pass operation
-		// because its CDF is calculated from the complete prepared raster.
-		applyStretch := stretchMeta.Mode != stretch.HistEq
-		if err := prepareDiskChannel(ctx, req.Channels[i], req.Channels[1].Image, stretchMeta, w, h, prepared[i], applyStretch); err != nil {
-			for _, p := range prepared {
-				if p != "" {
-					_ = os.Remove(p)
-				}
-			}
+		// Every channel is stretched with its own settings, as in normal
+		// Compose. Non-HistEq stretches are scalar and can be fused into the
+		// mapping pass. HistEq intentionally remains a separate multi-pass
+		// operation because its CDF is calculated from the complete prepared
+		// raster; the preparation pass then only maps the channel.
+		meta := req.Channels[i].Image
+		applyStretch := meta.Mode != stretch.HistEq
+		prepareMeta := meta
+		if !applyStretch {
+			prepareMeta.Mode = stretch.Linear
+		}
+		if err := prepareDiskChannel(ctx, req.Channels[i], req.Channels[1].Image, prepareMeta, w, h, prepared[i], applyStretch); err != nil {
 			return DiskComposeResult{}, err
+		}
+		if meta.Mode == stretch.HistEq {
+			cdf, err := diskHistEqCDF(ctx, prepared[i], meta)
+			if err != nil {
+				return DiskComposeResult{}, err
+			}
+			if err := stretchDiskArtifact(ctx, prepared[i], meta, cdf); err != nil {
+				return DiskComposeResult{}, err
+			}
 		}
 	}
 	for oi, ov := range req.Overlays {
@@ -170,34 +182,17 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 		p := ov.Channel.ArtifactPath + fmt.Sprintf(".overlay-prepared-%d", oi)
 		intermediates = append(intermediates, p)
 		// Artistic overlays own their stretch metadata; preserve that
-		// ownership while fusing only non-HistEq scalar modes.
+		// ownership while fusing only non-HistEq scalar modes. HistEq is
+		// applied by the CDF pass below on the mapped overlay.
 		applyStretch := ov.Channel.Image.Mode != stretch.HistEq
 		prepareMeta := ov.Channel.Image
 		if !applyStretch {
-			// HistEq is applied by the caller-owned CDF pass below. Keep the
-			// preparation pass purely calibrated/mapped so prepareDiskChannel's
-			// legacy internal HistEq pass does not consume the overlay.
 			prepareMeta.Mode = stretch.Linear
 		}
 		if err := prepareDiskChannel(ctx, ov.Channel, req.Channels[1].Image, prepareMeta, w, h, p, applyStretch); err != nil {
 			return DiskComposeResult{}, err
 		}
 		artistic = append(artistic, artisticDiskOverlay{path: p, settings: ov.Settings, meta: ov.Channel.Image})
-	}
-	var cdf []float32
-	if stretchMeta.Mode == stretch.HistEq {
-		var histErr error
-		cdf, histErr = diskHistEqCDF(ctx, prepared[1], stretchMeta)
-		if histErr != nil {
-			return DiskComposeResult{}, histErr
-		}
-	}
-	if stretchMeta.Mode == stretch.HistEq {
-		for _, p := range prepared {
-			if err := stretchDiskArtifact(ctx, p, stretchMeta, cdf); err != nil {
-				return DiskComposeResult{}, err
-			}
-		}
 	}
 	for _, ov := range artistic {
 		var overlayCDF []float32
@@ -222,6 +217,11 @@ func ComposeDisk(ctx context.Context, req DiskComposeRequest) (DiskComposeResult
 	// B,G,R order. Preview them before publication, then rename them directly
 	// into the R,G,B destinations to avoid another pair of full-plane copies.
 	previewPaths := [3]string{prepared[2], prepared[1], prepared[0]}
+	if req.StarWhitening != nil {
+		if err := req.StarWhitening.ApplyDisk(ctx, previewPaths); err != nil {
+			return DiskComposeResult{}, err
+		}
+	}
 	preview, stats, err := diskCompositePreviewForCompose(ctx, previewPaths, w, h, req.PreviewMax, nil)
 	if err != nil {
 		return DiskComposeResult{}, err
@@ -347,6 +347,11 @@ func composeDiskWeighted(ctx context.Context, req DiskComposeRequest, w, h int) 
 	if err := compressDiskRGB(ctx, acc, w, h); err != nil {
 		return DiskComposeResult{}, fmt.Errorf("weighted compression: %w", err)
 	}
+	if req.StarWhitening != nil {
+		if err := req.StarWhitening.ApplyDisk(ctx, acc); err != nil {
+			return DiskComposeResult{}, fmt.Errorf("white stars: %w", err)
+		}
+	}
 	preview, stats, err := diskCompositePreviewForCompose(ctx, [3]string{acc[0], acc[1], acc[2]}, w, h, req.PreviewMax, nil)
 	if err != nil {
 		return DiskComposeResult{}, fmt.Errorf("weighted preview: %w", err)
@@ -390,6 +395,10 @@ func streamWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.L
 		defer outs[c].Close()
 	}
 	sampler := newArtifactSampler(a)
+	stretchAt, err := diskStretchFunc(src, src.Image, a.Width, a.Height)
+	if err != nil {
+		return err
+	}
 	rows := [3][]float32{make([]float32, w), make([]float32, w), make([]float32, w)}
 	weights := [3]float64{weight.Red, weight.Green, weight.Blue}
 	for y := 0; y < h; y++ {
@@ -403,7 +412,7 @@ func streamWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.L
 		}
 		for x := 0; x < w; x++ {
 			fx, fy := mapper.mapCoordinate(x, y)
-			v := float64(stretchDiskValue(sampler.sample(fx, fy), src.Image))
+			v := float64(stretchAt(sampler.sample(fx, fy), fx, fy))
 			if peak > 0 {
 				v /= peak
 			}
@@ -425,6 +434,10 @@ func streamWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.L
 
 func calibrateWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.LoadedImage, a *fitsio.Float32Artifact, w, h int, mapper *diskCoordinateMapper) (float64, []float32, error) {
 	sampler := newArtifactSampler(a)
+	stretchAt, err := diskStretchFunc(src, src.Image, a.Width, a.Height)
+	if err != nil {
+		return 0, nil, err
+	}
 	peak := 0.0
 	hist := make([]int, 256)
 	for y := 0; y < h; y++ {
@@ -433,7 +446,7 @@ func calibrateWeightedDiskSource(ctx context.Context, src DiskChannel, ref model
 		}
 		for x := 0; x < w; x++ {
 			fx, fy := mapper.mapCoordinate(x, y)
-			v := float64(stretchDiskValue(sampler.sample(fx, fy), src.Image))
+			v := float64(stretchAt(sampler.sample(fx, fy), fx, fy))
 			if v > peak {
 				peak = v
 			}
@@ -506,7 +519,14 @@ func compressDiskRGB(ctx context.Context, paths [3]string, w, h int) error {
 	return nil
 }
 
+// prepareDiskChannel maps one source onto the output grid and, when
+// applyStretch is set, fuses its scalar stretch into the same pass. HistEq is
+// not a scalar stretch; callers map with applyStretch false and apply the CDF
+// afterwards with diskHistEqCDF and stretchDiskArtifact.
 func prepareDiskChannel(ctx context.Context, src DiskChannel, ref, stretchMeta models.LoadedImage, dw, dh int, dst string, applyStretch bool) error {
+	if applyStretch && stretchMeta.Mode == stretch.HistEq {
+		return errors.New("prepareDiskChannel cannot fuse HistEq; apply its CDF in a separate pass")
+	}
 	a, err := fitsio.OpenFloat32ArtifactReadOnly(src.ArtifactPath)
 	if err != nil {
 		return err
@@ -519,7 +539,13 @@ func prepareDiskChannel(ctx context.Context, src DiskChannel, ref, stretchMeta m
 	out, row := tx.Artifact(), make([]float32, dw)
 	sampler := newArtifactSampler(a)
 	mapper := newDiskCoordinateMapper(src.Image, ref, src.OffsetX, src.OffsetY, src.OffsetRot, dw, dh, a.Width, a.Height)
-	hist := make([]int, 256)
+	var stretchAt func(float32, float64, float64) float32
+	if applyStretch {
+		if stretchAt, err = diskStretchFunc(src, stretchMeta, a.Width, a.Height); err != nil {
+			_ = tx.Abort()
+			return err
+		}
+	}
 	for y := 0; y < dh; y++ {
 		if err := ctx.Err(); err != nil {
 			_ = tx.Abort()
@@ -529,56 +555,19 @@ func prepareDiskChannel(ctx context.Context, src DiskChannel, ref, stretchMeta m
 			fx, fy := mapper.mapCoordinate(x, y)
 			row[x] = sampler.sample(fx, fy)
 			if applyStretch {
-				row[x] = stretchDiskValue(row[x], stretchMeta)
+				row[x] = stretchAt(row[x], fx, fy)
 			}
 		}
 		if err := out.WriteRow(y, row); err != nil {
 			_ = tx.Abort()
 			return err
 		}
-		if applyStretch && stretchMeta.Mode == stretch.HistEq {
-			for _, v := range row {
-				idx := int(clamp01(float64(v)) * 255)
-				hist[idx]++
-			}
-		}
-	}
-	if stretchMeta.Mode == stretch.HistEq {
-		cdf := make([]float32, 256)
-		total := 0
-		for _, n := range hist {
-			total += n
-		}
-		sum := 0
-		for i, n := range hist {
-			sum += n
-			if total > 0 {
-				cdf[i] = float32(float64(sum) / float64(total))
-			}
-		}
-		for y := 0; y < dh; y++ {
-			if err := ctx.Err(); err != nil {
-				_ = tx.Abort()
-				return err
-			}
-			if err := out.ReadRow(y, row); err != nil {
-				_ = tx.Abort()
-				return err
-			}
-			for i, v := range row {
-				row[i] = cdf[int(clamp01(float64(v))*255)]
-			}
-			if err := out.WriteRow(y, row); err != nil {
-				_ = tx.Abort()
-				return err
-			}
-		}
 	}
 	return tx.Commit()
 }
 
-// stretchDiskArtifact applies the shared reference stretch in place after
-// calibrated-linear overlays have been accumulated. It intentionally uses a
+// stretchDiskArtifact applies a stretch in place to a mapped artifact,
+// through a HistEq CDF when one is given. It intentionally uses a
 // bounded row buffer and never materializes the artifact.
 func stretchDiskArtifact(ctx context.Context, path string, meta models.LoadedImage, cdf []float32) error {
 	a, err := fitsio.OpenFloat32Artifact(path)
@@ -767,6 +756,25 @@ func (s *artifactSampler) sample(x, y float64) float32 {
 		return 0
 	}
 	return float32(float64(v00)*(1-wx)*(1-wy) + float64(v10)*wx*(1-wy) + float64(v01)*(1-wx)*wy + float64(v11)*wx*wy)
+}
+
+// diskStretchFunc returns the per-sample stretch for a source: the ordinary
+// scalar stretch, or the source's star treatment when one is attached. The
+// treatment must have been prepared for the settings actually applied and on
+// the artifact's own grid; anything else is an error, never a silent
+// fallback, because a stale footprint renders as an artifact.
+func diskStretchFunc(src DiskChannel, meta models.LoadedImage, sw, sh int) (func(v float32, x, y float64) float32, error) {
+	t := src.Image.StarTreatment
+	if t == nil {
+		return func(v float32, _, _ float64) float32 { return stretchDiskValue(v, meta) }, nil
+	}
+	if !t.MatchesStretch(meta) {
+		return nil, fmt.Errorf("star treatment for %s was prepared for different stretch settings", src.ArtifactPath)
+	}
+	if w, h := t.SourceSize(); w != sw || h != sh {
+		return nil, fmt.Errorf("star treatment for %s was prepared on a %dx%d grid, artifact is %dx%d", src.ArtifactPath, w, h, sw, sh)
+	}
+	return t.TreatedStretch, nil
 }
 
 func stretchDiskValue(v float32, img models.LoadedImage) float32 {

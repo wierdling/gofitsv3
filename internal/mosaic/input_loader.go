@@ -30,6 +30,9 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 	}
 
 	primary := file.HDUs[0].Header
+	if fitsio.HeaderString(primary, "PRODUCT") == "STARMAP" {
+		return nil, fmt.Errorf("star-map FITS is a derived mask, not a science exposure")
+	}
 	inst, _ := instrument.FromHeader(primary)
 	sci := scienceHDUs(file, primary)
 	if len(sci) == 0 {
@@ -104,6 +107,9 @@ func LoadInputsMetadataFromPath(path string) ([]Input, error) {
 	}
 
 	primary := file.HDUs[0].Header
+	if fitsio.HeaderString(primary, "PRODUCT") == "STARMAP" {
+		return nil, fmt.Errorf("star-map FITS is a derived mask, not a science exposure")
+	}
 	sci := scienceHDUs(file, primary)
 	if len(sci) == 0 {
 		hdu := file.HDUs[0]

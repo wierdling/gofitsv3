@@ -1434,6 +1434,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	drizzleCommands := container.NewVBox(
 		container.NewGridWithColumns(2, loadBtn, batchBtn),
 		directoryBtn,
+		widget.NewButton("Create Star Map...", ws.createStarMapDialog),
 		container.NewHBox(savePreviewToggle, widget.NewLabel("Save Preview")),
 		widget.NewSeparator(),
 		widget.NewLabel("Baseline Reference"),

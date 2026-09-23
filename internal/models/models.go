@@ -52,6 +52,48 @@ type LoadedImage struct {
 	// Stored as plain coefficients to avoid a models→processing import.
 	HasAlignTransform                              bool
 	AlignA, AlignB, AlignC, AlignD, AlignE, AlignF float64
+
+	// StarStretch is the persisted gentler-star-stretch setting for this
+	// source; StarTreatment is the prepared model that renders it. The model
+	// is evaluated at source-grid positions, so both the in-memory and disk
+	// compositors apply it before resampling to the reference grid. The
+	// model is render-time only and never persisted; Compose rebuilds it
+	// from the setting, the reviewed star map and the current stretch.
+	StarStretch   StarStretchState
+	StarTreatment StretchTreatment
+}
+
+// StarStretchState is the per-source gentler star stretch setting.
+type StarStretchState struct {
+	Enabled  bool    `json:"enabled"`
+	Strength float64 `json:"strength"`
+}
+
+// StarWhiteningState is the Compose "White Stars" setting: star footprints
+// from one reference source's map move the composite's stellar excess toward
+// a neutral level in the selected output channels. Artistic only.
+type StarWhiteningState struct {
+	Enabled          bool    `json:"enabled"`
+	ReferenceBlinkID string  `json:"referenceBlinkId,omitempty"`
+	Strength         float64 `json:"strength"`
+	Level            string  `json:"level,omitempty"` // StarWhiteningWhite (default) or StarWhiteningLuminance
+	Red              bool    `json:"red"`
+	Green            bool    `json:"green"`
+	Blue             bool    `json:"blue"`
+}
+
+const (
+	StarWhiteningWhite     = "white"     // white core; the whitening fades outward with the star's own profile
+	StarWhiteningLuminance = "luminance" // full neutralization across the footprint, excess luminance preserved
+)
+
+// StretchTreatment is a position-aware replacement for a source's scalar
+// stretch. MatchesStretch reports whether the treatment was prepared for the
+// given scalar settings; a compositor must not apply a stale treatment.
+type StretchTreatment interface {
+	MatchesStretch(img LoadedImage) bool
+	SourceSize() (width, height int)
+	TreatedStretch(v float32, x, y float64) float32
 }
 
 type ChannelState struct {
@@ -83,6 +125,10 @@ type ChannelState struct {
 	GHSStretch  float64 `json:"ghsStretch,omitempty"`
 	GHSLocal    float64 `json:"ghsLocal,omitempty"`
 	GHSSymmetry float64 `json:"ghsSymmetry,omitempty"`
+
+	// StarStretch persists the gentler star stretch setting; absent in older
+	// projects, which load with it disabled.
+	StarStretch *StarStretchState `json:"starStretch,omitempty"`
 }
 
 type ComposeProject struct {
@@ -108,6 +154,12 @@ type ComposeProject struct {
 	// CompositionMode selects how Compose maps loaded sources to RGB. An empty
 	// value is intentionally treated as artistic for legacy projects.
 	CompositionMode ComposeMode `json:"compositionMode,omitempty"`
+	// StarWhitening persists the White Stars setting; absent when never used.
+	StarWhitening *StarWhiteningState `json:"starWhitening,omitempty"`
+	// StarStretchGeometryBlinkID names the source whose reviewed star map
+	// supplies the footprints for every source's gentler star stretch; empty
+	// means each source uses its own map.
+	StarStretchGeometryBlinkID string `json:"starStretchGeometryBlinkId,omitempty"`
 	// MixWeights is keyed by overlay BlinkID, rather than the overlay's sparse
 	// slot, so inserting/removing overlays does not retarget saved weights.
 	MixWeights []ComposeMixWeight `json:"mixWeights,omitempty"`

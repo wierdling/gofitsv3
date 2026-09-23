@@ -24,6 +24,19 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Can lock the output to the reference baseline's exact size, orientation, origin, and plate scale so separately drizzled filters share a compose-ready grid.
 - Allows the reference baseline and all loaded inputs to be cleared independently.
 
+### Star maps
+
+- Creates per-mosaic, dimensionless soft star-selection masks in the source directory's `working/` folder through **Create Star Map...** in Mosaic's Drizzle Commands.
+- Uses local background/contrast, analytic stellar-profile fitting and an empirical radial-profile consistency check when enough isolated seeds exist. Leaves the alignment detector unchanged.
+- Supports native WFC3/UVIS SCI/DQ saturation seeds and independent original-exposure profile confirmations with validated geometry; saved mosaics also support an explicitly identified mosaic-only mode.
+- Writes primary mask, integer `LABELS` / `FLAGS`, binary `STARS` catalog and `INPUTS` provenance table with mosaic WCS and science-pixel fingerprint. Masks are excluded from science loading.
+- Provides source-stamp review with selection overlays, uncertainty reasons, per-observation counts, manual accept/exclude decisions and adjustable footprint radii. Saved maps can be reopened for the matching science pixels/grid.
+- Provides a separate local browser labeling benchmark through `starmap benchmark`: point labels, protected nebular rectangles, development/validation regions, reveal auditing, revisioned JSON annotations, frozen FITS detector runs, and paired precision/recall/footprint-leakage reports. Scoring requires human-reviewed regions and does not establish the precision target without independent labels. See `docs/star-map-benchmark.md`.
+- Benchmark point labels support drag-to-reposition and optional science-pixel centering previews with explicit apply/cancel. Centering uses no detector catalog, retains label metadata, and preserves revision/reveal auditing; nearby peaks and blends require human review.
+- The benchmark loads local FITS mosaics through a path field or directory browser without restarting, restoring each image's saved workspace. It saves edits before switching, blocks switching during detector runs, and rejects stale browser writes. New regions can be drawn as rectangles on the overview, then named and assigned to development or validation before saving; overlap and size restrictions still apply.
+- Runs detection and writing in cancellable background jobs and preserves earlier output on failed publication. Recreating a map replaces earlier review edits; use **Review saved map** to retain them.
+- Current scope: one linear, distortion-corrected primary-image mosaic per run; no cross-filter catalog fusion, stellar-flux reconstruction, RGB whitening, automatic spike/bleed removal, or completeness guarantee. The outer 12 pixels are not searched. Scores are diagnostics, not calibrated probabilities; the 99% precision target has not been established.
+
 ### FITS, detector, WCS, and quality-data handling
 
 - Reads primary and image-extension FITS headers and floating-point image arrays.
@@ -143,6 +156,7 @@ GoFitsV3 is aimed at producing visually compelling astronomy images from calibra
 - Preview level tools: manual background/peak/scaled peak/black/white, Auto Scaling, Auto MTF, and Magic presets (Balanced, Nebula, Galaxy).
 - Preview zoom includes fit, fixed percentages from 6% through 400%, custom percentage, and step zoom.
 - Saves the completed mosaic as a floating-point FITS image with output WCS metadata.
+- Reference-only baselines contribute output WCS geometry only; exposure and provenance metadata come from the first combined science input.
 - Sends the in-memory result directly to Examine.
 - Opens a separate blinker over saved debug/aligned FITS outputs.
 
@@ -324,3 +338,29 @@ This inventory was cross-checked against the current UI entry points, settings d
 - `internal/mosaic`, `internal/processing`, `internal/fitsio`, `internal/instrument`, and `internal/export`.
 
 Planning or roadmap documents were not treated as proof of an implemented feature.
+
+- The star-map benchmark offers an optional original-exposure verification checkbox (off by default). Mosaic-only runs bypass native profile and saturation checks; enabled runs require two independent confirmations. Each saved run records its evidence mode and verification choice.
+
+- Star maps can infer severely saturated stars directly from the mosaic using multiscale wing fits, central-light deficits or excesses, and persistent diffraction-spike pairs. This conservative rescue requires neither native DQ flags nor original-exposure confirmation; spike-free or edge-truncated cases may remain uncertain. Inferred saturation is identified in the source reason, with a larger feathered core/halo footprint rather than a mask for the entire spike pattern.
+
+- Saturated-star wing rescues take precedence over competing core fits during duplicate suppression, preventing reconstructed bright cores from hiding an otherwise accepted star.
+
+- Desktop Star Map creation exposes minimum SNR (3–100), maximum residual (greater than 0 through 1), and FWHM (0 = auto, up to 8 pixels). Settings apply to current and saved mosaics and are stored in the output FITS; review-only mode uses the saved map.
+
+Desktop Star Map Review offers brightness, source ID, uncertain-first, and saturated-first sorting while preserving the selected source. With the list focused, Up/Down navigate, Left accepts, and Right excludes; decisions do not reorder the list and require Save FITS to persist.
+
+- Changing the Star Map Review sort returns keyboard focus to the star list after the dropdown closes, so arrow-key review continues immediately.
+
+Star Map Review keeps its visible rows and selection rendering synchronized during resizing, scrolling, and keyboard navigation.
+
+### Gentler stellar stretch: experimental preview
+
+- **Compose > Gentler Star Stretch...** enables a gentler stellar stretch per loaded source with a strength, prepared in the background from the original linear file and its reviewed star map. Treated sources render through the same footprint model in normal and disk-backed Compose, channel tiles, exports and Send to Edit; footprints are re-prepared automatically when the source's stretch changes. The per-source setting persists with the project.
+- **Compose > Gentler Star Stretch... > Star geometry** optionally uses one source's reviewed star map for every treated source (footprints borrowed, each source's own star backgrounds measured), so all channels compress over the same area.
+- **Compose > White Stars...** neutralizes star color in the composite using one reference source's reviewed star map for geometry: stellar light above the local background moves toward a neutral level (white core fading with the star's profile, or luminance-preserving) in the selected output channels, in normal and disk-backed Compose; artistic only, saved with the project.
+- **Compose > Gentler Star Stretch Preview...** compares normal and reduced stellar stretching for selected stars from an existing reviewed map. It reloads the original linear mosaic and uses the selected source's scalar stretch settings; it does not apply changes to the composite.
+- Shows normal, gentler and feather-mask cutouts, with explicit reasons for skipped stars. Treatment preserves the fitted local background; inaccurate separation from complex nebulosity remains a limitation. Ordinary-star footprints with significant directional wing residuals are conservatively skipped, including faint curved rims exceeding the fitted stellar tail and noise allowance. Known-background tests cover curved rims, an offset knot, a filament and planar controls. Symmetric knots indistinguishable from stellar profiles and saturated-star background separation remain limitations. Source selection honors saved accept/exclude decisions and validates the science/map identity.
+- Supports source-grid diagnostics for Linear, Log, Asinh, Sqrt and MTF. Full Compose alignment, cleaning, PSF matching, weighted RGB application, histogram equalization, GHS and clipped-core recovery are not implemented in this preview.
+- Extended support can include a measured circular halo and four paired, rotated orthogonal diffraction-spike arms, with independent outer-background fitting and finite feathers along and across each arm. Mask display and rendering use the same two-dimensional support. Searches are bounded to 192 pixels; incomplete, contaminated, neighbor-limited or unvalidated components are reported explicitly. Arbitrary asymmetric halos, curved spikes and a full spatial PSF remain unsupported.
+- Display-clipped stars can be previewed at the current source settings: stellar excess is compressed before display clipping, with a measured full-core/halo feather and neighbor boundaries. Saturation-tagged stars use separate wing validation, excluding the suspect core from fitting while treating its recorded finite pixels. This reduces their appearance without reconstructing lost core flux. Insufficient wings, invalid samples, poor fits and overlapping/truncated footprints remain explicit skips. Skipped rows show only the original image and a reason; the report displays the stretch settings used.
+- `go run ./cmd/starstretch` produces a new HTML/PNG/JSON diagnostic report with radial profiles, extended-coverage diagnostics and clickable full-resolution cutouts. Original FITS and maps remain unchanged; existing report directories are never overwritten.

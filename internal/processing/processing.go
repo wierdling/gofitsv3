@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
@@ -547,6 +548,25 @@ func stretchForReferenceGrid(ctx context.Context, img, ref *models.LoadedImage) 
 	if img == nil || ref == nil {
 		return fitsio.ImageData{}
 	}
+	if img.StarTreatment != nil {
+		// The gentler star stretch is defined at source-grid positions, so a
+		// treated source is stretched on its own grid and the stretched result
+		// is resampled. On a shared grid this is exact; otherwise the order
+		// (stretch, then resample) differs from the untreated path by the
+		// bilinear interpolation of an already-stretched sample, matching the
+		// disk compositor, which also treats at the sampled source position.
+		treated, err := TreatedStretchForSource(ctx, img)
+		if err == nil {
+			if img == ref || sharedDrizzleGrid(img, ref) {
+				return treated
+			}
+			clone := *img
+			clone.HDU = img.HDU
+			clone.HDU.Data = treated
+			return ImageDataForReferenceGridCtx(ctx, &clone, ref)
+		}
+		debuglog.Log(fmt.Sprintf("stretchForReferenceGrid: star treatment ignored: %v", err))
+	}
 	if img == ref || sharedDrizzleGrid(img, ref) {
 		data, _ := ApplyStretchParallel(img)
 		return data
@@ -560,6 +580,71 @@ func stretchForReferenceGrid(ctx context.Context, img, ref *models.LoadedImage) 
 	clone.HDU.Data = raw
 	data, _ := ApplyStretchParallel(&clone)
 	return data
+}
+
+// StretchForDisplay is ApplyStretchParallel with the source's star treatment
+// applied when one is attached and current. The clip mask is still produced
+// from the ordinary stretch when ShowClip is set; a stale treatment renders
+// untreated, as in the compositors.
+func StretchForDisplay(img *models.LoadedImage) (fitsio.ImageData, []byte) {
+	if img == nil || img.StarTreatment == nil {
+		return ApplyStretchParallel(img)
+	}
+	treated, err := TreatedStretchForSource(context.Background(), img)
+	if err != nil {
+		debuglog.Log(fmt.Sprintf("StretchForDisplay: star treatment ignored: %v", err))
+		return ApplyStretchParallel(img)
+	}
+	var mask []byte
+	if img.ShowClip {
+		_, mask = ApplyStretchParallel(img)
+	}
+	return treated, mask
+}
+
+// TreatedStretchForSource renders a source through its attached star
+// treatment on its own grid. It fails, rather than falling back, when the
+// treatment was prepared for other stretch settings or another grid.
+func TreatedStretchForSource(ctx context.Context, img *models.LoadedImage) (fitsio.ImageData, error) {
+	if img == nil || img.StarTreatment == nil {
+		return fitsio.ImageData{}, fmt.Errorf("no star treatment attached")
+	}
+	t := img.StarTreatment
+	if !t.MatchesStretch(*img) {
+		return fitsio.ImageData{}, fmt.Errorf("star treatment was prepared for different stretch settings")
+	}
+	w, h := img.HDU.Data.Width, img.HDU.Data.Height
+	if tw, th := t.SourceSize(); tw != w || th != h {
+		return fitsio.ImageData{}, fmt.Errorf("star treatment was prepared on a %dx%d grid, source is %dx%d", tw, th, w, h)
+	}
+	if len(img.HDU.Data.Pixels) != w*h {
+		return fitsio.ImageData{}, fmt.Errorf("source pixel count does not match its dimensions")
+	}
+	out := make([]float32, w*h)
+	numWorkers := max(1, runtime.NumCPU())
+	rowsPer := (h + numWorkers - 1) / numWorkers
+	var wg sync.WaitGroup
+	for y0 := 0; y0 < h; y0 += rowsPer {
+		y1 := min(h, y0+rowsPer)
+		wg.Add(1)
+		go func(y0, y1 int) {
+			defer wg.Done()
+			for y := y0; y < y1; y++ {
+				if ctx.Err() != nil {
+					return
+				}
+				row := img.HDU.Data.Pixels[y*w : (y+1)*w]
+				for x, v := range row {
+					out[y*w+x] = t.TreatedStretch(v, float64(x), float64(y))
+				}
+			}
+		}(y0, y1)
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return fitsio.ImageData{}, err
+	}
+	return fitsio.ImageData{Width: w, Height: h, Pixels: out}, nil
 }
 
 func sharedDrizzleGrid(img, ref *models.LoadedImage) bool {

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Star Map Benchmark</title><link rel="stylesheet" href="/style.css"><script src="/label-position.js" defer></script><script src="/app.js" defer></script></head>
+<body>
+<header><div><h1>Star Map Benchmark</h1><div id="dataset">Loading science image…</div></div><div><span id="saveStatus">Loading</span> <button id="save">Save labels</button> <a id="exportLabels" href="/api/labels" download>Export labels</a></div></header>
+<details id="openFilePanel"><summary>Open another FITS mosaic</summary><div class="toolbar"><label>FITS file path <input id="filePath" placeholder="D:\images\F656N_drizzle.fits"></label><button id="openFile">Load file</button><button id="browseFiles">Browse local files</button></div><p class="hint">Current labels are saved before loading. Each mosaic resumes its own benchmark directory. Finish or cancel an active detector run first.</p><div id="fileBrowser" hidden><div class="toolbar"><label>Directory <input id="browseDirectory"></label><button id="browseGo">Go</button><button id="browseParent">Parent directory</button></div><div id="fileEntries"></div></div></details>
+<div id="error" role="alert" hidden></div>
+<main>
+<aside>
+<h2>1. Choose a region</h2>
+<canvas id="overview" width="320" height="320" aria-label="Mosaic overview; click a region to select it"></canvas>
+<label class="check"><input id="drawRegion" type="checkbox"> Draw new region on overview</label><p id="regionDraftStatus" class="hint">Drag a rectangle in this mode, then name it and click Add region.</p>
+<select id="region" aria-label="Region"></select>
+<label>Name <input id="regionName" maxlength="160"></label>
+<label>Split <select id="split"><option value="development">Development</option><option value="validation">Validation (hold out)</option></select></label>
+<label class="check"><input type="checkbox" id="reviewed"> All stars in this region are labeled</label>
+<p class="hint">Leave this unchecked until you have inspected the entire region, including faint stars. Only checked regions contribute to scores.</p>
+<div id="audit" class="hint"></div>
+<details id="newRegionPanel"><summary>Add a region</summary><p class="hint">Draw on the overview or enter zero-based FITS pixel bounds. Regions must be 16–2048 pixels per side and cannot overlap.</p><label>Name <input id="newName" value="Additional region"></label><label>New region split <select id="newSplit"><option value="development">Development</option><option value="validation">Validation (hold out)</option></select></label><div class="pair"><label>X <input id="newX" type="number" value="0" min="0"></label><label>Y <input id="newY" type="number" value="0" min="0"></label></div><div class="pair"><label>Width <input id="newW" type="number" value="256" min="16" max="2048"></label><label>Height <input id="newH" type="number" value="256" min="16" max="2048"></label></div><button id="addRegion">Add region</button><button id="deleteRegion">Delete current region</button></details>
+<h2>2. Label the science</h2>
+<label>Click tool <select id="tool"><option value="star">1 · Certain star</option><option value="nonstar">2 · Certain nonstar</option><option value="ambiguous">3 · Ambiguous object</option><option value="unusable">4 · Unusable object</option><option value="protected">5 · Protect nebula (drag rectangle)</option><option value="select">6 · Select / inspect label</option></select></label>
+<p class="hint">Click an existing label to edit it, or drag it to reposition. Escape cancels a drag or centering preview. Add every certain star, including stars the detector missed. Purple areas score unwanted mask coverage; keep real stars outside them.</p>
+<fieldset id="labelEditor" disabled><legend>Selected label</legend><label>Class <select id="labelKind"><option value="star">Star</option><option value="nonstar">Nonstar</option><option value="ambiguous">Ambiguous</option><option value="unusable">Unusable</option></select></label><div id="tags"><label class="check"><input type="checkbox" value="bright"> Bright</label><label class="check"><input type="checkbox" value="saturated"> Saturated</label><label class="check"><input type="checkbox" value="on-nebula"> On nebula</label><label class="check"><input type="checkbox" value="blended"> Blended</label><label class="check"><input type="checkbox" value="artifact"> Artifact</label></div><label>Note <textarea id="note" maxlength="1000" rows="2"></textarea></label></fieldset>
+<button id="deleteLabel" disabled>Delete selected mark</button><div id="labelCount" class="hint"></div>
+</aside>
+<section class="workspace">
+<div class="toolbar"><label>Stretch <input id="gain" type="range" min="1" max="200" value="20"></label><label>Zoom <select id="zoom"><option value="0.5">50%</option><option value="1" selected>100%</option><option value="2">200%</option><option value="4">400%</option></select></label><label class="check"><input type="checkbox" id="showLabels" checked> Labels</label><button id="reveal">Reveal run A detections</button></div>
+<div class="toolbar"><label>Center search radius <select id="centerRadius"><option value="3">3 pixels</option><option value="6">6 pixels</option><option value="10" selected>10 pixels</option><option value="12">12 pixels</option></select></label><button id="previewCenter" disabled>Preview star center</button><button id="applyCenter" disabled>Use proposed center</button><button id="cancelCenter" disabled>Cancel preview</button></div>
+<p id="centerStatus" class="hint" role="status">Select a star label to preview a center from science pixels. Detector catalogs are not used.</p>
+<div id="viewport"><canvas id="science" aria-label="Science region; click to label objects"></canvas></div>
+<div class="status"><span id="coordinates">FITS coordinates (zero-based); north follows the mosaic orientation.</span><span id="overlayStatus">Detector hidden</span></div>
+<section class="evaluation"><h2>3. Compare frozen detector runs</h2><div class="pair"><label>Run A <select id="runA"></select></label><label>Run B (optional) <select id="runB"></select></label></div><p id="runDetails" class="hint"></p>
+<div class="toolbar"><label>Score split <select id="scoreSplit"><option value="development">Development</option><option value="validation">Validation — reveal held-out results</option></select></label><label>Match radius (pixels) <input id="tolerance" type="number" min="0.1" max="10" step="0.1" value="2"></label><button id="evaluate">Evaluate / compare</button><button id="downloadReport" disabled>Download report</button></div>
+<p class="hint">Label with detections hidden first. Revealing or scoring records exposure. Changes after reveal are flagged. Compare runs at the same matching radius; keep validation results held out until tuning is complete.</p>
+<div id="results"></div>
+<details><summary>Create a detector run</summary><p id="evidence" class="hint"></p><div class="toolbar"><label>Name <input id="runName" value="Candidate 1" maxlength="100"></label><label>Min. SNR <input id="snr" type="number" value="7" min="3" max="100" step="0.5"></label><label>Max. residual <input id="residual" type="number" value="0.22" min="0.01" max="1" step="0.01"></label><label>FWHM (0 = auto) <input id="fwhm" type="number" value="0" min="0" max="8" step="0.1"></label><label><input id="verifyOriginals" type="checkbox"> Verify against original exposures</label><button id="run">Run detector</button><button id="cancel" disabled>Cancel</button></div><div id="job" role="status"></div></details>
+</section>
+</section>
+</main>
+<footer>Local benchmark · Science pixels are never edited · Labels and reports are JSON; frozen star maps are FITS · <span id="revision"></span></footer>
+</body></html>

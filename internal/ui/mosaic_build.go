@@ -199,6 +199,8 @@ func (ws *mosaicWorkspace) buildDrizzlePreview() {
 			return
 		}
 		ws.state.result = result
+		ws.starMapBuildResult = result
+		ws.starMapBuildEvidence = mosaic.StarMapEvidenceForResult(result, buildInputs)
 		ws.state.resultName = ""
 		markMosaicArtifactMaskDocumentsStale(ws.state.artifactMasks)
 		if auto != nil {

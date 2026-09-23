@@ -12,7 +12,7 @@ coverage.out
 bin/
 dist/
 build/
-.gocache/
+.gocache*/
 .gomodcache/
 .gopath/
 TestImages/

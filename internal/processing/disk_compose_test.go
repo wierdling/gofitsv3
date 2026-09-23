@@ -697,43 +697,82 @@ func TestComposeDiskHistEqOverlayRetainsStructureWithScalarBase(t *testing.T) {
 	}
 }
 
-func TestComposeDiskHistEqUsesSharedCDFAfterCalibratedAccumulation(t *testing.T) {
+// TestComposeDiskArtisticUsesEachChannelsOwnStretch renders three channels
+// with different stretch settings, one of them HistEq, through the normal
+// and disk artistic compositors and requires the same planes. Disk artistic
+// mode once stretched every base channel with Channel 2's settings and zeroed
+// a HistEq channel before computing its CDF.
+func TestComposeDiskArtisticUsesEachChannelsOwnStretch(t *testing.T) {
 	dir := t.TempDir()
-	base, overlay := filepath.Join(dir, "base.bin"), filepath.Join(dir, "overlay.bin")
-	a, err := fitsio.CreateFloat32Artifact(base, 2, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for y, row := range [][]float32{{.1, .2}, {.3, .4}} {
-		if err := a.WriteRow(y, row); err != nil {
+	const w, h = 6, 5
+	imgs := make([]*models.LoadedImage, 3)
+	var channels [3]DiskChannel
+	for i := range imgs {
+		pixels := make([]float32, w*h)
+		for k := range pixels {
+			pixels[k] = float32(.05 + .9*float64((k*7+i*3)%11)/10)
+		}
+		p := filepath.Join(dir, fmt.Sprintf("own-%d.bin", i))
+		a, err := fitsio.CreateFloat32Artifact(p, w, h)
+		if err != nil {
 			t.Fatal(err)
 		}
+		for y := 0; y < h; y++ {
+			if err := a.WriteRow(y, pixels[y*w:(y+1)*w]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := a.Close(); err != nil {
+			t.Fatal(err)
+		}
+		img := models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Width: w, Height: h, Pixels: pixels}}, Black: 0, White: 1}
+		switch i {
+		case 0:
+			img.Mode, img.Background, img.Peak, img.ScaledPeak = stretch.HistEq, 0, 1, 1
+		case 1:
+			img.Mode, img.Background, img.Peak, img.ScaledPeak, img.AsinhScale = stretch.Asinh, .1, .8, 10, 1
+		case 2:
+			img.Mode, img.Background, img.Peak, img.ScaledPeak = stretch.Linear, .2, .6, 1
+		}
+		imgs[i] = &img
+		channels[i] = DiskChannel{ArtifactPath: p, Image: img}
 	}
-	if err := a.Close(); err != nil {
-		t.Fatal(err)
+	normal, nw, nh, _ := ComposeRGB(context.Background(), imgs)
+	if nw != w || nh != h {
+		t.Fatalf("normal compose size %dx%d", nw, nh)
 	}
-	writeDiskComposeFixture(t, overlay, .1)
 	out := [3]string{filepath.Join(dir, "r.bin"), filepath.Join(dir, "g.bin"), filepath.Join(dir, "b.bin")}
-	meta := diskComposeTestChannel(base)
-	meta.Image.Mode = stretch.HistEq
-	ch := [3]DiskChannel{meta, meta, meta}
-	if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: ch, Overlays: []DiskOverlay{{Channel: diskComposeTestChannel(overlay), Settings: models.OrangeLayerState{ColorR: 255}}}, Output: out, PreviewMax: 1600}); err != nil {
+	if _, err := ComposeDisk(context.Background(), DiskComposeRequest{Channels: channels, Output: out, PreviewMax: 1600}); err != nil {
 		t.Fatal(err)
 	}
-	// The bounded bilinear sampler treats the outer edge as invalid; for this
-	// 2x2 fixture only the first sample contributes and the shared CDF therefore
-	// maps both observed bins to the upper quantile.
-	a, err = fitsio.OpenFloat32ArtifactReadOnly(out[0])
-	if err != nil {
-		t.Fatal(err)
+	// Output artifacts are R,G,B; normal RGBA bytes are R,G,B,A per pixel.
+	for c := 0; c < 3; c++ {
+		a, err := fitsio.OpenFloat32ArtifactReadOnly(out[c])
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := make([]float32, w)
+		for y := 0; y < h; y++ {
+			if err := a.ReadRow(y, row); err != nil {
+				t.Fatal(err)
+			}
+			for x, v := range row {
+				want := float64(normal[(y*w+x)*4+c]) / 255
+				if math.Abs(float64(v)-want) > 1.5/255 {
+					t.Fatalf("channel %d pixel (%d,%d): disk %v, normal %v", c, x, y, v, want)
+				}
+			}
+		}
+		_ = a.Close()
 	}
-	defer a.Close()
-	row := make([]float32, 2)
-	if err := a.ReadRow(0, row); err != nil {
-		t.Fatal(err)
+	// The channels genuinely differ, so a shared stretch could not have passed.
+	stretched := [3][]float32{}
+	for i := range imgs {
+		d, _ := ApplyStretchParallel(imgs[i])
+		stretched[i] = d.Pixels
 	}
-	if math.Abs(float64(row[0]-1)) > .02 || math.Abs(float64(row[1]-1)) > .02 {
-		t.Fatalf("shared HistEq row = %v, want [1 1] for edge-clipped fixture", row)
+	if math.Abs(float64(stretched[0][3]-stretched[1][3])) < 1e-3 && math.Abs(float64(stretched[1][3]-stretched[2][3])) < 1e-3 {
+		t.Fatal("fixture channels do not exercise distinct stretches")
 	}
 }
 

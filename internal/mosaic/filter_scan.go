@@ -56,7 +56,7 @@ func DiscoverFITSFiles(dir string) ([]string, error) {
 
 	paths := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() || strings.HasSuffix(strings.ToLower(entry.Name()), "_starmap.fits") {
 			continue
 		}
 		switch strings.ToLower(filepath.Ext(entry.Name())) {
