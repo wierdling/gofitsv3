@@ -329,6 +329,7 @@ func (ws *mosaicWorkspace) reviewStarMap(product *mosaic.StarMapProduct, data fi
 					}
 				} else {
 					dialog.ShowInformation("Saved", "Reviewed FITS mask and source catalog saved in working/.", win)
+					notifyStarMapSaved()
 				}
 			})
 		}()

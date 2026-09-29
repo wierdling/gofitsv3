@@ -52,9 +52,12 @@ type mosaicState struct {
 	gmosCalibration  *mosaic.GMOSCalibrationSelection
 }
 
+var activeMosaicWorkspace *mosaicWorkspace
+
 func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu, *fyne.MenuItem, *fyne.MenuItem) {
 	state := &mosaicState{drizzleSettings: defaultDrizzleSettings(), alignmentSettings: defaultAlignmentSettings(), skysubSettings: defaultSkysubSettings()}
 	ws := &mosaicWorkspace{app: app, win: win, state: state, zoomLevel: 1.0, stretchMode: stretch.Asinh, mtfMidtone: stretch.DefaultMTFMidtone}
+	activeMosaicWorkspace = ws
 	// ws.activeFilter is set when a filter batch is loaded; used for default save names.
 	// ws.lastProjectName is updated on save/load so the save dialog pre-populates the same name.
 
@@ -1434,7 +1437,6 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	drizzleCommands := container.NewVBox(
 		container.NewGridWithColumns(2, loadBtn, batchBtn),
 		directoryBtn,
-		widget.NewButton("Create Star Map...", ws.createStarMapDialog),
 		container.NewHBox(savePreviewToggle, widget.NewLabel("Save Preview")),
 		widget.NewSeparator(),
 		widget.NewLabel("Baseline Reference"),

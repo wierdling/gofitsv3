@@ -32,6 +32,10 @@ type StarTreatmentFit struct {
 	Saturated                            bool
 	WingValidated                        bool
 	WingModel                            string
+	RingValidated                        bool
+	RingOscillations                     int
+	RingRadii                            []float64
+	RingValues                           []float64
 	// Extended components are populated only after independent validation by
 	// PrepareStarStretchFits. They are deliberately separate from OuterRadius
 	// so an unsafe halo or spike can never enlarge the ordinary core mask.
@@ -283,7 +287,34 @@ func FitStarTreatment(ctx context.Context, m *StarMap, pixels []float32, w, h in
 		}
 		f.Residual = bestLoss
 		if !starFinite(f.Signal) || f.Signal <= 0 || bestLoss > .25 {
-			f.Reason = "stellar profile does not match circular model"
+			// A resolved-but-non-Gaussian profile (Airy rings, diffraction
+			// spikes, or another bright-but-unclipped structure) fails a plain
+			// circular Gaussian the same way a genuinely saturated core does.
+			// Retry with the wing-only model built for saturated stars, which
+			// excludes the core and fits the halo without assuming a single
+			// Gaussian, before giving up on this source entirely.
+			ring, ringOK := fitDiffractionRingProfile(ctx, f, s, m.Sources, pixels, w, h, opt)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if ringOK {
+				out = append(out, ring)
+				continue
+			}
+			wing := StarTreatmentFit{SourceID: s.ID, X: s.X, Y: s.Y, Sigma: f.Sigma}
+			wf, wingOK := fitSaturatedStarWings(ctx, wing, s, m.Sources, pixels, w, h, opt)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if wingOK {
+				out = append(out, wf)
+				continue
+			}
+			if ring.Reason != "" {
+				f.Reason = ring.Reason
+			} else {
+				f.Reason = "stellar profile does not match circular model"
+			}
 			out = append(out, f)
 			continue
 		}

@@ -89,6 +89,40 @@ func (c *composeStarTreatments) modelFor(img *models.LoadedImage) *processing.St
 	return nil
 }
 
+// invalidateAll clears every source's cached fit/model, forcing the next sync
+// to re-fit from disk. Used when a star map FITS file was saved outside
+// Compose (the Star Map review dialog or Pick Missed Stars): the mtime-based
+// staleness check in TreatmentFits.Current only runs inside start(), which
+// sync only calls when it already thinks a source's model is out of date for
+// some other reason, so an external save otherwise goes unnoticed.
+func (c *composeStarTreatments) invalidateAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, e := range c.entries {
+		if e.cancel != nil {
+			e.cancel()
+			e.cancel, e.busy = nil, false
+		}
+		e.fits, e.model, e.derivedFrom = nil, nil, nil
+	}
+}
+
+// modelSnapshot returns a source's current prepared model, if any, regardless
+// of whether its geometry was borrowed from a reference (unlike modelFor,
+// which only reports sources fit on their own map). Used by the star
+// treatment diagnostics overlay, which needs every treated source.
+func (c *composeStarTreatments) modelSnapshot(img *models.LoadedImage) *processing.StarTreatmentModel {
+	if img == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e := c.entries[img]; e != nil {
+		return e.model
+	}
+	return nil
+}
+
 // geometrySource returns the reference model and fits a source must borrow,
 // or nil pointers when it fits on its own map (no shared geometry, or it is
 // the reference itself). ready is false while the reference is not prepared.
@@ -356,7 +390,7 @@ func showComposeWhiteStarsDialog(win fyne.Window, imgs []*models.LoadedImage, ro
 	if refImg := whiteningReferenceImage(imgs, blinkIDs, state.ReferenceBlinkID); refImg != nil {
 		status.SetText("Reference star model: " + c.statusFor(refImg))
 	}
-	help := widget.NewLabel("Star footprints come from the reference source's reviewed star map (Mosaic > Star Map). In each footprint the stellar light above the local background is moved toward a neutral level in the selected output channels, fading with the footprint; the background keeps its color. Artistic only: stars are not all white. Exclude a star by rejecting it in the map review.")
+	help := widget.NewLabel("The reference source's reviewed star map (Mosaic > Star Map) identifies the stars. Their footprints are remeasured from the current stretched RGB composite on every apply, including visible wings in other channels. In each footprint the stellar light above the local background is moved toward a neutral level in the selected output channels, fading at the footprint edge; the background keeps its color. Artistic only: stars are not all white. Exclude a star by rejecting it in the map review.")
 	help.Wrapping = fyne.TextWrapWord
 	content := container.NewVBox(
 		enabled,
@@ -384,10 +418,28 @@ func showComposeWhiteStarsDialog(win fyne.Window, imgs []*models.LoadedImage, ro
 		if level.SelectedIndex() == 1 {
 			lvl = models.StarWhiteningLuminance
 		}
-		*state = models.StarWhiteningState{Enabled: enabled.Checked, ReferenceBlinkID: ids[reference.SelectedIndex()], Strength: v, Level: lvl, Red: red.Checked, Green: green.Checked, Blue: blue.Checked}
+		referenceBlinkID := ids[reference.SelectedIndex()]
+		forcedStars := preservedForcedStarsForReference(*state, referenceBlinkID)
+		*state = models.StarWhiteningState{
+			Enabled:          enabled.Checked,
+			ReferenceBlinkID: referenceBlinkID,
+			Strength:         v,
+			Level:            lvl,
+			Red:              red.Checked,
+			Green:            green.Checked,
+			Blue:             blue.Checked,
+			ForcedStars:      forcedStars,
+		}
 		refresh()
 	}, win)
 	d.Show()
+}
+
+func preservedForcedStarsForReference(state models.StarWhiteningState, referenceBlinkID string) map[int]bool {
+	if referenceBlinkID != state.ReferenceBlinkID || len(state.ForcedStars) == 0 {
+		return nil
+	}
+	return state.ForcedStars
 }
 
 func whiteningReferenceImage(imgs []*models.LoadedImage, blinkIDs []string, id string) *models.LoadedImage {

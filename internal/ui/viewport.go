@@ -14,6 +14,8 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"gofitsv3/internal/processing"
 )
 
 // hpad returns a fixed-width invisible spacer for horizontal edge padding.
@@ -516,7 +518,19 @@ func (vp *viewport) imageLetterboxOffset() (float32, float32, bool) {
 	}
 	dispW := float32(vp.origW) * float32(vp.zoom)
 	dispH := float32(vp.origH) * float32(vp.zoom)
+	// Prefer the overlay's own on-screen size, but that size lags behind a
+	// fresh image/zoom change until Fyne's next layout pass runs (see the
+	// Resize comment on viewerInteractionLayer), which otherwise leaves the
+	// diagnostics overlay positioned for the old size until something else
+	// (e.g. a pane resize) forces a relayout. vp.scroll's own size is set by
+	// the outer layout independent of that inner content relayout, so it is
+	// already current; fall back to it whenever the overlay looks stale.
 	sz := vp.overlay.Size()
+	if vp.scroll != nil && (sz.Width < dispW || sz.Height < dispH) {
+		if scrollSz := vp.scroll.Size(); scrollSz.Width > 0 && scrollSz.Height > 0 {
+			sz = scrollSz
+		}
+	}
 	var offX, offY float32
 	if sz.Width > dispW {
 		offX = (sz.Width - dispW) / 2
@@ -548,4 +562,47 @@ func (vp *viewport) setMeasurementOverlay(first *imagePoint, second *imagePoint,
 		end = &pos
 	}
 	vp.overlay.setMeasurement(start, end)
+}
+
+// setDiagnosticOverlay draws the star-treatment diagnostics as colored dots:
+// green for a treated (Usable) star, red for one that was skipped. points are
+// in the same continuous composite-grid coordinates as StarMapSource.X/Y (no
+// half-pixel offset), matching how the rest of the app draws catalog markers.
+// Canvas positions follow the image's actual contain scale; re-call this
+// (or let the overlay's onResized hook do
+// it) whenever the viewport's size, zoom, or pan changes.
+func (vp *viewport) setDiagnosticOverlay(points []processing.StarTreatmentDiagnostic) {
+	vp.setDiagnosticOverlayWithForce(points, nil)
+}
+
+// setDiagnosticOverlayWithForce keeps every diagnostic point addressable for
+// hover/click handling, while drawing circles only for processed points.
+// forceEligible is parallel to points and identifies the reference stars that
+// may receive a White Stars forced-processing override.
+func (vp *viewport) setDiagnosticOverlayWithForce(points []processing.StarTreatmentDiagnostic, forceEligible []bool) {
+	if vp == nil || vp.overlay == nil {
+		return
+	}
+	offX, offY, _ := vp.imageLetterboxOffset()
+	scale := float32(vp.zoom)
+	// The image and overlay share the same layout box. Max/Restore can change
+	// that box without changing zoom, and ImageFillContain scales the image
+	// to fit it. Match that scale and centering rather than the saved zoom.
+	sz := vp.overlay.Size()
+	if vp.origW > 0 && vp.origH > 0 && sz.Width > 0 && sz.Height > 0 {
+		scale = min(sz.Width/float32(vp.origW), sz.Height/float32(vp.origH))
+		offX = (sz.Width - float32(vp.origW)*scale) / 2
+		offY = (sz.Height - float32(vp.origH)*scale) / 2
+	}
+	markers := make([]viewerMarker, 0, len(points))
+	for i, p := range points {
+		col := color.RGBA{R: 60, G: 220, B: 90, A: 230}
+		if !p.Usable {
+			col = color.RGBA{R: 230, G: 40, B: 40, A: 230}
+		}
+		pos := fyne.NewPos(float32(p.X)*scale+offX, float32(p.Y)*scale+offY)
+		eligible := i < len(forceEligible) && forceEligible[i]
+		markers = append(markers, viewerMarker{Pos: pos, Color: col, Radius: 6, Draw: p.Usable, ForceEligible: eligible, HoverDiagnostic: !p.Usable && !eligible})
+	}
+	vp.overlay.setMarkers(markers)
 }

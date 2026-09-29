@@ -248,3 +248,126 @@ func TestStarNeutralizerFollowsReferenceOffsetAndMatchesDisk(t *testing.T) {
 		}
 	}
 }
+
+func TestStarNeutralizerMapsCurrentStretchedWingsAndResetsPerApply(t *testing.T) {
+	const w, h, cx, cy = 90, 80, 45, 40
+	imgs, fits := neutralizeScene(t, w, h, cx, cy)
+	model, err := NewStarTreatmentModel(fits, w, h, *imgs[0], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := models.StarWhiteningState{Enabled: true, Strength: 1, Level: models.StarWhiteningWhite, Red: true, Green: true, Blue: true}
+	n, err := NewStarNeutralizer(model, DiskChannel{Image: *imgs[0]}, *imgs[1], w, h, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := neutralizePlanes(imgs)
+	extent := StarTreatmentExtent(fits[0])
+	wing := func(planes [3][]float32) {
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				d := math.Hypot(float64(x)-cx, float64(y)-cy)
+				if d <= extent {
+					continue
+				}
+				v := .14 * math.Exp(-.5*math.Pow((d-extent)/2.8, 2))
+				planes[0][y*w+x] += float32(v)
+				planes[1][y*w+x] += float32(.025 * math.Exp(-.5*math.Pow((d-extent)/2.8, 2)))
+				planes[2][y*w+x] += float32(.015 * math.Exp(-.5*math.Pow((d-extent)/2.8, 2)))
+			}
+		}
+	}
+	wing(base)
+	p := int(cy)*w + int(cx+math.Ceil(extent)+2)
+	before := [3]float32{base[0][p], base[1][p], base[2][p]}
+	if err := n.Apply(context.Background(), base); err != nil {
+		t.Fatal(err)
+	}
+	if base[1][p] <= before[1] || base[2][p] <= before[2] {
+		t.Fatalf("current stretched wing was not mapped: before=(%.4f,%.4f,%.4f) after=(%.4f,%.4f,%.4f)", before[0], before[1], before[2], base[0][p], base[1][p], base[2][p])
+	}
+	if base[0][p]-base[1][p] >= before[0]-before[1] {
+		t.Fatalf("red wing remained saturated: before R-G=%.4f after=%.4f", before[0]-before[1], base[0][p]-base[1][p])
+	}
+
+	// A second Apply receives a changed image. Transient samples, peaks, and
+	// the mapped extent must be rebuilt rather than reused from the first pass.
+	second := neutralizePlanes(imgs)
+	wing(second)
+	second[0][p] += .08
+	secondBefore := second[1][p]
+	if err := n.Apply(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if second[1][p] <= secondBefore {
+		t.Fatal("changed input did not receive a fresh footprint mapping")
+	}
+}
+
+// TestStarNeutralizerForcedOverrideBypassesSampleMinimum checks the White
+// Stars "Force process" override: a star whose annulus gathered fewer than
+// neutralizeMinSamples clean pixels is normally left untouched (s.valid
+// stays false), but settings.ForcedStars marks it forced and finishBackgrounds
+// must accept it anyway, still measuring a real background from whatever
+// samples it has.
+func TestStarNeutralizerForcedOverrideBypassesSampleMinimum(t *testing.T) {
+	n := &StarNeutralizer{}
+	few := []float64{.10, .12, .11} // well under neutralizeMinSamples
+	base := neutralizeStar{peak: [3]float64{.5, .5, .5}}
+	base.samples = [3][]float64{append([]float64(nil), few...), append([]float64(nil), few...), append([]float64(nil), few...)}
+	notForced := base
+	forced := base
+	forced.forced = true
+	n.stars = []neutralizeStar{notForced, forced}
+	n.finishBackgrounds()
+	if n.stars[0].valid {
+		t.Fatalf("star with only %d samples should stay invalid without an override", len(few))
+	}
+	if !n.stars[1].valid {
+		t.Fatal("forced star should become valid despite too few samples")
+	}
+	if n.stars[1].background[0] <= 0 {
+		t.Fatalf("forced star should still measure a real background from its samples, got %+v", n.stars[1].background)
+	}
+}
+
+// TestStarNeutralizerForcedOverrideWithNoSamplesStillWhitens checks the
+// degenerate case: an annulus so fully clipped or occluded that it gathered
+// zero samples. The override must still mark the star valid (background
+// defaults to zero per channel) rather than panic or leave it skipped.
+func TestStarNeutralizerForcedOverrideWithNoSamplesStillWhitens(t *testing.T) {
+	n := &StarNeutralizer{}
+	n.stars = []neutralizeStar{{forced: true, peak: [3]float64{.4, .1, .1}}}
+	n.finishBackgrounds()
+	if !n.stars[0].valid {
+		t.Fatal("forced star with zero annulus samples should still be marked valid")
+	}
+	if n.stars[0].background != [3]float64{} {
+		t.Fatalf("expected zero background with no samples, got %+v", n.stars[0].background)
+	}
+	if n.stars[0].peakExcess <= 0 {
+		t.Fatal("peak excess should still be measured against the zero-valued background")
+	}
+}
+
+// TestStarNeutralizerForcedSettingFlowsFromSourceID checks that
+// NewStarNeutralizer reads settings.ForcedStars by the fit's catalog
+// SourceID, which is how the compose UI's per-star override reaches the
+// neutralizer.
+func TestStarNeutralizerForcedSettingFlowsFromSourceID(t *testing.T) {
+	const w, h, cx, cy = 90, 80, 45, 40
+	imgs, fits := neutralizeScene(t, w, h, cx, cy)
+	model, err := NewStarTreatmentModel(fits, w, h, *imgs[0], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := models.StarWhiteningState{Enabled: true, Strength: 1, Level: models.StarWhiteningWhite, Red: true, Green: true, Blue: true,
+		ForcedStars: map[int]bool{fits[0].SourceID: true}}
+	n, err := NewStarNeutralizer(model, DiskChannel{Image: *imgs[0]}, *imgs[1], w, h, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !n.stars[0].forced {
+		t.Fatal("star matching settings.ForcedStars should be marked forced")
+	}
+}

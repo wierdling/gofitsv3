@@ -80,6 +80,11 @@ type StarWhiteningState struct {
 	Red              bool    `json:"red"`
 	Green            bool    `json:"green"`
 	Blue             bool    `json:"blue"`
+	// ForcedStars overrides the runtime validity check for specific catalog
+	// source IDs (from the reference source's star map), so a star that would
+	// otherwise be skipped for insufficient background samples, or for any
+	// other runtime reason, is whitened anyway on a best-effort basis.
+	ForcedStars map[int]bool `json:"forcedStars,omitempty"`
 }
 
 const (

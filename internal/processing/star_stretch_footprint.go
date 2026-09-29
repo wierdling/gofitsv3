@@ -28,6 +28,8 @@ func PrepareStarStretchFits(ctx context.Context, pixels []float32, w, h int, met
 	out := append([]StarTreatmentFit(nil), fits...)
 	for i := range out {
 		out[i].Spikes = append([]StarTreatmentSpike(nil), out[i].Spikes...)
+		out[i].RingRadii = append([]float64(nil), out[i].RingRadii...)
+		out[i].RingValues = append([]float64(nil), out[i].RingValues...)
 	}
 	// Stars are independent, so preparation runs in parallel; results keep
 	// their input order and the first error wins.
@@ -187,7 +189,7 @@ func prepareOneStarStretchFit(ctx context.Context, pixels []float32, w, h int, m
 	}
 	out.InnerRadius = inner
 	out.OuterRadius = outer
-	if !f.Saturated && footprintHasStructuredResidual(ctx, pixels, w, h, out, inner, outer) {
+	if !f.Saturated && (footprintHasStructuredResidual(ctx, pixels, w, h, out, inner, outer) || (f.RingValidated && ringHasDirectionalResidual(ctx, pixels, w, h, out, inner, outer))) {
 		out.Usable = false
 		out.Reason = "structured local residual; stellar footprint is ambiguous"
 		return out, nil
@@ -203,6 +205,66 @@ func prepareOneStarStretchFit(ctx context.Context, pixels []float32, w, h int, m
 		out.Reason += "; " + coverage
 	}
 	return out, nil
+}
+
+func ringHasDirectionalResidual(ctx context.Context, pixels []float32, w, h int, f StarTreatmentFit, inner, outer float64) bool {
+	flagged := 0
+	for r0 := math.Max(2*f.Sigma, inner*.55); r0 < outer; r0 += .75 {
+		if ctx.Err() != nil {
+			return false
+		}
+		var sectors [4][]float64
+		var maxima [4]float64
+		for y := max(0, int(math.Floor(f.Y-r0-1))); y <= min(h-1, int(math.Ceil(f.Y+r0+1))); y++ {
+			for x := max(0, int(math.Floor(f.X-r0-1))); x <= min(w-1, int(math.Ceil(f.X+r0+1))); x++ {
+				dx, dy := float64(x)-f.X, float64(y)-f.Y
+				r := math.Hypot(dx, dy)
+				if r < r0 || r >= r0+.75 {
+					continue
+				}
+				v := float64(pixels[y*w+x])
+				if !starFinite(v) {
+					continue
+				}
+				e := v - (f.Background + f.BackgroundX*dx + f.BackgroundY*dy)
+				if e <= 0 {
+					continue
+				}
+				q := 0
+				if dx < 0 {
+					q++
+				}
+				if dy < 0 {
+					q += 2
+				}
+				sectors[q] = append(sectors[q], e)
+				maxima[q] = math.Max(maxima[q], e)
+			}
+		}
+		medians := make([]float64, 0, 4)
+		for _, s := range sectors {
+			if len(s) >= 2 {
+				medians = append(medians, starMedian(s))
+			}
+		}
+		if len(medians) < 4 {
+			continue
+		}
+		sort.Float64s(medians)
+		maxLow, maxHigh := maxima[0], maxima[0]
+		for _, v := range maxima[1:] {
+			maxLow, maxHigh = math.Min(maxLow, v), math.Max(maxHigh, v)
+		}
+		if (medians[3] > 1.4*math.Max(medians[0], f.Noise) || maxHigh > 2*math.Max(maxLow, f.Noise)) && maxHigh > math.Max(4*f.Noise, .03*f.Signal) {
+			flagged++
+			if flagged >= 2 {
+				return true
+			}
+		} else if flagged > 0 {
+			flagged--
+		}
+	}
+	return false
 }
 
 // starCompanionModelError is the assumed relative error of a subtracted

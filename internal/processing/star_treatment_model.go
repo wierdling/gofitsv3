@@ -16,6 +16,7 @@ import (
 // a linear sample at a source position maps to one treated stretched value.
 type StarTreatmentModel struct {
 	fits     []StarTreatmentFit
+	usable   int // count of fits actually indexed/rendered; the rest are kept in fits only for diagnostics
 	meta     models.LoadedImage
 	strength float64
 	w, h     int
@@ -28,8 +29,10 @@ type StarTreatmentModel struct {
 const starTreatmentIndexCell = 64
 
 // NewStarTreatmentModel validates prepared fits and stretch settings the same
-// way ApplyGentlerStarStretch does and builds the spatial index. Fits that are
-// not usable are dropped. Strength zero yields the ordinary stretch.
+// way ApplyGentlerStarStretch does and builds the spatial index over the
+// usable fits. An unusable fit is kept in Fits() (for the "why wasn't this
+// star treated" diagnostics) but never indexed, so it is never rendered.
+// Strength zero yields the ordinary stretch.
 func NewStarTreatmentModel(fits []StarTreatmentFit, w, h int, meta models.LoadedImage, strength float64) (*StarTreatmentModel, error) {
 	if !validStarTreatmentDimensions(w, h) {
 		return nil, fmt.Errorf("invalid star treatment dimensions")
@@ -46,6 +49,7 @@ func NewStarTreatmentModel(fits []StarTreatmentFit, w, h int, meta models.Loaded
 	m.buckets = make([][]int, m.cols*m.rows)
 	for _, f := range fits {
 		if !f.Usable {
+			m.fits = append(m.fits, f)
 			continue
 		}
 		if !validStarTreatmentFit(f, w, h) {
@@ -53,6 +57,7 @@ func NewStarTreatmentModel(fits []StarTreatmentFit, w, h int, meta models.Loaded
 		}
 		idx := len(m.fits)
 		m.fits = append(m.fits, f)
+		m.usable++
 		extent := StarTreatmentExtent(f)
 		c0, c1 := m.clampCol(int(math.Floor((f.X-extent)/float64(m.cell)))), m.clampCol(int(math.Floor((f.X+extent)/float64(m.cell))))
 		r0, r1 := m.clampRow(int(math.Floor((f.Y-extent)/float64(m.cell)))), m.clampRow(int(math.Floor((f.Y+extent)/float64(m.cell))))
@@ -68,7 +73,9 @@ func NewStarTreatmentModel(fits []StarTreatmentFit, w, h int, meta models.Loaded
 func (m *StarTreatmentModel) clampCol(c int) int { return max(0, min(m.cols-1, c)) }
 func (m *StarTreatmentModel) clampRow(r int) int { return max(0, min(m.rows-1, r)) }
 
-// Fits returns the usable fits the model renders, in index order.
+// Fits returns every prepared fit, usable or not, in index order. Only the
+// usable ones are indexed and rendered; the rest carry their skip Reason for
+// diagnostics.
 func (m *StarTreatmentModel) Fits() []StarTreatmentFit { return m.fits }
 
 // Strength returns the treatment strength the model was built with.
@@ -108,7 +115,7 @@ func (m *StarTreatmentModel) TreatedStretch(v float32, x, y float64) float32 {
 // shared pixel is never treated twice.
 func (m *StarTreatmentModel) stretchAt(v float32, x, y float64, maskWeight float64) float32 {
 	base := stretchDiskValue(v, m.meta)
-	if m.strength == 0 || len(m.fits) == 0 || maskWeight == 0 {
+	if m.strength == 0 || m.usable == 0 || maskWeight == 0 {
 		return base
 	}
 	if x < 0 || y < 0 || x >= float64(m.w) || y >= float64(m.h) {

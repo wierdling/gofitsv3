@@ -212,7 +212,7 @@ Once aligned, you are ready to combine the images.
 
 #### Create and review star maps
 
-Open **Drizzle Commands > Create Star Map...** after building a mosaic, or select **Saved mosaic FITS** in the dialog. Work on the linear FITS mosaic before RGB stretching. The output is `<source directory>/working/<mosaic stem without _drizzle>_starmap.fits`.
+Open **Compose > Create Star Map** after building a mosaic, or select **Saved mosaic FITS** in the dialog. Work on the linear FITS mosaic before RGB stretching. The output is `<source directory>/working/<mosaic stem without _drizzle>_starmap.fits`.
 
 For a current WFC3/UVIS result built in this session, the tool uses the captured original-exposure placement where available. For a saved mosaic, optional original FLT/FLC paths can be entered separated by commas. Set **Alignment reference** to the FITS reference used for their working-image alignment sidecars. The reference must match the mosaic grid, and the sidecars must still match their target/reference file identities. A stale sidecar produces an error rather than guessed placement. Leaving originals blank produces a clearly marked **mosaic-only** map.
 

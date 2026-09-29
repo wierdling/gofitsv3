@@ -75,5 +75,8 @@ Prefer narrow, deliberate changes over broad exploration.
 - If one or two nearby files must be inspected to verify correctness, do that and explain why.
 - Ask before expanding into refactors, unrelated cleanup, or architecture changes.
 - If a workflow becomes repetitive or long, suggest creating a skill or subagent instead of enlarging this file.
+
 ## Large files (read by range only)
-- `internal/ui/workspace_compose.go` (~7.7k lines) and `internal/mosaic/drizzle.go` (~3.5k lines): never Read whole. `Grep -n` for the func/symbol first, then Read with `offset`/`limit` (≤200 lines).
+- `internal/mosaic/drizzle.go` (~3.5k lines): never Read whole. `Grep -n` for the func/symbol first, then Read with `offset`/`limit` (<=200 lines).
+- Compose tab = `composeWorkspace` struct (`internal/ui/compose_workspace.go`) built by `newComposeWorkspace` (`workspace_compose.go`, state + callback wiring only). Methods by area in `internal/ui/compose_*.go`: `_project` (save/load), `_export` (headers, RGB export), `_channels` (load channel/L, send to edit), `_large_mode`, `_overlay_ui` (layer windows), `_blink_ui`, `_picker`, `_stretch_ui` (match/normalize/levels), `_weights_ui`, `_align_ui`, `_cross_channel_ui` / `_cross_channel_large`, `_render` (refresh, composeRGB), `_reset`, `_menus` (updateMenus), `_layout` (buildMenus/buildLayout), `_filter_set`, `_magic_ui`.
+- Pure helpers: `_load`, `_channel_state`, `_channel_controls`, `_preview`, `_blink`, `_overlay`, `_offset`, `_stretch_match`, `_large_stretch`, `_cross_channel_replay`, `_widgets`. History: `docs/compose-workspace-refactor-plan.md`.
