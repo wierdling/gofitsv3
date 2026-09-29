@@ -1,6 +1,7 @@
 package processing
 
 import (
+	"context"
 	"math"
 	"testing"
 
@@ -31,6 +32,21 @@ func TestAutoScaleLikeFitsLiberatorSetsFieldsAndRepairsPeak(t *testing.T) {
 	}
 	if img.ScaledPeak != fitsLiberatorAutoScaledPeak {
 		t.Fatalf("ScaledPeak = %v, want %v", img.ScaledPeak, fitsLiberatorAutoScaledPeak)
+	}
+}
+
+func TestImageDataForReferenceGridWCSFailureFallsBackToResize(t *testing.T) {
+	img := &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 2, Height: 2, Pixels: []float32{1, 2, 3, 4}}, Header: fitsio.Header{Cards: map[string]string{"CRPIX1": "bad"}}}}
+	ref := &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Width: 3, Height: 1, Pixels: make([]float32, 3)}}}
+	got := ImageDataForReferenceGridCtx(context.Background(), img, ref)
+	want := ResizeChannel(img.HDU.Data.Pixels, 2, 2, 3, 1)
+	if got.Width != 3 || got.Height != 1 || len(got.Pixels) != len(want) {
+		t.Fatalf("fallback dimensions/pixels = %dx%d/%d", got.Width, got.Height, len(got.Pixels))
+	}
+	for i := range want {
+		if math.Abs(float64(got.Pixels[i]-want[i])) > 1e-6 {
+			t.Fatalf("pixel %d = %v, want %v", i, got.Pixels[i], want[i])
+		}
 	}
 }
 

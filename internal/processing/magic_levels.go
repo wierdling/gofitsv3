@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"gofitsv3/internal/models"
+	"gofitsv3/internal/stretch"
 )
 
 // MagicPreset selects how the stretch levels are estimated. Galaxy uses a
@@ -147,6 +148,53 @@ func ApplyMagicLevels(img *models.LoadedImage, preset MagicPreset) MagicLevelsRe
 	img.Peak = res.White
 	img.Black = res.Black
 	img.White = res.White
+	return res
+}
+
+// ApplyMagicLevelsAndMTF applies the Combine Magic operation as one coherent
+// stretch. The MTF is derived from the same robust background and sigma used
+// to choose Magic's levels, rather than estimating them again from the raw
+// image. This keeps the auto-STF 0.25 sky target stable for heavily padded or
+// unevenly sampled images.
+func ApplyMagicLevelsAndMTF(img *models.LoadedImage, preset MagicPreset) MagicLevelsResult {
+	res := ApplyMagicLevels(img, preset)
+	if img == nil || res.ValidPixels == 0 {
+		return res
+	}
+
+	black, white := res.Black, res.White
+	if !finite(black) {
+		black = 0
+	}
+	if !finite(white) || white <= black {
+		white = black + 1
+	}
+	target := res.Background + 2.8*res.Sigma
+	if !finite(target) {
+		target = res.Background
+	}
+	if !finite(target) {
+		target = black
+	}
+	xRef := (target - black) / (white - black)
+	if !finite(xRef) {
+		xRef = 0.25
+	}
+	if xRef < 1e-5 {
+		xRef = 1e-5
+	}
+	if xRef > 1 {
+		xRef = 1
+	}
+	m := 3 * xRef / (2*xRef + 1)
+	if !finite(m) || m < 0.001 {
+		m = 0.001
+	}
+	if m > 0.5 {
+		m = 0.5
+	}
+	img.MTFMidtone = m
+	img.Mode = stretch.MTF
 	return res
 }
 
@@ -294,7 +342,7 @@ func MagicLevels(pixels []float32, width, height int, valid []bool, preset Magic
 
 	// Clip diagnostics over the sampled valid pixels (sample is sorted).
 	res.ClipLowPercent = 100 * float64(countBelow(sample, black)) / float64(len(sample))
-	res.ClipHighPercent = 100 * float64(len(sample)-countBelow(sample, white)) / float64(len(sample))
+	res.ClipHighPercent = 100 * float64(len(sample)-countAtMost(sample, white)) / float64(len(sample))
 
 	return res
 }
@@ -370,13 +418,16 @@ func detectStarMask(pixels []float32, width, height int, valid []bool, bg, sigma
 					if dx == 0 && dy == 0 {
 						continue
 					}
+					if !pixOK(i + dy*width + dx) {
+						continue
+					}
 					if float64(pixels[i+dy*width+dx]) > v {
 						isPeak = false
 						break
 					}
 				}
 			}
-			if isPeak && isCompactPeak(pixels, width, height, x, y, v, bg) {
+			if isPeak && isCompactPeak(pixels, width, height, x, y, v, bg, valid) {
 				peaks = append(peaks, pt{x, y})
 			}
 		}
@@ -420,7 +471,7 @@ func detectStarMask(pixels []float32, width, height int, valid []bool, bg, sigma
 // isCompactPeak reports whether the peak at (x,y) with value v falls off toward
 // background within starCompactnessRadius. It samples 8 points on a ring at that
 // radius; a compact star drops sharply, extended nebulosity stays bright.
-func isCompactPeak(pixels []float32, width, height, x, y int, v, bg float64) bool {
+func isCompactPeak(pixels []float32, width, height, x, y int, v, bg float64, valid []bool) bool {
 	r := starCompactnessRadius
 	offsets := [8][2]int{
 		{r, 0}, {-r, 0}, {0, r}, {0, -r},
@@ -434,7 +485,8 @@ func isCompactPeak(pixels []float32, width, height, x, y int, v, bg float64) boo
 			continue
 		}
 		rv := float64(pixels[ny*width+nx])
-		if math.IsNaN(rv) || math.IsInf(rv, 0) {
+		ri := ny*width + nx
+		if (valid != nil && !valid[ri]) || pixels[ri] == 0 || math.IsNaN(rv) || math.IsInf(rv, 0) {
 			continue
 		}
 		sum += rv
@@ -454,4 +506,8 @@ func isCompactPeak(pixels []float32, width, height, x, y int, v, bg float64) boo
 // countBelow returns the number of values in a sorted slice strictly below v.
 func countBelow(sorted []float64, v float64) int {
 	return sort.SearchFloat64s(sorted, v)
+}
+
+func countAtMost(sorted []float64, v float64) int {
+	return sort.Search(len(sorted), func(i int) bool { return sorted[i] > v })
 }

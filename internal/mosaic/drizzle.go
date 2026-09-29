@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"gofitsv3/internal/astroio"
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/instrument"
@@ -23,7 +25,34 @@ import (
 // Very small denominators are treated as uncovered to avoid edge blow-ups.
 const weightEpsilon float32 = 1e-12
 
+// catalogsEffectivelyIdentical avoids repeating a fit when consensus retained
+// exactly the same detections as the raw candidate catalog. The small tolerance
+// accommodates harmless floating-point copies without suppressing a meaningful
+// raw-catalog fallback.
+func catalogsEffectivelyIdentical(a, b []processing.Star) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if math.Abs(a[i].X-b[i].X) > 1e-9 || math.Abs(a[i].Y-b[i].Y) > 1e-9 || math.Abs(a[i].Flux-b[i].Flux) > 1e-9 {
+			return false
+		}
+	}
+	return true
+}
+
+// shouldRetryRawCatalog reports whether a failed consensus fit has a different
+// source or reference catalog available for a meaningful raw-catalog retry.
+// Keeping this decision centralized prevents the direct and chained paths from
+// accidentally retrying identical catalogs (or skipping a retry when only the
+// reference was filtered).
+func shouldRetryRawCatalog(source, rawSource, reference, rawReference []processing.Star) bool {
+	return !catalogsEffectivelyIdentical(source, rawSource) || !catalogsEffectivelyIdentical(reference, rawReference)
+}
+
 type Input struct {
+	DQExcluded         []bool
+	DQRepaired         []bool
 	Path               string
 	SCIExt             int
 	PrimaryHeader      fitsio.Header
@@ -66,6 +95,11 @@ type Input struct {
 	// decide automatically whether the pixels are total counts that must be
 	// divided by exposure time. Empty when the header has no BUNIT.
 	BUnit string
+	// NativeGWCS carries the calibrated detector-to-sky transform for ASDF
+	// inputs. It is intentionally separate from the FITS-like header used for
+	// the output TAN grid; nil means this is a normal FITS input.
+	NativeGWCS        astroio.PixelToICRS
+	NativeGWCSProfile string
 	// NormalizeExposure, when true, causes prepareFramePixels to convert this
 	// frame's SCI (and ERR) pixels to a rate (per-second) by multiplying by
 	// ExposureScale before any drizzle weighting. This is independent of
@@ -75,6 +109,124 @@ type Input struct {
 	// NormalizeExposure is set. Zero or non-finite disables normalization for the
 	// frame even when NormalizeExposure is true.
 	ExposureScale float64
+}
+
+// newInputMapper is the single placement boundary for Mosaic. Native GWCS is
+// evaluated directly; only FITS inputs use the header-based mapper.
+func newInputMapper(input, reference Input) (*processing.WCSMapper, error) {
+	if input.NativeGWCS != nil {
+		return processing.NewNativeGWCSMapper(input.NativeGWCS, reference.HDU.Header)
+	}
+	if reference.NativeGWCS != nil {
+		return nil, fmt.Errorf("cannot project FITS input onto a native GWCS reference")
+	}
+	return processing.NewWCSMapper(input.HDU.Header, input.D2IX, input.D2IY,
+		reference.HDU.Header, reference.D2IX, reference.D2IY)
+}
+
+func affineApproximationFromMapper(mapper *processing.WCSMapper) (processing.AffineTransform, error) {
+	if mapper == nil {
+		return processing.AffineTransform{}, fmt.Errorf("nil native mapper")
+	}
+	x00, y00 := mapper.MapPixel(0, 0)
+	x10, y10 := mapper.MapPixel(1, 0)
+	x01, y01 := mapper.MapPixel(0, 1)
+	for _, v := range []float64{x00, y00, x10, y10, x01, y01} {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return processing.AffineTransform{}, fmt.Errorf("native GWCS returned non-finite control point")
+		}
+	}
+	return processing.AffineTransform{A: x10 - x00, B: x01 - x00, C: x00, D: y10 - y00, E: y01 - y00, F: y00}, nil
+}
+
+// referenceAffinePair derives the compact transforms used only to move a
+// refinement solved in one reference frame into the primary reference frame.
+// Native inputs must be sampled through GWCS in both directions; header-only
+// ComputeWCSTransform would discard their nonlinear detector mapping.
+func referenceAffinePair(source, target Input) (processing.AffineTransform, processing.AffineTransform, error) {
+	forward, err := newInputMapper(source, target)
+	if err != nil {
+		return processing.AffineTransform{}, processing.AffineTransform{}, err
+	}
+	backward, err := newInputMapper(target, source)
+	if err != nil {
+		return processing.AffineTransform{}, processing.AffineTransform{}, err
+	}
+	w0toR, err := affineApproximationFromMapper(forward)
+	if err != nil {
+		return processing.AffineTransform{}, processing.AffineTransform{}, err
+	}
+	wRto0, err := affineApproximationFromMapper(backward)
+	if err != nil {
+		return processing.AffineTransform{}, processing.AffineTransform{}, err
+	}
+	return w0toR, wRto0, nil
+}
+
+// buildSeamMap replays accepted source samples one frame at a time and compares
+// them with the finalized SCI value at their mapped output location. It is
+// deliberately post-SCI and opt-in, keeping the normal drizzle path unchanged.
+func buildSeamMap(planned []plannedInput, dataPlanned []int, skyOffset []float64, skyPlanes []skyPlane, crMasks []BitMask, crMaskIndex []int, options Options, sci []float32, width, height int, minX, minY float64) ([]float32, error) {
+	seam := make([]float32, width*height)
+	for i := range seam {
+		seam[i] = float32(math.NaN())
+	}
+	ss := make([]float64, width*height)
+	sw := make([]float64, width*height)
+	seen := make([][]uint32, (len(dataPlanned)+31)/32)
+	for i := range seen {
+		seen[i] = make([]uint32, width*height)
+	}
+	for slot, pi := range dataPlanned {
+		if err := options.cancelled(); err != nil {
+			return nil, err
+		}
+		pixels, _, _, err := prepareFramePixels(planned[pi], options, skyOffset[pi], skyPlanes[pi])
+		if err != nil {
+			return nil, err
+		}
+		var mask BitMask
+		if slot := crMaskIndex[pi]; slot >= 0 && slot < len(crMasks) {
+			mask = crMasks[slot]
+		}
+		w, h := planned[pi].input.HDU.Data.Width, planned[pi].input.HDU.Data.Height
+		for idx, value := range pixels {
+			if idx >= w*h || !isFinite32(value) || (mask != nil && mask.Get(idx)) {
+				continue
+			}
+			x, y := float64(idx%w), float64(idx/w)
+			ox, oy := planned[pi].mapOutputPixel(x, y, minX, minY, options.Scale)
+			ix, iy := int(math.Round(ox)), int(math.Round(oy))
+			if ix < 0 || ix >= width || iy < 0 || iy >= height {
+				continue
+			}
+			out := sci[iy*width+ix]
+			if !isFinite32(out) {
+				continue
+			}
+			value = drizzlePixelValue(planned[pi], idx, value, options.WeightingMode)
+			d := float64(value - out)
+			j := iy*width + ix
+			weight := float64(drizzlePixelWeight(planned[pi], idx, options.WeightingMode))
+			if weight <= 0 || !isFinite64(weight) {
+				continue
+			}
+			ss[j] += d * d * weight
+			sw[j] += weight
+			seen[slot/32][j] |= uint32(1) << uint(slot%32)
+		}
+		pixels = nil
+	}
+	for i := range seam {
+		unique := 0
+		for _, plane := range seen {
+			unique += bits.OnesCount32(plane[i])
+		}
+		if unique >= 2 && sw[i] > 0 {
+			seam[i] = float32(math.Sqrt(ss[i] / sw[i]))
+		}
+	}
+	return seam, nil
 }
 
 func InputKey(input Input) string {
@@ -261,6 +413,10 @@ func AlignmentStreamsPixels(mode AlignmentMode) bool {
 }
 
 type Options struct {
+	// DiagnosticProducts retains optional coverage/context/rejection/sky
+	// products in Result for callers that request a diagnostic FITS product.
+	// It is deliberately opt-in to preserve the legacy memory/output behavior.
+	DiagnosticProducts bool
 	// Scale is the internal output/input pixel size ratio used directly when
 	// FinalScale is zero.  A value of 2.0 doubles the output dimensions.
 	Scale float64
@@ -326,6 +482,12 @@ type Options struct {
 	// their FITS file via LoadInputsFromPath. Inputs that already carry pixels are
 	// used directly regardless of this field.
 	FrameLoader func(in Input) (sci []float32, errPix []float32, err error)
+	// FrameLoaderCtx is the cancellation-aware variant of FrameLoader. When set,
+	// it is preferred for streamed loads and receives Options.Ctx directly.
+	FrameLoaderCtx func(ctx context.Context, in Input) (sci []float32, errPix []float32, err error)
+	// FrameLoaderDiagnosticsCtx optionally returns matching DQ excluded/repaired
+	// masks for metadata-only streamed inputs. Existing loaders remain valid.
+	FrameLoaderDiagnosticsCtx func(ctx context.Context, in Input) (excluded, repaired []bool, err error)
 }
 
 // ErrCancelled is returned by Build (or AlignInputsByStarsWithMode) when its
@@ -397,15 +559,26 @@ type InputStatus struct {
 }
 
 type Result struct {
-	Pixels       []float32
-	Weights      []float32
-	Width        int
-	Height       int
-	OriginX      float64
-	OriginY      float64
-	Scale        float64
-	OutputHeader fitsio.Header
-	Inputs       []InputStatus
+	Pixels  []float32
+	Weights []float32
+	// Diagnostic planes are populated only when Options.DiagnosticProducts is
+	// true. Context uses one bit per contributing input (up to 32 inputs).
+	NContrib           []int32
+	Context            []uint32
+	ContextPlanes      [][]uint32
+	ContextInputKeys   []string
+	CRMask             []int32
+	DQ                 []int32
+	SkyModel           []float32
+	Seam               []float32
+	DiagnosticProducts bool
+	Width              int
+	Height             int
+	OriginX            float64
+	OriginY            float64
+	Scale              float64
+	OutputHeader       fitsio.Header
+	Inputs             []InputStatus
 	// InputFootprints holds the 4 output-space corners (TL, TR, BL, BR) for
 	// each successfully drizzled input, in [x, y] order.
 	InputFootprints [][4][2]float64
@@ -424,10 +597,25 @@ type StarAlignmentResult struct {
 	// Alignment diagnostics are intentionally part of the public result shape,
 	// but this file cannot fully populate them until the processing-package
 	// alignment estimators return match/residual statistics. Zero means unknown.
-	MatchedStars int
-	RMS          float64
-	MedianError  float64
-	MaxError     float64
+	MatchedStars           int
+	RMS                    float64
+	MedianError            float64
+	MaxError               float64
+	DetectedSourceStars    int
+	DetectedReferenceStars int
+	AcceptedStars          int
+	RejectedStars          int
+	RANSACInlierPercent    float64
+	FinalSupport           int
+	FinalSupportPercent    float64
+	XRMS                   float64
+	YRMS                   float64
+	RadialRMS              float64
+	Residuals              string
+	RScaleTransform        processing.AffineTransform
+	RScaleRMS              float64
+	RScaleMaxError         float64
+	Warnings               string
 }
 
 type plannedInput struct {
@@ -440,6 +628,83 @@ type plannedInput struct {
 	// drizzle kernels so a single large frame can be interrupted partway through
 	// rather than only between frames. Returns true once the build is cancelled.
 	cancel func() bool
+}
+
+// drizzleDiagnostics is intentionally a compact, optional side accumulator.
+// It records deposition provenance without changing the numerical science
+// image. Context bits identify the first 32 contributing exposures.
+type drizzleDiagnostics struct {
+	ncontrib []int32
+	context  []uint32
+	planes   [][]uint32
+	crmask   []int32
+	dq       []int32
+	plane    int
+	inputBit uint32
+}
+
+func (d *drizzleDiagnostics) projectDQ(p plannedInput, width, height int, minX, minY, scale float64) {
+	if d == nil || len(d.dq) == 0 {
+		return
+	}
+	n := p.input.HDU.Data.Width * p.input.HDU.Data.Height
+	for i := 0; i < n; i++ {
+		var bit int32
+		if i < len(p.input.DQExcluded) && p.input.DQExcluded[i] {
+			bit |= 1
+		}
+		if i < len(p.input.DQRepaired) && p.input.DQRepaired[i] {
+			bit |= 2
+		}
+		if bit == 0 {
+			continue
+		}
+		x, y := float64(i%p.input.HDU.Data.Width), float64(i/p.input.HDU.Data.Width)
+		rx, ry := p.mapOutputPixel(x, y, minX, minY, scale)
+		ox, oy := int(math.Round(rx)), int(math.Round(ry))
+		if ox >= 0 && ox < width && oy >= 0 && oy < height {
+			d.dq[oy*width+ox] |= bit
+		}
+	}
+}
+
+func (d *drizzleDiagnostics) mark(index int) {
+	if d == nil || index < 0 || index >= len(d.ncontrib) {
+		return
+	}
+	d.ncontrib[index]++
+	if d.inputBit != 0 {
+		if d.plane == 0 {
+			d.context[index] |= d.inputBit
+		}
+		if d.plane >= 0 && d.plane < len(d.planes) {
+			d.planes[d.plane][index] |= d.inputBit
+		}
+	}
+}
+
+func (d *drizzleDiagnostics) markRejected(crMask BitMask, sourceIndex int, x, y float64, width, height int) {
+	if d == nil || crMask == nil || !crMask.Get(sourceIndex) {
+		return
+	}
+	ox, oy := int(math.Round(x)), int(math.Round(y))
+	if ox >= 0 && ox < width && oy >= 0 && oy < height {
+		d.crmask[oy*width+ox] = 1
+	}
+}
+
+func (d *drizzleDiagnostics) markRejectedSourcePixels(p plannedInput, crMask BitMask, width, height int, minX, minY, scale float64) {
+	if d == nil || crMask == nil {
+		return
+	}
+	n := p.input.HDU.Data.Width * p.input.HDU.Data.Height
+	for i := 0; i < n; i++ {
+		if crMask.Get(i) {
+			x, y := float64(i%p.input.HDU.Data.Width), float64(i/p.input.HDU.Data.Width)
+			ox, oy := p.mapOutputPixel(x, y, minX, minY, scale)
+			d.markRejected(crMask, i, ox, oy, width, height)
+		}
+	}
 }
 
 // cancelled reports whether this frame's drizzle should abort early.
@@ -671,6 +936,21 @@ func Build(inputs []Input, options Options) (*Result, error) {
 	debuglog.Log(fmt.Sprintf("Build: starting final drizzle pass, %d planned inputs", len(planned)))
 	sums := make([]float32, width*height)
 	weights := make([]float32, width*height)
+	var diagnostics *drizzleDiagnostics
+	if options.DiagnosticProducts {
+		planeCount := (len(dataPlanned) + 31) / 32
+		planes := make([][]uint32, planeCount)
+		for i := range planes {
+			planes[i] = make([]uint32, width*height)
+		}
+		diagnostics = &drizzleDiagnostics{
+			ncontrib: make([]int32, width*height),
+			context:  make([]uint32, width*height),
+			planes:   planes,
+			crmask:   make([]int32, width*height),
+			dq:       make([]int32, width*height),
+		}
+	}
 	finalKernel := options.FinalKernel
 	finalSlot := 0
 
@@ -679,7 +959,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		if err := os.MkdirAll(options.DebugOutputDir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create debug output directory: %w", err)
 		}
-		debugBaseHeader = buildOutputHeader(wcsReferenceInput(inputs), firstDataInput(inputs), width, height, minX, minY, options.Scale, 1)
+		debugBaseHeader = buildOutputHeader(wcsReferenceInput(inputs), firstPlannedDataInput(planned), width, height, minX, minY, options.Scale, 1)
 	}
 
 	for i := range planned {
@@ -700,6 +980,17 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		// (combined working frames) or ERRPixels (ordinary frames).
 		planned[i].input.ERRPixels = errPix
 		planned[i].input.WeightPixels = whtPix
+		if options.DiagnosticProducts && options.FrameLoaderDiagnosticsCtx != nil && planned[i].input.HDU.Data.Pixels == nil {
+			ctx := options.Ctx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			excluded, repaired, derr := options.FrameLoaderDiagnosticsCtx(ctx, planned[i].input)
+			if derr != nil {
+				return nil, fmt.Errorf("load DQ for frame %s: %w", InputKey(planned[i].input), derr)
+			}
+			planned[i].input.DQExcluded, planned[i].input.DQRepaired = excluded, repaired
+		}
 		var crMask BitMask
 		cleaned := false
 
@@ -729,15 +1020,29 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		debuglog.Log(fmt.Sprintf("Build: frame %d input %dx%d kernel=%d trimX=%d trimY=%d", finalSlot,
 			planned[i].input.HDU.Data.Width, planned[i].input.HDU.Data.Height, int(finalKernel), trimX, trimY))
 		dropSize := inputDropSize(planned[i], options.Scale, options.PixFrac)
+		var diag *drizzleDiagnostics
+		if options.DiagnosticProducts {
+			diag = diagnostics
+			diag.plane = (finalSlot - 1) / 32
+			diag.inputBit = uint32(1) << uint((finalSlot-1)%32)
+			diag.markRejectedSourcePixels(planned[i], crMask, width, height, minX, minY, options.Scale)
+			diag.projectDQ(planned[i], width, height, minX, minY, options.Scale)
+		}
 		drizzlePlannedInput(planned[i], sums, weights, width, height, minX, minY,
-			options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY)
+			options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY, diag)
+		if err := options.cancelled(); err != nil {
+			return nil, err
+		}
 		debuglog.Log(fmt.Sprintf("Build: frame %d done", finalSlot))
 
 		if options.DebugOutputDir != "" {
 			dbgSums := make([]float32, width*height)
 			dbgWeights := make([]float32, width*height)
 			drizzlePlannedInput(planned[i], dbgSums, dbgWeights, width, height, minX, minY,
-				options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY)
+				options.Scale, dropSize, finalKernel, options.WeightingMode, crMask, pixels, trimX, trimY, nil)
+			if err := options.cancelled(); err != nil {
+				return nil, err
+			}
 			normalizeAccumulatedImage(dbgSums, dbgWeights)
 
 			safeName := strings.ReplaceAll(InputLabel(planned[i].input), "[", "_")
@@ -763,10 +1068,23 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 	}
 
+	if err := options.cancelled(); err != nil {
+		return nil, err
+	}
 	options.reportProgress("Finalizing", len(dataPlanned), len(dataPlanned))
+	if err := options.cancelled(); err != nil {
+		return nil, err
+	}
 	debuglog.Log("Build: normalizing accumulated image")
 	normalizeAccumulatedImage(sums, weights)
 	logMemStats("finalized")
+	var seamMap []float32
+	if options.DiagnosticProducts {
+		seamMap, err = buildSeamMap(planned, dataPlanned, skyOffset, skyPlanes, crMasks, crMaskIndex, options, sums, width, height, minX, minY)
+		if err != nil {
+			return nil, err
+		}
+	}
 	debuglog.Log("Build: normalization done, computing footprints")
 
 	// Compute output-space footprints for preview border drawing.
@@ -805,7 +1123,7 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		}
 	}
 
-	return &Result{
+	result := &Result{
 		Pixels:              sums,
 		Weights:             weights,
 		Width:               width,
@@ -813,11 +1131,52 @@ func Build(inputs []Input, options Options) (*Result, error) {
 		OriginX:             minX,
 		OriginY:             minY,
 		Scale:               options.Scale,
-		OutputHeader:        buildOutputHeader(wcsReferenceInput(inputs), firstDataInput(inputs), width, height, minX, minY, options.Scale, includedCount),
+		OutputHeader:        buildOutputHeader(wcsReferenceInput(inputs), firstPlannedDataInput(planned), width, height, minX, minY, options.Scale, includedCount),
 		Inputs:              statuses,
 		InputFootprints:     footprints,
 		InputFootprintPaths: footprintPaths,
-	}, nil
+	}
+	if diagnostics != nil {
+		result.NContrib = diagnostics.ncontrib
+		result.DiagnosticProducts = true
+		result.Context = diagnostics.context
+		result.ContextPlanes = diagnostics.planes
+		result.ContextInputKeys = make([]string, len(dataPlanned))
+		for i, pi := range dataPlanned {
+			result.ContextInputKeys[i] = InputKey(planned[pi].input)
+		}
+		for i := range result.NContrib {
+			result.NContrib[i] = 0
+			for _, plane := range diagnostics.planes {
+				result.NContrib[i] += int32(bits.OnesCount32(plane[i]))
+			}
+		}
+		result.CRMask = diagnostics.crmask
+		result.DQ = diagnostics.dq
+		result.SkyModel = make([]float32, width*height)
+		result.Seam = seamMap
+		for y := 0; y < height; y++ {
+			for x := 0; x < width; x++ {
+				var sum float64
+				var count int
+				rx, ry := float64(x)/options.Scale+minX, float64(y)/options.Scale+minY
+				for slot, pi := range dataPlanned {
+					applied := skyApplied[pi]
+					plane := slot / 32
+					bit := uint(slot % 32)
+					covered := plane < len(diagnostics.planes) && (diagnostics.planes[plane][y*width+x]&(uint32(1)<<bit)) != 0
+					if applied && skyPlanes[pi].Valid && covered {
+						sum += skyPlanes[pi].value(rx, ry)
+						count++
+					}
+				}
+				if count > 0 {
+					result.SkyModel[y*width+x] = float32(sum / float64(count))
+				}
+			}
+		}
+	}
+	return result, nil
 }
 
 // DrizzleOrder returns the indices 1..len(inputs)-1 sorted by ascending WCS
@@ -879,7 +1238,7 @@ func SortInputsByWCSDistance(inputs []Input, statuses []InputStatus) {
 			continue
 		}
 		rep := inputs[groups[g].indices[0]]
-		mapper, err := processing.NewWCSMapper(rep.HDU.Header, nil, nil, ref.HDU.Header, nil, nil)
+		mapper, err := newInputMapper(rep, ref)
 		if err == nil {
 			groups[g].x, groups[g].y = mapper.MapPixel(float64(rep.HDU.Data.Width)/2, float64(rep.HDU.Data.Height)/2)
 			groups[g].hasPos = true
@@ -1171,9 +1530,29 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	if isTweakReg {
 		catalogCap = 2000
 	}
-	candidateCatalogs := extractStarCatalogsForAlignment(inputs, catalogCap)
+	externalReference := isTweakReg && inputs[0].ReferenceOnly
+	caps := make([]int, len(inputs))
+	for i := range caps {
+		caps[i] = catalogCap
+	}
+	if externalReference {
+		// The external baseline is a multi-tile image. Keep its complete catalog
+		// once; each target below selects only its mapped local footprint.
+		caps[0] = 0
+	}
+	candidateCatalogs, _ := extractStarCatalogsForAlignmentCapsCtx(context.Background(), inputs, caps)
 	catalogs := candidateCatalogs
 	if isTweakReg {
+		// Keep target consensus selection unchanged. For an external multi-tile
+		// baseline, use a bounded voting view of the reference, but preserve its
+		// full catalog for the per-target footprint match below.
+		votingCatalogs := candidateCatalogs
+		if externalReference {
+			votingCatalogs = append([][]processing.Star(nil), candidateCatalogs...)
+			if len(votingCatalogs[0]) > catalogCap {
+				votingCatalogs[0] = processing.SelectSpatiallyDistributedStars(votingCatalogs[0], inputs[0].HDU.Data.Width, inputs[0].HDU.Data.Height, catalogCap)
+			}
+		}
 		projected := make([][]projectedCatalogDetection, len(inputs))
 		exposures := make([]string, len(inputs))
 		for i := range inputs {
@@ -1181,16 +1560,13 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			if exposures[i] == "" {
 				exposures[i] = inputs[i].Path
 			}
-			mapper, err := processing.NewWCSMapper(
-				inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
-				inputs[0].HDU.Header, inputs[0].D2IX, inputs[0].D2IY,
-			)
+			mapper, err := newInputMapper(inputs[i], inputs[0])
 			if err != nil {
 				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: consensus projection input[%d] %s failed: %v; using fallback catalog", i, InputKey(inputs[i]), err))
 				continue
 			}
-			projected[i] = make([]projectedCatalogDetection, 0, len(candidateCatalogs[i]))
-			for j, star := range candidateCatalogs[i] {
+			projected[i] = make([]projectedCatalogDetection, 0, len(votingCatalogs[i]))
+			for j, star := range votingCatalogs[i] {
 				x, y := mapper.MapPixel(star.X, star.Y)
 				if !finite(x) || !finite(y) {
 					continue
@@ -1199,7 +1575,10 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			}
 		}
 		var stats []alignmentConsensusStats
-		catalogs, stats = selectCrossFrameConsensusCatalogs(candidateCatalogs, projected, exposures, processing.TweakRegCatalogMaxStars, consensusMatchRadius)
+		catalogs, stats = selectCrossFrameConsensusCatalogs(votingCatalogs, projected, exposures, processing.TweakRegCatalogMaxStars, consensusMatchRadius)
+		if externalReference {
+			catalogs[0] = candidateCatalogs[0]
+		}
 		for i := range stats {
 			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: consensus input[%d] %s raw=%d corroborated=%d strong=%d selected=%d fallback=%t", i, InputKey(inputs[i]), stats[i].Candidates, stats[i].Corroborated, stats[i].Strong, stats[i].Selected, stats[i].Fallback))
 		}
@@ -1223,8 +1602,15 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			refCaches[r] = refCache{input: inputs[r]}
 			continue
 		}
-		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
-		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
+		var w0toR, wRto0 processing.AffineTransform
+		var err0, err1 error
+		if inputs[r].NativeGWCS != nil || inputs[0].NativeGWCS != nil {
+			w0toR, wRto0, err0 = referenceAffinePair(inputs[0], inputs[r])
+			err1 = err0
+		} else {
+			w0toR, err0 = processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
+			wRto0, err1 = processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
+		}
 		if err0 != nil || err1 != nil {
 			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: reference=%s WCS error: %v / %v", InputKey(inputs[r]), err0, err1))
 			refCaches[r] = refCache{input: inputs[r]}
@@ -1258,6 +1644,25 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				continue
 			}
 			debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: matching source=%s reference=%s mode=%s", InputKey(inputs[i]), InputKey(rc.input), fitgeom))
+			var mapper *processing.WCSMapper
+			if isTweakReg {
+				var mapErr error
+				mapper, mapErr = newInputMapper(inputs[i], rc.input)
+				if mapErr != nil {
+					attemptErrors = append(attemptErrors, fmt.Sprintf("reference %s: WCSMapper: %v", InputKey(rc.input), mapErr))
+					continue
+				}
+			}
+			referenceStars := rc.stars
+			if externalReference && r == 0 {
+				local, footprintErr := referenceStarsForTarget(inputs[i], rc.input, mapper, rc.stars, searchRadiusArcsec)
+				if footprintErr != nil {
+					attemptErrors = append(attemptErrors, fmt.Sprintf("reference %s: %v", InputKey(rc.input), footprintErr))
+					continue
+				}
+				referenceStars = local
+				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: target=%s local reference stars=%d", InputKey(inputs[i]), len(referenceStars)))
+			}
 			var (
 				refinement processing.AffineTransform
 				stats      processing.AlignStats
@@ -1265,14 +1670,6 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			)
 			switch mode {
 			case AlignmentModeTweakRegRScale, AlignmentModeTweakRegGeneral:
-				mapper, mapErr := processing.NewWCSMapper(
-					inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
-					rc.input.HDU.Header, rc.input.D2IX, rc.input.D2IY,
-				)
-				if mapErr != nil {
-					err = fmt.Errorf("WCSMapper: %v", mapErr)
-					break
-				}
 				if processing.AlignmentDebugHook != nil {
 					// Debug visualization needs the actual pixels; reload the pair
 					// on demand so the common (non-debug) path stays pixel-free.
@@ -1288,7 +1685,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 						inputs[i].HDU.Data.Height,
 						mapper,
 						refPix,
-						rc.stars,
+						referenceStars,
 						rc.input.HDU.Data.Width,
 						rc.input.HDU.Data.Height,
 						rc.input.HDU.Header,
@@ -1299,7 +1696,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 					refinement, stats, err = processing.EstimateTweakRegAlignmentFromCatalogs(
 						catalogs[i],
 						mapper,
-						rc.stars,
+						referenceStars,
 						rc.input.HDU.Data.Width,
 						rc.input.HDU.Data.Height,
 						rc.input.HDU.Header,
@@ -1319,6 +1716,47 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 					rc.input.HDU.Data.Pixels, rc.input.HDU.Data.Width, rc.input.HDU.Data.Height, rc.input.HDU.Header,
 					inputs[i].OffsetX, inputs[i].OffsetY,
 				)
+			}
+			if err != nil && isTweakReg {
+				// Consensus can discard real but weakly corroborated stars. Retry the
+				// same target/reference footprint with the complete candidate catalog,
+				// while leaving all physical/support gates in the processing matcher.
+				rawReferenceStars := candidateCatalogs[r]
+				if externalReference && r == 0 {
+					var fallbackFootprintErr error
+					rawReferenceStars, fallbackFootprintErr = referenceStarsForTarget(inputs[i], rc.input, mapper, rawReferenceStars, searchRadiusArcsec)
+					if fallbackFootprintErr != nil {
+						rawReferenceStars = nil
+					}
+				}
+				retrySource := catalogs[i]
+				if processing.AlignmentDebugHook != nil {
+					retrySource = candidateCatalogs[i]
+				}
+				if shouldRetryRawCatalog(retrySource, candidateCatalogs[i], referenceStars, rawReferenceStars) && len(rawReferenceStars) > 0 {
+					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: direct fallback attempt source=%s reference=%s raw-source-stars=%d raw-reference-stars=%d after consensus error: %v", InputKey(inputs[i]), InputKey(rc.input), len(candidateCatalogs[i]), len(rawReferenceStars), err))
+					var fallbackRefinement processing.AffineTransform
+					var fallbackStats processing.AlignStats
+					var fallbackErr error
+					if processing.AlignmentDebugHook != nil {
+						refPix, _, _, _, refErr := resolveFramePixels(rc.input, Options{})
+						if refErr != nil {
+							fallbackErr = fmt.Errorf("debug reference pixel reload: %v", refErr)
+						} else {
+							fallbackRefinement, fallbackStats, fallbackErr = processing.EstimateTweakRegAlignmentFromCatalogsWithDebug(candidateCatalogs[i], mapper, refPix, rawReferenceStars, rc.input.HDU.Data.Width, rc.input.HDU.Data.Height, rc.input.HDU.Header, searchRadiusArcsec, fitgeom)
+						}
+					} else {
+						fallbackRefinement, fallbackStats, fallbackErr = processing.EstimateTweakRegAlignmentFromCatalogs(candidateCatalogs[i], mapper, rawReferenceStars, rc.input.HDU.Data.Width, rc.input.HDU.Data.Height, rc.input.HDU.Header, searchRadiusArcsec, fitgeom)
+					}
+					if fallbackErr == nil {
+						refinement, stats, err = fallbackRefinement, fallbackStats, nil
+						debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: direct fallback success source=%s reference=%s matched=%d support=%d rms=%.3f", InputKey(inputs[i]), InputKey(rc.input), stats.MatchedStars, stats.GlobalInliers, stats.RMS))
+					} else {
+						err = fmt.Errorf("%v; raw catalog retry: %v", err, fallbackErr)
+					}
+				} else if shouldRetryRawCatalog(retrySource, candidateCatalogs[i], referenceStars, rawReferenceStars) {
+					err = fmt.Errorf("%v; raw catalog retry: no usable reference stars", err)
+				}
 			}
 			if err != nil {
 				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: match source=%s reference=%s: %v", InputKey(inputs[i]), InputKey(rc.input), err))
@@ -1352,10 +1790,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		if e, seen := mapperCache[idx]; seen {
 			return e.m, e.ok
 		}
-		m, err := processing.NewWCSMapper(
-			inputs[idx].HDU.Header, inputs[idx].D2IX, inputs[idx].D2IY,
-			inputs[0].HDU.Header, inputs[0].D2IX, inputs[0].D2IY,
-		)
+		m, err := newInputMapper(inputs[idx], inputs[0])
 		e := mapperEntry{m: m, ok: err == nil}
 		mapperCache[idx] = e
 		return e.m, e.ok
@@ -1363,49 +1798,45 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	// projectRaw maps a frame's catalog into inputs[0] pixel space using only its
 	// WCS placement (mapper + base offset), i.e. before any residual correction —
 	// the "projected source" role for a residual fit.
-	projectRaw := func(idx int) ([]processing.Star, bool) {
+	projectCatalog := func(idx int, source []processing.Star, corrected bool) ([]processing.Star, bool) {
 		m, ok := getMapper(idx)
 		if !ok {
 			return nil, false
 		}
-		src := getStars(idx)
-		out := make([]processing.Star, len(src))
-		for k, s := range src {
+		offX, offY := inputs[idx].OffsetX, inputs[idx].OffsetY
+		if results[idx].Applied {
+			offX, offY = results[idx].OffsetX, results[idx].OffsetY
+		}
+		mt, hasMT := inputs[idx].ManualTransform, inputs[idx].HasManualTransform
+		if results[idx].Applied {
+			mt, hasMT = results[idx].ManualTransform, results[idx].HasManualTransform
+		}
+		out := make([]processing.Star, len(source))
+		for k, s := range source {
 			rx, ry := m.MapPixel(s.X, s.Y)
-			out[k] = processing.Star{X: rx + inputs[idx].OffsetX, Y: ry + inputs[idx].OffsetY, Flux: s.Flux}
+			rx += offX
+			ry += offY
+			if corrected && hasMT {
+				rx, ry = processing.ApplyAffineTransform(mt, rx, ry)
+			}
+			out[k] = processing.Star{X: rx, Y: ry, Flux: s.Flux}
 		}
 		return out, true
+	}
+	projectRaw := func(idx int) ([]processing.Star, bool) {
+		return projectCatalog(idx, getStars(idx), false)
 	}
 	// projectCorrected maps an already-aligned frame's catalog into inputs[0] pixel
 	// space using its FULL solution (mapper + offset + ManualTransform), exactly as
 	// plannedInput.mapPixel does at render. Chaining off this (not the raw WCS
 	// placement) propagates the intermediate's own residual into the new frame.
 	projectCorrected := func(idx int) ([]processing.Star, bool) {
-		m, ok := getMapper(idx)
+		_, ok := getMapper(idx)
 		if !ok {
 			return nil, false
 		}
 		src := getStars(idx)
-		// Use the computed solution once it exists; otherwise fall back to the
-		// frame's accepted placement (the path designated references take, since
-		// their results entry is only filled at the very end).
-		offX, offY := inputs[idx].OffsetX, inputs[idx].OffsetY
-		mt, hasMT := inputs[idx].ManualTransform, inputs[idx].HasManualTransform
-		if results[idx].Applied {
-			offX, offY = results[idx].OffsetX, results[idx].OffsetY
-			mt, hasMT = results[idx].ManualTransform, results[idx].HasManualTransform
-		}
-		out := make([]processing.Star, len(src))
-		for k, s := range src {
-			rx, ry := m.MapPixel(s.X, s.Y)
-			rx += offX
-			ry += offY
-			if hasMT {
-				rx, ry = processing.ApplyAffineTransform(mt, rx, ry)
-			}
-			out[k] = processing.Star{X: rx, Y: ry, Flux: s.Flux}
-		}
-		return out, true
+		return projectCatalog(idx, src, true)
 	}
 
 	refW := inputs[0].HDU.Data.Width
@@ -1453,14 +1884,19 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			prog.report(done, len(toAlign))
 			if r.ok {
 				results[r.i] = StarAlignmentResult{
-					OffsetX:            inputs[r.i].OffsetX,
-					OffsetY:            inputs[r.i].OffsetY,
-					ManualTransform:    r.refinement,
-					HasManualTransform: true,
-					Applied:            true,
-					MatchedStars:       r.stats.MatchedStars,
-					RMS:                r.stats.RMS,
-					MaxError:           r.stats.MaxError,
+					OffsetX:             inputs[r.i].OffsetX,
+					OffsetY:             inputs[r.i].OffsetY,
+					ManualTransform:     r.refinement,
+					HasManualTransform:  true,
+					Applied:             true,
+					MatchedStars:        r.stats.MatchedStars,
+					RMS:                 r.stats.RMS,
+					MedianError:         r.stats.MedianError,
+					MaxError:            r.stats.MaxError,
+					DetectedSourceStars: r.stats.DetectedSourceStars, DetectedReferenceStars: r.stats.DetectedReferenceStars,
+					AcceptedStars: r.stats.AcceptedStars, RejectedStars: r.stats.RejectedStars, RANSACInlierPercent: r.stats.RANSACInlierPercent, FinalSupport: r.stats.FinalSupport, FinalSupportPercent: r.stats.FinalSupportPercent,
+					XRMS: r.stats.XRMS, YRMS: r.stats.YRMS, RadialRMS: r.stats.RadialRMS, Residuals: r.stats.Residuals,
+					RScaleTransform: r.stats.RScaleTransform, RScaleRMS: r.stats.RScaleRMS, RScaleMaxError: r.stats.RScaleMaxError, Warnings: r.stats.Warnings,
 				}
 				aligned[r.i] = true
 			} else {
@@ -1526,6 +1962,22 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				attemptedCandidates++
 				debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: matching source=%s reference=%s mode=%s (chain fallback) source-stars=%d reference-stars=%d search-radius=%.2f", InputKey(inputs[i]), InputKey(inputs[j]), fitgeom, len(srcProj), len(intProj), chainSearchRadiusPx))
 				t, stats, err := processing.FitCatalogResidual(srcProj, intProj, refW, refH, chainSearchRadiusPx, fitgeom)
+				if err != nil && isTweakReg && shouldRetryRawCatalog(catalogs[i], candidateCatalogs[i], catalogs[j], candidateCatalogs[j]) {
+					rawSrcProj, rawSrcOK := projectCatalog(i, candidateCatalogs[i], false)
+					rawIntProj, rawIntOK := projectCatalog(j, candidateCatalogs[j], true)
+					if rawSrcOK && rawIntOK {
+						debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain fallback attempt source=%s reference=%s raw-source-stars=%d raw-reference-stars=%d after consensus error: %v", InputKey(inputs[i]), InputKey(inputs[j]), len(rawSrcProj), len(rawIntProj), err))
+						fallbackT, fallbackStats, fallbackErr := processing.FitCatalogResidual(rawSrcProj, rawIntProj, refW, refH, chainSearchRadiusPx, fitgeom)
+						if fallbackErr == nil {
+							t, stats, err = fallbackT, fallbackStats, nil
+							debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain fallback success source=%s reference=%s matched=%d support=%d rms=%.3f", InputKey(inputs[i]), InputKey(inputs[j]), stats.MatchedStars, stats.GlobalInliers, stats.RMS))
+						} else {
+							err = fmt.Errorf("%v; raw catalog retry: %v", err, fallbackErr)
+						}
+					} else {
+						err = fmt.Errorf("%v; raw catalog retry: projection unavailable", err)
+					}
+				}
 				if err != nil {
 					lastErr[i] = fmt.Sprintf("chain via %s: %v", InputKey(inputs[j]), err)
 					debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: chain match failed source=%s reference=%s: %v", InputKey(inputs[i]), InputKey(inputs[j]), err))
@@ -1543,14 +1995,19 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			}
 			if bestJ >= 0 {
 				results[i] = StarAlignmentResult{
-					OffsetX:            inputs[i].OffsetX,
-					OffsetY:            inputs[i].OffsetY,
-					ManualTransform:    bestT,
-					HasManualTransform: true,
-					Applied:            true,
-					MatchedStars:       bestStats.MatchedStars,
-					RMS:                bestStats.RMS,
-					MaxError:           bestStats.MaxError,
+					OffsetX:             inputs[i].OffsetX,
+					OffsetY:             inputs[i].OffsetY,
+					ManualTransform:     bestT,
+					HasManualTransform:  true,
+					Applied:             true,
+					MatchedStars:        bestStats.MatchedStars,
+					RMS:                 bestStats.RMS,
+					MedianError:         bestStats.MedianError,
+					MaxError:            bestStats.MaxError,
+					DetectedSourceStars: bestStats.DetectedSourceStars, DetectedReferenceStars: bestStats.DetectedReferenceStars,
+					AcceptedStars: bestStats.AcceptedStars, RejectedStars: bestStats.RejectedStars, RANSACInlierPercent: bestStats.RANSACInlierPercent, FinalSupport: bestStats.FinalSupport, FinalSupportPercent: bestStats.FinalSupportPercent,
+					XRMS: bestStats.XRMS, YRMS: bestStats.YRMS, RadialRMS: bestStats.RadialRMS, Residuals: bestStats.Residuals,
+					RScaleTransform: bestStats.RScaleTransform, RScaleRMS: bestStats.RScaleRMS, RScaleMaxError: bestStats.RScaleMaxError, Warnings: bestStats.Warnings,
 				}
 				aligned[i] = true
 				progressed = true
@@ -1639,6 +2096,24 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 			continue
 		}
 		result := results[i]
+		// Re-evaluate after bundle adjustment using the final corrected catalogue.
+		if corrected, ok := projectCorrected(i); ok && len(refCaches) > 0 {
+			finalStats := processing.RecomputeAlignmentDiagnostics(corrected, refCaches[0].stars, processing.IdentityTransform())
+			result.DetectedSourceStars, result.DetectedReferenceStars = finalStats.DetectedSourceStars, finalStats.DetectedReferenceStars
+			result.MatchedStars = finalStats.MatchedStars
+			// Preserve the pre-bundle solver consensus fields; finalStats contains
+			// separately named final-support values and is not a second RANSAC run.
+			result.FinalSupport, result.FinalSupportPercent = finalStats.FinalSupport, finalStats.FinalSupportPercent
+			result.RMS, result.XRMS, result.YRMS, result.RadialRMS = finalStats.RMS, finalStats.XRMS, finalStats.YRMS, finalStats.RadialRMS
+			result.MedianError, result.MaxError = finalStats.MedianError, finalStats.MaxError
+			result.Residuals = finalStats.Residuals
+			result.RScaleTransform, result.RScaleRMS, result.RScaleMaxError = finalStats.RScaleTransform, finalStats.RScaleRMS, finalStats.RScaleMaxError
+			if result.Warnings != "" && finalStats.Warnings != "" {
+				result.Warnings += "; "
+			}
+			result.Warnings += finalStats.Warnings
+			results[i] = result
+		}
 		debuglog.Log(fmt.Sprintf("AlignInputsByStarsWithMode: final source=%s applied=%t matched=%d rms=%.3f max=%.3f offset=(%.3f,%.3f) has-transform=%t transform=[%.8f %.8f %.3f; %.8f %.8f %.3f]", InputKey(inputs[i]), result.Applied, result.MatchedStars, result.RMS, result.MaxError, result.OffsetX, result.OffsetY, result.HasManualTransform, result.ManualTransform.A, result.ManualTransform.B, result.ManualTransform.C, result.ManualTransform.D, result.ManualTransform.E, result.ManualTransform.F))
 	}
 
@@ -1657,6 +2132,20 @@ func AlignInputsBySelectedStars(inputs []Input, refStars []processing.Star) ([]S
 // linear WCS when needed.  The returned ManualTransform for every aligned image
 // is always expressed in inputs[0] pixel space.
 func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.Star, numRefs int, mode AlignmentMode, searchRadiusArcsec float64) ([]StarAlignmentResult, error) {
+	return AlignInputsBySelectedStarsWithModeCtx(context.Background(), inputs, refStars, numRefs, mode, searchRadiusArcsec)
+}
+
+// AlignInputsBySelectedStarsWithModeCtx is the cancellable selected-star
+// alignment entry point. Cancellation is checked between catalog extraction,
+// reference setup, and each target/reference fit so a superseded UI job cannot
+// continue expensive work or publish stale results.
+func AlignInputsBySelectedStarsWithModeCtx(ctx context.Context, inputs []Input, refStars []processing.Star, numRefs int, mode AlignmentMode, searchRadiusArcsec float64) ([]StarAlignmentResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: starting files=[%s]", alignmentInputFiles(inputs)))
 	defer debuglog.Log("AlignInputsBySelectedStarsWithMode: finished")
 	if len(inputs) == 0 {
@@ -1681,6 +2170,9 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 
 	results := make([]StarAlignmentResult, len(inputs))
 	for i := range inputs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if inputs[i].Excluded {
 			results[i] = StarAlignmentResult{
 				OffsetX:            inputs[i].OffsetX,
@@ -1693,6 +2185,9 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 		}
 	}
 	for r := 0; r < numRefs; r++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if inputs[r].Excluded {
 			continue
 		}
@@ -1721,12 +2216,22 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 	refs := make([]refEntry, numRefs)
 	refs[0] = refEntry{input: inputs[0], stars: refStars, hasWCS: true}
 	for r := 1; r < numRefs; r++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if inputs[r].Excluded {
 			refs[r] = refEntry{input: inputs[r]}
 			continue
 		}
-		w0toR, err0 := processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
-		wRto0, err1 := processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
+		var w0toR, wRto0 processing.AffineTransform
+		var err0, err1 error
+		if inputs[r].NativeGWCS != nil || inputs[0].NativeGWCS != nil {
+			w0toR, wRto0, err0 = referenceAffinePair(inputs[0], inputs[r])
+			err1 = err0
+		} else {
+			w0toR, err0 = processing.ComputeWCSTransform(inputs[r].HDU.Header, inputs[0].HDU.Header)
+			wRto0, err1 = processing.ComputeWCSTransform(inputs[0].HDU.Header, inputs[r].HDU.Header)
+		}
 		if err0 != nil || err1 != nil {
 			debuglog.Log(fmt.Sprintf("AlignInputsBySelectedStarsWithMode: reference=%s WCS error: %v / %v", InputKey(inputs[r]), err0, err1))
 			refs[r] = refEntry{input: inputs[r]}
@@ -1749,10 +2254,16 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 	// dataset is never resident at once. The reference catalogs come from the
 	// user-picked refStars (and their WCS projections), so only the non-reference
 	// targets are extracted here.
-	catalogs := extractStarCatalogsForAlignment(inputs, processing.TweakRegCatalogMaxStars)
+	catalogs, err := extractStarCatalogsForAlignmentCtx(ctx, inputs, processing.TweakRegCatalogMaxStars)
+	if err != nil {
+		return nil, err
+	}
 
 	// Align closest images first so results are more stable across runs.
 	for _, i := range sortedByDistFromRef(inputs) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if i < numRefs || inputs[i].Excluded {
 			continue
 		}
@@ -1761,6 +2272,9 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 		aligned := false
 
 		for r := 0; r < numRefs && !aligned; r++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			ref := refs[r]
 			if !ref.hasWCS {
 				continue
@@ -1774,10 +2288,7 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 			)
 			switch mode {
 			case AlignmentModeTweakRegRScale, AlignmentModeTweakRegGeneral:
-				mapper, mapErr := processing.NewWCSMapper(
-					inputs[i].HDU.Header, inputs[i].D2IX, inputs[i].D2IY,
-					ref.input.HDU.Header, ref.input.D2IX, ref.input.D2IY,
-				)
+				mapper, mapErr := newInputMapper(inputs[i], ref.input)
 				if mapErr != nil {
 					err = fmt.Errorf("WCSMapper: %v", mapErr)
 					break
@@ -1857,14 +2368,19 @@ func AlignInputsBySelectedStarsWithMode(inputs []Input, refStars []processing.St
 				manualT = processing.ComposeAffineTransforms(manualT, inputs[i].ManualTransform)
 			}
 			results[i] = StarAlignmentResult{
-				OffsetX:            inputs[i].OffsetX,
-				OffsetY:            inputs[i].OffsetY,
-				ManualTransform:    manualT,
-				HasManualTransform: true,
-				Applied:            true,
-				MatchedStars:       stats.MatchedStars,
-				RMS:                stats.RMS,
-				MaxError:           stats.MaxError,
+				OffsetX:             inputs[i].OffsetX,
+				OffsetY:             inputs[i].OffsetY,
+				ManualTransform:     manualT,
+				HasManualTransform:  true,
+				Applied:             true,
+				MatchedStars:        stats.MatchedStars,
+				RMS:                 stats.RMS,
+				MaxError:            stats.MaxError,
+				MedianError:         stats.MedianError,
+				DetectedSourceStars: stats.DetectedSourceStars, DetectedReferenceStars: stats.DetectedReferenceStars,
+				AcceptedStars: stats.AcceptedStars, RejectedStars: stats.RejectedStars, RANSACInlierPercent: stats.RANSACInlierPercent, FinalSupport: stats.FinalSupport, FinalSupportPercent: stats.FinalSupportPercent,
+				XRMS: stats.XRMS, YRMS: stats.YRMS, RadialRMS: stats.RadialRMS, Residuals: stats.Residuals,
+				RScaleTransform: stats.RScaleTransform, RScaleRMS: stats.RScaleRMS, RScaleMaxError: stats.RScaleMaxError, Warnings: stats.Warnings,
 			}
 			aligned = true
 		}
@@ -1906,11 +2422,58 @@ func SaveResultFITS(path string, result *Result) error {
 	if result == nil {
 		return fmt.Errorf("no drizzle result available")
 	}
-	return fitsio.WriteFloat32Image(path, result.OutputHeader, fitsio.ImageData{
+	var exts []fitsio.ImageExtension
+	if result.DiagnosticProducts {
+		if len(result.Weights) == result.Width*result.Height {
+			exts = append(exts, fitsio.ImageExtension{ExtName: "WHT", Data: fitsio.ImageData{Width: result.Width, Height: result.Height, Pixels: result.Weights}})
+		}
+		if len(result.NContrib) == result.Width*result.Height {
+			exts = append(exts, fitsio.ImageExtension{ExtName: "NCONTRIB", Data: fitsio.ImageData{Width: result.Width, Height: result.Height, Int32Pixels: result.NContrib}})
+		}
+		if len(result.Context) == result.Width*result.Height {
+			ctx := make([]int32, len(result.Context))
+			for i, v := range result.Context {
+				ctx[i] = int32(v)
+			}
+			exts = append(exts, fitsio.ImageExtension{ExtName: "CTX", Data: fitsio.ImageData{Width: result.Width, Height: result.Height, Int32Pixels: ctx}})
+		}
+		for i, plane := range result.ContextPlanes {
+			ctx := make([]int32, len(plane))
+			for j, v := range plane {
+				ctx[j] = int32(v)
+			}
+			cards := map[string]string{"CTXBIT": strconv.Itoa(i * 32)}
+			for bit := 0; bit < 32 && i*32+bit < len(result.ContextInputKeys); bit++ {
+				cards[fmt.Sprintf("CTXK%02d", bit)] = "'" + result.ContextInputKeys[i*32+bit] + "'"
+			}
+			exts = append(exts, fitsio.ImageExtension{ExtName: fmt.Sprintf("CTX%02d", i+1), Header: fitsio.Header{Cards: cards}, Data: fitsio.ImageData{Width: result.Width, Height: result.Height, Int32Pixels: ctx}})
+		}
+		mapping := strings.Join(result.ContextInputKeys, "\x00")
+		bytes := make([]int32, len(mapping))
+		for i, b := range []byte(mapping) {
+			bytes[i] = int32(b)
+		}
+		if len(bytes) > 0 {
+			exts = append(exts, fitsio.ImageExtension{ExtName: "CTXMAP", Header: fitsio.Header{Cards: map[string]string{"CTXNKEY": strconv.Itoa(len(result.ContextInputKeys))}}, Data: fitsio.ImageData{Width: len(bytes), Height: 1, Int32Pixels: bytes}})
+		}
+		if len(result.CRMask) == result.Width*result.Height {
+			exts = append(exts, fitsio.ImageExtension{ExtName: "CRMASK", Data: fitsio.ImageData{Width: result.Width, Height: result.Height, Int32Pixels: result.CRMask}})
+		}
+		if len(result.DQ) == result.Width*result.Height {
+			exts = append(exts, fitsio.ImageExtension{ExtName: "DQ", Data: fitsio.ImageData{Width: result.Width, Height: result.Height, Int32Pixels: result.DQ}})
+		}
+		if len(result.SkyModel) == result.Width*result.Height {
+			exts = append(exts, fitsio.ImageExtension{ExtName: "SKYMODEL", Data: fitsio.ImageData{Width: result.Width, Height: result.Height, Pixels: result.SkyModel}})
+		}
+		if len(result.Seam) == result.Width*result.Height {
+			exts = append(exts, fitsio.ImageExtension{ExtName: "SEAM", Data: fitsio.ImageData{Width: result.Width, Height: result.Height, Pixels: result.Seam}})
+		}
+	}
+	return fitsio.WriteFloat32ImageWithExtensions(path, result.OutputHeader, fitsio.ImageData{
 		Width:  result.Width,
 		Height: result.Height,
 		Pixels: result.Pixels,
-	})
+	}, exts...)
 }
 
 func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, float64, float64, float64, float64, error) {
@@ -1957,7 +2520,11 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 			// land undistorted, so a single multi-chip exposure's chips no
 			// longer line up (non-uniform chip gap, mismatched outer edges).
 			var mapperErr error
-			mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
+			if input.NativeGWCS != nil {
+				mapper, mapperErr = processing.NewNativeGWCSMapper(input.NativeGWCS, ref.HDU.Header)
+			} else {
+				mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
+			}
 			if mapperErr != nil {
 				statuses[idx].Status = "failed"
 				statuses[idx].Error = mapperErr.Error()
@@ -1970,7 +2537,11 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 			// This replaces the old chipPlacementTransform hack which stripped
 			// inter-chip rotation and produced a rotational offset in SCI[2].
 			var mapperErr error
-			mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
+			if input.NativeGWCS != nil {
+				mapper, mapperErr = processing.NewNativeGWCSMapper(input.NativeGWCS, ref.HDU.Header)
+			} else {
+				mapper, mapperErr = processing.NewWCSMapperToLinearRef(input.HDU.Header, input.D2IX, input.D2IY, ref.HDU.Header)
+			}
 			if mapperErr != nil {
 				statuses[idx].Status = "failed"
 				statuses[idx].Error = mapperErr.Error()
@@ -1978,21 +2549,32 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 				continue
 			}
 
-			// Also compute a linear affine approximation for CR detection.
-			refToSource, wcsErr := processing.ComputeWCSTransform(input.HDU.Header, ref.HDU.Header)
+			// CR detection needs an affine only as a compact working coordinate
+			// hint; native inputs derive it from native mapper control points.
+			var refToSource processing.AffineTransform
+			var wcsErr error
+			if input.NativeGWCS != nil {
+				refToSource, wcsErr = affineApproximationFromMapper(mapper)
+			} else {
+				refToSource, wcsErr = processing.ComputeWCSTransform(input.HDU.Header, ref.HDU.Header)
+			}
 			if wcsErr != nil {
 				statuses[idx].Status = "failed"
 				statuses[idx].Error = wcsErr.Error()
 				debuglog.Log(fmt.Sprintf("planInputs: FAILED %s - WCSTransform: %v", InputKey(input), wcsErr))
 				continue
 			}
-			var invertErr error
-			transform, invertErr = processing.InvertAffineTransform(refToSource)
-			if invertErr != nil {
-				statuses[idx].Status = "failed"
-				statuses[idx].Error = invertErr.Error()
-				debuglog.Log(fmt.Sprintf("planInputs: FAILED %s - InvertAffine: %v", InputKey(input), invertErr))
-				continue
+			if input.NativeGWCS != nil {
+				transform = refToSource
+			} else {
+				var invertErr error
+				transform, invertErr = processing.InvertAffineTransform(refToSource)
+				if invertErr != nil {
+					statuses[idx].Status = "failed"
+					statuses[idx].Error = invertErr.Error()
+					debuglog.Log(fmt.Sprintf("planInputs: FAILED %s - InvertAffine: %v", InputKey(input), invertErr))
+					continue
+				}
 			}
 			statuses[idx].Status = "aligned"
 		}
@@ -2073,12 +2655,16 @@ func planInputs(inputs []Input, scale float64) ([]plannedInput, []InputStatus, f
 // ref, so the output header describes what was drizzled rather than the WCS
 // anchor.
 func buildOutputHeader(ref, metaSource Input, width, height int, originX, originY, scale float64, includedCount int) fitsio.Header {
-	merged := mergeHeaders(ref.PrimaryHeader, ref.HDU.Header)
-	cards := fitsio.CloneHeader(merged).Cards
-
+	refMerged := mergeHeaders(ref.PrimaryHeader, ref.HDU.Header)
 	metaMerged := mergeHeaders(metaSource.PrimaryHeader, metaSource.HDU.Header)
-	for _, key := range []string{"FILTER", "FILTNAM1", "FILTNAM2", "FILTER1", "FILTER2", "PUPIL", "INSTRUME", "DETECTOR"} {
-		if v, ok := metaMerged.Cards[key]; ok {
+	cards := fitsio.CloneHeader(metaMerged).Cards
+
+	// A ReferenceOnly input supplies the output coordinate frame, but it is not
+	// a science contributor. Copy only WCS geometry from it so exposure and
+	// provenance metadata (for example EXPTIME and SRCFILE) describe the first
+	// actual science input instead of the reference image.
+	for _, key := range outputWCSHeaderCards {
+		if v, ok := refMerged.Cards[key]; ok {
 			cards[key] = v
 		} else {
 			delete(cards, key)
@@ -2088,6 +2674,9 @@ func buildOutputHeader(ref, metaSource Input, width, height int, originX, origin
 	for _, key := range []string{
 		"END", "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "XTENSION", "PCOUNT", "GCOUNT", "EXTNAME", "EXTVER",
 		"CHECKSUM", "DATASUM", "BSCALE", "BZERO", "LTV1", "LTV2", "LTM1_1", "LTM2_2",
+		// GWCSMODEL is an input-loader marker for native ASDF transforms, not
+		// a valid description of the linear TAN output written by drizzle.
+		"GWCSMODEL",
 	} {
 		delete(cards, key)
 	}
@@ -2102,7 +2691,7 @@ func buildOutputHeader(ref, metaSource Input, width, height int, originX, origin
 	cards["CTYPE1"] = stripSIPSuffix(cards["CTYPE1"])
 	cards["CTYPE2"] = stripSIPSuffix(cards["CTYPE2"])
 
-	cards["OBJECT"] = firstNonEmpty(cards["OBJECT"], quotedString(filepath.Base(ref.Path)))
+	cards["OBJECT"] = firstNonEmpty(cards["OBJECT"], quotedString(filepath.Base(metaSource.Path)))
 	cards["IMAGETYP"] = quotedString("DRIZZLE")
 	cards["NCOMBINE"] = strconv.Itoa(includedCount)
 	cards["DRIZSCAL"] = formatFloat(scale)
@@ -2140,6 +2729,13 @@ func buildOutputHeader(ref, metaSource Input, width, height int, originX, origin
 	}
 
 	return fitsio.Header{Cards: cards}
+}
+
+var outputWCSHeaderCards = []string{
+	"WCSAXES", "WCSNAME", "CTYPE1", "CTYPE2", "CUNIT1", "CUNIT2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2",
+	"CD1_1", "CD1_2", "CD2_1", "CD2_2", "CDELT1", "CDELT2",
+	"PC1_1", "PC1_2", "PC2_1", "PC2_2", "CROTA1", "CROTA2",
+	"RADESYS", "EQUINOX", "LONPOLE", "LATPOLE",
 }
 
 func isDistortionHeaderCard(key string) bool {
@@ -2200,7 +2796,7 @@ func drizzleSepFrame(p plannedInput, pixels []float32, outW, outH int, minX, min
 	weights := make([]float32, outW*outH)
 	// Keep the original behavior of not trimming the separate CR-model frames.
 	trimX, trimY := 0, 0
-	drizzlePlannedInput(p, out, weights, outW, outH, minX, minY, scale, dropSize, kernel, weightingMode, nil, pixels, trimX, trimY)
+	drizzlePlannedInput(p, out, weights, outW, outH, minX, minY, scale, dropSize, kernel, weightingMode, nil, pixels, trimX, trimY, nil)
 
 	for i := range out {
 		if abs32(weights[i]) <= weightEpsilon {
@@ -2241,22 +2837,22 @@ func normalizeAccumulatedImage(sums, weights []float32) {
 	}
 }
 
-func drizzlePlannedInput(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, kernel DrizzleKernel, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int) {
+func drizzlePlannedInput(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, kernel DrizzleKernel, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	switch kernel {
 	case KernelPoint:
-		drizzlePlannedInputPoint(p, sums, weights, width, height, minX, minY, scale, weightingMode, crMask, pixels, trimX, trimY)
+		drizzlePlannedInputPoint(p, sums, weights, width, height, minX, minY, scale, weightingMode, crMask, pixels, trimX, trimY, diag)
 	case KernelTurbo:
-		drizzlePlannedInputTurbo(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY)
+		drizzlePlannedInputTurbo(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
 	case KernelGaussian:
-		drizzlePlannedInputGaussian(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY)
+		drizzlePlannedInputGaussian(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
 	case KernelTophat:
-		drizzlePlannedInputTophat(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY)
+		drizzlePlannedInputTophat(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
 	case KernelLanczos2:
-		drizzlePlannedInputLanczos(p, sums, weights, width, height, minX, minY, scale, 2, weightingMode, crMask, pixels, trimX, trimY)
+		drizzlePlannedInputLanczos(p, sums, weights, width, height, minX, minY, scale, 2, weightingMode, crMask, pixels, trimX, trimY, diag)
 	case KernelLanczos3:
-		drizzlePlannedInputLanczos(p, sums, weights, width, height, minX, minY, scale, 3, weightingMode, crMask, pixels, trimX, trimY)
+		drizzlePlannedInputLanczos(p, sums, weights, width, height, minX, minY, scale, 3, weightingMode, crMask, pixels, trimX, trimY, diag)
 	default:
-		drizzlePlannedInputSquare(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY)
+		drizzlePlannedInputSquare(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
 	}
 }
 
@@ -2406,7 +3002,7 @@ func drizzlePixelValue(p plannedInput, idx int, value float32, weightingMode Wei
 	return value
 }
 
-func drizzlePlannedInputPoint(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int) {
+func drizzlePlannedInputPoint(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
@@ -2427,12 +3023,12 @@ func drizzlePlannedInputPoint(p plannedInput, sums, weights []float32, width, he
 				continue
 			}
 			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
-			drizzlePixelPoint(sums, weights, width, height, outX, outY, value, drizzlePixelWeight(p, idx, weightingMode))
+			drizzlePixelPoint(sums, weights, width, height, outX, outY, value, drizzlePixelWeight(p, idx, weightingMode), diag)
 		}
 	}
 }
 
-func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int) {
+func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
 	half := normalizedDropSize(dropSize) / 2.0
 	const rowInterval = 200
@@ -2466,7 +3062,7 @@ func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, h
 				}
 				continue
 			}
-			drizzlePixelSquarePrepared(sums, weights, width, height, outX, outY, half, value, drizzlePixelWeight(p, idx, weightingMode))
+			drizzlePixelSquarePrepared(sums, weights, width, height, outX, outY, half, value, drizzlePixelWeight(p, idx, weightingMode), diag)
 		}
 	}
 	if extremeCount > 0 {
@@ -2474,7 +3070,7 @@ func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, h
 	}
 }
 
-func drizzlePlannedInputTurbo(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int) {
+func drizzlePlannedInputTurbo(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
 	half := normalizedDropSize(dropSize) / 2.0
 	const rowInterval = 200
@@ -2496,12 +3092,12 @@ func drizzlePlannedInputTurbo(p plannedInput, sums, weights []float32, width, he
 				continue
 			}
 			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
-			drizzlePixelTurboPrepared(sums, weights, width, height, outX, outY, half, value, drizzlePixelWeight(p, idx, weightingMode))
+			drizzlePixelTurboPrepared(sums, weights, width, height, outX, outY, half, value, drizzlePixelWeight(p, idx, weightingMode), diag)
 		}
 	}
 }
 
-func drizzlePlannedInputGaussian(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int) {
+func drizzlePlannedInputGaussian(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
 	sigma := normalizedDropSize(dropSize) / (2 * math.Sqrt(2*math.Log(2)))
 	params := gaussianParams{twoSigSq: 2 * sigma * sigma, radius: 3 * sigma}
@@ -2524,12 +3120,12 @@ func drizzlePlannedInputGaussian(p plannedInput, sums, weights []float32, width,
 				continue
 			}
 			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
-			drizzlePixelGaussianPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, weightingMode))
+			drizzlePixelGaussianPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, weightingMode), diag)
 		}
 	}
 }
 
-func drizzlePlannedInputTophat(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int) {
+func drizzlePlannedInputTophat(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
 	radius := normalizedDropSize(dropSize) / 2.0
 	params := tophatParams{radius: radius, radSq: radius * radius}
@@ -2552,12 +3148,12 @@ func drizzlePlannedInputTophat(p plannedInput, sums, weights []float32, width, h
 				continue
 			}
 			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
-			drizzlePixelTophatPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, weightingMode))
+			drizzlePixelTophatPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, weightingMode), diag)
 		}
 	}
 }
 
-func drizzlePlannedInputLanczos(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale float64, n int, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int) {
+func drizzlePlannedInputLanczos(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale float64, n int, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
@@ -2578,7 +3174,7 @@ func drizzlePlannedInputLanczos(p plannedInput, sums, weights []float32, width, 
 				continue
 			}
 			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
-			drizzlePixelLanczosPrepared(sums, weights, width, height, outX, outY, value, n, drizzlePixelWeight(p, idx, weightingMode))
+			drizzlePixelLanczosPrepared(sums, weights, width, height, outX, outY, value, n, drizzlePixelWeight(p, idx, weightingMode), diag)
 		}
 	}
 }
@@ -2607,7 +3203,7 @@ func clampKernelBounds(x0, x1, y0, y1, width, height int) (int, int, int, int, b
 }
 
 // drizzlePixelPoint deposits flux into the single nearest output pixel.
-func drizzlePixelPoint(sums, weights []float32, width, height int, cx, cy float64, value float32, pixelWeight float32) {
+func drizzlePixelPoint(sums, weights []float32, width, height int, cx, cy float64, value float32, pixelWeight float32, diag *drizzleDiagnostics) {
 	x := int(math.Round(cx))
 	y := int(math.Round(cy))
 	if x < 0 || x >= width || y < 0 || y >= height {
@@ -2616,11 +3212,12 @@ func drizzlePixelPoint(sums, weights []float32, width, height int, cx, cy float6
 	idx := y*width + x
 	sums[idx] += value * pixelWeight
 	weights[idx] += pixelWeight
+	diag.mark(idx)
 }
 
 // drizzlePixelSquarePrepared is the classic drizzle box-overlap kernel with
 // precomputed half drop size.
-func drizzlePixelSquarePrepared(sums, weights []float32, width, height int, cx, cy, half float64, value float32, pixelWeight float32) {
+func drizzlePixelSquarePrepared(sums, weights []float32, width, height int, cx, cy, half float64, value float32, pixelWeight float32, diag *drizzleDiagnostics) {
 	if width <= 0 || height <= 0 {
 		return
 	}
@@ -2660,6 +3257,7 @@ func drizzlePixelSquarePrepared(sums, weights []float32, width, height int, cx, 
 			idx := row + x
 			sums[idx] += value * w
 			weights[idx] += w
+			diag.mark(idx)
 		}
 	}
 }
@@ -2667,14 +3265,14 @@ func drizzlePixelSquarePrepared(sums, weights []float32, width, height int, cx, 
 // drizzlePixelTurboPrepared is a fast axis-aligned approximation: it accumulates
 // into every output pixel whose center falls within the drop footprint with
 // equal weight, skipping fractional-edge overlap computation.
-func drizzlePixelTurboPrepared(sums, weights []float32, width, height int, cx, cy, half float64, value float32, pixelWeight float32) {
+func drizzlePixelTurboPrepared(sums, weights []float32, width, height int, cx, cy, half float64, value float32, pixelWeight float32, diag *drizzleDiagnostics) {
 	x0 := int(math.Ceil(cx - half))
 	x1 := int(math.Floor(cx + half))
 	y0 := int(math.Ceil(cy - half))
 	y1 := int(math.Floor(cy + half))
 	if x0 > x1 || y0 > y1 {
 		// Drop is smaller than one pixel: fall back to nearest.
-		drizzlePixelPoint(sums, weights, width, height, cx, cy, value, pixelWeight)
+		drizzlePixelPoint(sums, weights, width, height, cx, cy, value, pixelWeight, diag)
 		return
 	}
 	var ok bool
@@ -2688,6 +3286,7 @@ func drizzlePixelTurboPrepared(sums, weights []float32, width, height int, cx, c
 			idx := row + x
 			sums[idx] += value * pixelWeight
 			weights[idx] += pixelWeight
+			diag.mark(idx)
 		}
 	}
 }
@@ -2698,7 +3297,7 @@ type gaussianParams struct {
 }
 
 // drizzlePixelGaussianPrepared spreads flux with a Gaussian footprint.
-func drizzlePixelGaussianPrepared(sums, weights []float32, width, height int, cx, cy float64, params gaussianParams, value float32, pixelWeight float32) {
+func drizzlePixelGaussianPrepared(sums, weights []float32, width, height int, cx, cy float64, params gaussianParams, value float32, pixelWeight float32, diag *drizzleDiagnostics) {
 	x0 := int(math.Floor(cx - params.radius))
 	x1 := int(math.Ceil(cx + params.radius))
 	y0 := int(math.Floor(cy - params.radius))
@@ -2721,6 +3320,7 @@ func drizzlePixelGaussianPrepared(sums, weights []float32, width, height int, cx
 			idx := row + x
 			sums[idx] += value * w
 			weights[idx] += w
+			diag.mark(idx)
 		}
 	}
 }
@@ -2731,7 +3331,7 @@ type tophatParams struct {
 }
 
 // drizzlePixelTophatPrepared spreads flux uniformly within a circular aperture.
-func drizzlePixelTophatPrepared(sums, weights []float32, width, height int, cx, cy float64, params tophatParams, value float32, pixelWeight float32) {
+func drizzlePixelTophatPrepared(sums, weights []float32, width, height int, cx, cy float64, params tophatParams, value float32, pixelWeight float32, diag *drizzleDiagnostics) {
 	x0 := int(math.Floor(cx - params.radius))
 	x1 := int(math.Ceil(cx + params.radius))
 	y0 := int(math.Floor(cy - params.radius))
@@ -2752,6 +3352,7 @@ func drizzlePixelTophatPrepared(sums, weights []float32, width, height int, cx, 
 			idx := row + x
 			sums[idx] += value * pixelWeight
 			weights[idx] += pixelWeight
+			diag.mark(idx)
 		}
 	}
 }
@@ -2772,7 +3373,7 @@ func lanczos(x float64, n int) float64 {
 // drizzlePixelLanczosPrepared uses a separable Lanczos-n resampling kernel.
 // It accumulates signed kernel weights. Using abs(weight) here changes the
 // interpolation normalization and can damp/alter sharp features.
-func drizzlePixelLanczosPrepared(sums, weights []float32, width, height int, cx, cy float64, value float32, n int, pixelWeight float32) {
+func drizzlePixelLanczosPrepared(sums, weights []float32, width, height int, cx, cy float64, value float32, n int, pixelWeight float32, diag *drizzleDiagnostics) {
 	x0 := int(math.Floor(cx)) - n + 1
 	x1 := int(math.Floor(cx)) + n
 	y0 := int(math.Floor(cy)) - n + 1
@@ -2798,13 +3399,14 @@ func drizzlePixelLanczosPrepared(sums, weights []float32, width, height int, cx,
 			idx := row + x
 			sums[idx] += value * w
 			weights[idx] += w
+			diag.mark(idx)
 		}
 	}
 }
 
 // drizzlePixelSquare is the classic drizzle box-overlap kernel.
-func drizzlePixelSquare(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, pixelWeight float32) {
-	drizzlePixelSquarePrepared(sums, weights, width, height, cx, cy, normalizedDropSize(dropSize)/2.0, value, pixelWeight)
+func drizzlePixelSquare(sums, weights []float32, width, height int, cx, cy, dropSize float64, value float32, pixelWeight float32, diag *drizzleDiagnostics) {
+	drizzlePixelSquarePrepared(sums, weights, width, height, cx, cy, normalizedDropSize(dropSize)/2.0, value, pixelWeight, diag)
 }
 
 func FormatStatusLines(inputs []InputStatus) []string {
@@ -2865,7 +3467,36 @@ func LooksLikeCal(path string) bool {
 // LooksLikeCalibratedInput reports whether path is a supported calibrated
 // science exposure: HST _flc/_flt or JWST _cal.
 func LooksLikeCalibratedInput(path string) bool {
-	return LooksLikeFLC(path) || LooksLikeCal(path)
+	return LooksLikeFLC(path) || LooksLikeCal(path) || LooksLikeGemini(path) || strings.EqualFold(filepath.Ext(path), ".asdf")
+}
+
+// LooksLikeGemini identifies FITS files from the Gemini Multi-Object
+// Spectrograph. Raw GMOS files are admitted so the loader can apply the
+// detector-section preparation before drizzle.
+func LooksLikeGemini(path string) bool {
+	if strings.EqualFold(filepath.Ext(path), ".asdf") {
+		return false
+	}
+	h, err := fitsio.LoadPrimaryHeader(path)
+	return err == nil && IsGeminiHeader(h)
+}
+
+func IsGeminiHeader(h fitsio.Header) bool {
+	inst := strings.ToUpper(fitsio.HeaderString(h, "INSTRUME", "INSTRUMENT"))
+	return strings.Contains(inst, "GMOS")
+}
+
+func IsGeminiCalibrationHeader(h fitsio.Header) bool {
+	if !IsGeminiHeader(h) {
+		return false
+	}
+	for _, key := range []string{"OBSTYPE", "IMAGETYP", "OBJECT"} {
+		t := strings.ToUpper(strings.TrimSpace(fitsio.HeaderString(h, key)))
+		if strings.Contains(t, "BIAS") || strings.Contains(t, "FLAT") || strings.Contains(t, "TWILIGHT") || strings.Contains(t, "DARK") || strings.Contains(t, "MASK") || strings.Contains(t, "MDF") || strings.Contains(t, "BAD PIXEL") || t == "BPM" || strings.Contains(t, "BAD PIXEL MASK") {
+			return true
+		}
+	}
+	return false
 }
 
 func formatFloat(v float64) string {
@@ -2890,6 +3521,15 @@ func firstDataInput(inputs []Input) Input {
 		}
 	}
 	return inputs[0]
+}
+
+func firstPlannedDataInput(planned []plannedInput) Input {
+	for _, p := range planned {
+		if !p.input.ReferenceOnly {
+			return p.input
+		}
+	}
+	return planned[0].input
 }
 
 // wcsReferenceInput returns the input whose WCS should anchor the output header.

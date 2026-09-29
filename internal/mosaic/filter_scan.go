@@ -36,6 +36,9 @@ type FilterFile struct {
 	// DateObs is the observation calendar date ("YYYY-MM-DD") parsed from the
 	// DATE-OBS header, or "" when absent. Used for range filtering.
 	DateObs string
+	// Product identifies the source family: flc, flt, cal, or gemini-science.
+	// Gemini calibration frames are intentionally never returned by discovery.
+	Product string
 }
 
 func IsPipelineProductFLC(path string) bool {
@@ -53,11 +56,11 @@ func DiscoverFITSFiles(dir string) ([]string, error) {
 
 	paths := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() || strings.HasSuffix(strings.ToLower(entry.Name()), "_starmap.fits") {
 			continue
 		}
 		switch strings.ToLower(filepath.Ext(entry.Name())) {
-		case ".fits", ".fit", ".fts":
+		case ".fits", ".fit", ".fts", ".asdf":
 			paths = append(paths, filepath.Join(dir, entry.Name()))
 		}
 	}
@@ -151,13 +154,26 @@ func scanFilterHeaders(paths []string) []FilterFile {
 				if i >= len(paths) {
 					return
 				}
-				header, err := fitsio.LoadPrimaryHeader(paths[i])
+				var header fitsio.Header
+				var err error
+				if strings.EqualFold(filepath.Ext(paths[i]), ".asdf") {
+					var inputs []Input
+					inputs, err = LoadInputsMetadataFromPath(paths[i])
+					if len(inputs) > 0 {
+						header = inputs[0].PrimaryHeader
+					}
+				} else {
+					header, err = fitsio.LoadPrimaryHeader(paths[i])
+				}
 				if err != nil {
 					continue
 				}
 				filter := fitsio.FilterString(header)
 				if filter == "" {
 					filter = "Unknown"
+				}
+				if IsGeminiCalibrationHeader(header) {
+					continue
 				}
 				proposalID := fitsio.HeaderString(header, "PROPOSID", "PROPOSAL", "PROPOSALID", "PROGRAM")
 				if proposalID == "" {
@@ -174,6 +190,7 @@ func scanFilterHeaders(paths []string) []FilterFile {
 					Instrument:   instrument,
 					ExposureTime: formatExposure(loadExposureTime(header)),
 					DateObs:      parseDateObs(fitsio.HeaderString(header, "DATE-OBS", "DATEOBS")),
+					Product:      ProductType(paths[i]),
 				}
 				ok[i] = true
 			}
@@ -349,6 +366,9 @@ func parseDateObs(raw string) string {
 	if len(date) != 10 || date[4] != '-' || date[7] != '-' {
 		return ""
 	}
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		return ""
+	}
 	return date
 }
 
@@ -402,6 +422,8 @@ func ProductType(path string) string {
 		return "flt"
 	case strings.Contains(base, "_cal"):
 		return "cal"
+	case LooksLikeGemini(path):
+		return "gemini"
 	default:
 		return ""
 	}

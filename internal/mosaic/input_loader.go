@@ -1,10 +1,13 @@
 package mosaic
 
 import (
+	"context"
 	"fmt"
 	"math"
+	"path/filepath"
 	"strings"
 
+	"gofitsv3/internal/astroio"
 	"gofitsv3/internal/badpix"
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/instrument"
@@ -15,6 +18,9 @@ import (
 // Each SCI extension is returned as its own input so drizzle can treat
 // multi-chip files the same way AstroDrizzle does.
 func LoadInputsFromPath(path string) ([]Input, error) {
+	if isASDFPath(path) {
+		return loadASDFInputs(path, true)
+	}
 	file, err := fitsio.LoadFile(path)
 	if err != nil {
 		return nil, err
@@ -24,9 +30,13 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 	}
 
 	primary := file.HDUs[0].Header
+	if fitsio.HeaderString(primary, "PRODUCT") == "STARMAP" {
+		return nil, fmt.Errorf("star-map FITS is a derived mask, not a science exposure")
+	}
 	inst, _ := instrument.FromHeader(primary)
-	sci := file.SelectSCI()
+	sci := scienceHDUs(file, primary)
 	if len(sci) == 0 {
+		excluded, repaired := diagnosticDQMasks(file.HDUs[0], file, inst)
 		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst)
 		return []Input{{
 			Path:          path,
@@ -36,13 +46,25 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 			DateObs:       loadDateObs(primary, hdu.Header),
 			BUnit:         loadBUnit(hdu.Header, primary),
 			WeightPixels:  loadWHTPixels(file),
+			DQExcluded:    excluded, DQRepaired: repaired,
 		}}, nil
 	}
 
 	inputs := make([]Input, 0, len(sci))
 	for i := range sci {
+		excluded, repaired := diagnosticDQMasks(sci[i], file, inst)
 		hdu := cleanSCIWithMatchingDQ(sci[i], file, inst)
-		extver := sciExtNumber(hdu.Header, i+1)
+		if IsGeminiHeader(primary) {
+			var prepErr error
+			hdu, prepErr = prepareGMOSHDU(hdu)
+			if prepErr != nil {
+				return nil, prepErr
+			}
+		}
+		extver := i + 1
+		if !IsGeminiHeader(primary) || strings.TrimSpace(hdu.ExtName) != "" {
+			extver = sciExtNumber(hdu.Header, i+1)
+		}
 		d2iX, d2iY := loadD2ITables(file, extver)
 		inputs = append(inputs, Input{
 			Path:          path,
@@ -54,7 +76,8 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 			BUnit:         loadBUnit(hdu.Header, primary),
 			D2IX:          d2iX,
 			D2IY:          d2iY,
-			ERRPixels:     loadERRPixels(file, extver),
+			ERRPixels:     loadERRPixels(file, extver, fitsio.HeaderString(hdu.Header, "EXTVER") == ""),
+			DQExcluded:    excluded, DQRepaired: repaired,
 		})
 	}
 	return inputs, nil
@@ -72,6 +95,9 @@ func LoadInputsFromPath(path string) ([]Input, error) {
 // D2IMARR tables are loaded here because the build planner reads them from the
 // in-memory Input and does not reload them per frame.
 func LoadInputsMetadataFromPath(path string) ([]Input, error) {
+	if isASDFPath(path) {
+		return loadASDFInputs(path, false)
+	}
 	file, err := fitsio.LoadFileMetadata(path)
 	if err != nil {
 		return nil, err
@@ -81,7 +107,10 @@ func LoadInputsMetadataFromPath(path string) ([]Input, error) {
 	}
 
 	primary := file.HDUs[0].Header
-	sci := file.SelectSCI()
+	if fitsio.HeaderString(primary, "PRODUCT") == "STARMAP" {
+		return nil, fmt.Errorf("star-map FITS is a derived mask, not a science exposure")
+	}
+	sci := scienceHDUs(file, primary)
 	if len(sci) == 0 {
 		hdu := file.HDUs[0]
 		return []Input{{
@@ -97,7 +126,17 @@ func LoadInputsMetadataFromPath(path string) ([]Input, error) {
 	inputs := make([]Input, 0, len(sci))
 	for i := range sci {
 		hdu := sci[i]
-		extver := sciExtNumber(hdu.Header, i+1)
+		if IsGeminiHeader(primary) {
+			var prepErr error
+			hdu, prepErr = prepareGMOSMetadata(hdu)
+			if prepErr != nil {
+				return nil, prepErr
+			}
+		}
+		extver := i + 1
+		if !IsGeminiHeader(primary) || strings.TrimSpace(hdu.ExtName) != "" {
+			extver = sciExtNumber(hdu.Header, i+1)
+		}
 		d2iX, d2iY := loadD2ITables(file, extver)
 		inputs = append(inputs, Input{
 			Path:          path,
@@ -121,7 +160,7 @@ func LoadInputsMetadataFromPath(path string) ([]Input, error) {
 // the WHT plane of a combined working file) when needAux is set, and the primary
 // image of a single-HDU file. Skipped extensions are not decoded, so multi-chip
 // exposures are not re-decoded in full per chip.
-func chipDecodePredicate(sciExtVer int, needAux bool) func(fitsio.Header) bool {
+func chipDecodePredicate(sciExtVer int, needAux bool, gemini ...bool) func(fitsio.Header) bool {
 	want := fmt.Sprintf("%d", sciExtVer)
 	matchesChip := func(hdr fitsio.Header) bool {
 		ev := fitsio.HeaderString(hdr, "EXTVER")
@@ -140,10 +179,28 @@ func chipDecodePredicate(sciExtVer int, needAux bool) func(fitsio.Header) bool {
 		case "":
 			// Primary image of a single-HDU file (multi-extension primaries have
 			// NAXIS=0 and are filtered out by the data-size guard in fitsio).
+			// Unnamed GMOS chips may all carry EXTVER=-1 (or no EXTVER), so
+			// decode all unnamed images and select the ordinal after parsing.
 			return true
 		}
 		return false
 	}
+}
+
+// scienceHDUs recognizes the unnamed image extensions emitted by raw GMOS
+// three-chip files. Other instruments retain the strict SCI convention.
+func scienceHDUs(file *fitsio.File, primary fitsio.Header) []fitsio.HDU {
+	if sci := file.SelectSCI(); len(sci) > 0 || !IsGeminiHeader(primary) {
+		return sci
+	}
+	result := make([]fitsio.HDU, 0, len(file.HDUs)-1)
+	for i := 1; i < len(file.HDUs); i++ {
+		h := file.HDUs[i]
+		if h.Data.Width > 0 && h.Data.Height > 0 && strings.TrimSpace(h.ExtName) == "" {
+			result = append(result, h)
+		}
+	}
+	return result
 }
 
 // loadChipFromDisk loads only the one SCI chip matching in.SCIExt (plus the DQ
@@ -154,7 +211,20 @@ func chipDecodePredicate(sciExtVer int, needAux bool) func(fitsio.Header) bool {
 // memory and I/O and without re-decoding the whole file once per chip for
 // multi-chip exposures.
 func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w, h int, err error) {
-	file, err := fitsio.LoadFileSelective(in.Path, chipDecodePredicate(in.SCIExt, needAux))
+	if isASDFPath(in.Path) {
+		sci, errPix, _, err = loadASDFPlanes(in.Path, needAux)
+		if err != nil {
+			return nil, nil, nil, 0, 0, err
+		}
+		return sci, errPix, nil, in.HDU.Data.Width, in.HDU.Data.Height, nil
+	}
+	gemini := IsGeminiHeader(in.PrimaryHeader)
+	file, err := fitsio.LoadFileSelectiveIndexed(in.Path, func(index int, hdr fitsio.Header) bool {
+		if gemini && strings.TrimSpace(fitsio.HeaderString(hdr, "EXTNAME")) == "" {
+			return index == in.SCIExt
+		}
+		return chipDecodePredicate(in.SCIExt, needAux, gemini)(hdr)
+	})
 	if err != nil {
 		return nil, nil, nil, 0, 0, err
 	}
@@ -163,7 +233,7 @@ func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w,
 	}
 
 	inst, _ := instrument.FromHeader(file.HDUs[0].Header)
-	sciHDUs := file.SelectSCI()
+	sciHDUs := scienceHDUs(file, file.HDUs[0].Header)
 	if len(sciHDUs) == 0 {
 		hdu := cleanSCIWithMatchingDQ(file.HDUs[0], file, inst)
 		if needAux {
@@ -175,7 +245,11 @@ func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w,
 	target := sciHDUs[0]
 	matched := false
 	for i := range sciHDUs {
-		if sciExtNumber(sciHDUs[i].Header, i+1) == in.SCIExt {
+		chipNumber := sciExtNumber(sciHDUs[i].Header, i+1)
+		if IsGeminiHeader(file.HDUs[0].Header) && strings.TrimSpace(sciHDUs[i].ExtName) == "" {
+			chipNumber = i + 1
+		}
+		if chipNumber == in.SCIExt {
 			target = sciHDUs[i]
 			matched = true
 			break
@@ -188,8 +262,15 @@ func loadChipFromDisk(in Input, needAux bool) (sci, errPix, whtPix []float32, w,
 		return nil, nil, nil, 0, 0, fmt.Errorf("SCI ext %d not loaded from %s", in.SCIExt, in.Path)
 	}
 	hdu := cleanSCIWithMatchingDQ(target, file, inst)
+	if IsGeminiHeader(file.HDUs[0].Header) && strings.TrimSpace(target.ExtName) == "" {
+		var prepErr error
+		hdu, prepErr = prepareGMOSHDU(hdu)
+		if prepErr != nil {
+			return nil, nil, nil, 0, 0, prepErr
+		}
+	}
 	if needAux {
-		errPix = loadERRPixels(file, in.SCIExt)
+		errPix = loadERRPixels(file, in.SCIExt, fitsio.HeaderString(target.Header, "EXTVER") == "")
 	}
 	return hdu.Data.Pixels, errPix, whtPix, hdu.Data.Width, hdu.Data.Height, nil
 }
@@ -212,6 +293,179 @@ func LoadInputFromPath(path string) (Input, error) {
 		return Input{}, fmt.Errorf("no mosaic inputs found in %s", path)
 	}
 	return inputs[0], nil
+}
+
+func isASDFPath(path string) bool { return strings.EqualFold(filepath.Ext(path), ".asdf") }
+
+func loadASDFInputs(path string, pixels bool) ([]Input, error) {
+	src, err := astroio.Open(context.Background(), path)
+	if err != nil {
+		return nil, err
+	}
+	meta, err := src.Metadata(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	var data astroio.PlaneInfo
+	for _, plane := range meta.Planes {
+		if plane.ID == astroio.PlaneID("asdf:data") {
+			data = plane
+			break
+		}
+	}
+	if data.Width <= 0 || data.Height <= 0 {
+		return nil, fmt.Errorf("ASDF %s has no supported 2-D data plane", path)
+	}
+	if meta.NativeGWCS == nil || (meta.Cards["GWCSMODEL"] != "MIRI_NATIVE_GWCS" && meta.Cards["GWCSMODEL"] != "NIRCAM_NATIVE_GWCS") {
+		return nil, fmt.Errorf("ASDF %s is Examine-only for Mosaic: embedded GWCS is not a registered native imaging pipeline", path)
+	}
+	header, err := asdfMosaicHeader(meta.Cards)
+	if err != nil {
+		return nil, fmt.Errorf("ASDF %s is Examine-only for Mosaic: %w", path, err)
+	}
+	in := Input{Path: path, PrimaryHeader: header, NativeGWCS: meta.NativeGWCS, NativeGWCSProfile: meta.NativeGWCSProfile, HDU: fitsio.HDU{Header: header, ExtName: "SCI", Data: fitsio.ImageData{Width: data.Width, Height: data.Height}},
+		ExposureTime: loadExposureTime(header), DateObs: loadDateObs(header), BUnit: loadBUnit(header)}
+	if pixels {
+		in.HDU.Data.Pixels, in.ERRPixels, in.DQExcluded, err = loadASDFPlanes(path, true)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return []Input{in}, nil
+}
+
+func asdfMosaicHeader(cards map[string]string) (fitsio.Header, error) {
+	h := fitsio.Header{Cards: map[string]string{}}
+	// The header below is an internal compiled representation of the native
+	// forward evaluator. It is never treated as an input fallback: planInputs
+	// requires NativeGWCS and invokes the native mapper explicitly.
+	keys := []string{"CRPIX1", "CRPIX2", "CRVAL1", "CRVAL2"}
+	for _, key := range keys {
+		value := cards[key]
+		if value == "" {
+			return fitsio.Header{}, fmt.Errorf("supported meta.wcsinfo is missing %s", key)
+		}
+		h.Cards[key] = value
+	}
+	for key, value := range cards {
+		if key == "GWCSMODEL" || strings.HasPrefix(key, "A_") || strings.HasPrefix(key, "B_") || strings.HasPrefix(key, "AP_") || strings.HasPrefix(key, "BP_") || key == "CD1_1" || key == "CD1_2" || key == "CD2_1" || key == "CD2_2" || key == "CDELT1" || key == "CDELT2" || key == "CTYPE1" || key == "CTYPE2" || key == "FILTER" || key == "INSTRUME" || key == "DETECTOR" || key == "EXPTIME" || key == "DATE-OBS" || key == "BUNIT" {
+			h.Cards[key] = value
+		}
+	}
+	for _, key := range []string{"PC1_1", "PC1_2", "PC2_1", "PC2_2", "CTYPE1", "CTYPE2", "FILTER", "INSTRUME", "DETECTOR", "EXPTIME", "DATE-OBS", "BUNIT"} {
+		if value := cards[key]; value != "" {
+			h.Cards[key] = value
+		}
+	}
+	for _, key := range keys {
+		v, ok := fitsio.HeaderFloat(h, key)
+		if !ok || math.IsNaN(v) || math.IsInf(v, 0) {
+			return fitsio.Header{}, fmt.Errorf("supported meta.wcsinfo has invalid %s", key)
+		}
+	}
+	valid := func(key string) bool {
+		v, ok := fitsio.HeaderFloat(h, key)
+		return ok && math.IsNaN(v) == false && math.IsInf(v, 0) == false
+	}
+	hasCD11, hasCD12 := valid("CD1_1"), valid("CD1_2")
+	hasCD21, hasCD22 := valid("CD2_1"), valid("CD2_2")
+	hasCDELT1, hasCDELT2 := valid("CDELT1"), valid("CDELT2")
+	if !(hasCD11 && hasCD12 && hasCD21 && hasCD22) && !(hasCDELT1 && hasCDELT2) {
+		return fitsio.Header{}, fmt.Errorf("supported meta.wcsinfo requires complete CD or CDELT terms")
+	}
+	if h.Cards["CTYPE1"] != "" && h.Cards["CTYPE2"] == "" || h.Cards["CTYPE1"] == "" && h.Cards["CTYPE2"] != "" {
+		return fitsio.Header{}, fmt.Errorf("supported meta.wcsinfo requires both CTYPE1 and CTYPE2")
+	}
+	if h.Cards["CD1_1"] != "" {
+		for _, key := range []string{"CD1_2", "CD2_1", "CD2_2"} {
+			if h.Cards[key] == "" {
+				return fitsio.Header{}, fmt.Errorf("supported meta.wcsinfo has incomplete CD matrix")
+			}
+		}
+		if a, _ := fitsio.HeaderFloat(h, "CD1_1"); true {
+			b, _ := fitsio.HeaderFloat(h, "CD1_2")
+			c, _ := fitsio.HeaderFloat(h, "CD2_1")
+			d, _ := fitsio.HeaderFloat(h, "CD2_2")
+			if math.Abs(a*d-b*c) < 1e-15 {
+				return fitsio.Header{}, fmt.Errorf("supported meta.wcsinfo has singular CD matrix")
+			}
+		}
+	} else {
+		pc11, pc12, pc21, pc22 := 1.0, 0.0, 0.0, 1.0
+		if h.Cards["PC1_1"] != "" {
+			pc11, _ = fitsio.HeaderFloat(h, "PC1_1")
+		}
+		if h.Cards["PC1_2"] != "" {
+			pc12, _ = fitsio.HeaderFloat(h, "PC1_2")
+		}
+		if h.Cards["PC2_1"] != "" {
+			pc21, _ = fitsio.HeaderFloat(h, "PC2_1")
+		}
+		if h.Cards["PC2_2"] != "" {
+			pc22, _ = fitsio.HeaderFloat(h, "PC2_2")
+		}
+		if math.Abs(pc11*pc22-pc12*pc21) < 1e-12 {
+			return fitsio.Header{}, fmt.Errorf("supported meta.wcsinfo has singular PC matrix")
+		}
+	}
+	return h, nil
+}
+
+func loadASDFPlanes(path string, needAux bool) (sci, errPix []float32, excluded []bool, err error) {
+	src, err := astroio.Open(context.Background(), path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	read := func(id astroio.PlaneID) (astroio.Plane, error) {
+		options := astroio.ReadOptions{}
+		if id == "asdf:dq" {
+			options.ExactIntegerDQ = true
+		}
+		plane, e := src.ReadPlane(context.Background(), id, options)
+		if e != nil {
+			return astroio.Plane{}, e
+		}
+		return plane, nil
+	}
+	var sciPlane astroio.Plane
+	sciPlane, err = read("asdf:data")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	sci = sciPlane.Data
+	var errPlane astroio.Plane
+	if needAux {
+		// Only the JWST ERR plane is sigma. VAR_* planes are intentionally not
+		// substituted: their variance semantics differ from drizzle's ERR input.
+		errPlane, err = read("asdf:err")
+		errPix = errPlane.Data
+		if err != nil && !strings.Contains(err.Error(), `array "err" is unavailable`) {
+			return nil, nil, nil, err
+		}
+	}
+	if needAux && err == nil && len(errPix) != len(sci) {
+		return nil, nil, nil, fmt.Errorf("ASDF ERR dimensions do not match data")
+	}
+	// ERR shape is checked explicitly as well as by element count.
+	if needAux && err == nil && (errPlane.Width != sciPlane.Width || errPlane.Height != sciPlane.Height) {
+		return nil, nil, nil, fmt.Errorf("ASDF ERR dimensions do not match data")
+	}
+	dq, dqErr := src.ReadPlane(context.Background(), "asdf:dq", astroio.ReadOptions{ExactIntegerDQ: true})
+	if dqErr == nil {
+		if dq.Width != sciPlane.Width || dq.Height != sciPlane.Height || len(dq.ExactDQ) != len(sci) {
+			return nil, nil, nil, fmt.Errorf("ASDF DQ dimensions do not match data")
+		}
+		excluded = make([]bool, len(sci))
+		for i, bits := range dq.ExactDQ {
+			excluded[i] = bits&(uint32(1)|uint32(512)) != 0
+			if excluded[i] {
+				sci[i] = float32(math.NaN())
+			}
+		}
+	} else if !strings.Contains(dqErr.Error(), `array "dq" is unavailable`) {
+		return nil, nil, nil, dqErr
+	}
+	return sci, errPix, excluded, nil
 }
 
 func sciExtNumber(header fitsio.Header, fallback int) int {
@@ -280,10 +534,11 @@ func loadDateObs(headers ...fitsio.Header) string {
 	return ""
 }
 
-func loadERRPixels(file *fitsio.File, sciExtver int) []float32 {
+func loadERRPixels(file *fitsio.File, sciExtver int, unversioned ...bool) []float32 {
+	sciUnversioned := len(unversioned) > 0 && unversioned[0]
 	extver := fmt.Sprintf("%d", sciExtver)
 	hdu := file.GetHDUByExtVer("ERR", extver)
-	if hdu == nil {
+	if hdu == nil && sciUnversioned {
 		hdu = file.GetHDU("ERR")
 	}
 	if hdu == nil || len(hdu.Data.Pixels) == 0 {
@@ -334,6 +589,67 @@ func cleanSCIWithMatchingDQ(hdu fitsio.HDU, file *fitsio.File, inst instrument.I
 	}
 	hdu.Data = badpix.RepairMaskedPixels(hdu.Data, mask)
 	return hdu
+}
+
+func diagnosticDQMasks(hdu fitsio.HDU, file *fitsio.File, inst instrument.Info) (excluded, repaired []bool) {
+	dq := matchingDQHDU(file, hdu)
+	if dq == nil {
+		return nil, nil
+	}
+	mask, err := badpix.MaskFromDQ(hdu, *dq, inst.BadDQBits)
+	if err != nil {
+		return nil, nil
+	}
+	if inst.DQAction == instrument.DQActionExclude {
+		excluded = append([]bool(nil), mask...)
+	} else {
+		repaired = append([]bool(nil), mask...)
+		edge := dqEdgeNoDataMask(mask, hdu.Data.Width, hdu.Data.Height, 0.75)
+		for i, isEdge := range edge {
+			if isEdge {
+				repaired[i] = false
+				if excluded == nil {
+					excluded = make([]bool, len(mask))
+				}
+				excluded[i] = true
+			}
+		}
+	}
+	return excluded, repaired
+}
+
+// LoadDiagnosticMasks loads only the matching SCI/DQ pair for a streamed
+// input, preserving the same DQ interpretation used by normal input loading.
+func LoadDiagnosticMasks(in Input) (excluded, repaired []bool, err error) {
+	if isASDFPath(in.Path) {
+		_, _, excluded, err := loadASDFPlanes(in.Path, false)
+		return excluded, nil, err
+	}
+	file, err := fitsio.LoadFile(in.Path)
+	if err != nil {
+		return nil, nil, err
+	}
+	primary := file.HDUs[0].Header
+	inst, _ := instrument.FromHeader(primary)
+	var target fitsio.HDU
+	if in.SCIExt > 0 {
+		for _, h := range file.SelectSCI() {
+			if sciExtNumber(h.Header, 0) == in.SCIExt {
+				target = h
+				break
+			}
+		}
+	}
+	if target.Data.Width == 0 {
+		sci := file.SelectSCI()
+		if len(sci) > 0 {
+			target = sci[0]
+		} else {
+			target = file.HDUs[0]
+		}
+	}
+	excluded, repaired = diagnosticDQMasks(target, file, inst)
+	return excluded, repaired, nil
 }
 
 func excludeMaskedPixels(hdu fitsio.HDU, mask []bool) fitsio.HDU {
@@ -414,7 +730,7 @@ func matchingDQHDU(file *fitsio.File, sci fitsio.HDU) *fitsio.HDU {
 				return hdu
 			}
 		}
-		if sizeMatch == nil && hdu.Data.Width == sci.Data.Width && hdu.Data.Height == sci.Data.Height {
+		if sciExtver == "" && sizeMatch == nil && hdu.Data.Width == sci.Data.Width && hdu.Data.Height == sci.Data.Height {
 			sizeMatch = hdu
 		}
 	}

@@ -126,13 +126,20 @@ func MergeSaveAlignmentSidecar(target, reference Input, result StarAlignmentResu
 	}
 
 	entries := make([]AlignmentSidecarEntry, 0, len(file.Entries)+1)
+	targetPath := filepath.Clean(target.Path)
 	for _, existing := range file.Entries {
-		if existing.Target.SCIExt != target.SCIExt {
+		if filepath.Clean(existing.Target.Path) != targetPath || existing.Target.SCIExt != target.SCIExt {
 			entries = append(entries, existing)
 		}
 	}
 	entries = append(entries, entry)
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Target.SCIExt < entries[j].Target.SCIExt })
+	sort.Slice(entries, func(i, j int) bool {
+		pi, pj := filepath.Clean(entries[i].Target.Path), filepath.Clean(entries[j].Target.Path)
+		if pi != pj {
+			return pi < pj
+		}
+		return entries[i].Target.SCIExt < entries[j].Target.SCIExt
+	})
 	file.Entries = entries
 	return writeAlignmentSidecar(path, file)
 }
@@ -162,7 +169,7 @@ func LoadValidatedAlignmentSidecar(target, reference Input) AlignmentSidecarLoad
 	}
 	for i := range file.Entries {
 		entry := &file.Entries[i]
-		if entry.Target.SCIExt != target.SCIExt {
+		if filepath.Clean(entry.Target.Path) != filepath.Clean(target.Path) || entry.Target.SCIExt != target.SCIExt {
 			continue
 		}
 		if err := validateAlignmentEntry(*entry); err != nil {

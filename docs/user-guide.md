@@ -43,6 +43,8 @@ All Hubble Space Telescope data is public and stored in the **Mikulski Archive f
 
 ### Step-by-Step Data Retrieval
 1. Go to the official MAST search portal: **[https://mast.stsci.edu/search/ui/#/hst](https://mast.stsci.edu/search/ui/#/hst)**
+
+![SCREENSHOT: Searching for MAST data in web browser](images/screenshots/mast_search.png)
 2. **Search for a Target**: In the search bar, type the name of a famous deep-sky object. Excellent beginner targets include:
    * `M16` (Eagle Nebula / Pillars of Creation)
    * `M51` (Whirlpool Galaxy)
@@ -79,9 +81,11 @@ GoFitsV3 is a desktop application built to make processing these raw files intui
 ```
 
 1. **Mosaic**: Load raw, individual exposures from a single filter, align them together, and "drizzle" them into a single, clean image stack with cosmic rays removed.
-2. **Examine**: Inspect single FITS files, view their raw histograms, explore FITS header metadata, and measure pixel coordinates.
+2. **Examine**: Inspect FITS or ASDF image planes, view their raw histograms, explore source metadata, and measure pixel coordinates.
 3. **Compose**: Take your combined filter images (e.g., Red, Green, Blue filters), align them relative to each other, stretch them to reveal details, and merge them into a single color image.
 4. **Edit**: Apply final touches to the color image, such as tone curves, sharpening, pixel healing, color speck cleaning, and export the file.
+
+![SCREENSHOT: GoFitsV3 Main Application Window](images/screenshots/main_window.png)
 
 ---
 
@@ -92,6 +96,19 @@ GoFitsV3 is a desktop application built to make processing these raw files intui
 ### Mosaic Workspace (Aligning & Combining Exposures)
 
 The Mosaic tab is where your processing begins. Telescopes take multiple short exposures of the same target to avoid overexposing bright stars and to allow the removal of random cosmic ray strikes. The Mosaic tab combines these exposures.
+
+Mosaic accepts supported JWST MIRI and NIRCam ASDF ImageModel files as single-chip inputs
+when they contain a registered native MIRI/MIRIMAGE or NIRCam module-B imaging GWCS profile.
+Mosaic/drizzle
+evaluates that native GWCS for every detector pixel, retaining nonlinear
+distortion during placement and alignment; it does not flatten the input to
+`meta.wcsinfo` for registration. The ASDF `data` plane is drizzled,
+`DO_NOT_USE`/`NON_SCIENCE` DQ pixels are excluded, and a dimension-matching
+`err` plane is used for inverse-variance weighting when present. The saved
+mosaic has a FITS TAN output WCS. Unknown or incomplete GWCS models remain
+available in Examine only, and ASDF writing is unsupported. Future instruments such as
+Nancy Grace Roman will require an explicitly registered native profile; they are not
+treated as MIRI or NIRCam by fallback.
 
 #### Step 1 - Loading Files
 
@@ -170,6 +187,9 @@ Background sky brightness can vary due to zodiacal light, scattered light, or sm
   * The default project-local output is `masks/`. Mask directories are saved relative to the mosaic project when possible, so moving the project with its `masks/` folder keeps the links working.
   * The export review shows target frames, dimensions, masked-pixel counts, detector-space previews, and an overwrite checkbox. Existing mask files are preserved unless **Overwrite existing mask** is checked.
   * Troubleshooting: if **Current Mosaic** is unavailable, build a drizzle result first and make sure the result has WCS metadata. If a mosaic-authored mask is marked stale, reopen/reproject it after rebuilding or changing alignment/drizzle geometry. A mask dimension error means the FITS mask does not match that specific calibrated input. MIRI showers/snowballs and severe ramp-level artifacts should usually be fixed by rerunning the current STScI JWST pipeline rather than by drawing masks over calibrated products.
+  
+![SCREENSHOT: Artifact Mask Editor showing drawn regions](images/screenshots/artifact_mask_editor.png)
+
 
 ![Sky Subtraction Settings](images/screenshots/SkysubSettings.png)
 
@@ -190,21 +210,51 @@ Once aligned, you are ready to combine the images.
 2. **IMPORTANT SAVE STEP**: Once the drizzle combine finishes, you **must save the file** by clicking the **Save Drizzle FITS** button in the upper-right panel. This exports the 32-bit FITS file for this filter, which you will load into the Compose workspace later.
 3. Click **Send to Examine** to review the result.
 
+#### Create and review star maps
+
+Open **Compose > Create Star Map** after building a mosaic, or select **Saved mosaic FITS** in the dialog. Work on the linear FITS mosaic before RGB stretching. The output is `<source directory>/working/<mosaic stem without _drizzle>_starmap.fits`.
+
+For a current WFC3/UVIS result built in this session, the tool uses the captured original-exposure placement where available. For a saved mosaic, optional original FLT/FLC paths can be entered separated by commas. Set **Alignment reference** to the FITS reference used for their working-image alignment sidecars. The reference must match the mosaic grid, and the sidecars must still match their target/reference file identities. A stale sidecar produces an error rather than guessed placement. Leaving originals blank produces a clearly marked **mosaic-only** map.
+
+The review window lists candidates by brightness. Select a source to inspect its local image and footprint: green means selected, amber means uncertain. **Accept**, **Exclude**, and **Automatic** change the selection decision. The radius slider adjusts its finite feathered footprint without automatically accepting an uncertain source. Click **Save FITS** to persist edits. To return later, choose **Review saved map** and select the original mosaic. The science pixels, grid and recorded evidence files must still match. Choosing Create again replaces the existing map and its manual edits.
+
+The primary FITS image is a 0-1 selection mask, not a star-flux image. `LABELS`, `FLAGS`, `STARS` and `INPUTS` store source identity, uncertainty/saturation information, fit diagnostics, manual decisions and provenance. Uncertain sources remain outside the default mask. Saturated stars are assessed using their wings and original data-quality flags when available. Diffraction spikes and bleed trails are not automatically included in the footprint.
+
+This first version deliberately favors conservative selections. It does not yet implement cross-filter matching, whitening or recovery of clipped flux. Faint stars, close blends and stars in the outer 12 pixels may be missed. Review stars on sharp nebular rims before using the mask for color changes.
+
+For independent star-map accuracy checks, use the separate [star-map labeling benchmark](star-map-benchmark.md). It opens a local browser viewer, saves labels and reports under `working/benchmark/`, and compares frozen FITS maps without changing the desktop review catalog.
+
+#### Batch Processing (Drizzle Queue)
+If you have multiple filter stacks to process, you can automate the alignment and drizzling using the Drizzle Queue.
+1. First, set up and save a Mosaic project for each of your filters (`File -> Save Project As...`).
+2. Open the **`Mosaic -> Drizzle Queue...`** window.
+3. Click **Add Projects** and select your saved JSON project files.
+4. For each project, you can toggle **Auto-Align** on or off. If off, it will use the alignment offsets already saved in the project.
+5. Click **Start Queue**. The application will sequentially process each project unattended, saving a final `<filter>_<datetime>_drizzle.fits` file next to each project file.
+
+![SCREENSHOT: Drizzle Queue window showing batch jobs](images/screenshots/drizzle_queue.png)
+
 ---
 
-### Examine Workspace (Inspecting Raw Images & Metadata)
+### Examine Workspace (Inspecting Image Planes & Metadata)
 
-The Examine workspace acts as a scientific magnifying glass.
+The Examine workspace acts as a scientific magnifying glass for supported FITS and ASDF images. Load an image to list every supported 2-D plane in stable selector order, then use the plane selector to switch among science, uncertainty, data-quality, and other image arrays. FITS planes retain their extension headers; ASDF planes retain source metadata and array names.
 
-* **FITS Header Viewer**: The scrollable list on the right displays the raw metadata stored in the FITS file. Here you can find:
+* **Source Metadata Viewer**: The scrollable list on the right displays metadata from the selected source. FITS files commonly include:
   * `INSTRUME` (e.g., `WFC3`)
   * `FILTER` (e.g., `F555W`)
   * `EXPTIME` (total exposure duration in seconds)
   * `DATE-OBS` (date of observation)
+  ASDF files expose the source metadata available in the ASDF tree, including the selected array's role and shape.
 * **Measurement Tool**: Check **Measure offsets**:
   * Click point A and then point B on the image preview.
   * The interface will display the starting and ending pixel coordinates, the delta X and delta Y shifts, and the exact distance in pixels. This is helpful for measuring offsets manually.
-* **Stretch Previews**: Choose between different stretches (`Linear`, `Log`, `Sqrt`, `Asinh`, `HistEq`) to check the structure of your image and its background noise levels.
+* **Stretch Previews**: Both the Mosaic and Examine workspaces feature powerful stretch controls to help you visualize raw data:
+  * **Modes**: Choose between `Linear`, `Log`, `Sqrt`, `Asinh`, `HistEq`, and `MTF` (Midtones Transfer Function).
+  * **Magic Presets**: Click the **Magic** button to automatically estimate black and white points. You can select presets like **Balanced**, **Nebula**, or **Galaxy** to optimize the auto-stretch for different types of targets.
+  * **Auto MTF**: When using the MTF stretch mode, click **Auto MTF** to mathematically calculate the ideal midtone balance for the image.
+
+![SCREENSHOT: Magic stretch presets in the Examine workspace](images/screenshots/examine_magic_stretch.png)
 
 Here is an example of Cassiopeia A (a supernova remnant) stretched using the MTF (Midtones Transfer Function) model to reveal the faint shockwaves and ejecta:
 
@@ -221,15 +271,60 @@ Here is a color composite of the colliding Antennae Galaxies, showing dust lanes
 ![The colliding Antennae Galaxies color composite](images/AntennaeGalaxies_MT.png)
 
 #### Mapping Channels
-Assign your FITS files to the channel slots:
+Assign your FITS files to the channel slots using the custom FITS file picker:
 * **Blue Channel**: Load your shortest-wavelength filter (e.g., `F390W`, `F438W` or `OIII`).
 * **Green Channel**: Load your middle-wavelength filter (e.g., `F555W`, `F606W` or `H-alpha`).
 * **Red Channel**: Load your longest-wavelength filter (e.g., `F814W` or `SII`).
 * *Tip: If you do not have three filters, you can load the same file into multiple channels, or use the "Copy Settings" menu item to help balance them.*
 
+#### Wavelength-aware color mapping
+
+Open **Compose -> Color Mixing...** and choose **Wavelength-aware** to derive a
+creative starting palette from the filters' relative wavelengths. The mapping
+uses linear spacing: a filter that is closer to its red neighbor receives more
+red contribution than one equally close to blue. For example, with F445W,
+F550W, and F600W, the 50 nm F550W-to-F600W gap makes F550W sit closer to red
+than the 105 nm F445W-to-F550W gap would suggest in an evenly spaced palette.
+
+The dialog shows each included source's detected name, wavelength, band class,
+and metadata origin. A finite positive FITS `PHOTPLAM` value takes precedence;
+otherwise a supported filter name is parsed. Unknown, ambiguous, and
+name-only long-pass filters are left unresolved rather than guessed. Edit the
+wavelength and class in the dialog to recover those sources; these manual
+values affect the generated weights only and do not change FITS headers.
+
+The **Cross-mix** control sets neighboring-color blending (8% by default).
+Continuum filters (W/W2, M, and L/LP when a wavelength is supplied) are
+column-normalized so adding nearby wide filters does not create a color cast.
+Narrow filters are treated as detail accents: all narrow sources share one
+**Narrowband accent** budget (25% by default), so adding several narrow JWST
+filters redistributes that accent instead of multiplying it. If fewer than two
+continuum filters are present, narrow sources are promoted to the base palette
+and the dialog warns you.
+
+The result is a false-color, non-photometric starting point—not a physical
+throughput or flux reconstruction. Review and edit the generated R/G/B values
+before applying; manual RGB edits are authoritative. Examples supported by
+the preset include W/W/W, W/W/W/N (such as a red H-alpha accent), multiple-W
+and multiple-N JWST sets, W/W/M, and L/W/W. At least two included sources with
+distinct resolved wavelengths are required. The preset selects explicit
+**Weighted** mode and saves only the resulting stable per-source weights;
+wavelength metadata, warnings, and temporary disk artifact paths are not saved
+in projects. Existing projects and the legacy Artistic/Auto behavior are
+unchanged until this preset is applied.
+
+![SCREENSHOT: Compose Workspace showing loaded color channels](images/screenshots/compose_channels.png)
+
 #### Aligning the Channels
 Filters are photographed sequentially, so the telescope may have drifted between them.
 * Open the **Compose Menu** and select **Align to Channel 2**. GoFitsV3 will detect stars across all three channels and apply a full affine transform to register the Red and Blue channels perfectly to the Green channel.
+
+#### Matching PSF (FWHM)
+If your color channels have different levels of sharpness (often because they were taken with different instruments or at different wavelengths), you can match their stellar profiles to prevent color fringing on stars:
+* Select **Match PSF/FWHM** from the Compose menu.
+* GoFitsV3 will measure each base channel's stellar PSF, suggest a common target, and non-destructively convolve the sharper channels to match the softest one.
+* It includes optional saturated-core protection and a visual before/after representative-star preview.
+* *Note: PSF matching is currently unavailable in disk-backed Compose.*
 
 #### Stretching the Data
 To make the image visible, you must configure the stretch parameters for each channel. GoFitsV3 offers several stretch modes:
@@ -242,80 +337,24 @@ To make the image visible, you must configure the stretch parameters for each ch
    * **Center (SP - Stretch Point)**: The pixel value you want to stretch around (usually set just above your background noise level).
    * **Symmetry (BP)**: Controls the width of the stretch region.
 
+![SCREENSHOT: Compose stretching tools and histogram](images/screenshots/compose_stretch.png)
+
 #### Blending an "Orange Layer" (4-Channel Composition)
 If you have a fourth filter (for example, a narrow-band Hydrogen-Alpha `F656N` image that contains rich details), you can blend it in:
 * Go to `Compose -> Add Orange Image...`.
 * Load your fourth FITS file.
 * This opens a control window allowing you to adjust the custom RGB color tint (defaults to a beautiful golden-orange) and opacity slider to screen-blend this detail layer over your composite.
 
+#### LRGB Combination
+GoFitsV3 supports LRGB-style combination to enhance image detail and reduce color noise:
+* Access the **LRGB Processing** options from the Compose menu.
+* You can provide a dedicated high-resolution luminance FITS input, or generate a synthetic luminance from selected RGB filters.
+* Adjust the luminance contribution and apply chrominance-only smoothing to preserve fine luminance details while softening color noise.
+* *Note: LRGB settings persist in Compose projects, but processing is currently unavailable in disk-backed Compose.*
+
 #### Clean Operations
 * **Cross-Channel Clean**: Click this under the `Compose` menu. It builds a protective star mask and cleans up single-channel cosmic rays or hot pixels that survived the drizzling stage.
 * **Normalize Scale**: Adjusts the scale factor of the channels relative to Channel 2 to ensure a color-balanced starting point.
-
-#### Optional color calibration
-
-Compose color calibration is opt-in. Existing projects and new projects start
-with calibration **Off**, and the established Artistic overlay behavior remains
-the default. Calibration is a non-destructive render transform: it never
-replaces loaded channel pixels and a saved result remains inspectable when its
-inputs later become stale.
-
-The Phase 1 instrument matrix is deliberately explicit:
-
-| Telescope | Instrument / detector | Filters | Accepted input |
-| --- | --- | --- | --- |
-| HST | ACS / WFC | F435W, F606W, F814W | `ELECTRONS/S` or `COUNTS` with positive `PHOTFLAM` or `PHOTFNU`; `COUNTS` also requires positive `EXPTIME` |
-| HST | WFC3 / UVIS | F275W, F336W, F438W, F555W, F606W, F814W | same count/count-rate rules |
-| HST | WFC3 / IR | F105W, F125W, F160W | same count/count-rate rules |
-| JWST | NIRCam / NRC detector | F090W, F150W, F200W, F277W, F356W, F444W | calibrated `Jy`, `MJy`, or `MJy/sr` |
-| JWST | MIRI / MIRIMAGE | F770W, F1000W, F1500W, F1800W, F2100W, F2550W | calibrated `Jy`, `MJy`, or `MJy/sr` |
-
-SCI keywords are authoritative; primary-header keywords are only a fallback.
-Unknown filters, detectors, units, missing or contradictory keywords,
-non-positive exposure or pixel-area values, and unsupported combinations are
-reported as **Unsupported** rather than guessed. JWST detector counts and
-Flambda inputs are not accepted in this phase.
-
-For an HST count-rate image, `F_lambda = countRate * PHOTFLAM`; counts are
-first divided by `EXPTIME`. When Fnu is requested,
-`F_nu[Jy] = F_lambda * pivotAngstrom^2 / cAngstromPerSecond * 1e23`.
-The inverse conversion is used for Flambda output. A calibrated JWST Fnu image
-is used as-is in Jy (`MJy` is multiplied by 1e6); `MJy/sr` is multiplied by
-`PIXAR_SR` before conversion. Supported white references are flat Fnu and flat
-Flambda. The average spiral-galaxy reference is reserved for a future
-reference-data release and is reported unsupported when selected.
-
-Background neutralization is independent of instrument mode. Automatic
-sampling rejects non-finite pixels, detected stars, bright outliers, and
-insufficient samples; a shared ROI can instead be specified in aligned
-reference coordinates. Spatial tiles are checked for uniformity. A gradient or
-extended structure beyond the threshold is refused as **Unsupported**, because
-a scalar offset cannot remove a two-dimensional background. The operation is
-always `y = (x - offset) * gain`.
-
-The optional linked calibrated stretch is applied once to calibrated RGB data
-so channels retain their relative color. Calibration gains are normalized to
-remove arbitrary global luminance scale. A **Calibrated Linear** overlay is
-opt-in and contributes before that shared stretch using its persisted transform,
-tint, and strength. Artistic overlays continue to use the existing post-stretch
-palette path. Even with a physically normalized input, an overlay tint is a
-user-chosen display palette, not a unique scientific color.
-
-Each result records status, diagnostics, algorithm/reference versions,
-provenance, and source/settings fingerprints. **Valid** results are applied;
-**Stale**, **Unsupported**, **Cancelled**, and **Failed** results are not.
-Changing pixels, alignment, metadata, ROI, white reference, stretch, overlay
-order/source/tint/strength/mode, or the algorithm version marks a result stale.
-The same immutable render result supplies preview, Before/After, Edit handoff,
-and 8-bit/16-bit export representations. Cancelling a calculation leaves the
-previous valid result available until a replacement succeeds.
-
-For acceptance testing, verify Off regression, background-only operation, each
-matrix row and reference, unsupported metadata, ROI, cancellation, save/reload,
-Before/After, preview/export equality, and mixed Artistic plus Calibrated Linear
-overlays. The automated processing fixture covers deterministic save/load/render
-and stale/non-application cases; UI dialogs and visual Before/After appearance
-remain manual checks.
 
 When finished, select `File -> Send Composite to Edit`.
 
@@ -335,9 +374,18 @@ The Edit tab is where you perform traditional photography adjustments before sav
   * **Click and drag** over a scratch, hot pixel, or bloated artifact (the destination) to stamp the clean background texture over it.
 * **Exporting**: Click `File -> Export...` to save your image. Choose between:
   * **PNG** (8-bit or high-fidelity 16-bit)
-  * **JPEG** (with quality controls)
+  * **JPEG** (with quality controls and a live estimated output size)
+
+In Compose, open **Color Legend...**, enter any desired labels, then choose
+**Add to Edit** to place the legend on the Edit canvas. The single legend can
+be dragged within the image, resized with the Legend size control (100–600%),
+reset to the lower-right corner, or removed. Its current position and size are
+included when saving any supported image format; cropping translates and clips
+the legend to the cropped image.
   * **TIFF**
   * **WebP** (lossless compression)
+
+![SCREENSHOT: Edit workspace showing Tone Curves and Sharpening](images/screenshots/edit_tools.png)
 
 ---
 
@@ -368,10 +416,12 @@ Let's walk through the creation of a color image of the **Whirlpool Galaxy (M51)
 1. Go to the **Compose** tab.
 2. Load `M51_Blue_Drizzled.fits` into the Blue channel slot, `M51_Green_Drizzled.fits` into Green, and `M51_Red_Drizzled.fits` into Red.
 3. Select `Compose -> Align to Channel 2` to register the three color channels together.
-4. Set the Stretch mode on all channels to **Asinh**.
-5. Adjust the sliders: set the Black levels just below the background peak on the histogram, and raise the stretch values until the galaxy's spiral arms are visible.
-6. Select `Compose -> Cross-Channel Clean` to erase any remaining pixel artifacts.
-7. Select `File -> Send Composite to Edit`.
+4. (Optional) Select `Compose -> Match PSF/FWHM` to normalize star sizes across channels and prevent color fringing.
+5. Set the Stretch mode on all channels to **Asinh**.
+6. Adjust the sliders: set the Black levels just below the background peak on the histogram, and raise the stretch values until the galaxy's spiral arms are visible.
+7. (Optional) Access **LRGB Processing** from the Compose menu to add luminance detail or chrominance smoothing.
+8. Select `Compose -> Cross-Channel Clean` to erase any remaining pixel artifacts.
+9. Select `File -> Send Composite to Edit`.
 
 ### Phase 4: Final Adjustments & Save
 1. In the **Edit** tab, open the **Curves** widget.
@@ -385,31 +435,6 @@ Let's walk through the creation of a color image of the **Whirlpool Galaxy (M51)
 
 ---
 
-### Gaia Photometric Calibration (optional)
-
-Gaia mode is an SPCC-like, reproducible photometric fit—not PixInsight code.
-In **Online** mode GoFitsV3 requests only the selected sky footprint and
-catalog criteria from the configured Gaia service; image pixels and project
-files stay local. The default ESA service uses TAP for DR3 source discovery and
-DataLink to download sampled XP spectra only for stars matched to the image.
-**Cache Only** uses the local SQLite catalog and reports a clear miss when data
-are unavailable. The default cache is stored under the user cache directory
-(`gofitsv3/gaia-cache.sqlite`); overlapping fields reuse deduplicated source and
-XP records. You may delete or relocate it at any time; a saved valid project
-still renders from its persisted transforms and provenance, without network
-access.
-
-Proper motion is propagated from Gaia's reference epoch to the FITS observation
-epoch. The quality selector, magnitude limit, match radius and observation epoch
-are saved as Gaia settings. Compose persists/displays the matched/accepted
-status message; residuals, scatter and per-star rejection details remain
-internal fit data. Persisted provenance retains source IDs, catalog release,
-provider/passband versions, and source and settings fingerprints. Only
-versioned passbands with complete
-XP wavelength coverage are supported (currently G/BP/RP, F435W, F606W and
-F814W); unsupported bands fail rather than extrapolate. Gaia can estimate an
-overlay scalar, but artistic tint and opacity remain your choices.
-
 ## 6. Glossary of Terms
 
 * **Calibrated Files (FLT/FLC)**: Raw images that have been processed by the telescope's ground pipeline to correct for instrument bias, dark current, and flat-field illumination.
@@ -420,3 +445,55 @@ overlay scalar, but artistic tint and opacity remain your choices.
 * **GHS (Generalised Hyperbolic Stretch)**: A mathematical stretch algorithm that allows non-linear boosting of midtones or shadows without clipping bright highlights.
 * **MAST**: Mikulski Archive for Space Telescopes. The central online repository for all NASA space telescope data, including Hubble, Kepler, and James Webb.
 * **WCS (World Coordinate System)**: A coordinate mapping system stored inside FITS headers that links pixel positions (X, Y) directly to physical celestial coordinates (Right Ascension, Declination).
+### Gemini GMOS calibration
+
+For raw GMOS imaging, open **Mosaic > Gemini GMOS Calibration...** after loading
+the science directory. GoFitsV3 groups the science by effective filter, ignores
+open filter-wheel positions, and selects compatible detector calibration files.
+Full calibration requires both a compatible bias ensemble and a twilight flat
+for the active filter; a missing flat is reported and blocks full calibration.
+The current reduction performs overscan subtraction and trim, master-bias
+subtraction, normalized flat division, and BPM exclusion before chip
+combination. Accepting a complete selection atomically recombines already
+loaded GMOS exposures; incomplete selections are rejected. The same validated
+recipe is restored before input combination when loading a Mosaic project or
+running a Drizzle Queue job. It does not provide dark, fringe, or illumination
+correction, and DRAGONS remains recommended for scientific-grade reduction.
+
+### Star-map detection settings
+
+The Create Star Map dialog exposes **Min. SNR**, **Max. residual**, and **FWHM**. Lower SNR admits fainter candidates; higher residual allows less exact stellar profiles. FWHM is in pixels; 0 estimates it automatically. Defaults remain SNR 7, residual 0.22, and automatic FWHM. To reproduce the recent mosaic-only benchmark settings, enter 5, 0.36, and 0 and use a saved mosaic without original exposures. Current drizzle results still use available captured exposure evidence. Review saved map disables the creation settings and preserves the saved catalog.
+
+In Star Map Review, use **Sort stars** to choose brightness, source ID, uncertain-first, or saturated-first ordering. Brightness is the default. Click the star list, then use Up/Down to navigate, Left to accept, and Right to exclude. Sorting preserves the selected star; decisions leave the current order stable. Radius and sorting controls retain their own keyboard behavior. Click **Save FITS** to persist decisions.
+
+### Apply a gentler stellar stretch in Compose (experimental)
+
+**Compose > Gentler Star Stretch...** lists every loaded source with its composite role (Blue, Green, Red, or a colored layer). Enable the treatment on the sources you want, typically the ones assigned to red, and set a strength from 0 to 1; 0 reproduces the ordinary stretch and 1 is the strongest compression, not star removal. Apply prepares the treatment in the background from the source's original linear FITS file and its reviewed star map (the map must exist in the file's `working/` folder), then refreshes the preview. From then on the channel tile, the composite, exports and Send to Edit all use the treated stretch for that source, in both normal and disk-backed Compose.
+
+**Star geometry** at the top of the dialog chooses whose map defines the footprints. "Each source's own star map" fits every treated source on its own map. Choosing one source's map instead makes every treated source use that source's star footprints (core, feather, halo and spikes) and only measure its own star backgrounds, so all channels are compressed over exactly the same area; this avoids colored rims where channels' own halos would end at different radii, and needs the sources on one grid. Only accepted map stars are treated; to exclude a star, reject it in Star Map Review and Apply again. When you change a treated source's stretch settings, the preview renders that source untreated while the footprints are re-prepared for the new settings (a few seconds on a large mosaic), then refreshes with the treatment. The dialog shows each source's status, including why a source could not be treated: a source rotated in Compose, or one whose loaded grid differs from the original file, cannot use the map. The setting is saved with the project; the prepared footprints are rebuilt on load.
+
+### White stars (experimental, artistic)
+
+**Compose > White Stars...** neutralizes star color in the composite. Choose a **reference source**: its reviewed star map supplies every star's footprint (core, feather, validated halo and spikes), mapped onto the composite grid. In each footprint the stellar light above the local background is moved toward a neutral level in the selected output channels (default all three), fading with the footprint, while the background under the star keeps its color. **Strength** scales the effect. **Neutral level** "White" makes the core white and fades the whitening outward with the star's own brightness profile, so a faint halo keeps most of its color; "Preserve luminance" neutralizes the whole footprint while keeping each pixel's stellar brightness. This is an artistic adjustment applied after mixing and colored layers, before LRGB, in normal and disk-backed Compose; it is saved with the project. Only accepted map stars are affected; stars missing from the map stay as they are, so lower the map's SNR threshold or accept sources in Star Map Review to cover fainter ones. For the best result use the same source as the gentler stretch's shared star geometry, so compression and whitening cover the same area.
+
+### Preview a gentler stellar stretch (experimental)
+
+After creating and saving a reviewed star map, open **Compose > Gentler Star Stretch Preview...**. Select a loaded source filter, choose strength from 0 to 1, and preview its brightest accepted stars or one catalog source ID. The source normally assigned to red is the initial selection; this diagnostic does not infer which source dominates a custom RGB mixture.
+
+The preview reloads the source's original linear FITS file, verifies the map in its `working/` directory, and uses a snapshot of the selected source's stretch settings. It shows **Normal**, **Gentler**, and **Treatment mask** cutouts. Stellar excess above the fitted local background is compressed before display clipping, then blended through a measured core/halo feather. The normal panel retains your source settings; strength zero reproduces it. Strength one is the strongest reduction, not star removal. Try strength 0.75 for an obvious comparison; at lower strengths a bright core can remain white while its wings become less prominent. The result lists the exact stretch settings used.
+
+This is an original-source diagnostic, not an RGB composite preview. It excludes Compose alignment/rotation, cleaning, PSF matching, channel mixing and final RGB levels. It does not apply or export a modified science image. Saturation-tagged stars are assessed using their surrounding wings, excluding the suspect core from fitting. When the wings provide reliable support, the recorded finite core and wings receive the gentler stretch together; missing core brightness is not reconstructed. Insufficient wings, poor profile fits and footprints reaching a neighbor or cutout boundary are skipped with explanations. An invalid (nonfinite) sample inside a footprint keeps its original appearance while the rest of the star is still treated. Stars whose cores overlap are fit together as one group and share one footprint; map sources left "uncertain" next to an accepted star are modelled as companions so they do not block the fit, but are not treated on their own. A skipped row shows only its original appearance; it does not display an unchanged copy as a corrected result. Display clipping alone no longer rejects a star, and the normal stretch peak is not raised automatically. Arbitrary diffraction-spike shapes are not modeled. Use a supported scalar mode (Linear, Log, Asinh, Sqrt or MTF); histogram equalization and GHS are unavailable here.
+
+An ordinary star can also be skipped when its wings contain significant directional structure that cannot safely be separated from nebulosity. This rejects the whole footprint rather than cutting holes into the feather. Validated narrow spike support is excluded from that directional check; other structure remains subject to it. This is a conservative check, not a complete background model: symmetric nebular structure and saturated-star background separation still require visual review. A centered nebular knot can have the same observed profile as stellar light; a successful fit cannot distinguish those explanations from one filter alone. Inspect the surrounding nebula and outer halo as well as the core before judging a preview successful.
+
+The preview also examines a wider cutout for a circular halo and a rotated, orthogonal four-arm diffraction cross. These components require a separate robust outer-background fit, distributed or paired declining signal, and room for a smooth feather. The core retains its fitted background, blending smoothly toward the outer estimate across the core feather. The halo has a circular outer taper; each spike has finite side and end tapers. This is still measured support rather than a complete optical PSF model.
+
+Coverage diagnostics distinguish measured extensions from incomplete or unvalidated components. A safe core may still be shown when a halo or spike cannot be extended safely; that does not mean the whole star was treated. Neighbors, missing samples, image edges, complex background and the 192-pixel search bound can limit coverage. Nonorthogonal, curved or unpaired spikes are not supported by this detector. In the HTML report, click each image to inspect its original-resolution PNG; radial averages can hide narrow spikes, so also inspect the two-dimensional mask.
+
+For reproducible developer reports:
+
+```powershell
+go run ./cmd/starstretch -input TestImages/Trifid/F673N_drizzle.fits -star 483 -strength 0.5 -mode asinh -peak 50 -scaled-peak 20 -output tmp/starstretch-example
+```
+
+Omit `-star` to inspect the brightest accepted sources, with `-limit` from 1 to 24. Omit `-peak` for automatic source levels; if supplied, `-background` requires `-peak`. Use `-map` for a nondefault saved-map path. The output directory must be new. Open its `index.html` for fixed-scale cutout comparisons and radial profiles; `report.json` records settings and fit diagnostics. Comparison panels are not independently auto-scaled. No original FITS or map is overwritten. A cancelled/failed report can leave an incomplete new directory; only a completed report has `index.html`.

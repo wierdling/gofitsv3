@@ -12,7 +12,7 @@ func TestNormalizationForCalibratedFluxNotNormalized(t *testing.T) {
 		{"MJy/sr", false},
 		{"MJy", false},
 		{"Jy", false},
-		{"ELECTRONS", true},   // total counts -> normalize
+		{"ELECTRONS", true},    // total counts -> normalize
 		{"ELECTRONS/S", false}, // already a rate
 		{"", false},            // unknown -> leave alone
 	}
@@ -44,5 +44,21 @@ func TestBunitIsAlreadyRate(t *testing.T) {
 func TestNormalizationForOffNeverNormalizes(t *testing.T) {
 	if normalize, _ := NormalizationFor(NormOff, "ELECTRONS", 100); normalize {
 		t.Fatal("NormOff should never normalize")
+	}
+}
+
+func TestNormalizationForAutoLeavesUnknownUnitsOff(t *testing.T) {
+	for _, unit := range []string{"", "UNKNOWN", "MJY/SR", "PHOTONS", "COUNTS/S"} {
+		if normalize, _ := NormalizationFor(NormAuto, unit, 100); normalize {
+			t.Errorf("NormalizationFor(Auto, %q) normalized unknown/rate unit", unit)
+		}
+	}
+}
+
+func TestNormalizationForAutoRecognizesExplicitTotalCounts(t *testing.T) {
+	for _, unit := range []string{"ELECTRON", "ELECTRONS", "E-", "COUNTS", "COUNT", "DN", "ADU", "COUNTS/PIXEL"} {
+		if normalize, scale := NormalizationFor(NormAuto, unit, 100); !normalize || scale != 0.01 {
+			t.Errorf("NormalizationFor(Auto, %q) = (%t, %v), want (true, 0.01)", unit, normalize, scale)
+		}
 	}
 }

@@ -102,13 +102,25 @@ func LoadFileMetadata(path string) (*File, error) {
 // need (e.g. a single SCI chip and its DQ) without paying the memory or I/O cost
 // of the rest of the file.
 func LoadFileSelective(path string, decode func(hdr Header) bool) (*File, error) {
-	return loadFileFiltered(path, decode)
+	return LoadFileSelectiveIndexed(path, func(_ int, hdr Header) bool { return decode(hdr) })
+}
+
+// LoadFileSelectiveIndexed is the positional variant of LoadFileSelective.
+// index is the zero-based HDU number, allowing formats with repeated or
+// unusable EXTVER values (notably raw Gemini GMOS) to select one chip without
+// decoding sibling image arrays.
+func LoadFileSelectiveIndexed(path string, decode func(index int, hdr Header) bool) (*File, error) {
+	return loadFileFilteredIndexed(path, decode)
 }
 
 // loadFileFiltered walks every HDU header and decodes a data unit only when it
 // has image data (NAXIS>=2, supported BITPIX) and decode(hdr) returns true. It
 // underpins LoadFileMetadata and LoadFileSelective.
 func loadFileFiltered(path string, decode func(hdr Header) bool) (*File, error) {
+	return loadFileFilteredIndexed(path, func(_ int, hdr Header) bool { return decode(hdr) })
+}
+
+func loadFileFilteredIndexed(path string, decode func(index int, hdr Header) bool) (*File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -117,7 +129,7 @@ func loadFileFiltered(path string, decode func(hdr Header) bool) (*File, error) 
 
 	var hdus []HDU
 	var pos int64
-	for {
+	for index := 0; ; index++ {
 		if _, err := f.Seek(pos, io.SeekStart); err != nil {
 			return nil, err
 		}
@@ -130,8 +142,11 @@ func loadFileFiltered(path string, decode func(hdr Header) bool) (*File, error) 
 		}
 		pos += int64(headerBytes)
 
-		dataBytes := imageDataBytes(hdr)
-		if dataBytes > 0 && decode(hdr) {
+		dataBytes, sizeErr := checkedImageDataBytes(hdr)
+		if sizeErr != nil {
+			return nil, sizeErr
+		}
+		if dataBytes > 0 && decode(index, hdr) {
 			if _, err := f.Seek(pos, io.SeekStart); err != nil {
 				return nil, err
 			}
@@ -163,8 +178,13 @@ func loadFileFiltered(path string, decode func(hdr Header) bool) (*File, error) 
 // stays byte-for-byte aligned with LoadFile. Returns 0 for non-image HDUs and
 // unsupported BITPIX values.
 func imageDataBytes(hdr Header) int {
+	bytes, _ := checkedImageDataBytes(hdr)
+	return bytes
+}
+
+func checkedImageDataBytes(hdr Header) (int, error) {
 	if parseInt(hdr.Cards["NAXIS"]) < 2 {
-		return 0
+		return 0, nil
 	}
 	var bpp int
 	switch parseInt(hdr.Cards["BITPIX"]) {
@@ -177,9 +197,25 @@ func imageDataBytes(hdr Header) int {
 	case -64:
 		bpp = 8
 	default:
-		return 0
+		return 0, nil
 	}
-	return parseInt(hdr.Cards["NAXIS1"]) * parseInt(hdr.Cards["NAXIS2"]) * bpp
+	width, height := parseInt(hdr.Cards["NAXIS1"]), parseInt(hdr.Cards["NAXIS2"])
+	if width <= 0 || height <= 0 {
+		return 0, fmt.Errorf("invalid image dimensions %dx%d", width, height)
+	}
+	maxInt := int(^uint(0) >> 1)
+	if width > maxInt/height {
+		return 0, fmt.Errorf("image dimensions overflow: %dx%d", width, height)
+	}
+	pixels := width * height
+	if pixels > maxInt/bpp {
+		return 0, fmt.Errorf("image byte size overflow for %dx%d", width, height)
+	}
+	dataBytes := pixels * bpp
+	if dataBytes > maxInt-padding(dataBytes) {
+		return 0, fmt.Errorf("padded image byte size overflow for %dx%d", width, height)
+	}
+	return dataBytes, nil
 }
 
 func (f *File) SelectSCI() []HDU {
@@ -264,21 +300,19 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 	if naxis < 2 {
 		return HDU{Header: hdr}, 0, nil
 	}
+	dataBytes, err := checkedImageDataBytes(hdr)
+	if err != nil {
+		return HDU{}, 0, err
+	}
 	width := parseInt(hdr.Cards["NAXIS1"])
 	height := parseInt(hdr.Cards["NAXIS2"])
-
 	total := width * height
 
-	bytesPerPixel := 0
 	switch bitpix {
 	case 8:
-		bytesPerPixel = 1
 	case 16:
-		bytesPerPixel = 2
 	case 32, -32:
-		bytesPerPixel = 4
 	case -64:
-		bytesPerPixel = 8
 	default:
 		return HDU{}, 0, fmt.Errorf("unsupported BITPIX %d", bitpix)
 	}
@@ -288,7 +322,6 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 	// still allocation-heavy path (a typed intermediate slice plus its own
 	// full-size byte buffer) and the extra element-by-element conversion loop,
 	// roughly halving both transient memory and decode work per HDU.
-	dataBytes := total * bytesPerPixel
 	raw := make([]byte, dataBytes)
 	if _, err := io.ReadFull(r, raw); err != nil {
 		return HDU{}, 0, err

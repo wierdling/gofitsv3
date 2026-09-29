@@ -95,3 +95,36 @@ func TestApplyAlignmentRowsAndSaveReturnsSaveErrorAfterApplying(t *testing.T) {
 		t.Fatalf("offset = %v, want applied value despite save failure", got)
 	}
 }
+
+func TestApplyAlignmentRowsRejectsStaleTargetIdentity(t *testing.T) {
+	ws := &mosaicWorkspace{state: &mosaicState{
+		inputs:   []mosaic.Input{{Path: "reference.fits"}, {Path: "replacement.fits"}},
+		statuses: []mosaic.InputStatus{{Status: "reference"}, {}},
+	}}
+	rows := []alignmentResultRow{{stateIdx: 1, target: mosaic.Input{Path: "original.fits"}, reference: mosaic.Input{Path: "reference.fits"}, result: mosaic.StarAlignmentResult{Applied: true, OffsetX: 9}}}
+	if err := ws.applyAlignmentRowsAndSave(rows, func(int) bool { return true }, func(mosaic.Input, mosaic.Input, mosaic.StarAlignmentResult) error {
+		t.Fatal("stale row was saved")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ws.state.inputs[1].OffsetX != 0 {
+		t.Fatal("stale result changed replacement input")
+	}
+}
+
+func TestApplyAlignmentRowsRejectsSameIdentityAfterGenerationAdvance(t *testing.T) {
+	ref := mosaic.Input{Path: "reference.fits"}
+	target := mosaic.Input{Path: "target.fits", SCIExt: 1}
+	ws := &mosaicWorkspace{state: &mosaicState{inputs: []mosaic.Input{ref, target}, statuses: []mosaic.InputStatus{{Status: "reference"}, {}}}, inputGenerations: map[string]uint64{artifactMaskTargetKey(target): 2}}
+	rows := []alignmentResultRow{{stateIdx: 1, target: target, reference: ref, targetGeneration: 1, referenceGeneration: 0, result: mosaic.StarAlignmentResult{Applied: true, OffsetX: 4}}}
+	if err := ws.applyAlignmentRowsAndSave(rows, func(int) bool { return true }, func(mosaic.Input, mosaic.Input, mosaic.StarAlignmentResult) error {
+		t.Fatal("stale generation was saved")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ws.state.inputs[1].OffsetX != 0 {
+		t.Fatal("stale generation changed target")
+	}
+}

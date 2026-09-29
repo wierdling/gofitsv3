@@ -28,6 +28,36 @@ import (
 // layouts allow content to grow and are used for different UI behavior.
 type mosaicFixedWidthLayout struct{ w float32 }
 
+type mosaicFilterBatchFileCheck struct {
+	path    string
+	checked bool
+}
+
+type mosaicFilterBatchPreviewRequest struct {
+	path         string
+	sourceNumber int
+}
+
+func snapshotCheckedPaths(checks []mosaicFilterBatchFileCheck) []mosaicFilterBatchPreviewRequest {
+	paths := make([]mosaicFilterBatchPreviewRequest, 0, len(checks))
+	for index, check := range checks {
+		if check.checked {
+			paths = append(paths, mosaicFilterBatchPreviewRequest{path: check.path, sourceNumber: index + 1})
+		}
+	}
+	return paths
+}
+
+func filterPreviewRefreshRequests(previewOpen, bulkUpdate bool, changed int) int {
+	if !previewOpen || changed <= 0 {
+		return 0
+	}
+	if bulkUpdate {
+		return 1
+	}
+	return changed
+}
+
 const mosaicInputNameColumnWidth = 320
 
 func (l *mosaicFixedWidthLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
@@ -218,26 +248,32 @@ func (ws *mosaicWorkspace) rebuildOffsetControls() {
 
 		upBtn := widget.NewButton("↑", func(index int) func() {
 			return func() {
+				ws.inputMu.Lock()
 				if index == 0 {
+					ws.inputMu.Unlock()
 					return
 				}
 				ws.state.inputs[index-1], ws.state.inputs[index] = ws.state.inputs[index], ws.state.inputs[index-1]
 				if index < len(ws.state.statuses) && index-1 < len(ws.state.statuses) {
 					ws.state.statuses[index-1], ws.state.statuses[index] = ws.state.statuses[index], ws.state.statuses[index-1]
 				}
+				ws.inputMu.Unlock()
 				ws.resetPreview()
 				ws.rebuildOffsetControls()
 			}
 		}(idx))
 		downBtn := widget.NewButton("↓", func(index int) func() {
 			return func() {
+				ws.inputMu.Lock()
 				if index >= len(ws.state.inputs)-1 {
+					ws.inputMu.Unlock()
 					return
 				}
 				ws.state.inputs[index], ws.state.inputs[index+1] = ws.state.inputs[index+1], ws.state.inputs[index]
 				if index < len(ws.state.statuses) && index+1 < len(ws.state.statuses) {
 					ws.state.statuses[index], ws.state.statuses[index+1] = ws.state.statuses[index+1], ws.state.statuses[index]
 				}
+				ws.inputMu.Unlock()
 				ws.resetPreview()
 				ws.rebuildOffsetControls()
 			}
@@ -448,26 +484,32 @@ func (ws *mosaicWorkspace) openInputFramesPopup() {
 
 		upBtn := widget.NewButton("↑", func(index int) func() {
 			return func() {
+				ws.inputMu.Lock()
 				if index == 0 {
+					ws.inputMu.Unlock()
 					return
 				}
 				ws.state.inputs[index-1], ws.state.inputs[index] = ws.state.inputs[index], ws.state.inputs[index-1]
 				if index < len(ws.state.statuses) && index-1 < len(ws.state.statuses) {
 					ws.state.statuses[index-1], ws.state.statuses[index] = ws.state.statuses[index], ws.state.statuses[index-1]
 				}
+				ws.inputMu.Unlock()
 				ws.resetPreview()
 				ws.rebuildOffsetControls()
 			}
 		}(idx))
 		downBtn := widget.NewButton("↓", func(index int) func() {
 			return func() {
+				ws.inputMu.Lock()
 				if index >= len(ws.state.inputs)-1 {
+					ws.inputMu.Unlock()
 					return
 				}
 				ws.state.inputs[index], ws.state.inputs[index+1] = ws.state.inputs[index+1], ws.state.inputs[index]
 				if index < len(ws.state.statuses) && index+1 < len(ws.state.statuses) {
 					ws.state.statuses[index], ws.state.statuses[index+1] = ws.state.statuses[index+1], ws.state.statuses[index]
 				}
+				ws.inputMu.Unlock()
 				ws.resetPreview()
 				ws.rebuildOffsetControls()
 			}
@@ -539,6 +581,9 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 		dialog.ShowInformation("Already Added", "All selected files are already in the mosaic.", ws.win)
 		return
 	}
+	ws.inputMu.RLock()
+	calibration := ws.state.gmosCalibration
+	ws.inputMu.RUnlock()
 	skipped := len(paths) - len(filtered)
 	paths = filtered
 
@@ -640,10 +685,13 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 		}
 
 		combineOne := func(path string, meta []mosaic.Input) preparedInputs {
-			workingPath, cached, cerr := mosaic.EnsureCombinedExposure(path, mosaic.CombineOptions{Ctx: pt.ctx})
+			workingPath, cached, cerr := mosaic.EnsureCombinedExposure(path, mosaic.CombineOptions{Ctx: pt.ctx, GMOSCalibration: calibration})
 			if cerr != nil {
 				if cerr == mosaic.ErrCancelled {
 					return preparedInputs{}
+				}
+				if calibration != nil {
+					return preparedInputs{statuses: []mosaic.InputStatus{{Path: path, Status: "failed", Error: cerr.Error()}}, combineWarn: fmt.Sprintf("%s: %v", filepath.Base(path), cerr)}
 				}
 				debuglog.Log(fmt.Sprintf("loadPaths: combine %s failed, using per-chip mode: %v", filepath.Base(path), cerr))
 				p := buildPerChip(path, meta, "loaded (combine failed: per-chip mode)")
@@ -761,8 +809,13 @@ func (ws *mosaicWorkspace) loadPaths(paths []string, title string) {
 		}
 		messages = append(messages, offsetMessages...)
 		fyne.Do(func() {
+			ws.inputMu.Lock()
+			defer ws.inputMu.Unlock()
 			pt.hide()
 			ws.state.inputs = append(ws.state.inputs, newInputs...)
+			for _, input := range newInputs {
+				ws.advanceInputGenerationLocked(input)
+			}
 			ws.state.statuses = append(ws.state.statuses, newStatuses...)
 			// Re-sort the full inputs list so overall drizzle order is correct.
 			if len(ws.state.inputs) > 1 {

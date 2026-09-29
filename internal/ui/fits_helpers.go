@@ -12,7 +12,7 @@ import (
 // It matches the DQ extension by EXTVER when the SCI HDU has one, and selects
 // bad-pixel bits based on the instrument declared in the primary header.
 func cleanHDUWithDQ(hdu fitsio.HDU, file *fitsio.File) (fitsio.HDU, error) {
-	extver := hdu.Header.Cards["EXTVER"]
+	extver := fitsio.HeaderString(hdu.Header, "EXTVER")
 	dq := file.GetHDUByExtVer("DQ", extver)
 	if dq == nil {
 		return hdu, fmt.Errorf("DQ not found")

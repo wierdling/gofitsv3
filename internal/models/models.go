@@ -1,7 +1,6 @@
 package models
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 
@@ -53,6 +52,53 @@ type LoadedImage struct {
 	// Stored as plain coefficients to avoid a models→processing import.
 	HasAlignTransform                              bool
 	AlignA, AlignB, AlignC, AlignD, AlignE, AlignF float64
+
+	// StarStretch is the persisted gentler-star-stretch setting for this
+	// source; StarTreatment is the prepared model that renders it. The model
+	// is evaluated at source-grid positions, so both the in-memory and disk
+	// compositors apply it before resampling to the reference grid. The
+	// model is render-time only and never persisted; Compose rebuilds it
+	// from the setting, the reviewed star map and the current stretch.
+	StarStretch   StarStretchState
+	StarTreatment StretchTreatment
+}
+
+// StarStretchState is the per-source gentler star stretch setting.
+type StarStretchState struct {
+	Enabled  bool    `json:"enabled"`
+	Strength float64 `json:"strength"`
+}
+
+// StarWhiteningState is the Compose "White Stars" setting: star footprints
+// from one reference source's map move the composite's stellar excess toward
+// a neutral level in the selected output channels. Artistic only.
+type StarWhiteningState struct {
+	Enabled          bool    `json:"enabled"`
+	ReferenceBlinkID string  `json:"referenceBlinkId,omitempty"`
+	Strength         float64 `json:"strength"`
+	Level            string  `json:"level,omitempty"` // StarWhiteningWhite (default) or StarWhiteningLuminance
+	Red              bool    `json:"red"`
+	Green            bool    `json:"green"`
+	Blue             bool    `json:"blue"`
+	// ForcedStars overrides the runtime validity check for specific catalog
+	// source IDs (from the reference source's star map), so a star that would
+	// otherwise be skipped for insufficient background samples, or for any
+	// other runtime reason, is whitened anyway on a best-effort basis.
+	ForcedStars map[int]bool `json:"forcedStars,omitempty"`
+}
+
+const (
+	StarWhiteningWhite     = "white"     // white core; the whitening fades outward with the star's own profile
+	StarWhiteningLuminance = "luminance" // full neutralization across the footprint, excess luminance preserved
+)
+
+// StretchTreatment is a position-aware replacement for a source's scalar
+// stretch. MatchesStretch reports whether the treatment was prepared for the
+// given scalar settings; a compositor must not apply a stale treatment.
+type StretchTreatment interface {
+	MatchesStretch(img LoadedImage) bool
+	SourceSize() (width, height int)
+	TreatedStretch(v float32, x, y float64) float32
 }
 
 type ChannelState struct {
@@ -84,6 +130,10 @@ type ChannelState struct {
 	GHSStretch  float64 `json:"ghsStretch,omitempty"`
 	GHSLocal    float64 `json:"ghsLocal,omitempty"`
 	GHSSymmetry float64 `json:"ghsSymmetry,omitempty"`
+
+	// StarStretch persists the gentler star stretch setting; absent in older
+	// projects, which load with it disabled.
+	StarStretch *StarStretchState `json:"starStretch,omitempty"`
 }
 
 type ComposeProject struct {
@@ -102,303 +152,111 @@ type ComposeProject struct {
 	// BlinkChannels stores the selected channel indices in compact project order.
 	// An omitted value preserves the legacy BlinkFilters/BlinkExcludedFilter
 	// behavior when loading older projects.
-	BlinkChannels    *[]int    `json:"blinkChannels,omitempty"`
-	BlinkChannelKeys *[]string `json:"blinkChannelKeys,omitempty"`
-	// ColorCalibration is optional so projects written before calibration was
-	// introduced continue to decode with the calibration workflow disabled.
-	ColorCalibration        *ColorCalibrationState `json:"colorCalibration,omitempty"`
-	DisableColorCalibration bool                   `json:"disableColorCalibration,omitempty"`
+	BlinkChannels    *[]int       `json:"blinkChannels,omitempty"`
+	BlinkChannelKeys *[]string    `json:"blinkChannelKeys,omitempty"`
+	PSF              PSFSettings  `json:"psf,omitempty"`
+	LRGB             LRGBSettings `json:"lrgb,omitempty"`
+	// CompositionMode selects how Compose maps loaded sources to RGB. An empty
+	// value is intentionally treated as artistic for legacy projects.
+	CompositionMode ComposeMode `json:"compositionMode,omitempty"`
+	// StarWhitening persists the White Stars setting; absent when never used.
+	StarWhitening *StarWhiteningState `json:"starWhitening,omitempty"`
+	// StarStretchGeometryBlinkID names the source whose reviewed star map
+	// supplies the footprints for every source's gentler star stretch; empty
+	// means each source uses its own map.
+	StarStretchGeometryBlinkID string `json:"starStretchGeometryBlinkId,omitempty"`
+	// MixWeights is keyed by overlay BlinkID, rather than the overlay's sparse
+	// slot, so inserting/removing overlays does not retarget saved weights.
+	MixWeights []ComposeMixWeight `json:"mixWeights,omitempty"`
 }
 
-// PhotometricMode selects the source of per-channel photometric gains.
-type PhotometricMode string
+// ComposeMode controls the RGB composition strategy.
+type ComposeMode string
 
 const (
-	PhotometricOff        PhotometricMode = "off"
-	PhotometricInstrument PhotometricMode = "instrument"
-	PhotometricGaia       PhotometricMode = "gaia"
+	ComposeModeAuto     ComposeMode = "auto"
+	ComposeModeWeighted ComposeMode = "weighted"
+	ComposeModeArtistic ComposeMode = "artistic"
 )
 
-func (m PhotometricMode) valid() bool {
-	return m == "" || m == PhotometricOff || m == PhotometricInstrument || m == PhotometricGaia
-}
-
-// BackgroundSelection identifies the pixels used for neutralization.
-type BackgroundSelection string
-
+// Stable identities used by persisted weights for the three standard slots.
 const (
-	BackgroundAutomatic BackgroundSelection = "automatic"
-	BackgroundROI       BackgroundSelection = "alignedReferenceROI"
+	ComposeChannel1BlinkID = "channel-1"
+	ComposeChannel2BlinkID = "channel-2"
+	ComposeChannel3BlinkID = "channel-3"
 )
 
-func (s BackgroundSelection) valid() bool {
-	return s == "" || s == BackgroundAutomatic || s == BackgroundROI
-}
-
-type WhiteReference string
-
-const (
-	WhiteReferenceFlatFnu             WhiteReference = "flatFnu"
-	WhiteReferenceFlatFlambda         WhiteReference = "flatFlambda"
-	WhiteReferenceAverageSpiralGalaxy WhiteReference = "averageSpiralGalaxy"
-)
-
-func (w WhiteReference) valid() bool {
-	return w == "" || w == WhiteReferenceFlatFnu || w == WhiteReferenceFlatFlambda || w == WhiteReferenceAverageSpiralGalaxy
-}
-
-type CalibrationStatus string
-
-const (
-	CalibrationDisabled    CalibrationStatus = "disabled"
-	CalibrationCalculating CalibrationStatus = "calculating"
-	CalibrationValid       CalibrationStatus = "valid"
-	CalibrationStale       CalibrationStatus = "stale"
-	CalibrationUnsupported CalibrationStatus = "unsupported"
-	CalibrationCancelled   CalibrationStatus = "cancelled"
-	CalibrationFailed      CalibrationStatus = "failed"
-)
-
-func (s CalibrationStatus) valid() bool {
-	return s == "" || s == CalibrationDisabled || s == CalibrationCalculating || s == CalibrationValid || s == CalibrationStale || s == CalibrationUnsupported || s == CalibrationCancelled || s == CalibrationFailed
-}
-
-type OverlayMixMode string
-
-const (
-	OverlayArtistic         OverlayMixMode = "artistic"
-	OverlayCalibratedLinear OverlayMixMode = "calibratedLinear"
-)
-
-func (m OverlayMixMode) valid() bool {
-	return m == "" || m == OverlayArtistic || m == OverlayCalibratedLinear
-}
-
-// LinearTransform represents the immutable scalar calibration operation
-// y=(x-Offset)*Gain. Gain must be finite and positive when the transform is
-// applied; Offset may be any finite value.
-type LinearTransform struct {
-	Offset float64 `json:"offset,omitempty"`
-	Gain   float64 `json:"gain,omitempty"`
-}
-
-func (t LinearTransform) Valid() bool {
-	return math.IsNaN(t.Offset) == false && math.IsInf(t.Offset, 0) == false && math.IsNaN(t.Gain) == false && math.IsInf(t.Gain, 0) == false && t.Gain > 0
-}
-
-type CalibrationROI struct {
-	X      int `json:"x"`
-	Y      int `json:"y"`
-	Width  int `json:"width"`
-	Height int `json:"height"`
-}
-
-type CalibrationStretchSettings struct {
-	Mode    string  `json:"mode,omitempty"`
-	Black   float64 `json:"black,omitempty"`
-	White   float64 `json:"white,omitempty"`
-	Midtone float64 `json:"midtone,omitempty"`
-	Linked  bool    `json:"linked,omitempty"`
-}
-
-type CalibrationDiagnostics struct {
-	Warnings []string `json:"warnings,omitempty"`
-	Message  string   `json:"message,omitempty"`
-	Samples  int      `json:"samples,omitempty"`
-}
-
-type CalibrationProvenance struct {
-	AlgorithmVersion string   `json:"algorithmVersion,omitempty"`
-	ReferenceVersion string   `json:"referenceVersion,omitempty"`
-	Source           string   `json:"source,omitempty"`
-	CatalogVersion   string   `json:"catalogVersion,omitempty"`
-	ProviderVersion  string   `json:"providerVersion,omitempty"`
-	PassbandVersions []string `json:"passbandVersions,omitempty"`
-	SourceIDs        []uint64 `json:"sourceIDs,omitempty"`
-}
-
-// GaiaCalibrationSettings contains provider/query choices persisted with a
-// Compose calibration. Cache location is operational metadata; the endpoint,
-// release, quality and query values participate in fingerprints when used.
-type GaiaCalibrationSettings struct {
-	AccessMode        string  `json:"accessMode,omitempty"`
-	Endpoint          string  `json:"endpoint,omitempty"`
-	Release           string  `json:"release,omitempty"`
-	XPRepresentation  string  `json:"xpRepresentation,omitempty"`
-	QualitySelector   string  `json:"qualitySelector,omitempty"`
-	MagnitudeLimit    float64 `json:"magnitudeLimit,omitempty"`
-	MatchRadiusArcsec float64 `json:"matchRadiusArcsec,omitempty"`
-	ObservationEpoch  float64 `json:"observationEpoch,omitempty"`
-	CachePath         string  `json:"cachePath,omitempty"`
-	CacheMaxBytes     int64   `json:"cacheMaxBytes,omitempty"`
-}
-
-type OverlayCalibrationState struct {
-	Mode                 OverlayMixMode         `json:"mode,omitempty"`
-	Transform            LinearTransform        `json:"transform"`
-	Strength             float64                `json:"strength,omitempty"`
-	Status               CalibrationStatus      `json:"status,omitempty"`
-	Fingerprint          string                 `json:"fingerprint,omitempty"`
-	Passband             string                 `json:"passband,omitempty"`
-	Diagnostics          CalibrationDiagnostics `json:"diagnostics,omitempty"`
-	Provenance           CalibrationProvenance  `json:"provenance,omitempty"`
-	NeutralizeBackground bool                   `json:"neutralizeBackground,omitempty"`
-}
-
-type ColorCalibrationState struct {
-	Version              int                        `json:"version,omitempty"`
-	PhotometricMode      PhotometricMode            `json:"photometricMode,omitempty"`
-	NeutralizeBackground bool                       `json:"neutralizeBackground,omitempty"`
-	BackgroundSelection  BackgroundSelection        `json:"backgroundSelection,omitempty"`
-	BackgroundROI        CalibrationROI             `json:"backgroundROI,omitempty"`
-	WhiteReference       WhiteReference             `json:"whiteReference,omitempty"`
-	LinkedStretch        CalibrationStretchSettings `json:"linkedStretch,omitempty"`
-	BaseTransforms       [3]LinearTransform         `json:"baseTransforms,omitempty"`
-	Overlays             []OverlayCalibrationState  `json:"overlays,omitempty"`
-	Status               CalibrationStatus          `json:"status,omitempty"`
-	Diagnostics          CalibrationDiagnostics     `json:"diagnostics,omitempty"`
-	Provenance           CalibrationProvenance      `json:"provenance,omitempty"`
-	SourceFingerprint    string                     `json:"sourceFingerprint,omitempty"`
-	SettingsFingerprint  string                     `json:"settingsFingerprint,omitempty"`
-	Gaia                 GaiaCalibrationSettings    `json:"gaia,omitempty"`
-}
-
-func (s ColorCalibrationState) MarshalJSON() ([]byte, error) {
-	type alias ColorCalibrationState
-	allZero := true
-	for _, t := range s.BaseTransforms {
-		if t.Offset != 0 || t.Gain != 0 {
-			allZero = false
-			break
+// ResolveComposeMode applies the compatibility and Auto rules used by Compose.
+// Empty mode is legacy artistic behavior; Auto chooses weighted for four or
+// more sources and retains artistic behavior for smaller sets.
+func (p ComposeProject) ResolveComposeMode(sourceCount int) ComposeMode {
+	switch p.CompositionMode {
+	case ComposeModeWeighted:
+		return ComposeModeWeighted
+	case ComposeModeAuto:
+		if sourceCount >= 4 {
+			return ComposeModeWeighted
 		}
 	}
-	b, err := json.Marshal(alias(s))
-	if err != nil || !allZero {
-		return b, err
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(b, &fields); err != nil {
-		return nil, err
-	}
-	delete(fields, "baseTransforms")
-	return json.Marshal(fields)
+	return ComposeModeArtistic
 }
 
-func (s ColorCalibrationState) Effective() ColorCalibrationState {
-	if s.PhotometricMode == "" {
-		s.PhotometricMode = PhotometricOff
-	}
-	if s.BackgroundSelection == "" {
-		s.BackgroundSelection = BackgroundAutomatic
-	}
-	if s.WhiteReference == "" {
-		s.WhiteReference = WhiteReferenceFlatFnu
-	}
-	if s.Status == "" {
-		s.Status = CalibrationDisabled
-	}
-	return s
+// ComposeMixWeight assigns a non-negative RGB contribution to one stable
+// overlay identity. An all-zero value with a BlinkID is an explicit persisted
+// disable; an absent row retains the caller's legacy default fallback.
+type ComposeMixWeight struct {
+	BlinkID string  `json:"blinkId,omitempty"`
+	Red     float64 `json:"red"`
+	Green   float64 `json:"green"`
+	Blue    float64 `json:"blue"`
 }
 
-func (s ColorCalibrationState) Validate() error {
-	if !s.PhotometricMode.valid() {
-		return fmt.Errorf("invalid photometric mode %q", s.PhotometricMode)
+func (w ComposeMixWeight) Validate() error {
+	if !isFiniteModelNumber(w.Red) || !isFiniteModelNumber(w.Green) || !isFiniteModelNumber(w.Blue) {
+		return fmt.Errorf("compose mix weights must be finite")
 	}
-	if !s.BackgroundSelection.valid() {
-		return fmt.Errorf("invalid background selection %q", s.BackgroundSelection)
+	if w.Red < 0 || w.Green < 0 || w.Blue < 0 {
+		return fmt.Errorf("compose mix weights must be non-negative")
 	}
-	if !s.WhiteReference.valid() {
-		return fmt.Errorf("invalid white reference %q", s.WhiteReference)
-	}
-	if !s.Status.valid() {
-		return fmt.Errorf("invalid calibration status %q", s.Status)
-	}
-	for i, t := range s.BaseTransforms {
-		if transformPresent(t) && !t.Valid() {
-			return fmt.Errorf("invalid base transform %d", i)
+	return nil
+}
+
+func (p ComposeProject) ValidateMixWeights() error {
+	seen := make(map[string]struct{}, len(p.MixWeights))
+	for _, w := range p.MixWeights {
+		if w.BlinkID == "" {
+			return fmt.Errorf("compose mix weight BlinkID is required")
 		}
-		if s.Status == CalibrationValid && !transformPresent(t) {
-			return fmt.Errorf("missing base transform %d", i)
+		if _, ok := seen[w.BlinkID]; ok {
+			return fmt.Errorf("duplicate compose mix weight BlinkID %q", w.BlinkID)
 		}
-	}
-	for i, o := range s.Overlays {
-		if !o.Mode.valid() {
-			return fmt.Errorf("invalid overlay mode %d", i)
-		}
-		if transformPresent(o.Transform) && !o.Transform.Valid() {
-			return fmt.Errorf("invalid overlay transform %d", i)
-		}
-		if o.Status == CalibrationValid && !transformPresent(o.Transform) {
-			return fmt.Errorf("missing overlay transform %d", i)
-		}
-		if math.IsNaN(o.Strength) || math.IsInf(o.Strength, 0) {
-			return fmt.Errorf("invalid overlay strength %d", i)
+		seen[w.BlinkID] = struct{}{}
+		if err := w.Validate(); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func finiteTransform(t LinearTransform) bool {
-	return !math.IsNaN(t.Offset) && !math.IsInf(t.Offset, 0) && !math.IsNaN(t.Gain) && !math.IsInf(t.Gain, 0)
+func isFiniteModelNumber(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+
+// PSFSettings stores the optional cross-filter PSF matching recipe.
+type PSFSettings struct {
+	Enabled          bool    `json:"enabled,omitempty"`
+	TargetFWHMX      float64 `json:"targetFwhmX,omitempty"`
+	TargetFWHMY      float64 `json:"targetFwhmY,omitempty"`
+	ProtectSaturated bool    `json:"protectSaturated,omitempty"`
+	Saturation       float64 `json:"saturation,omitempty"`
 }
 
-func transformPresent(t LinearTransform) bool {
-	return t.Offset != 0 || t.Gain != 0
-}
-
-func (s *ColorCalibrationState) UnmarshalJSON(data []byte) error {
-	type plain ColorCalibrationState
-	var v plain
-	if err := json.Unmarshal(data, &v); err != nil {
-		return err
-	}
-	state := ColorCalibrationState(v).Effective()
-	var raw struct {
-		BaseTransforms []json.RawMessage `json:"baseTransforms"`
-		Overlays       []json.RawMessage `json:"overlays"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	for i, item := range raw.BaseTransforms {
-		if i >= len(state.BaseTransforms) {
-			break
-		}
-		if len(item) > 0 && string(item) != "null" && transformObjectExplicit(item) && !state.BaseTransforms[i].Valid() {
-			return fmt.Errorf("invalid base transform %d", i)
-		}
-	}
-	for i := range state.Overlays {
-		if state.Overlays[i].Mode == "" {
-			state.Overlays[i].Mode = OverlayArtistic
-		}
-		if state.Overlays[i].Status == "" {
-			state.Overlays[i].Status = CalibrationDisabled
-		}
-		if i < len(raw.Overlays) {
-			var overlayRaw struct {
-				Transform json.RawMessage `json:"transform"`
-			}
-			if json.Unmarshal(raw.Overlays[i], &overlayRaw) == nil && len(overlayRaw.Transform) > 0 && string(overlayRaw.Transform) != "null" && transformObjectExplicit(overlayRaw.Transform) && !state.Overlays[i].Transform.Valid() {
-				return fmt.Errorf("invalid overlay transform %d", i)
-			}
-		}
-	}
-	if err := state.Validate(); err != nil {
-		return err
-	}
-	*s = state
-	return nil
-}
-
-func transformObjectExplicit(raw json.RawMessage) bool {
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(raw, &fields) != nil {
-		return false
-	}
-	_, offset := fields["offset"]
-	_, gain := fields["gain"]
-	return offset || gain
+// LRGBSettings stores the optional luminance recipe used by Compose.
+type LRGBSettings struct {
+	Enabled              bool         `json:"enabled,omitempty"`
+	DedicatedLPath       string       `json:"dedicatedLPath,omitempty"`
+	DedicatedLState      ChannelState `json:"dedicatedLState,omitempty"`
+	SyntheticWeights     [3]float64   `json:"syntheticWeights,omitempty"`
+	LuminanceWeight      float64      `json:"luminanceWeight,omitempty"`
+	ChrominanceSmoothing float64      `json:"chrominanceSmoothing,omitempty"`
 }
 
 type OrangeLayerState struct {
@@ -420,6 +278,9 @@ type OrangeLayerState struct {
 // via the Settings > Drizzle dialog. All kernel/method values are stored as
 // ints so they round-trip through JSON without importing the mosaic package.
 type DrizzleSettings struct {
+	// DiagnosticProducts enables optional diagnostic IMAGE extensions in saved
+	// drizzle products. It is false by default for legacy-compatible output.
+	DiagnosticProducts bool `json:"diagnosticProducts,omitempty"`
 	// FinalScale is the desired output plate scale in arcsec/pixel (AstroDrizzle
 	// final_scale semantics).  When > 0, the internal multiplier is computed from
 	// the reference image WCS.  Scale is used as a raw multiplier fallback when
@@ -595,8 +456,9 @@ type ArtifactMaskProject struct {
 }
 
 type MosaicInputState struct {
-	Path   string `json:"path"`
-	SCIExt int    `json:"sciExt,omitempty"`
+	Path       string `json:"path"`
+	SourcePath string `json:"sourcePath,omitempty"`
+	SCIExt     int    `json:"sciExt,omitempty"`
 	// Combined marks an entry whose Path is the original multi-chip source file
 	// that gets drizzled into a single working image on load. Absent (false) for
 	// ordinary single-chip inputs and for pre-combine legacy projects.
@@ -617,18 +479,24 @@ type MosaicInputState struct {
 }
 
 type MosaicProject struct {
-	Inputs               []MosaicInputState   `json:"inputs"`
-	ReferencePath        string               `json:"referencePath,omitempty"`
-	ReferenceSCIExt      int                  `json:"referenceSciExt,omitempty"`
-	DrizzleSettings      DrizzleSettings      `json:"drizzleSettings"`
-	DrizzleSettingsSet   bool                 `json:"drizzleSettingsSet"`
-	AlignmentSettings    AlignmentSettings    `json:"alignmentSettings"`
-	AlignmentSettingsSet bool                 `json:"alignmentSettingsSet"`
-	SkysubSettings       SkysubSettings       `json:"skysubSettings"`
-	SkysubSettingsSet    bool                 `json:"skysubSettingsSet"`
-	ActiveFilter         string               `json:"activeFilter,omitempty"`
-	ArtifactMasks        *ArtifactMaskProject `json:"artifactMasks,omitempty"`
-	ExposureNormMode     int                  `json:"exposureNormMode,omitempty"`
+	Inputs                     []MosaicInputState   `json:"inputs"`
+	ReferencePath              string               `json:"referencePath,omitempty"`
+	ReferenceSCIExt            int                  `json:"referenceSciExt,omitempty"`
+	DrizzleSettings            DrizzleSettings      `json:"drizzleSettings"`
+	DrizzleSettingsSet         bool                 `json:"drizzleSettingsSet"`
+	AlignmentSettings          AlignmentSettings    `json:"alignmentSettings"`
+	AlignmentSettingsSet       bool                 `json:"alignmentSettingsSet"`
+	SkysubSettings             SkysubSettings       `json:"skysubSettings"`
+	SkysubSettingsSet          bool                 `json:"skysubSettingsSet"`
+	ActiveFilter               string               `json:"activeFilter,omitempty"`
+	ArtifactMasks              *ArtifactMaskProject `json:"artifactMasks,omitempty"`
+	ExposureNormMode           int                  `json:"exposureNormMode,omitempty"`
+	GMOSCalibrationEnabled     bool                 `json:"gmosCalibrationEnabled,omitempty"`
+	GMOSPartialCalibration     bool                 `json:"gmosPartialCalibration,omitempty"`
+	GMOSCalibrationFingerprint string               `json:"gmosCalibrationFingerprint,omitempty"`
+	GMOSBiasPaths              []string             `json:"gmosBiasPaths,omitempty"`
+	GMOSFlatPaths              []string             `json:"gmosFlatPaths,omitempty"`
+	GMOSBPMPaths               []string             `json:"gmosBPMPaths,omitempty"`
 }
 
 type ChannelControl struct {

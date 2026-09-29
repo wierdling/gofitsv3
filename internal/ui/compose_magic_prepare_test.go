@@ -285,6 +285,38 @@ func TestComposeMagicCustomControlInstallPreservesMTF(t *testing.T) {
 	}
 }
 
+func TestComposeMagicCustomControlSyncsAllStretchFields(t *testing.T) {
+	const idx = 3
+	img := composeMagicTestImage("custom.fits")
+	img.Background = 0.12
+	img.Peak = 0.91
+	img.Black = 0.18
+	img.White = 0.86
+	img.MTFMidtone = 0.31
+	img.Mode = stretch.MTF
+
+	imgs := make([]*models.LoadedImage, idx+1)
+	imgs[idx] = img
+	origPixels := make([][]float32, idx+1)
+	views := make([]*viewport, idx+1)
+	views[idx] = newViewport()
+	control := channelControls("Custom Image", color.NRGBA{R: 12, G: 34, B: 56, A: 255}, idx, imgs, &origPixels, views, func() {}, nil, false)
+	controls := make([]*models.ChannelControl, idx+1)
+	controls[idx] = control
+
+	applyChannelState(idx, channelStateFromImage(img), imgs, views, controls)
+
+	if control.BackgroundEntry.Value() != img.Background || control.PeakEntry.Value() != img.Peak {
+		t.Fatalf("custom control levels = (%v, %v), want (%v, %v)", control.BackgroundEntry.Value(), control.PeakEntry.Value(), img.Background, img.Peak)
+	}
+	if control.MTFMidtoneEntry.Value() != img.MTFMidtone || control.ModeSelect.Selected != "MTF" {
+		t.Fatalf("custom control MTF = (%v, %q), want (%v, MTF)", control.MTFMidtoneEntry.Value(), control.ModeSelect.Selected, img.MTFMidtone)
+	}
+	if views[idx].blackBox.Value() != img.Black || views[idx].whiteBox.Value() != img.White {
+		t.Fatalf("custom viewport levels = (%v, %v), want (%v, %v)", views[idx].blackBox.Value(), views[idx].whiteBox.Value(), img.Black, img.White)
+	}
+}
+
 func TestPlanComposeMagicInstallFailureDoesNotMutateExistingChannels(t *testing.T) {
 	rows := composeMagicPrepareRows()
 	channels := make([]composeMagicPreparedChannel, len(rows))

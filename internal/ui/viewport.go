@@ -14,6 +14,8 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"gofitsv3/internal/processing"
 )
 
 // hpad returns a fixed-width invisible spacer for horizontal edge padding.
@@ -183,6 +185,7 @@ type viewport struct {
 	customZoom    string
 	histColor     [4]uint8 // bar color; if zero, use default white-bg/gray-bar style
 	StatsLabel    *widget.Label
+	renderStatus  *widget.Label
 	FilterLabel   *widget.Label
 	pickerLabel   *widget.Label
 	pickerBox     fyne.CanvasObject
@@ -220,13 +223,16 @@ func newViewport() *viewport {
 	vp.StatsLabel = widget.NewLabel("Sky --  μ --  σ --")
 	vp.StatsLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.StatsLabel.Alignment = fyne.TextAlignCenter
+	vp.renderStatus = widget.NewLabel("Rendering composite…")
+	vp.renderStatus.TextStyle = fyne.TextStyle{Italic: true}
+	vp.renderStatus.Hide()
 	vp.FilterLabel = widget.NewLabel("")
 	vp.FilterLabel.TextStyle = fyne.TextStyle{Italic: true}
 	vp.pickerLabel = widget.NewLabel("Value: --")
 	vp.pickerLabel.TextStyle = fyne.TextStyle{Monospace: true}
 	vp.pickerBox = container.New(layout.NewGridWrapLayout(fyne.NewSize(135, vp.pickerLabel.MinSize().Height)), vp.pickerLabel)
 
-	vp.actionRow = container.NewHBox(layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer())
+	vp.actionRow = container.NewHBox(layout.NewSpacer(), vp.StatsLabel, layout.NewSpacer(), vp.renderStatus)
 
 	histRow := container.NewBorder(nil, nil, container.NewHBox(hpad(6), vp.FilterLabel, hpad(6)), nil, vp.histogram)
 
@@ -255,6 +261,35 @@ func newViewport() *viewport {
 	vp.zoomLabel.SetSelected("fit")
 
 	return vp
+}
+
+// SetCompositeRendering shows a small, modeless status indicator in the
+// viewport header. It deliberately does not cover the image or intercept
+// pointer input, so zooming, picking, and other controls remain interactive
+// while a disk-backed composite is being prepared.
+func (vp *viewport) SetCompositeRendering(rendering bool) {
+	if vp == nil || vp.renderStatus == nil {
+		return
+	}
+	if rendering {
+		vp.renderStatus.Show()
+	} else {
+		vp.renderStatus.Hide()
+	}
+	vp.actionRow.Refresh()
+}
+
+// SetStatsText updates the viewport's status text without changing the image
+// or histogram. Callers that are not already on Fyne's UI thread should wrap
+// this method in fyne.Do.
+func (vp *viewport) SetStatsText(text string) {
+	if vp == nil || vp.StatsLabel == nil {
+		return
+	}
+	if text == "" {
+		text = "Sky --  μ --  σ --"
+	}
+	vp.StatsLabel.SetText(text)
 }
 
 func (vp *viewport) SetLevelPickers(blackFn, whiteFn func()) {
@@ -302,6 +337,7 @@ func (vp *viewport) SetLoadSave(chanLabel, letter string, col color.Color, loadF
 		)
 	}
 	objects = append(objects, hpad(6), newCompactBtn("Load", loadFn), newCompactBtn("Save", saveFn), hpad(6))
+	objects = append(objects, layout.NewSpacer(), vp.renderStatus)
 	vp.actionRow.Objects = objects
 	vp.actionRow.Refresh()
 }
@@ -315,6 +351,7 @@ func (vp *viewport) SetCenterAction(chanLabel, letter string, col color.Color, a
 		hpad(6), badge, hpad(4), nameText,
 		layout.NewSpacer(),
 		vp.StatsLabel, hpad(6), newCompactBtn(actionLabel, fn), hpad(6),
+		layout.NewSpacer(), vp.renderStatus,
 	}
 	vp.actionRow.Refresh()
 }
@@ -469,25 +506,39 @@ func blankImg() *image.RGBA {
 
 func (vp *viewport) imagePointAtPosition(pos fyne.Position, flipped bool) (imagePoint, bool) {
 	adj := pos
-	if vp.overlay != nil && vp.zoom > 0 && vp.origW > 0 && vp.origH > 0 {
-		// img/overlay sit in a NewMax container, which stretches both to fill
-		// the scroll viewport whenever the zoomed image is smaller than it.
-		// ImageFillContain then centers the actual pixels with a letterbox
-		// margin, so that margin must be backed out before mapping (mirrors
-		// screenToImagePt in workspace_edit.go).
-		dispW := float32(vp.origW) * float32(vp.zoom)
-		dispH := float32(vp.origH) * float32(vp.zoom)
-		sz := vp.overlay.Size()
-		var offX, offY float32
-		if sz.Width > dispW {
-			offX = (sz.Width - dispW) / 2
-		}
-		if sz.Height > dispH {
-			offY = (sz.Height - dispH) / 2
-		}
+	if offX, offY, ok := vp.imageLetterboxOffset(); ok {
 		adj = fyne.NewPos(pos.X-offX, pos.Y-offY)
 	}
 	return mapViewportPositionToImage(adj, fyne.NewPos(0, 0), vp.zoom, vp.origW, vp.origH, flipped)
+}
+
+func (vp *viewport) imageLetterboxOffset() (float32, float32, bool) {
+	if vp == nil || vp.overlay == nil || vp.zoom <= 0 || vp.origW <= 0 || vp.origH <= 0 {
+		return 0, 0, false
+	}
+	dispW := float32(vp.origW) * float32(vp.zoom)
+	dispH := float32(vp.origH) * float32(vp.zoom)
+	// Prefer the overlay's own on-screen size, but that size lags behind a
+	// fresh image/zoom change until Fyne's next layout pass runs (see the
+	// Resize comment on viewerInteractionLayer), which otherwise leaves the
+	// diagnostics overlay positioned for the old size until something else
+	// (e.g. a pane resize) forces a relayout. vp.scroll's own size is set by
+	// the outer layout independent of that inner content relayout, so it is
+	// already current; fall back to it whenever the overlay looks stale.
+	sz := vp.overlay.Size()
+	if vp.scroll != nil && (sz.Width < dispW || sz.Height < dispH) {
+		if scrollSz := vp.scroll.Size(); scrollSz.Width > 0 && scrollSz.Height > 0 {
+			sz = scrollSz
+		}
+	}
+	var offX, offY float32
+	if sz.Width > dispW {
+		offX = (sz.Width - dispW) / 2
+	}
+	if sz.Height > dispH {
+		offY = (sz.Height - dispH) / 2
+	}
+	return offX, offY, true
 }
 
 func (vp *viewport) setMeasurementOverlay(first *imagePoint, second *imagePoint, flipped bool) {
@@ -498,11 +549,60 @@ func (vp *viewport) setMeasurementOverlay(first *imagePoint, second *imagePoint,
 	var end *fyne.Position
 	if first != nil {
 		pos := imagePointToCanvasPosition(*first, vp.zoom, vp.origH, flipped)
+		if offX, offY, ok := vp.imageLetterboxOffset(); ok {
+			pos = fyne.NewPos(pos.X+offX, pos.Y+offY)
+		}
 		start = &pos
 	}
 	if second != nil {
 		pos := imagePointToCanvasPosition(*second, vp.zoom, vp.origH, flipped)
+		if offX, offY, ok := vp.imageLetterboxOffset(); ok {
+			pos = fyne.NewPos(pos.X+offX, pos.Y+offY)
+		}
 		end = &pos
 	}
 	vp.overlay.setMeasurement(start, end)
+}
+
+// setDiagnosticOverlay draws the star-treatment diagnostics as colored dots:
+// green for a treated (Usable) star, red for one that was skipped. points are
+// in the same continuous composite-grid coordinates as StarMapSource.X/Y (no
+// half-pixel offset), matching how the rest of the app draws catalog markers.
+// Canvas positions follow the image's actual contain scale; re-call this
+// (or let the overlay's onResized hook do
+// it) whenever the viewport's size, zoom, or pan changes.
+func (vp *viewport) setDiagnosticOverlay(points []processing.StarTreatmentDiagnostic) {
+	vp.setDiagnosticOverlayWithForce(points, nil)
+}
+
+// setDiagnosticOverlayWithForce keeps every diagnostic point addressable for
+// hover/click handling, while drawing circles only for processed points.
+// forceEligible is parallel to points and identifies the reference stars that
+// may receive a White Stars forced-processing override.
+func (vp *viewport) setDiagnosticOverlayWithForce(points []processing.StarTreatmentDiagnostic, forceEligible []bool) {
+	if vp == nil || vp.overlay == nil {
+		return
+	}
+	offX, offY, _ := vp.imageLetterboxOffset()
+	scale := float32(vp.zoom)
+	// The image and overlay share the same layout box. Max/Restore can change
+	// that box without changing zoom, and ImageFillContain scales the image
+	// to fit it. Match that scale and centering rather than the saved zoom.
+	sz := vp.overlay.Size()
+	if vp.origW > 0 && vp.origH > 0 && sz.Width > 0 && sz.Height > 0 {
+		scale = min(sz.Width/float32(vp.origW), sz.Height/float32(vp.origH))
+		offX = (sz.Width - float32(vp.origW)*scale) / 2
+		offY = (sz.Height - float32(vp.origH)*scale) / 2
+	}
+	markers := make([]viewerMarker, 0, len(points))
+	for i, p := range points {
+		col := color.RGBA{R: 60, G: 220, B: 90, A: 230}
+		if !p.Usable {
+			col = color.RGBA{R: 230, G: 40, B: 40, A: 230}
+		}
+		pos := fyne.NewPos(float32(p.X)*scale+offX, float32(p.Y)*scale+offY)
+		eligible := i < len(forceEligible) && forceEligible[i]
+		markers = append(markers, viewerMarker{Pos: pos, Color: col, Radius: 6, Draw: p.Usable, ForceEligible: eligible, HoverDiagnostic: !p.Usable && !eligible})
+	}
+	vp.overlay.setMarkers(markers)
 }

@@ -2,6 +2,7 @@ package processing
 
 import (
 	"context"
+	"fmt"
 	"image"
 	"math"
 	"runtime"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
@@ -19,6 +21,8 @@ import (
 )
 
 const fitsLiberatorAutoScaledPeak = 10.0
+
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 func AutoScaleLikeFitsLiberator(img *models.LoadedImage) {
 	if img == nil {
@@ -241,7 +245,7 @@ func ApplyStretchParallel(img *models.LoadedImage) (fitsio.ImageData, []byte) {
 }
 
 func ComposeRGB(ctx context.Context, imgs []*models.LoadedImage) ([]byte, int, int, [3]histogram.Stats) {
-	if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+	if len(imgs) < 3 || imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
 		return nil, 0, 0, [3]histogram.Stats{}
 	}
 
@@ -271,9 +275,6 @@ func ComposeRGB(ctx context.Context, imgs []*models.LoadedImage) ([]byte, int, i
 type OverlayLayer struct {
 	Image    *models.LoadedImage
 	Settings models.OrangeLayerState
-	// Photometry is optional metadata captured for a calibrated overlay. The
-	// persisted overlay transform remains authoritative during rendering.
-	Photometry *InstrumentPhotometry
 }
 
 func ComposeRGBWithOrange(ctx context.Context, imgs []*models.LoadedImage, orange *models.LoadedImage, settings models.OrangeLayerState) ([]byte, int, int, [3]histogram.Stats) {
@@ -298,6 +299,100 @@ func ComposeRGBWithOverlays(ctx context.Context, imgs []*models.LoadedImage, ove
 		blendOverlayCtx(ctx, buf, ov.Image, ref, ov.Settings)
 	}
 	return buf, w, h, HistogramRGB(buf)
+}
+
+// ComposeWeightedRGBPlanes aligns and stretches all supplied sources to the
+// Channel 2 reference grid, then mixes them simultaneously in float32. The
+// standard channels use their stable channel identities; overlays use their
+// persisted BlinkID. This path is deliberately separate from the artistic
+// compositor so legacy output remains byte-for-byte compatible.
+func ComposeWeightedRGBPlanes(ctx context.Context, imgs []*models.LoadedImage, overlays []OverlayLayer, weights []models.ComposeMixWeight) ([3][]float32, int, int, error) {
+	var empty [3][]float32
+	if len(imgs) < 3 || imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+		return empty, 0, 0, fmt.Errorf("all three channels are required")
+	}
+	ref := imgs[1]
+	w, h := ref.HDU.Data.Width, ref.HDU.Data.Height
+	lookup := make(map[string]models.ComposeMixWeight, len(weights))
+	for _, weight := range weights {
+		if err := weight.Validate(); err != nil {
+			return empty, 0, 0, err
+		}
+		if weight.BlinkID == "" {
+			return empty, 0, 0, fmt.Errorf("compose mix weight BlinkID is required")
+		}
+		lookup[weight.BlinkID] = weight
+	}
+	standard := []struct {
+		image *models.LoadedImage
+		id    string
+		color [3]float64
+	}{
+		{imgs[2], models.ComposeChannel3BlinkID, [3]float64{1, 0, 0}},
+		{imgs[1], models.ComposeChannel2BlinkID, [3]float64{0, 1, 0}},
+		{imgs[0], models.ComposeChannel1BlinkID, [3]float64{0, 0, 1}},
+	}
+	sources := make([]WeightedComposeSource, 0, 3+len(overlays))
+	for _, item := range standard {
+		data := stretchForReferenceGrid(ctx, item.image, ref)
+		if err := ctx.Err(); err != nil {
+			return empty, 0, 0, err
+		}
+		weight, ok := lookup[item.id]
+		if !ok {
+			weight = models.ComposeMixWeight{BlinkID: item.id, Red: item.color[0], Green: item.color[1], Blue: item.color[2]}
+		}
+		sources = append(sources, WeightedComposeSource{BlinkID: item.id, Pixels: data.Pixels, Weights: weight})
+	}
+	for i, overlay := range overlays {
+		if overlay.Image == nil {
+			continue
+		}
+		id := overlay.Settings.BlinkID
+		if id == "" {
+			id = fmt.Sprintf("overlay-%d", i+1)
+		}
+		data := stretchForReferenceGrid(ctx, overlay.Image, ref)
+		if err := ctx.Err(); err != nil {
+			return empty, 0, 0, err
+		}
+		weight, ok := lookup[id]
+		if !ok {
+			opacity := overlay.Settings.Opacity
+			if opacity < 0 {
+				opacity = 0
+			} else if opacity > 1 {
+				opacity = 1
+			}
+			weight = models.ComposeMixWeight{BlinkID: id,
+				Red:   float64(overlay.Settings.ColorR) / 255 * opacity,
+				Green: float64(overlay.Settings.ColorG) / 255 * opacity,
+				Blue:  float64(overlay.Settings.ColorB) / 255 * opacity}
+			if weight.Red == 0 && weight.Green == 0 && weight.Blue == 0 {
+				continue
+			}
+		}
+		sources = append(sources, WeightedComposeSource{BlinkID: id, Pixels: data.Pixels, Weights: weight})
+	}
+	result, err := WeightedComposeRGB(ctx, sources, w, h)
+	return result, w, h, err
+}
+
+// Float32RGBToRGBA converts planar normalized RGB data to RGBA only after all
+// float-domain composition and luminance operations have completed.
+func Float32RGBToRGBA(rgb [3][]float32, width, height int) ([]byte, error) {
+	n := width * height
+	if width <= 0 || height <= 0 || len(rgb[0]) < n || len(rgb[1]) < n || len(rgb[2]) < n {
+		return nil, fmt.Errorf("invalid RGB dimensions")
+	}
+	out := make([]byte, n*4)
+	for i := 0; i < n; i++ {
+		out[i*4] = byte(utils.Clamp01(float64(rgb[0][i]))*255 + .5)
+		out[i*4+1] = byte(utils.Clamp01(float64(rgb[1][i]))*255 + .5)
+		out[i*4+2] = byte(utils.Clamp01(float64(rgb[2][i]))*255 + .5)
+		out[i*4+3] = 255
+	}
+	return out, nil
 }
 
 // blendOverlay combines a single tinted overlay image onto buf in place,
@@ -356,7 +451,7 @@ func blendOverlayCtx(ctx context.Context, buf []byte, overlay, ref *models.Loade
 // the three loaded images, aligned and stretched to the green reference grid.
 // Channel order: r, g, b matching imgs[2], imgs[1], imgs[0].
 func ComposeRGBFloat32(imgs []*models.LoadedImage) (r, g, b []float32, width, height int) {
-	if imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
+	if len(imgs) < 3 || imgs[0] == nil || imgs[1] == nil || imgs[2] == nil {
 		return nil, nil, nil, 0, 0
 	}
 	ref := imgs[1]
@@ -453,6 +548,25 @@ func stretchForReferenceGrid(ctx context.Context, img, ref *models.LoadedImage) 
 	if img == nil || ref == nil {
 		return fitsio.ImageData{}
 	}
+	if img.StarTreatment != nil {
+		// The gentler star stretch is defined at source-grid positions, so a
+		// treated source is stretched on its own grid and the stretched result
+		// is resampled. On a shared grid this is exact; otherwise the order
+		// (stretch, then resample) differs from the untreated path by the
+		// bilinear interpolation of an already-stretched sample, matching the
+		// disk compositor, which also treats at the sampled source position.
+		treated, err := TreatedStretchForSource(ctx, img)
+		if err == nil {
+			if img == ref || sharedDrizzleGrid(img, ref) {
+				return treated
+			}
+			clone := *img
+			clone.HDU = img.HDU
+			clone.HDU.Data = treated
+			return ImageDataForReferenceGridCtx(ctx, &clone, ref)
+		}
+		debuglog.Log(fmt.Sprintf("stretchForReferenceGrid: star treatment ignored: %v", err))
+	}
 	if img == ref || sharedDrizzleGrid(img, ref) {
 		data, _ := ApplyStretchParallel(img)
 		return data
@@ -466,6 +580,71 @@ func stretchForReferenceGrid(ctx context.Context, img, ref *models.LoadedImage) 
 	clone.HDU.Data = raw
 	data, _ := ApplyStretchParallel(&clone)
 	return data
+}
+
+// StretchForDisplay is ApplyStretchParallel with the source's star treatment
+// applied when one is attached and current. The clip mask is still produced
+// from the ordinary stretch when ShowClip is set; a stale treatment renders
+// untreated, as in the compositors.
+func StretchForDisplay(img *models.LoadedImage) (fitsio.ImageData, []byte) {
+	if img == nil || img.StarTreatment == nil {
+		return ApplyStretchParallel(img)
+	}
+	treated, err := TreatedStretchForSource(context.Background(), img)
+	if err != nil {
+		debuglog.Log(fmt.Sprintf("StretchForDisplay: star treatment ignored: %v", err))
+		return ApplyStretchParallel(img)
+	}
+	var mask []byte
+	if img.ShowClip {
+		_, mask = ApplyStretchParallel(img)
+	}
+	return treated, mask
+}
+
+// TreatedStretchForSource renders a source through its attached star
+// treatment on its own grid. It fails, rather than falling back, when the
+// treatment was prepared for other stretch settings or another grid.
+func TreatedStretchForSource(ctx context.Context, img *models.LoadedImage) (fitsio.ImageData, error) {
+	if img == nil || img.StarTreatment == nil {
+		return fitsio.ImageData{}, fmt.Errorf("no star treatment attached")
+	}
+	t := img.StarTreatment
+	if !t.MatchesStretch(*img) {
+		return fitsio.ImageData{}, fmt.Errorf("star treatment was prepared for different stretch settings")
+	}
+	w, h := img.HDU.Data.Width, img.HDU.Data.Height
+	if tw, th := t.SourceSize(); tw != w || th != h {
+		return fitsio.ImageData{}, fmt.Errorf("star treatment was prepared on a %dx%d grid, source is %dx%d", tw, th, w, h)
+	}
+	if len(img.HDU.Data.Pixels) != w*h {
+		return fitsio.ImageData{}, fmt.Errorf("source pixel count does not match its dimensions")
+	}
+	out := make([]float32, w*h)
+	numWorkers := max(1, runtime.NumCPU())
+	rowsPer := (h + numWorkers - 1) / numWorkers
+	var wg sync.WaitGroup
+	for y0 := 0; y0 < h; y0 += rowsPer {
+		y1 := min(h, y0+rowsPer)
+		wg.Add(1)
+		go func(y0, y1 int) {
+			defer wg.Done()
+			for y := y0; y < y1; y++ {
+				if ctx.Err() != nil {
+					return
+				}
+				row := img.HDU.Data.Pixels[y*w : (y+1)*w]
+				for x, v := range row {
+					out[y*w+x] = t.TreatedStretch(v, float64(x), float64(y))
+				}
+			}
+		}(y0, y1)
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return fitsio.ImageData{}, err
+	}
+	return fitsio.ImageData{Width: w, Height: h, Pixels: out}, nil
 }
 
 func sharedDrizzleGrid(img, ref *models.LoadedImage) bool {
@@ -828,6 +1007,9 @@ func RotateImageData90CW(data fitsio.ImageData) fitsio.ImageData {
 }
 
 func ResizeChannel(pixels []float32, oldW, oldH, newW, newH int) []float32 {
+	if oldW <= 0 || oldH <= 0 || newW <= 0 || newH <= 0 || oldW > len(pixels)/oldH || newW > int(^uint(0)>>1)/newH {
+		return nil
+	}
 	out := make([]float32, newW*newH)
 	xRatio := float64(oldW) / float64(newW)
 	yRatio := float64(oldH) / float64(newH)
@@ -841,15 +1023,23 @@ func ResizeChannel(pixels []float32, oldW, oldH, newW, newH int) []float32 {
 			yDiff := py - float64(yBase)
 			idx := yBase*oldW + xBase
 			if xBase >= oldW-1 || yBase >= oldH-1 {
-				out[y*newW+x] = pixels[idx]
+				if finite(float64(pixels[idx])) {
+					out[y*newW+x] = pixels[idx]
+				} else {
+					out[y*newW+x] = float32(math.NaN())
+				}
 				continue
 			}
 			a := float64(pixels[idx])
 			b := float64(pixels[idx+1])
 			c := float64(pixels[(yBase+1)*oldW+xBase])
 			d := float64(pixels[(yBase+1)*oldW+xBase+1])
-			if math.IsNaN(a) || math.IsNaN(b) || math.IsNaN(c) || math.IsNaN(d) {
-				out[y*newW+x] = float32(a)
+			if !finite(a) || !finite(b) || !finite(c) || !finite(d) {
+				if !finite(a) {
+					out[y*newW+x] = float32(math.NaN())
+				} else {
+					out[y*newW+x] = float32(a)
+				}
 				continue
 			}
 			out[y*newW+x] = float32(a*(1-xDiff)*(1-yDiff) + b*xDiff*(1-yDiff) + c*(1-xDiff)*yDiff + d*xDiff*yDiff)

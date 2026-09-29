@@ -19,14 +19,14 @@ import (
 //	                            then fires onHealStroke with all sampled points.
 type healLayer struct {
 	widget.BaseWidget
-	mode        healMode
-	srcPos      *fyne.Position
-	strokeDsts  []fyne.Position // all sampled positions during the dest stroke
-	brushRadius float32
-	srcCircle   *canvas.Circle
-	dstCircle   *canvas.Circle  // tracks the current drag tip
-	trailRaster *canvas.Raster  // redraws the full stroke trail
-	background  *canvas.Rectangle
+	mode         healMode
+	srcPos       *fyne.Position
+	strokeDsts   []fyne.Position // all sampled positions during the dest stroke
+	brushRadius  float32
+	srcCircle    *canvas.Circle
+	dstCircle    *canvas.Circle // tracks the current drag tip
+	trailRaster  *canvas.Raster // redraws the full stroke trail
+	background   *canvas.Rectangle
 	onHealStroke func(src fyne.Position, dsts []fyne.Position)
 	onSourceSet  func()
 }
@@ -134,20 +134,40 @@ func (h *healLayer) Dragged(e *fyne.DragEvent) {
 	if minGap < 1 {
 		minGap = 1
 	}
-	if len(h.strokeDsts) == 0 {
-		h.strokeDsts = append(h.strokeDsts, pos)
+	if appendHealStrokeSamples(&h.strokeDsts, pos, minGap) {
 		h.trailRaster.Show()
-	} else {
-		last := h.strokeDsts[len(h.strokeDsts)-1]
-		dx := pos.X - last.X
-		dy := pos.Y - last.Y
-		if dx*dx+dy*dy >= minGap*minGap {
-			h.strokeDsts = append(h.strokeDsts, pos)
-		}
 	}
 	h.positionCircle(h.dstCircle, pos)
 	h.trailRaster.Refresh()
 	canvas.Refresh(h)
+}
+
+// appendHealStrokeSamples adds pos and interpolated points from the previous
+// sample. Pointer events can be separated by many pixels, so recording only
+// the event positions would leave gaps in the healed stroke.
+func appendHealStrokeSamples(samples *[]fyne.Position, pos fyne.Position, minGap float32) bool {
+	if samples == nil {
+		return false
+	}
+	if minGap < 1 {
+		minGap = 1
+	}
+	if len(*samples) == 0 {
+		*samples = append(*samples, pos)
+		return true
+	}
+	last := (*samples)[len(*samples)-1]
+	dx, dy := pos.X-last.X, pos.Y-last.Y
+	distance := float32(math.Hypot(float64(dx), float64(dy)))
+	if distance < minGap {
+		return false
+	}
+	steps := int(math.Ceil(float64(distance / minGap)))
+	for i := 1; i <= steps; i++ {
+		t := float32(i) / float32(steps)
+		*samples = append(*samples, fyne.NewPos(last.X+dx*t, last.Y+dy*t))
+	}
+	return true
 }
 
 // DragEnd commits the stroke when the mouse is released.

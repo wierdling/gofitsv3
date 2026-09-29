@@ -43,7 +43,13 @@ func matchIndicesByProximity(a, b []Star, radius float64) [][2]int {
 		bestAd[j] = r2
 	}
 	for i, sa := range a {
+		if !isFinite64(sa.X) || !isFinite64(sa.Y) {
+			continue
+		}
 		for j, sb := range b {
+			if !isFinite64(sb.X) || !isFinite64(sb.Y) {
+				continue
+			}
 			dx := sa.X - sb.X
 			dy := sa.Y - sb.Y
 			d := dx*dx + dy*dy
@@ -96,7 +102,7 @@ func GlobalBundleAdjust(cats [][]Star, fixed []bool, mayOverlap func(a, b int) b
 	for k := range updates {
 		updates[k] = IdentityTransform()
 	}
-	if n < 2 || mayOverlap == nil {
+	if n < 2 || len(fixed) < n || mayOverlap == nil {
 		return updates, false
 	}
 

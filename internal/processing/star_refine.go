@@ -581,6 +581,8 @@ func matchStarsByOffsetHistogram(projected, refStars []Star, windowPx, binPx, ma
 // matches are accepted, and ambiguous matches are rejected using a best-vs-
 // second-best distance ratio test.
 func matchStarsByMutualProximity(refStars, targetStars []Star, maxStars int, maxRadius, maxRatio float64) []MatchedPair {
+	refStars = finiteStars(refStars)
+	targetStars = finiteStars(targetStars)
 	if len(refStars) == 0 || len(targetStars) == 0 {
 		return nil
 	}
@@ -694,6 +696,16 @@ func matchStarsByMutualProximity(refStars, targetStars []Star, maxStars int, max
 		})
 	}
 	return pairs
+}
+
+func finiteStars(stars []Star) []Star {
+	out := make([]Star, 0, len(stars))
+	for _, s := range stars {
+		if isFinite64(s.X) && isFinite64(s.Y) && isFinite64(s.Flux) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func pairBoundsTarget(pairs []MatchedPair) (width, height, diag float64) {

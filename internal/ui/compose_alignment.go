@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gofitsv3/internal/debuglog"
+	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
 )
 
@@ -45,6 +46,19 @@ type composeAlignmentMatch struct {
 type composeAlignmentMatcher func(target, reference composeAlignmentChannel) (composeAlignmentMatch, error)
 
 type composeAlignmentFallbackEligibility func(target, reference composeAlignmentChannel) (bool, error)
+
+// composeAlignmentSlots returns the RGB slots plus each loaded, active extra
+// layer. Slot numbers are zero-based runtime indexes; the coordinator uses the
+// corresponding one-based channel numbers.
+func composeAlignmentSlots(images []*models.LoadedImage, extraSlots []int) []int {
+	slots := []int{0, 1, 2}
+	for _, index := range extraSlots {
+		if index >= 3 && index < len(images) && images[index] != nil {
+			slots = append(slots, index)
+		}
+	}
+	return slots
+}
 
 // composeAlignmentMatchFromFittedAffine converts the matcher affine, which is
 // fitted against a target resized to the reference dimensions, back to the
@@ -110,6 +124,28 @@ type composeAlignmentResult struct {
 	RootIndex int
 	Channels  map[int]composeAlignmentChannelResult
 	Attempts  []composeAlignmentAttempt
+}
+
+// composeLargeAlignmentReferenceCurrent is the commit guard for a catalog
+// alignment job. The reference descriptor must be unchanged before any target
+// affine is installed.
+func composeLargeAlignmentReferenceCurrent(current, expected composeArtifactDescriptor) bool {
+	return expected.Path != "" && current.Path == expected.Path && current.Generation == expected.Generation
+}
+
+func resetComposeAlignmentOffsets(control *models.ChannelControl) {
+	if control == nil {
+		return
+	}
+	if control.XOffsetEntry != nil {
+		control.XOffsetEntry.SetValue(0)
+	}
+	if control.YOffsetEntry != nil {
+		control.YOffsetEntry.SetValue(0)
+	}
+	if control.RotOffsetEntry != nil {
+		control.RotOffsetEntry.SetValue(0)
+	}
 }
 
 func coordinateComposeAlignment(channels []composeAlignmentChannel, rootIndex int, match composeAlignmentMatcher) composeAlignmentResult {

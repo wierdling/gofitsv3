@@ -10,6 +10,72 @@ import (
 	"gofitsv3/internal/processing"
 )
 
+type nonlinearNativeMIRI struct{}
+
+func (nonlinearNativeMIRI) PixelToICRS(x, y float64) (float64, float64, error) {
+	return 100 + x + 0.1*x*x, 20 + y + 0.05*y*y, nil
+}
+
+func nativeMIRIHeader() fitsio.Header {
+	return fitsio.Header{Cards: map[string]string{
+		"CRPIX1": "1", "CRPIX2": "1", "CRVAL1": "100", "CRVAL2": "20",
+		"CD1_1": "1", "CD1_2": "0", "CD2_1": "0", "CD2_2": "1",
+		"CTYPE1": "RA---TAN", "CTYPE2": "DEC--TAN",
+	}}
+}
+
+func TestNativeReferenceAffinePairUsesBothGWCSDirections(t *testing.T) {
+	ref := makeInput("ref.asdf", 8, 8, filledPixels(8, 8, 1), nativeMIRIHeader())
+	target := makeInput("target.asdf", 8, 8, filledPixels(8, 8, 1), nativeMIRIHeader())
+	ref.NativeGWCS = nonlinearNativeMIRI{}
+	target.NativeGWCS = nonlinearNativeMIRI{}
+	w0toR, wRto0, err := referenceAffinePair(ref, target)
+	if err != nil {
+		t.Fatalf("referenceAffinePair error = %v", err)
+	}
+	// The native model is nonlinear; the affine is only a local conversion,
+	// but it must be derived from native evaluations rather than header WCS.
+	if math.Abs(w0toR.A-1) < 1e-6 || math.Abs(w0toR.D-1) < 1e-6 {
+		t.Fatalf("native forward affine = %+v, want nonlinear native projection", w0toR)
+	}
+	if math.Abs(wRto0.A-1) < 1e-6 || math.Abs(wRto0.D-1) < 1e-6 {
+		t.Fatalf("native reverse affine = %+v, want nonlinear native projection", wRto0)
+	}
+}
+
+func TestProjectAuthoringMaskUsesNativeGWCSMapper(t *testing.T) {
+	ref := makeInput("ref.asdf", 8, 8, filledPixels(8, 8, 1), nativeMIRIHeader())
+	target := makeInput("target.asdf", 8, 8, filledPixels(8, 8, 1), nativeMIRIHeader())
+	ref.NativeGWCS = nonlinearNativeMIRI{}
+	target.NativeGWCS = nonlinearNativeMIRI{}
+	geom := MaskOutputGeometry{Width: 32, Height: 32, OriginX: 0, OriginY: 0, Scale: 1}
+	authoring := make([]bool, geom.Width*geom.Height)
+	nativeMapper, err := newInputMapper(target, ref)
+	if err != nil {
+		t.Fatalf("native mapper error = %v", err)
+	}
+	nx, ny := nativeMapper.MapPixel(4, 3)
+	fxMapper, err := processing.NewWCSMapperToLinearRef(target.HDU.Header, nil, nil, ref.HDU.Header)
+	if err != nil {
+		t.Fatalf("flattened mapper error = %v", err)
+	}
+	fx, fy := fxMapper.MapPixel(4, 3)
+	if math.Abs(nx-fx) < 0.1 || math.Abs(ny-fy) < 0.1 {
+		t.Fatalf("native map (%.3f,%.3f) did not differ from flattened (%.3f,%.3f)", nx, ny, fx, fy)
+	}
+	authoring[int(math.Round(ny))*geom.Width+int(math.Round(nx))] = true
+	mask, err := ProjectAuthoringMaskToDetector(target, ref, geom, authoring, MaskProjectionOptions{ConservativeRadius: 0.49})
+	if err != nil {
+		t.Fatalf("native mask projection error = %v", err)
+	}
+	if !mask[3*8+4] {
+		t.Fatalf("native projection did not select nonlinear target pixel: %v", mask)
+	}
+	if mask[0] {
+		t.Fatalf("native projection selected unrelated detector pixel 0: %v", mask)
+	}
+}
+
 func TestDetectorOutputMapperMatchesPlannedInputPlacement(t *testing.T) {
 	ref := makeInput("ref_cal.fits", 5, 5, filledPixels(5, 5, 1), headerWithCRPIX(10, 10))
 	target := makeInput("target_cal.fits", 5, 5, filledPixels(5, 5, 2), headerWithCRPIX(8, 9))

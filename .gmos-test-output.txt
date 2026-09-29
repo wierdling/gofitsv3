@@ -1,0 +1,1041 @@
+diff --git a/internal/processing/magic_levels.go b/internal/processing/magic_levels.go
+index b924ee2..47d75a7 100644
+--- a/internal/processing/magic_levels.go
++++ b/internal/processing/magic_levels.go
+@@ -1,47 +1,48 @@
+ package processing
+ 
+ import (
+ 	"math"
+ 	"sort"
+ 
+ 	"gofitsv3/internal/models"
++	"gofitsv3/internal/stretch"
+ )
+ 
+ // MagicPreset selects how the stretch levels are estimated. Galaxy uses a
+ // slightly raised black-point percentile for a darker sky; presets otherwise
+ // differ in their white-sample population and percentile.
+ type MagicPreset int
+ 
+ const (
+ 	// MagicBalanced is the general-purpose default used when no target type is
+ 	// specified. White comes from a high percentile of all non-star pixels.
+ 	MagicBalanced MagicPreset = iota
+ 	// MagicNebula protects diffuse nebulosity: white comes from the bright end
+ 	// of non-star pixels that are above the diffuse-content threshold, so stars
+ 	// (which are masked) are allowed to clip while nebulosity is not.
+ 	MagicNebula
+ 	// MagicGalaxy protects bright cores: white comes from a very high percentile
+ 	// of non-star pixels so the galaxy core is not blown out.
+ 	MagicGalaxy
+ )
+ 
+ func (p MagicPreset) String() string {
+ 	switch p {
+ 	case MagicNebula:
+ 		return "Nebula"
+ 	case MagicGalaxy:
+ 		return "Galaxy"
+ 	default:
+ 		return "Balanced"
+ 	}
+ }
+ 
+ // ParseMagicPreset maps a UI label to a preset, defaulting to Balanced.
+ func ParseMagicPreset(label string) MagicPreset {
+ 	switch label {
+ 	case "Nebula":
+ 		return MagicNebula
+ 	case "Galaxy":
+ 		return MagicGalaxy
+ 	default:
+ 		return MagicBalanced
+@@ -113,80 +114,127 @@ const (
+ 	// magicMaxSamples caps how many valid pixels are sampled for the percentile
+ 	// and noise statistics, keeping the estimator fast on large mosaics. Star
+ 	// detection still runs over the full-resolution grid.
+ 	magicMaxSamples = 2_000_000
+ )
+ 
+ // MagicLevelsResult reports the chosen levels plus diagnostics so the caller can
+ // display or debug the outcome.
+ type MagicLevelsResult struct {
+ 	Black              float64
+ 	White              float64
+ 	ClipLowPercent     float64 // percent of valid pixels below Black
+ 	ClipHighPercent    float64 // percent of valid pixels above White
+ 	StarsExcluded      bool    // whether any star pixels were masked
+ 	StarPixelPercent   float64 // percent of valid pixels masked as stars
+ 	WhiteSampleCount   int     // number of pixels used for the white estimate
+ 	WhiteSamplePercent float64 // those as a percent of valid pixels
+ 	WhiteSampleSource  string  // "diffuse", "non-star", or "all-valid"
+ 	Preset             MagicPreset
+ 	Background         float64 // estimated sky level
+ 	Sigma              float64 // robust noise sigma
+ 	ValidPixels        int
+ }
+ 
+ // ApplyMagicLevels computes Magic black/white levels for img and writes them to
+ // img.Background/img.Peak (the stretch input levels) and img.Black/img.White
+ // (the clip-overlay markers). It does not change the selected stretch mode or
+ // any stretch-shaping parameter. The returned result carries diagnostics.
+ func ApplyMagicLevels(img *models.LoadedImage, preset MagicPreset) MagicLevelsResult {
+ 	if img == nil {
+ 		return MagicLevelsResult{White: 1, Preset: preset}
+ 	}
+ 	res := MagicLevels(img.HDU.Data.Pixels, img.HDU.Data.Width, img.HDU.Data.Height, nil, preset)
+ 	img.Background = res.Black
+ 	img.Peak = res.White
+ 	img.Black = res.Black
+ 	img.White = res.White
+ 	return res
+ }
+ 
++// ApplyMagicLevelsAndMTF applies the Combine Magic operation as one coherent
++// stretch. The MTF is derived from the same robust background and sigma used
++// to choose Magic's levels, rather than estimating them again from the raw
++// image. This keeps the auto-STF 0.25 sky target stable for heavily padded or
++// unevenly sampled images.
++func ApplyMagicLevelsAndMTF(img *models.LoadedImage, preset MagicPreset) MagicLevelsResult {
++	res := ApplyMagicLevels(img, preset)
++	if img == nil || res.ValidPixels == 0 {
++		return res
++	}
++
++	black, white := res.Black, res.White
++	if !finite(black) {
++		black = 0
++	}
++	if !finite(white) || white <= black {
++		white = black + 1
++	}
++	target := res.Background + 2.8*res.Sigma
++	if !finite(target) {
++		target = res.Background
++	}
++	if !finite(target) {
++		target = black
++	}
++	xRef := (target - black) / (white - black)
++	if !finite(xRef) {
++		xRef = 0.25
++	}
++	if xRef < 1e-5 {
++		xRef = 1e-5
++	}
++	if xRef > 1 {
++		xRef = 1
++	}
++	m := 3 * xRef / (2*xRef + 1)
++	if !finite(m) || m < 0.001 {
++		m = 0.001
++	}
++	if m > 0.5 {
++		m = 0.5
++	}
++	img.MTFMidtone = m
++	img.Mode = stretch.MTF
++	return res
++}
++
+ // MagicLevels estimates black and white stretch levels from linear image data.
+ //
+ // valid is an optional per-pixel validity mask (len == len(pixels)); when nil
+ // every finite, non-padding pixel is considered. NaN, Inf and exact-zero
+ // drizzle padding are always ignored.
+ func MagicLevels(pixels []float32, width, height int, valid []bool, preset MagicPreset) MagicLevelsResult {
+ 	res := MagicLevelsResult{White: 1, Preset: preset, WhiteSampleSource: "all-valid"}
+ 	n := len(pixels)
+ 	if n == 0 {
+ 		return res
+ 	}
+ 	if len(valid) != n {
+ 		valid = nil
+ 	}
+ 
+ 	isValid := func(i int) bool {
+ 		if valid != nil && !valid[i] {
+ 			return false
+ 		}
+ 		v := pixels[i]
+ 		if v == 0 { // drizzle padding / empty border
+ 			return false
+ 		}
+ 		f := float64(v)
+ 		return !math.IsNaN(f) && !math.IsInf(f, 0)
+ 	}
+ 
+ 	// Sampled valid values for robust statistics and percentiles.
+ 	stride := 1
+ 	if n > magicMaxSamples {
+ 		stride = (n + magicMaxSamples - 1) / magicMaxSamples
+ 	}
+ 	sample := make([]float64, 0, magicMaxSamples)
+ 	for i := 0; i < n; i += stride {
+ 		if isValid(i) {
+ 			sample = append(sample, float64(pixels[i]))
+ 		}
+ 	}
+ 	if len(sample) == 0 {
+ 		return res
+diff --git a/internal/processing/magic_levels_test.go b/internal/processing/magic_levels_test.go
+index e43084b..bec97cd 100644
+--- a/internal/processing/magic_levels_test.go
++++ b/internal/processing/magic_levels_test.go
+@@ -1,72 +1,121 @@
+ package processing
+ 
+ import (
+ 	"math"
+ 	"testing"
++
++	"gofitsv3/internal/fitsio"
++	"gofitsv3/internal/models"
++	"gofitsv3/internal/stretch"
+ )
+ 
+ // makeMagicField builds a synthetic field: flat sky + noise pattern, a diffuse
+ // nebula blob, and a few very bright compact stars.
+ func makeMagicField(w, h int) []float32 {
+ 	px := make([]float32, w*h)
+ 	const sky = 100.0
+ 	for y := 0; y < h; y++ {
+ 		for x := 0; x < w; x++ {
+ 			i := y*w + x
+ 			// Deterministic pseudo-noise around the sky level, amplitude ~3.
+ 			v := sky + float64((x*7+y*13)%7) - 3
+ 			// Diffuse nebula bump in a central region (well above sky+2.5sigma).
+ 			dx, dy := float64(x-w/2), float64(y-h/2)
+ 			if dx*dx+dy*dy < float64((w/4)*(w/4)) {
+ 				v += 40
+ 			}
+ 			px[i] = float32(v)
+ 		}
+ 	}
+ 	// Bright compact stars: single hot peaks far above any nebulosity.
+ 	for _, s := range [][2]int{{10, 10}, {w - 10, 8}, {w / 3, h - 6}} {
+ 		px[s[1]*w+s[0]] = 5000
+ 	}
+ 	return px
+ }
+ 
++func TestApplyMagicLevelsAndMTFUsesRobustResultForPaddedField(t *testing.T) {
++	const w, h = 96, 80
++	px := make([]float32, w*h)
++	for y := 20; y < h-20; y++ {
++		for x := 20; x < w-20; x++ {
++			px[y*w+x] = float32(100 + (x*7+y*11)%5)
++		}
++	}
++	px[(h/2)*w+w/2] = 102
++	for y := 20; y < h-20; y++ {
++		for x := 60; x < w-20; x++ {
++			px[y*w+x] = 150
++		}
++	}
++	// A Gemini-like frame has a majority padded border. The old two-step route
++	// included those zeros in Auto MTF's statistics and drove the real field to
++	// white; the combined operation must keep it at a midtone.
++	old := &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Pixels: append([]float32(nil), px...), Width: w, Height: h}}}
++	ApplyMagicLevels(old, MagicBalanced)
++	AutoMTFMidtone(old)
++	oldStretched, _ := ApplyStretchParallel(old)
++	oldField := float64(oldStretched.Pixels[(h/2)*w+w/2])
++	img := &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Pixels: px, Width: w, Height: h}}}
++	res := ApplyMagicLevelsAndMTF(img, MagicBalanced)
++	if res.ValidPixels == 0 || img.Mode != stretch.MTF || !finite(img.MTFMidtone) {
++		t.Fatalf("Magic stretch result = %#v, mode=%v, mtf=%v", res, img.Mode, img.MTFMidtone)
++	}
++	stretched, _ := ApplyStretchParallel(img)
++	field := float64(stretched.Pixels[(h/2)*w+w/2])
++	if field >= oldField {
++		t.Fatalf("shared Magic MTF output %.3f did not improve over legacy %.3f", field, oldField)
++	}
++	if field >= 0.75 {
++		t.Fatalf("representative field output %.3f is oversaturated; result=%+v", field, res)
++	}
++}
++
++func TestApplyMagicLevelsAndMTFHandlesDegenerateLevels(t *testing.T) {
++	img := &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Pixels: []float32{5, 5, 5, 5}, Width: 2, Height: 2}}}
++	ApplyMagicLevelsAndMTF(img, MagicBalanced)
++	if !finite(img.MTFMidtone) || img.MTFMidtone <= 0 || img.MTFMidtone > 0.5 {
++		t.Fatalf("degenerate Magic MTF = %v, want finite in (0, .5]", img.MTFMidtone)
++	}
++}
++
+ func TestMagicLevelsBlackAndStarExclusion(t *testing.T) {
+ 	w, h := 200, 200
+ 	px := makeMagicField(w, h)
+ 
+ 	res := MagicLevels(px, w, h, nil, MagicNebula)
+ 
+ 	if res.ValidPixels != w*h {
+ 		t.Fatalf("ValidPixels = %d, want %d", res.ValidPixels, w*h)
+ 	}
+ 	// Black should sit near the sky floor, not the true minimum, and produce
+ 	// only a tiny amount of low clipping.
+ 	if res.Black <= 90 || res.Black >= 110 {
+ 		t.Errorf("Black = %.3f, want near sky ~97-103", res.Black)
+ 	}
+ 	if res.ClipLowPercent > 1.0 {
+ 		t.Errorf("ClipLowPercent = %.3f%%, want tiny (<1%%)", res.ClipLowPercent)
+ 	}
+ 	if !res.StarsExcluded {
+ 		t.Errorf("expected stars to be excluded")
+ 	}
+ 	// Nebula white must be driven by nebulosity (~sky+40), NOT by the 5000 stars.
+ 	if res.White <= res.Black {
+ 		t.Fatalf("White %.3f <= Black %.3f", res.White, res.Black)
+ 	}
+ 	if res.White > 1000 {
+ 		t.Errorf("White = %.3f, nebula white should not be dragged toward stars (5000)", res.White)
+ 	}
+ 	if res.WhiteSampleSource != "diffuse" {
+ 		t.Errorf("WhiteSampleSource = %q, want \"diffuse\"", res.WhiteSampleSource)
+ 	}
+ }
+ 
+ func TestMagicLevelsIgnoresPaddingAndNaN(t *testing.T) {
+ 	w, h := 64, 64
+ 	px := make([]float32, w*h)
+ 	for i := range px {
+ 		px[i] = 50 // uniform real data
+ 	}
+ 	// Surround/scatter invalid pixels that must be ignored.
+ 	px[0] = 0                    // drizzle padding
+diff --git a/internal/ui/compose_helpers.go b/internal/ui/compose_helpers.go
+index 7705e39..13e4f3d 100644
+--- a/internal/ui/compose_helpers.go
++++ b/internal/ui/compose_helpers.go
+@@ -10,82 +10,81 @@ import (
+ 	"gofitsv3/internal/processing"
+ )
+ 
+ type composeOverlayPreviewData struct {
+ 	image      *image.RGBA
+ 	bins       [256]int
+ 	width      int
+ 	height     int
+ 	sky        float64
+ 	mean       float64
+ 	std        float64
+ 	filterText string
+ }
+ 
+ type composeGlobalMagicTarget struct {
+ 	index       int
+ 	image       models.LoadedImage
+ 	independent bool
+ }
+ 
+ type composeGlobalMagicResult struct {
+ 	index   int
+ 	image   models.LoadedImage
+ 	preview *composeOverlayPreviewData
+ }
+ 
+ func composeLoadRequestCurrent(currentSession, requestSession, currentRequest, request uint64) bool {
+ 	return currentSession == requestSession && currentRequest == request
+ }
+ 
+ // prepareComposeGlobalMagic applies the shared Magic operation to every loaded
+ // channel and also prepares the independently displayed channel previews. The
+ // caller publishes the complete result atomically on the UI thread.
+ func prepareComposeGlobalMagic(ctx context.Context, targets []composeGlobalMagicTarget, preset processing.MagicPreset) ([]composeGlobalMagicResult, error) {
+ 	results := make([]composeGlobalMagicResult, len(targets))
+ 	for i, target := range targets {
+ 		if err := composeMagicCanceled(ctx); err != nil {
+ 			return nil, err
+ 		}
+ 		img := target.image
+-		processing.ApplyMagicLevels(&img, preset)
+-		processing.AutoMTFMidtone(&img)
++		processing.ApplyMagicLevelsAndMTF(&img, preset)
+ 		result := composeGlobalMagicResult{index: target.index, image: img}
+ 		if target.independent {
+ 			preview, err := buildComposeOverlayPreviewData(ctx, &img)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+ 			result.preview = preview
+ 		}
+ 		results[i] = result
+ 	}
+ 	return results, nil
+ }
+ 
+ func buildComposeOverlayPreviewData(ctx context.Context, img *models.LoadedImage) (*composeOverlayPreviewData, error) {
+ 	if err := composeMagicCanceled(ctx); err != nil {
+ 		return nil, err
+ 	}
+ 	stretched, mask := processing.ApplyStretchParallel(img)
+ 	if err := composeMagicCanceled(ctx); err != nil {
+ 		return nil, err
+ 	}
+ 	stats := histogram.Compute(stretched.Pixels)
+ 	sky, _ := processing.EstimateBackground(stretched.Pixels)
+ 	return &composeOverlayPreviewData{
+ 		image:      processing.ToGrayRGBA(stretched, mask),
+ 		bins:       stats.Hist,
+ 		width:      stretched.Width,
+ 		height:     stretched.Height,
+ 		sky:        sky,
+ 		mean:       stats.Mean,
+ 		std:        stats.Std,
+ 		filterText: fitsio.FilterString(img.Primary),
+ 	}, nil
+ }
+ 
+ // replaceComposeChannelImage installs a replacement while preserving the
+ // current channel orientation. Project loading and Reset Data restore their
+ // saved state directly instead.
+ func replaceComposeChannelImage(imgs []*models.LoadedImage, idx int, replacement *models.LoadedImage) {
+ 	if idx < 0 || idx >= len(imgs) {
+diff --git a/internal/ui/compose_magic_batch.go b/internal/ui/compose_magic_batch.go
+index 05cc7e9..4eaa9e6 100644
+--- a/internal/ui/compose_magic_batch.go
++++ b/internal/ui/compose_magic_batch.go
+@@ -30,83 +30,84 @@ const (
+ 	composeMagicBlue   composeMagicAssignment = "Blue"
+ 	composeMagicGreen  composeMagicAssignment = "Green"
+ 	composeMagicRed    composeMagicAssignment = "Red"
+ 	composeMagicCustom composeMagicAssignment = "Custom"
+ )
+ 
+ type composeMagicRow struct {
+ 	File       composeMagicFile
+ 	Assignment composeMagicAssignment
+ 	Color      color.NRGBA
+ }
+ 
+ type composeMagicSpec struct {
+ 	Preset string
+ 	Rows   []composeMagicRow
+ }
+ 
+ type composeMagicPreparedChannel struct {
+ 	Row   composeMagicRow
+ 	Image *models.LoadedImage
+ }
+ 
+ type composeMagicBatch struct {
+ 	Preset   string
+ 	Channels []composeMagicPreparedChannel
+ }
+ 
+ type composeMagicCustomInstall struct {
+ 	Channel composeMagicPreparedChannel
+ 	Slot    int
+ }
+ 
+ type composeMagicInstallPlan struct {
+ 	Base    [3]*models.LoadedImage
+ 	Customs []composeMagicCustomInstall
+ }
+ 
+ type composeMagicLoader func(string) (*models.LoadedImage, error)
+ 
+ type composeMagicStages struct {
+-	magic   func(*models.LoadedImage, processing.MagicPreset) processing.MagicLevelsResult
+-	setMTF  func(*models.LoadedImage)
+-	autoMTF func(*models.LoadedImage)
++	magic    func(*models.LoadedImage, processing.MagicPreset) processing.MagicLevelsResult
++	magicMTF func(*models.LoadedImage, processing.MagicPreset) processing.MagicLevelsResult
++	setMTF   func(*models.LoadedImage)
++	autoMTF  func(*models.LoadedImage)
+ }
+ 
+ var composeMagicFilenamePattern = regexp.MustCompile(`(?i)^(F([0-9]+)[A-Z]+[0-9]*)_(?:(.+)_)?(?:drz|driz|drizzle)\.fits$`)
+ 
+ func composeMagicFilter(name string) (string, int, bool) {
+ 	matches := composeMagicFilenamePattern.FindStringSubmatch(filepath.Base(name))
+ 	if matches == nil || (matches[3] != "" && !validComposeMagicAdditionalName(matches[3])) {
+ 		return "", 0, false
+ 	}
+ 	filterNumber, err := strconv.Atoi(matches[2])
+ 	if err != nil {
+ 		return "", 0, false
+ 	}
+ 	return strings.ToUpper(matches[1]), filterNumber, true
+ }
+ 
+ func validComposeMagicAdditionalName(name string) bool {
+ 	hasLetterOrDigit := false
+ 	for _, r := range name {
+ 		switch {
+ 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+ 			hasLetterOrDigit = true
+ 		case r == '_', r == '-', r == '.':
+ 		default:
+ 			return false
+ 		}
+ 	}
+ 	return hasLetterOrDigit
+ }
+ 
+ func discoverComposeMagicFiles(dir string) ([]composeMagicFile, error) {
+ 	if strings.TrimSpace(dir) == "" {
+ 		return nil, fmt.Errorf("compose Magic directory is empty")
+ 	}
+ 	absDir, err := filepath.Abs(dir)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("resolve compose Magic directory: %w", err)
+ 	}
+ 	entries, err := os.ReadDir(absDir)
+ 	if err != nil {
+@@ -231,165 +232,170 @@ func validateComposeMagicPlan(rows []composeMagicRow) error {
+ 		}
+ 		switch row.Assignment {
+ 		case composeMagicBlue, composeMagicGreen, composeMagicRed:
+ 			primaryCounts[row.Assignment]++
+ 		case composeMagicCustom:
+ 			customCount++
+ 		default:
+ 			return fmt.Errorf("row %d has unknown channel assignment %q", i+1, row.Assignment)
+ 		}
+ 	}
+ 	for _, assignment := range []composeMagicAssignment{composeMagicBlue, composeMagicGreen, composeMagicRed} {
+ 		if primaryCounts[assignment] != 1 {
+ 			return fmt.Errorf("exactly one %s channel is required (found %d)", assignment, primaryCounts[assignment])
+ 		}
+ 	}
+ 	if customCount > maxOverlayLayers {
+ 		return fmt.Errorf("a maximum of %d custom channels is supported", maxOverlayLayers)
+ 	}
+ 	return nil
+ }
+ 
+ func validateComposeMagicCapacity(rows []composeMagicRow, existingCustomChannels int) error {
+ 	customCount := 0
+ 	for _, row := range rows {
+ 		if row.Assignment == composeMagicCustom {
+ 			customCount++
+ 		}
+ 	}
+ 	remaining := maxOverlayLayers - existingCustomChannels
+ 	if remaining < 0 {
+ 		remaining = 0
+ 	}
+ 	if customCount > remaining {
+ 		return fmt.Errorf("the filter set needs %d custom channels, but only %d colored layer slots remain", customCount, remaining)
+ 	}
+ 	return nil
+ }
+ 
+ func prepareComposeMagicBatch(ctx context.Context, spec composeMagicSpec, loader composeMagicLoader) (*composeMagicBatch, error) {
+ 	stages := composeMagicStages{
+-		magic:   processing.ApplyMagicLevels,
+-		setMTF:  func(img *models.LoadedImage) { img.Mode = stretch.MTF },
+-		autoMTF: processing.AutoMTFMidtone,
++		magic:    processing.ApplyMagicLevels,
++		magicMTF: processing.ApplyMagicLevelsAndMTF,
++		setMTF:   func(img *models.LoadedImage) { img.Mode = stretch.MTF },
++		autoMTF:  processing.AutoMTFMidtone,
+ 	}
+ 	return prepareComposeMagicBatchWithStages(ctx, spec, loader, stages)
+ }
+ 
+ func prepareComposeMagicBatchWithStages(ctx context.Context, spec composeMagicSpec, loader composeMagicLoader, stages composeMagicStages) (*composeMagicBatch, error) {
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
+ 	if err := composeMagicCanceled(ctx); err != nil {
+ 		return nil, err
+ 	}
+ 	if err := validateComposeMagicPlan(spec.Rows); err != nil {
+ 		return nil, err
+ 	}
+ 	if loader == nil {
+ 		return nil, fmt.Errorf("compose Magic image loader is unavailable")
+ 	}
+ 	preset, err := composeMagicPreset(spec.Preset)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	rows := append([]composeMagicRow(nil), spec.Rows...)
+ 	sort.SliceStable(rows, func(i, j int) bool {
+ 		if rows[i].File.FilterNumber != rows[j].File.FilterNumber {
+ 			return rows[i].File.FilterNumber < rows[j].File.FilterNumber
+ 		}
+ 		left, right := strings.ToLower(rows[i].File.Name), strings.ToLower(rows[j].File.Name)
+ 		if left != right {
+ 			return left < right
+ 		}
+ 		return rows[i].File.Path < rows[j].File.Path
+ 	})
+ 
+ 	channels := make([]composeMagicPreparedChannel, len(rows))
+ 	for i, row := range rows {
+ 		if err := composeMagicCanceled(ctx); err != nil {
+ 			return nil, err
+ 		}
+ 		img, loadErr := loader(row.File.Path)
+ 		if err := composeMagicCanceled(ctx); err != nil {
+ 			return nil, err
+ 		}
+ 		if loadErr != nil {
+ 			return nil, fmt.Errorf("load %s: %w", composeMagicFileLabel(row.File), loadErr)
+ 		}
+ 		if img == nil {
+ 			return nil, fmt.Errorf("load %s: no image data", composeMagicFileLabel(row.File))
+ 		}
+ 		if structureErr := validateComposeMagicImage(img); structureErr != nil {
+ 			return nil, fmt.Errorf("load %s: %w", composeMagicFileLabel(row.File), structureErr)
+ 		}
+ 		channels[i] = composeMagicPreparedChannel{Row: row, Image: img}
+ 	}
+ 
+ 	for i := range channels {
+ 		if err := composeMagicCanceled(ctx); err != nil {
+ 			return nil, err
+ 		}
+-		res := stages.magic(channels[i].Image, preset)
++		var res processing.MagicLevelsResult
++		if stages.magicMTF != nil {
++			res = stages.magicMTF(channels[i].Image, preset)
++		} else {
++			res = stages.magic(channels[i].Image, preset)
++		}
+ 		if err := composeMagicCanceled(ctx); err != nil {
+ 			return nil, err
+ 		}
+ 		if res.ValidPixels == 0 {
+ 			return nil, fmt.Errorf("process %s: Magic found no valid image samples", composeMagicFileLabel(channels[i].Row.File))
+ 		}
+ 		debuglog.Log(fmt.Sprintf(
+ 			"Compose Magic batch[%s] %s: black=%.4g white=%.4g sky=%.4g sigma=%.4g clipLow=%.3f%% clipHigh=%.3f%% stars=%v(%.2f%%) whiteSrc=%s whiteN=%d(%.2f%%)",
+ 			res.Preset, composeMagicFileLabel(channels[i].Row.File), res.Black, res.White, res.Background, res.Sigma,
+ 			res.ClipLowPercent, res.ClipHighPercent, res.StarsExcluded, res.StarPixelPercent,
+ 			res.WhiteSampleSource, res.WhiteSampleCount, res.WhiteSamplePercent))
+ 		if err := composeMagicCanceled(ctx); err != nil {
+ 			return nil, err
+ 		}
+-		stages.setMTF(channels[i].Image)
+-		if err := composeMagicCanceled(ctx); err != nil {
+-			return nil, err
+-		}
+-		if err := composeMagicCanceled(ctx); err != nil {
+-			return nil, err
++		if stages.magicMTF == nil {
++			stages.setMTF(channels[i].Image)
++			if err := composeMagicCanceled(ctx); err != nil {
++				return nil, err
++			}
++			stages.autoMTF(channels[i].Image)
+ 		}
+-		stages.autoMTF(channels[i].Image)
+ 		if err := composeMagicCanceled(ctx); err != nil {
+ 			return nil, err
+ 		}
+ 	}
+ 	if err := composeMagicCanceled(ctx); err != nil {
+ 		return nil, err
+ 	}
+ 	return &composeMagicBatch{Preset: spec.Preset, Channels: channels}, nil
+ }
+ 
+ func composeMagicCanceled(ctx context.Context) error {
+ 	if err := ctx.Err(); err != nil {
+ 		return fmt.Errorf("compose Magic batch canceled: %w", err)
+ 	}
+ 	return nil
+ }
+ 
+ func composeMagicFileLabel(file composeMagicFile) string {
+ 	if strings.TrimSpace(file.Name) != "" {
+ 		return file.Name
+ 	}
+ 	return filepath.Base(file.Path)
+ }
+ 
+ func validateComposeMagicImage(img *models.LoadedImage) error {
+ 	width, height := img.HDU.Data.Width, img.HDU.Data.Height
+ 	if width <= 0 || height <= 0 {
+ 		return fmt.Errorf("invalid image dimensions %dx%d", width, height)
+ 	}
+ 	if width > int(^uint(0)>>1)/height {
+ 		return fmt.Errorf("image dimensions %dx%d overflow", width, height)
+ 	}
+ 	required := width * height
+ 	if len(img.HDU.Data.Pixels) == 0 {
+ 		return fmt.Errorf("image has no pixels for dimensions %dx%d", width, height)
+ 	}
+ 	if len(img.HDU.Data.Pixels) < required {
+ 		return fmt.Errorf("image has %d pixels, need %d for dimensions %dx%d", len(img.HDU.Data.Pixels), required, width, height)
+ 	}
+ 	return nil
+diff --git a/internal/ui/workspace_compose.go b/internal/ui/workspace_compose.go
+index 4ad5945..10a944d 100644
+--- a/internal/ui/workspace_compose.go
++++ b/internal/ui/workspace_compose.go
+@@ -4130,88 +4130,87 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
+ 						artifact composeArtifactDescriptor
+ 					}
+ 					ordered := append([]composeMagicRow(nil), spec.Rows...)
+ 					sort.SliceStable(ordered, func(i, j int) bool {
+ 						if ordered[i].File.FilterNumber != ordered[j].File.FilterNumber {
+ 							return ordered[i].File.FilterNumber < ordered[j].File.FilterNumber
+ 						}
+ 						return strings.ToLower(ordered[i].File.Name) < strings.ToLower(ordered[j].File.Name)
+ 					})
+ 					stagedRows := make([]staged, 0, len(ordered))
+ 					cleanup := func() {
+ 						for _, x := range stagedRows {
+ 							cleanupLargeArtifactIfCurrent(x.artifact)
+ 						}
+ 					}
+ 					for i, row := range ordered {
+ 						if ctx.Err() != nil {
+ 							cleanup()
+ 							return
+ 						}
+ 						slot := fmt.Sprintf("filter-stage-%d-%d", time.Now().UnixNano(), i)
+ 						img, preview, artifact, loadErr := loadLargeComposeImage(row.File.Path, largeStore, slot)
+ 						if loadErr != nil {
+ 							cleanup()
+ 							fyne.Do(func() {
+ 								finished = true
+ 								progressDialog.Hide()
+ 								dialog.ShowError(fmt.Errorf("load %s: %w", composeMagicFileLabel(row.File), loadErr), win)
+ 							})
+ 							return
+ 						}
+ 						lease, leaseErr := fitsio.MaterializeFloat32ArtifactLease(artifact.Path)
+ 						if leaseErr != nil {
+ 							cleanupLargeArtifactIfCurrent(artifact)
+ 							cleanup()
+ 							fyne.Do(func() { finished = true; progressDialog.Hide(); dialog.ShowError(leaseErr, win) })
+ 							return
+ 						}
+ 						clone := *img
+ 						clone.HDU.Data.Pixels = lease.Pixels
+-						magicResult := processing.ApplyMagicLevels(&clone, magicPresetValue)
++						magicResult := processing.ApplyMagicLevelsAndMTF(&clone, magicPresetValue)
+ 						if ctx.Err() != nil {
+ 							lease.Release()
+ 							cleanupLargeArtifactIfCurrent(artifact)
+ 							cleanup()
+ 							return
+ 						}
+-						processing.AutoMTFMidtone(&clone)
+ 						lease.Release()
+ 						if ctx.Err() != nil {
+ 							cleanupLargeArtifactIfCurrent(artifact)
+ 							cleanup()
+ 							return
+ 						}
+ 						if magicResult.ValidPixels == 0 {
+ 							cleanupLargeArtifactIfCurrent(artifact)
+ 							cleanup()
+ 							fyne.Do(func() {
+ 								finished = true
+ 								progressDialog.Hide()
+ 								dialog.ShowError(fmt.Errorf("process %s: Magic found no valid image samples", composeMagicFileLabel(row.File)), win)
+ 							})
+ 							return
+ 						}
+ 						preview, _, _, loadErr = composeLargeStretchedPreview(artifact.Path, &clone)
+ 						if loadErr != nil {
+ 							cleanupLargeArtifactIfCurrent(artifact)
+ 							cleanup()
+ 							fyne.Do(func() { finished = true; progressDialog.Hide(); dialog.ShowError(loadErr, win) })
+ 							return
+ 						}
+ 						clone.HDU.Data.Pixels = nil
+ 						stagedRows = append(stagedRows, staged{row: row, img: &clone, preview: preview, artifact: artifact})
+ 					}
+ 					if !composeLargeInstallAllowed(ctx) {
+ 						cleanup()
+ 						return
+ 					}
+ 					fyne.Do(func() {
+ 						if !composeLargeInstallAllowed(ctx) {
+ 							cleanup()
+ 							return
+ 						}
+ 						defer func() { finished = true; progressDialog.Hide() }()
+ 						existingSlots := make([]int, len(overlayLayers))
+ 						for i, layer := range overlayLayers {
+ 							existingSlots[i] = layer.idx
+ 						}
+@@ -4454,98 +4453,98 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
+ 			blinkCheck.SetChecked(false)
+ 			for i := range imgs {
+ 				if largeMode && largeStore != nil {
+ 					invalidateLargeSlot(i)
+ 					largeMu.Lock()
+ 					store := largeStore
+ 					d := largeArtifacts[i]
+ 					delete(largeArtifacts, i)
+ 					delete(largePreviews, i)
+ 					imgs[i] = nil
+ 					largeMu.Unlock()
+ 					if d.Slot != "" && store != nil {
+ 						_, _ = store.RemoveSlotIfCurrent(d)
+ 					}
+ 				} else {
+ 					imgs[i] = nil
+ 				}
+ 				clearComposeOrigPixels(&origPixels, i)
+ 			}
+ 			imgs = imgs[:3]
+ 			origPixels = origPixels[:3]
+ 			for i := range viewports {
+ 				viewports[i].image.Image = blankImg()
+ 			}
+ 			buildCompositeCheck.SetChecked(false)
+ 			refresh()
+ 			if updateMenus != nil {
+ 				updateMenus()
+ 			}
+ 			go func() {
+ 				runtime.GC()
+ 				debug.FreeOSMemory()
+ 			}()
+ 		}, win)
+ 	}
+ 
+ 	copySettingsItem := fyne.NewMenuItem("Copy Channel 1 Settings to 2 & 3", copySettings)
+ 	composeWeightSources := func() []composeWeightSource {
+ 		sources := make([]composeWeightSource, 0, 3+len(overlayLayers))
+ 		if imgs[0] != nil {
+-			sources = append(sources, composeWeightSource{ID: models.ComposeChannel1BlinkID, Label: "Channel 1 (Blue)", Defaults: models.ComposeMixWeight{Blue: 1}})
++			sources = append(sources, composeWeightSourceFromImage(models.ComposeChannel1BlinkID, "Channel 1 (Blue)", models.ComposeMixWeight{Blue: 1}, imgs[0]))
+ 		}
+ 		if imgs[1] != nil {
+-			sources = append(sources, composeWeightSource{ID: models.ComposeChannel2BlinkID, Label: "Channel 2 (Green)", Defaults: models.ComposeMixWeight{Green: 1}})
++			sources = append(sources, composeWeightSourceFromImage(models.ComposeChannel2BlinkID, "Channel 2 (Green)", models.ComposeMixWeight{Green: 1}, imgs[1]))
+ 		}
+ 		if imgs[2] != nil {
+-			sources = append(sources, composeWeightSource{ID: models.ComposeChannel3BlinkID, Label: "Channel 3 (Red)", Defaults: models.ComposeMixWeight{Red: 1}})
++			sources = append(sources, composeWeightSourceFromImage(models.ComposeChannel3BlinkID, "Channel 3 (Red)", models.ComposeMixWeight{Red: 1}, imgs[2]))
+ 		}
+ 		for _, layer := range overlayLayers {
+ 			if layer == nil || layer.idx >= len(imgs) || imgs[layer.idx] == nil {
+ 				continue
+ 			}
+ 			id := layer.settings.BlinkID
+ 			if id == "" {
+ 				id = fmt.Sprintf("overlay-%d", layer.idx-2)
+ 			}
+ 			defaults := composeWeightForColor(id, color.NRGBA{R: layer.settings.ColorR, G: layer.settings.ColorG, B: layer.settings.ColorB, A: 255}, layer.settings.Opacity)
+-			sources = append(sources, composeWeightSource{ID: id, Label: layer.name, Defaults: defaults})
++			sources = append(sources, composeWeightSourceFromImage(id, layer.name, defaults, imgs[layer.idx]))
+ 		}
+ 		return sources
+ 	}
+ 	showComposeWeights := func() {
+ 		sources := composeWeightSources()
+ 		showComposeWeightsDialog(win, &compositionMode, &mixWeights, sources, refresh)
+ 	}
+ 	composeWeightsItem := fyne.NewMenuItem("Color Mixing...", showComposeWeights)
+ 	matchStretchItem := fyne.NewMenuItem("Match Channel Stretch...", showMatchStretchDialog)
+ 	addLayerItem := fyne.NewMenuItem("Add Colored Layer...", addColoredLayer)
+ 	normalizeScaleItem := fyne.NewMenuItem("Normalize Scale to Channel 2", normalizeScale)
+ 	sendToEditItem := fyne.NewMenuItem("Send Composite to Edit", sendToEdit)
+ 	alignChannelsItem := fyne.NewMenuItem("Align to Channel 2", alignChannels)
+ 	cleanChannelsItem := fyne.NewMenuItem("Cross-Channel Clean", crossChannelClean)
+ 	resetDataItem := fyne.NewMenuItem("Reset Data (Undo Align & Clean)", resetData)
+ 	psfItem := fyne.NewMenuItem("Match Channel PSF...", func() { showComposePSFDialog(win, imgs, refresh, largeMode, &psfSettings) })
+ 	lrgbItem := fyne.NewMenuItem("LRGB Combination...", func() {
+ 		showComposeLRGBDialog(win, &lrgbSettings, func() {
+ 			lrgbMu.Lock()
+ 			lrgbGeneration++
+ 			lrgbMu.Unlock()
+ 			refresh()
+ 		}, &lrgbMu)
+ 	})
+ 	loadDedicatedLItem := fyne.NewMenuItem("Load Dedicated L...", loadDedicatedL)
+ 	clearDedicatedLItem := fyne.NewMenuItem("Clear Dedicated L", clearDedicatedL)
+ 
+ 	openLevels := func() {
+ 		if levelsWin == nil {
+ 			levelsWin = newRGBLevelsWindow(app, levels, refresh)
+ 		}
+ 		levelsWin.setHistogram(latestRGBStats)
+ 		levelsWin.updateEntries()
+ 		levelsWin.win.Show()
+ 		levelsWin.win.RequestFocus()
+ 	}
+ 
+ 	// File: project I/O and handing the result off to other tabs / disk.
+ 	fileMenu := fyne.NewMenu("File",
+ 		loadProjectItem,
+@@ -4855,82 +4854,81 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
+ 			progressDialog.SetOnClosed(func() {
+ 				if !finished {
+ 					cancel()
+ 				}
+ 			})
+ 			progressDialog.Show()
+ 			magicAll.Disable()
+ 			go func() {
+ 				largeRuntime.jobMu.Lock()
+ 				defer largeRuntime.jobMu.Unlock()
+ 				type result struct {
+ 					idx      int
+ 					identity *models.LoadedImage
+ 					img      models.LoadedImage
+ 					preview  *image.RGBA
+ 					d        composeArtifactDescriptor
+ 				}
+ 				results := make([]result, 0, len(targets))
+ 				for _, target := range targets {
+ 					if err := composeMagicCanceled(ctx); err != nil {
+ 						fyne.Do(func() {
+ 							finished = true
+ 							progressDialog.Hide()
+ 							magicAll.Enable()
+ 						})
+ 						return
+ 					}
+ 					d := target.d
+ 					lease, err := fitsio.MaterializeFloat32ArtifactLease(d.Path)
+ 					if err != nil {
+ 						fyne.Do(func() {
+ 							finished = true
+ 							progressDialog.Hide()
+ 							magicAll.Enable()
+ 							dialog.ShowError(fmt.Errorf("prepare channel %d for Magic: %w", target.idx+1, err), win)
+ 						})
+ 						return
+ 					}
+ 					clone := target.image
+ 					clone.HDU.Data.Pixels = lease.Pixels
+-					processing.ApplyMagicLevels(&clone, preset)
+-					processing.AutoMTFMidtone(&clone)
++					processing.ApplyMagicLevelsAndMTF(&clone, preset)
+ 					lease.Release()
+ 					if err := composeMagicCanceled(ctx); err != nil {
+ 						fyne.Do(func() {
+ 							finished = true
+ 							progressDialog.Hide()
+ 							magicAll.Enable()
+ 						})
+ 						return
+ 					}
+ 					preview, _, _, err := composeLargeStretchedPreview(d.Path, &clone)
+ 					if err != nil {
+ 						fyne.Do(func() {
+ 							finished = true
+ 							progressDialog.Hide()
+ 							magicAll.Enable()
+ 							dialog.ShowError(fmt.Errorf("build channel %d Magic preview: %w", target.idx+1, err), win)
+ 						})
+ 						return
+ 					}
+ 					results = append(results, result{target.idx, target.identity, clone, preview, d})
+ 				}
+ 				fyne.Do(func() {
+ 					defer cancel()
+ 					if ctx.Err() != nil {
+ 						finished = true
+ 						progressDialog.Hide()
+ 						magicAll.Enable()
+ 						return
+ 					}
+ 					largeRuntime.mu.Lock()
+ 					for _, r := range results {
+ 						cur, ok := largeRuntime.artifacts[r.idx]
+ 						var storeCur composeArtifactDescriptor
+ 						storeOK := largeRuntime.store != nil
+ 						if storeOK {
+ 							storeCur, storeOK = largeRuntime.store.Descriptor(r.d.Slot)
+ 						}
+ 						identityOK := r.idx < len(imgs) && imgs[r.idx] == r.identity
+ 						if !ok || !storeOK || !identityOK || cur.Generation != r.d.Generation || cur.Path != r.d.Path || storeCur.Generation != r.d.Generation || storeCur.Path != r.d.Path {
+ 							largeRuntime.mu.Unlock()
+@@ -6207,88 +6205,86 @@ func channelControls(label string, col color.Color, idx int, imgs []*models.Load
+ 		}
+ 		invalidateChannelRefinement()
+ 		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+ 			largeJob("auto scaling", func(img *models.LoadedImage) error { processing.AutoScaleLikeFitsLiberator(img); return nil })
+ 			return
+ 		}
+ 		processing.AutoScaleLikeFitsLiberator(imgs[idx])
+ 		views[idx].blackBox.SetValue(imgs[idx].Black)
+ 		views[idx].whiteBox.SetValue(imgs[idx].White)
+ 		backgroundEntry.SetValue(imgs[idx].Background)
+ 		peakEntry.SetValue(imgs[idx].Peak)
+ 		scaledPeakEntry.SetValue(imgs[idx].ScaledPeak)
+ 		refresh()
+ 	})
+ 
+ 	autoMTF := widget.NewButton("Auto MTF", func() {
+ 		if imgs[idx] == nil {
+ 			return
+ 		}
+ 		invalidateChannelRefinement()
+ 		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+ 			largeJob("auto MTF", func(img *models.LoadedImage) error { processing.AutoMTFMidtone(img); return nil })
+ 			return
+ 		}
+ 		processing.AutoMTFMidtone(imgs[idx])
+ 		backgroundEntry.SetValue(imgs[idx].Background)
+ 		peakEntry.SetValue(imgs[idx].Peak)
+ 		scaledPeakEntry.SetValue(imgs[idx].ScaledPeak)
+ 		mtfMidtoneEntry.SetValue(imgs[idx].MTFMidtone)
+ 		selectBox.SetSelected("MTF") // also reveals the MTF row and triggers refresh
+ 	})
+ 
+ 	magic := widget.NewButton("Magic", func() {
+ 		if imgs[idx] == nil {
+ 			return
+ 		}
+ 		invalidateChannelRefinement()
+ 		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+ 			preset := processing.ParseMagicPreset(magicPreset.Selected)
+ 			largeJob("magic", func(img *models.LoadedImage) error {
+-				processing.ApplyMagicLevels(img, preset)
+-				processing.AutoMTFMidtone(img)
++				processing.ApplyMagicLevelsAndMTF(img, preset)
+ 				return nil
+ 			})
+ 			return
+ 		}
+-		res := processing.ApplyMagicLevels(imgs[idx], processing.ParseMagicPreset(magicPreset.Selected))
+-		processing.AutoMTFMidtone(imgs[idx])
++		res := processing.ApplyMagicLevelsAndMTF(imgs[idx], processing.ParseMagicPreset(magicPreset.Selected))
+ 		backgroundEntry.SetValue(imgs[idx].Background)
+ 		peakEntry.SetValue(imgs[idx].Peak)
+ 		views[idx].blackBox.SetValue(imgs[idx].Black)
+ 		views[idx].whiteBox.SetValue(imgs[idx].White)
+ 		mtfMidtoneEntry.SetValue(imgs[idx].MTFMidtone)
+ 		selectBox.SetSelected("MTF") // also reveals the MTF row and triggers refresh
+ 		debuglog.Log(fmt.Sprintf(
+ 			"Magic[%s] ch%d: black=%.4g white=%.4g sky=%.4g sigma=%.4g clipLow=%.3f%% clipHigh=%.3f%% stars=%v(%.2f%%) whiteSrc=%s whiteN=%d(%.2f%%)",
+ 			res.Preset, idx, res.Black, res.White, res.Background, res.Sigma,
+ 			res.ClipLowPercent, res.ClipHighPercent, res.StarsExcluded, res.StarPixelPercent,
+ 			res.WhiteSampleSource, res.WhiteSampleCount, res.WhiteSamplePercent))
+ 		refresh()
+ 	})
+ 
+ 	xOffsetEntry := NewNumberEntry(1, 2)
+ 	yOffsetEntry := NewNumberEntry(1, 2)
+ 	rotOffsetEntry := NewNumberEntry(0.1, 1)
+ 
+ 	// Manual Offsets are applied at render time (never baked into the pixels), so
+ 	// "Apply Offset" simply re-renders the previews and composite with the current
+ 	// X/Y/Rot field values.
+ 	applyOffset := widget.NewButton("Apply Offset", func() {
+ 		if imgs[idx] == nil {
+ 			return
+ 		}
+ 		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+ 			largeJob("offset", func(_ *models.LoadedImage) error { return nil })
+ 			return
+ 		}
+ 		refresh()
+ 	})
+ 	rotate := widget.NewButton("Rotate 90°", func() {
+ 		if imgs[idx] == nil {
+ 			return
+ 		}
+ 		if disk != nil && composeLargeModeActive != nil && composeLargeModeActive() {
+ 			largeRotateChannel(disk, idx, imgs, refresh, func() {
+ 				xOffsetEntry.SetValue(0)
+ 				yOffsetEntry.SetValue(0)
+ 				rotOffsetEntry.SetValue(0)

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,8 @@ import (
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
 )
+
+func finitePositiveSky(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0 }
 
 func defaultSkysubSettings() models.SkysubSettings {
 	return models.SkysubSettings{
@@ -159,25 +162,25 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 		}
 
 		widthVal, errWidth := strconv.ParseFloat(strings.TrimSpace(widthEntry.Text), 64)
-		if errWidth != nil || widthVal <= 0 {
+		if errWidth != nil || !finitePositiveSky(widthVal) {
 			dialog.ShowInformation("Invalid Value", "skywidth must be a positive number.", win)
 			return
 		}
 
 		clipVal, errClip := strconv.Atoi(strings.TrimSpace(clipEntry.Text))
-		if errClip != nil || clipVal < 0 {
-			dialog.ShowInformation("Invalid Value", "skyclip must be zero or a positive integer.", win)
+		if errClip != nil || clipVal <= 0 {
+			dialog.ShowInformation("Invalid Value", "skyclip must be a positive integer.", win)
 			return
 		}
 
 		lSigmaVal, errLS := strconv.ParseFloat(strings.TrimSpace(lSigmaEntry.Text), 64)
-		if errLS != nil || lSigmaVal <= 0 {
+		if errLS != nil || !finitePositiveSky(lSigmaVal) {
 			dialog.ShowInformation("Invalid Value", "skylsigma must be a positive number.", win)
 			return
 		}
 
 		uSigmaVal, errUS := strconv.ParseFloat(strings.TrimSpace(uSigmaEntry.Text), 64)
-		if errUS != nil || uSigmaVal <= 0 {
+		if errUS != nil || !finitePositiveSky(uSigmaVal) {
 			dialog.ShowInformation("Invalid Value", "skyusigma must be a positive number.", win)
 			return
 		}
@@ -190,7 +193,7 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 		upperSet := false
 		if lowerText != "" {
 			v, err := strconv.ParseFloat(lowerText, 64)
-			if err != nil {
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 				dialog.ShowInformation("Invalid Value", "skylower must be blank or a number.", win)
 				return
 			}
@@ -199,7 +202,7 @@ func showSkysubSettingsDialog(win fyne.Window, current models.SkysubSettings, on
 		}
 		if upperText != "" {
 			v, err := strconv.ParseFloat(upperText, 64)
-			if err != nil {
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 				dialog.ShowInformation("Invalid Value", "skyupper must be blank or a number.", win)
 				return
 			}

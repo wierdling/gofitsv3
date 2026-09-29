@@ -3,12 +3,18 @@ package processing
 import "math"
 
 func Downsample(pixels []float32, width, height, factor int) ([]float32, int, int) {
+	if width <= 0 || height <= 0 || factor <= 0 || width > len(pixels)/height {
+		return nil, 0, 0
+	}
 	if factor <= 1 {
-		return pixels, width, height
+		return append([]float32(nil), pixels[:width*height]...), width, height
 	}
 
 	newWidth := width / factor
 	newHeight := height / factor
+	if newWidth <= 0 || newHeight <= 0 || newWidth > int(^uint(0)>>1)/newHeight {
+		return nil, 0, 0
+	}
 	newPixels := make([]float32, newWidth*newHeight)
 
 	for ny := 0; ny < newHeight; ny++ {
@@ -24,7 +30,7 @@ func Downsample(pixels []float32, width, height, factor int) ([]float32, int, in
 					}
 					idx := origY*width + origX
 					val := float64(pixels[idx])
-					if !math.IsNaN(val) {
+					if !math.IsNaN(val) && !math.IsInf(val, 0) {
 						sum += val
 						count++
 					}

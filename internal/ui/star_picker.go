@@ -27,6 +27,27 @@ type starPickerWidget struct {
 	MaxStars   int
 	OnChanged  func()
 	CentroidFn func(x, y float64) (float64, float64, bool) // optional; refines click to star centroid
+
+	// ExistingStars, when set, are drawn as red circles (e.g. stars already
+	// present in a saved star map) so they are visually distinct from Stars
+	// and are not re-picked. Unused by callers that don't set it.
+	ExistingStars []processing.StarMapSource
+
+	// OnExistingTapped, when set, is called with the index into ExistingStars
+	// nearest a right-click, letting the caller show that star's info (and
+	// offer to remove it). When set, right-click prefers an existing star over
+	// a pending one.
+	OnExistingTapped func(index int)
+
+	// BoxSelectMode switches left-click-drag to rectangle selection instead of
+	// picking a single star; OnBoxSelect receives the dragged rectangle in
+	// image pixel coordinates (x0<=x1, y0<=y1) once the drag ends.
+	BoxSelectMode bool
+	OnBoxSelect   func(x0, y0, x1, y1 float64)
+
+	dragging    bool
+	dragStart   fyne.Position
+	dragCurrent fyne.Position
 }
 
 func newStarPickerWidget(img image.Image, imageW, imageH int) *starPickerWidget {
@@ -53,6 +74,9 @@ func (w *starPickerWidget) SetZoom(z float64) {
 }
 
 func (w *starPickerWidget) Tapped(ev *fyne.PointEvent) {
+	if w.BoxSelectMode {
+		return
+	}
 	if len(w.Stars) >= w.MaxStars {
 		return
 	}
@@ -73,11 +97,32 @@ func (w *starPickerWidget) Tapped(ev *fyne.PointEvent) {
 }
 
 func (w *starPickerWidget) TappedSecondary(ev *fyne.PointEvent) {
-	if len(w.Stars) == 0 {
-		return
-	}
 	imgX, imgY, ok := w.widgetToImage(ev.Position)
 	if !ok {
+		return
+	}
+	if len(w.Stars) == 0 && w.OnExistingTapped != nil && len(w.ExistingStars) > 0 {
+		minDist := math.MaxFloat64
+		minIdx := -1
+		for i, s := range w.ExistingStars {
+			dx := s.X - imgX
+			dy := s.Y - imgY
+			d := dx*dx + dy*dy
+			if d < minDist {
+				minDist = d
+				minIdx = i
+			}
+		}
+		radius := 10.0
+		if minIdx >= 0 && w.ExistingStars[minIdx].Radius > radius {
+			radius = w.ExistingStars[minIdx].Radius * 2
+		}
+		if minIdx >= 0 && minDist <= radius*radius {
+			w.OnExistingTapped(minIdx)
+		}
+		return
+	}
+	if len(w.Stars) == 0 {
 		return
 	}
 	minDist := math.MaxFloat64
@@ -98,6 +143,66 @@ func (w *starPickerWidget) TappedSecondary(ev *fyne.PointEvent) {
 		}
 		w.Refresh()
 	}
+}
+
+// Dragged implements fyne.Draggable. Only active in BoxSelectMode, where a
+// left-click drag defines a rectangle selection instead of moving anything.
+func (w *starPickerWidget) Dragged(ev *fyne.DragEvent) {
+	if !w.BoxSelectMode {
+		return
+	}
+	if !w.dragging {
+		w.dragging = true
+		w.dragStart = fyne.NewPos(ev.Position.X-ev.Dragged.DX, ev.Position.Y-ev.Dragged.DY)
+	}
+	w.dragCurrent = ev.Position
+	w.Refresh()
+}
+
+// DragEnd implements fyne.Draggable, finalizing a box selection.
+func (w *starPickerWidget) DragEnd() {
+	if !w.BoxSelectMode || !w.dragging {
+		w.dragging = false
+		return
+	}
+	w.dragging = false
+	x0, y0 := w.widgetToImageClamped(w.dragStart)
+	x1, y1 := w.widgetToImageClamped(w.dragCurrent)
+	w.Refresh()
+	if x0 > x1 {
+		x0, x1 = x1, x0
+	}
+	if y0 > y1 {
+		y0, y1 = y1, y0
+	}
+	if w.OnBoxSelect != nil && x1 > x0 && y1 > y0 {
+		w.OnBoxSelect(x0, y0, x1, y1)
+	}
+}
+
+// widgetToImageClamped is like widgetToImage but clamps to the image bounds
+// instead of rejecting points outside the rendered image area, for drag
+// gestures that can end past the image edge.
+func (w *starPickerWidget) widgetToImageClamped(pos fyne.Position) (imgX, imgY float64) {
+	offsetX, offsetY, scale := w.letterboxParams()
+	if scale == 0 {
+		return 0, 0
+	}
+	imgX = (float64(pos.X) - offsetX) / scale
+	imgY = (float64(pos.Y) - offsetY) / scale
+	if imgX < 0 {
+		imgX = 0
+	}
+	if imgX > float64(w.imageW-1) {
+		imgX = float64(w.imageW - 1)
+	}
+	if imgY < 0 {
+		imgY = 0
+	}
+	if imgY > float64(w.imageH-1) {
+		imgY = float64(w.imageH - 1)
+	}
+	return
 }
 
 func (w *starPickerWidget) ClearStars() {
@@ -197,6 +302,41 @@ func (r *starPickerRenderer) Objects() []fyne.CanvasObject {
 func (r *starPickerRenderer) updateOverlay() {
 	offsetX, offsetY, scale := r.w.letterboxParams()
 	objs := []fyne.CanvasObject{r.img}
+
+	existingColor := color.RGBA{R: 230, G: 30, B: 30, A: 230}
+	for _, s := range r.w.ExistingStars {
+		radius := s.Radius
+		if radius <= 0 {
+			radius = 5
+		}
+		wx := float32(s.X*scale + offsetX)
+		wy := float32(s.Y*scale + offsetY)
+		wr := float32(radius * scale)
+
+		c := canvas.NewCircle(color.Transparent)
+		c.StrokeColor = existingColor
+		c.StrokeWidth = 2
+		c.Resize(fyne.NewSize(wr*2, wr*2))
+		c.Move(fyne.NewPos(wx-wr, wy-wr))
+		objs = append(objs, c)
+	}
+
+	if r.w.dragging {
+		x0, y0 := r.w.dragStart.X, r.w.dragStart.Y
+		x1, y1 := r.w.dragCurrent.X, r.w.dragCurrent.Y
+		if x0 > x1 {
+			x0, x1 = x1, x0
+		}
+		if y0 > y1 {
+			y0, y1 = y1, y0
+		}
+		box := canvas.NewRectangle(color.NRGBA{R: 80, G: 160, B: 255, A: 50})
+		box.StrokeColor = color.RGBA{R: 80, G: 160, B: 255, A: 230}
+		box.StrokeWidth = 2
+		box.Resize(fyne.NewSize(x1-x0, y1-y0))
+		box.Move(fyne.NewPos(x0, y0))
+		objs = append(objs, box)
+	}
 
 	const arm = float32(9)
 	markerColor := color.RGBA{R: 255, G: 100, B: 0, A: 230}

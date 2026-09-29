@@ -1,80 +1,26 @@
-# AGENTS.md
+# GoFitsV3 repository guidance
 
-## Purpose
-Work efficiently in this repository with minimal token usage.
-Prefer narrow, deliberate changes over broad exploration.
+## Scope and workflow
+- Inspect only the smallest relevant area; use targeted searches and avoid rereading unchanged files.
+- For non-trivial work, state the relevant files, intended change, and validation plan before editing.
+- Make the smallest practical change. Preserve existing architecture, naming, style, and unrelated user changes; do not expand a fix into cleanup or a broad refactor unless asked.
+- Keep responses concise. Summarize long output and report only relevant failures or key lines.
 
-## Operating rules
-- Do not scan the whole repository unless it is necessary.
-- First identify the smallest set of files relevant to the task.
-- For non-trivial tasks, explore first, then briefly summarize the plan before editing.
-- Prefer the smallest change that solves the problem.
-- Preserve existing architecture and naming unless there is a clear reason to change them.
-- Do not perform broad refactors unless explicitly requested.
+## Implementation
+- Prefer the standard library and existing utilities; add dependencies only when they provide clear value.
+- Write clear, idiomatic Go with explicit error handling and simple abstractions. Do not use placeholder implementations unless requested.
+- Preserve existing frontend patterns and localize state and styling changes.
+- Run expensive image processing in a background goroutine with a progress dialog, applying UI updates on the UI thread.
+- For any user-visible capability, limitation, supported format or instrument, or workspace behavior change, update `docs/feature-list.md`. Purely internal refactors do not require an inventory update.
 
-## Context discipline
-- Keep responses concise and focused on the current task.
-- Avoid repeating prior analysis.
-- Avoid re-reading unchanged files unless needed to verify behavior.
-- When searching, prefer targeted search patterns over opening many files.
-- If more context is needed, inspect one additional area at a time.
-- Summarize long outputs instead of pasting them in full.
-- For logs and test output, surface only the relevant failures, errors, and key lines.
-
-## Code changes
-- Change only the files needed for the task.
-- Keep functions and diffs as small as practical.
-- Do not introduce new dependencies unless they provide clear value.
-- Prefer standard library and existing project utilities over adding packages.
-- Follow the existing style of the repository.
-- Avoid placeholder implementations unless explicitly requested.
-
-## Go guidance
-- Prefer clear, idiomatic Go.
-- Keep error handling explicit.
-- Avoid clever abstractions when simple code is sufficient.
+## Testing
+- Follow `docs/unit-test-standards.md`; use `docs/unit-test-audit.md` to identify coverage gaps and high-value additions.
 - Add or update tests when behavior changes.
-- Do not expand scope from a bug fix into cleanup unless asked.
+- Run the narrowest relevant test, build, or lint command first. Run the full repository suite only when warranted or requested.
+- Report validation commands and results briefly, explaining any broader validation.
 
-## Frontend guidance
-- Preserve existing UI patterns and component structure.
-- Do not restyle unrelated areas.
-- Keep state changes localized.
-- Avoid large framework-level changes unless explicitly requested.
-- Do not run expensive image processing on the main UI thread; use a background goroutine with a progress dialog and apply UI updates via the UI thread.
-
-## Testing and validation
-- Follow `docs/unit-test-standards.md` as the repository definition of a good unit test and when deciding which code needs unit coverage.
-- Use `docs/unit-test-audit.md` as the living inventory of current test quality, missing coverage, and next high-value unit test additions.
-- Run the narrowest relevant test, build, or lint command first.
-- Do not run full-repo test suites unless the change warrants it or the user asks.
-- If a narrow validation passes, report that first.
-- If broader validation is needed, state why.
-- Report commands run and results briefly.
-
-## Git and safety
+## Safety and handoff
 - Do not create commits, branches, or PR text unless requested.
-- Do not modify secrets, credentials, CI, deployment, or infrastructure files unless the task requires it.
-- Do not run destructive commands without explicit user approval.
-- Flag risky assumptions before taking risky actions.
-
-## Communication
-- Be direct and brief.
-- For non-trivial tasks, explore first, then plan, then edit.
-- When starting work, state:
-  1. relevant files
-  2. intended change
-  3. validation plan
-- When finishing, state:
-  1. files changed
-  2. what changed
-  3. validation performed
-  4. any remaining risk, assumptions, or follow-up
-
-## Cost control
-- Optimize for minimal context use.
-- Prefer targeted reads, targeted edits, and targeted validation.
-- Avoid broad repo scans unless clearly necessary.
-- If one or two nearby files must be inspected to verify correctness, do that and explain why.
-- Ask before expanding into refactors, unrelated cleanup, or architecture changes.
-- If a workflow becomes repetitive or long, suggest creating a skill or subagent instead of enlarging this file.
+- Do not modify secrets, credentials, CI, deployment, or infrastructure unless required by the task.
+- Obtain explicit approval before destructive commands and flag risky assumptions before acting.
+- On completion, report files changed, behavior changed, validation performed, and remaining risks or follow-up.

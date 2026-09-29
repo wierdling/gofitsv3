@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -21,6 +22,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"gofitsv3/internal/debuglog"
+	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/histogram"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/mosaic"
@@ -47,11 +49,15 @@ type mosaicState struct {
 	// exposureNormMode controls per-frame exposure-time normalization applied
 	// before drizzle. Defaults to Off so existing behavior is preserved.
 	exposureNormMode mosaic.NormalizationMode
+	gmosCalibration  *mosaic.GMOSCalibrationSelection
 }
+
+var activeMosaicWorkspace *mosaicWorkspace
 
 func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne.Menu, *fyne.MenuItem, *fyne.MenuItem) {
 	state := &mosaicState{drizzleSettings: defaultDrizzleSettings(), alignmentSettings: defaultAlignmentSettings(), skysubSettings: defaultSkysubSettings()}
 	ws := &mosaicWorkspace{app: app, win: win, state: state, zoomLevel: 1.0, stretchMode: stretch.Asinh, mtfMidtone: stretch.DefaultMTFMidtone}
+	activeMosaicWorkspace = ws
 	// ws.activeFilter is set when a filter batch is loaded; used for default save names.
 	// ws.lastProjectName is updated on save/load so the save dialog pre-populates the same name.
 
@@ -73,6 +79,36 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	saveBtn.Disable()
 	sendToExamineBtn := widget.NewButton("Send to Examine", func() {
 		if globalSendToExamine == nil || state.result == nil {
+			return
+		}
+		if globalSendDiagnosticToExamine != nil && state.result.DiagnosticProducts {
+			layers := map[string]fitsio.ImageData{}
+			if len(state.result.Weights) == state.result.Width*state.result.Height {
+				layers["WHT"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Pixels: state.result.Weights}
+			}
+			if len(state.result.NContrib) == state.result.Width*state.result.Height {
+				layers["NCONTRIB"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Int32Pixels: state.result.NContrib}
+			}
+			for i, plane := range state.result.ContextPlanes {
+				ctx := make([]int32, len(plane))
+				for j, v := range plane {
+					ctx[j] = int32(v)
+				}
+				layers[fmt.Sprintf("CTX%02d", i+1)] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Int32Pixels: ctx}
+			}
+			if len(state.result.CRMask) == state.result.Width*state.result.Height {
+				layers["CRMASK"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Int32Pixels: state.result.CRMask}
+			}
+			if len(state.result.DQ) == state.result.Width*state.result.Height {
+				layers["DQ"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Int32Pixels: state.result.DQ}
+			}
+			if len(state.result.SkyModel) == state.result.Width*state.result.Height {
+				layers["SKYMODEL"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Pixels: state.result.SkyModel}
+			}
+			if len(state.result.Seam) == state.result.Width*state.result.Height {
+				layers["SEAM"] = fitsio.ImageData{Width: state.result.Width, Height: state.result.Height, Pixels: state.result.Seam}
+			}
+			globalSendDiagnosticToExamine(state.result.Pixels, state.result.Width, state.result.Height, layers)
 			return
 		}
 		globalSendToExamine(state.result.Pixels, state.result.Width, state.result.Height)
@@ -298,42 +334,74 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		}
 		ws.exitStarMode()
 
-		progressDialog := dialog.NewCustom("Aligning By Selected Stars", "Matching selected stars across images...", widget.NewProgressBarInfinite(), win)
-		progressDialog.Show()
+		alignCtx, alignGeneration, started := ws.beginMosaicAlignment()
+		if !started {
+			dialog.ShowInformation("Star Alignment", "An alignment operation is already running.", win)
+			return
+		}
+		settings := state.alignmentSettings
 		go func() {
-			if state.alignmentSettings.DebugAlignment {
-				defer installAlignmentDebugHook(win)()
+			var finishOnce sync.Once
+			finishOK := false
+			finish := func() bool {
+				finishOnce.Do(func() { finishOK = ws.finishMosaicAlignment(alignGeneration) })
+				return finishOK
+			}
+			queued := false
+			defer func() {
+				if !queued {
+					finish()
+				}
+			}()
+			pt := newProgressTrackerWithContext("Aligning By Selected Stars", "Matching selected stars across images...", win, alignCtx, func() { ws.cancelMosaicAlignment() })
+			if alignCtx.Err() != nil {
+				pt.hide()
+				return
 			}
 			// TweakReg modes stream each frame's pixels on demand during
-			// alignment, so only the legacy warp-based modes (and the debug hook,
-			// which needs image backdrops) require every frame resident up front.
-			alignMode := mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode)
-			if !mosaic.AlignmentStreamsPixels(alignMode) || state.alignmentSettings.DebugAlignment {
+			// alignment, so only legacy warp-based modes require every frame
+			// resident up front.
+			alignMode := mosaic.AlignmentMode(settings.AlignmentMode)
+			if !mosaic.AlignmentStreamsPixels(alignMode) {
 				if err := ws.ensureInputPixelsLoaded(); err != nil {
 					fyne.Do(func() {
-						progressDialog.Hide()
+						pt.hide()
 						dialog.ShowError(err, win)
 					})
 					return
 				}
 			}
-			alignInputs, stateIndices := ws.alignmentWorkset()
+			workerSnapshot := ws.alignmentInputSnapshot()
+			alignInputs, stateIndices := alignmentWorksetFor(workerSnapshot.inputs, workerSnapshot.statuses, workerSnapshot.reference, settings.NumRefs)
 			if len(alignInputs) < 2 {
 				fyne.Do(func() {
-					progressDialog.Hide()
+					pt.hide()
 					dialog.ShowInformation("Star Alignment", "All eligible inputs already have saved alignments.", win)
 				})
 				return
 			}
-			results, err := mosaic.AlignInputsBySelectedStarsWithMode(alignInputs, refStars, ws.alignmentNumRefs(), mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode), state.alignmentSettings.SearchRadiusArcsec)
+			results, err := mosaic.AlignInputsBySelectedStarsWithModeCtx(alignCtx, alignInputs, refStars, alignmentNumRefsFor(workerSnapshot.reference, settings.NumRefs), alignMode, settings.SearchRadiusArcsec)
+			if alignCtx.Err() != nil {
+				pt.hide()
+				return
+			}
 
 			var rows []alignmentResultRow
 			if err == nil {
 				rows = buildAlignmentResultRowsForStateIndices(results, stateIndices)
+				if len(alignInputs) > 0 {
+					bindAlignmentResultSnapshot(rows, workerSnapshot)
+				}
 			}
 
+			queued = true
 			fyne.Do(func() {
-				progressDialog.Hide()
+				finished := finish()
+				if alignCtx.Err() != nil || !finished {
+					pt.hide()
+					return
+				}
+				pt.hide()
 				if err != nil {
 					dialog.ShowError(err, win)
 					return
@@ -346,7 +414,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				content := container.NewVBox()
 				checks := make([]*widget.Check, len(rows))
 				for i, r := range rows {
-					name := mosaic.InputLabel(state.inputs[r.stateIdx])
+					name := mosaic.InputLabel(workerSnapshot.inputs[r.stateIdx])
 					if r.result.Applied {
 						rot := 0.0
 						if r.result.HasManualTransform {
@@ -358,6 +426,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						chk.SetChecked(true)
 						checks[i] = chk
 						content.Add(chk)
+						content.Add(widget.NewLabel(alignmentDiagnosticsText(r.result)))
+						diagBtn := widget.NewButton("Diagnostics…", func() {
+							showAlignmentDiagnosticsDialog(win, r, name)
+						})
+						content.Add(diagBtn)
 					} else {
 						label := fmt.Sprintf("%s  [failed: %s]", name, r.result.Error)
 						chk := widget.NewCheck(label, nil)
@@ -454,7 +527,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 
 	// ---- File loading -------------------------------------------------------
 
-	loadBtn := widget.NewButton("Add FITS", func() {
+	loadBtn := widget.NewButton("Add FITS / ASDF", func() {
 		fd := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
 			if err != nil || r == nil {
 				return
@@ -464,14 +537,14 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			app.Preferences().SetString("lastDir", filepath.Dir(path))
 			ws.loadPaths([]string{path}, "Loading FITS")
 		}, win)
-		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts", ".asdf"}))
 		ws.configureLastDir(fd)
 		fd.SetView(dialog.ListView)
 		sizeFileDialog(fd)
 		fd.Show()
 	})
 
-	directoryBtn := widget.NewButton("Add FITS Directory", func() {
+	directoryBtn := widget.NewButton("Add FITS / ASDF Directory", func() {
 		fd := dialog.NewFolderOpen(func(listable fyne.ListableURI, err error) {
 			if err != nil || listable == nil {
 				return
@@ -557,15 +630,16 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						dateByPath[f.Path] = f.DateObs
 					}
 
-					type fileCheck struct {
-						path    string
-						checked bool
-					}
-					var fileChecks []fileCheck
+					var fileChecks []mosaicFilterBatchFileCheck
 					var checkBoxes []*widget.Check
+					var updatingChecks bool
 					checkContainer := container.NewVBox()
 					filesScroll := container.NewVScroll(checkContainer)
-					filesScroll.SetMinSize(fyne.NewSize(420, 220))
+					filesScroll.SetMinSize(fyne.NewSize(300, 200))
+					footprintPreview := newMosaicFilterPreview()
+					var previewGeneration uint64
+					var previewWindow fyne.Window
+					var refreshPreview func()
 
 					filteredFiles := func() []mosaic.FilterFile {
 						filter := mosaic.FacetValue(filterSelect.Selected)
@@ -663,29 +737,81 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						}
 					}
 
+					planPreview := func(selected []mosaicFilterBatchPreviewRequest) {
+						previewGeneration++
+						generation := previewGeneration
+						footprintPreview.loading()
+						go func() {
+							var inputs []mosaic.Input
+							loaded := make(map[string]bool, len(selected))
+							for _, request := range selected {
+								meta, err := mosaic.LoadInputsMetadataFromPath(request.path)
+								if err == nil {
+									inputs = append(inputs, meta...)
+									loaded[request.path] = true
+								}
+							}
+							scale := mosaic.ResolvePreviewScale(inputs, state.drizzleSettings.Scale, state.drizzleSettings.FinalScale)
+							groups, width, height, _ := mosaic.PlanFootprintPreview(inputs, scale)
+							byPath := make(map[string]mosaic.FootprintPreview, len(groups))
+							for _, group := range groups {
+								byPath[group.SourcePath] = group
+							}
+							orderedGroups := make([]mosaic.FootprintPreview, 0, len(selected))
+							for _, request := range selected {
+								group, ok := byPath[request.path]
+								if !loaded[request.path] || !ok {
+									group = mosaic.FootprintPreview{SourcePath: request.path, Status: "warning: metadata unavailable", Error: "unable to read WCS metadata"}
+								}
+								group.SourceNumber = request.sourceNumber
+								orderedGroups = append(orderedGroups, group)
+							}
+							fyne.Do(func() {
+								if generation == previewGeneration {
+									footprintPreview.show(orderedGroups, width, height)
+								}
+							})
+						}()
+					}
+
 					updateSelectedFiles := func() {
 						if updating {
 							return
 						}
 						paths := mosaic.MatchFiles(files, criteria())
-						fileChecks = make([]fileCheck, len(paths))
+						fileChecks = make([]mosaicFilterBatchFileCheck, len(paths))
 						checkBoxes = make([]*widget.Check, len(paths))
 						checkContainer.Objects = nil
 						for i, path := range paths {
 							i, path := i, path
-							fileChecks[i] = fileCheck{path: path, checked: true}
-							label := filepath.Base(path)
+							fileChecks[i] = mosaicFilterBatchFileCheck{path: path, checked: true}
+							label := fmt.Sprintf("%d. %s", i+1, filepath.Base(path))
 							if date := dateByPath[path]; date != "" {
 								label += "  —  " + date
 							}
 							chk := widget.NewCheck(label, func(v bool) {
 								fileChecks[i].checked = v
+								if !updatingChecks && filterPreviewRefreshRequests(previewWindow != nil, false, 1) > 0 && refreshPreview != nil {
+									refreshPreview()
+								}
 							})
 							chk.SetChecked(true)
 							checkBoxes[i] = chk
 							checkContainer.Add(chk)
 						}
 						checkContainer.Refresh()
+						requests := make([]mosaicFilterBatchPreviewRequest, len(paths))
+						for i, path := range paths {
+							requests[i] = mosaicFilterBatchPreviewRequest{path: path, sourceNumber: i + 1}
+						}
+						planPreview(requests)
+					}
+
+					refreshPreview = func() {
+						// Re-run metadata planning for the current list without rebuilding
+						// checkboxes, preserving the user's load selection.
+						selected := snapshotCheckedPaths(fileChecks)
+						planPreview(selected)
 					}
 
 					filterSelect.OnChanged = func(string) {
@@ -743,12 +869,17 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					updateSelectedFiles()
 
 					setAllFilesChecked := func(checked bool) {
+						updatingChecks = true
 						for i, chk := range checkBoxes {
 							if chk == nil {
 								continue
 							}
 							fileChecks[i].checked = checked
 							chk.SetChecked(checked)
+						}
+						updatingChecks = false
+						if filterPreviewRefreshRequests(previewWindow != nil, true, len(checkBoxes)) > 0 && refreshPreview != nil {
+							refreshPreview()
 						}
 					}
 
@@ -766,16 +897,41 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						)
 					}
 
-					content := container.NewVBox(
+					openPreviewBtn := widget.NewButton("Open Footprint Preview", func() {
+						if previewWindow == nil {
+							previewWindow = app.NewWindow("Drizzle Footprint Preview")
+							refreshBtn := widget.NewButton("Refresh Preview", func() {
+								if refreshPreview != nil {
+									refreshPreview()
+								}
+							})
+							previewWindow.SetContent(container.NewBorder(refreshBtn, nil, nil, nil, footprintPreview.root))
+							previewWindow.Resize(fyne.NewSize(900, 700))
+							previewWindow.SetOnClosed(func() { previewWindow = nil })
+						}
+						previewWindow.Show()
+						if refreshPreview != nil {
+							refreshPreview()
+						}
+					})
+
+					body := container.NewVBox(
 						widget.NewLabel("Filter the discovered calibrated _flc/_flt inputs (each facet is optional):"),
 						widget.NewForm(formItems...),
 						container.NewGridWithColumns(2,
 							widget.NewButton("Check All", func() { setAllFilesChecked(true) }),
 							widget.NewButton("Uncheck All", func() { setAllFilesChecked(false) }),
 						),
+						openPreviewBtn,
 						filesScroll,
 					)
+					// Scroll the complete form/body; the modal's native action row remains
+					// outside this scroller and is therefore always visible below it.
+					content := container.NewVScroll(body)
 					confirm := dialog.NewCustomConfirm("Load Filter Batch", "Load Files", "Cancel", content, func(ok bool) {
+						if previewWindow != nil {
+							previewWindow.Close()
+						}
 						if !ok {
 							return
 						}
@@ -797,7 +953,9 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						}
 						ws.loadPaths(paths, "Loading Filter Batch")
 					}, win)
-					confirm.Resize(fyne.NewSize(540, 480))
+					// Fit both 300px panes plus dialog padding without horizontal
+					// clipping; the body scrolls vertically below the native actions.
+					confirm.Resize(fyne.NewSize(720, 480))
 					confirm.Show()
 				})
 			}()
@@ -826,23 +984,43 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			dialog.ShowInformation("Missing Inputs", "Load at least two FITS files before star alignment.", win)
 			return
 		}
+		alignCtx, alignGeneration, started := ws.beginMosaicAlignment()
+		if !started {
+			dialog.ShowInformation("Star Alignment", "An alignment operation is already running.", win)
+			return
+		}
+		settings := state.alignmentSettings
 		go func() {
-			pt := newProgressTracker("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", win)
-			if state.alignmentSettings.DebugAlignment {
-				defer installAlignmentDebugHook(win)()
+			var finishOnce sync.Once
+			finishOK := false
+			finish := func() bool {
+				finishOnce.Do(func() { finishOK = ws.finishMosaicAlignment(alignGeneration) })
+				return finishOK
+			}
+			queued := false
+			defer func() {
+				if !queued {
+					finish()
+				}
+			}()
+			pt := newProgressTrackerWithContext("Aligning By Stars", "Refining per-image offsets from stars in the shared overlap...", win, alignCtx, func() { ws.cancelMosaicAlignment() })
+			if alignCtx.Err() != nil {
+				pt.hide()
+				return
 			}
 			// TweakReg modes stream each frame's pixels on demand during
-			// alignment, so only the legacy warp-based modes (and the debug hook,
-			// which needs image backdrops) require every frame resident up front.
-			alignMode := mosaic.AlignmentMode(state.alignmentSettings.AlignmentMode)
-			if !mosaic.AlignmentStreamsPixels(alignMode) || state.alignmentSettings.DebugAlignment {
+			// alignment, so only legacy warp-based modes require every frame
+			// resident up front.
+			alignMode := mosaic.AlignmentMode(settings.AlignmentMode)
+			if !mosaic.AlignmentStreamsPixels(alignMode) {
 				if err := ws.ensureInputPixelsLoaded(); err != nil {
 					pt.hide()
 					fyne.Do(func() { dialog.ShowError(err, win) })
 					return
 				}
 			}
-			alignInputs, stateIndices := ws.alignmentWorkset()
+			workerSnapshot := ws.alignmentInputSnapshot()
+			alignInputs, stateIndices := alignmentWorksetFor(workerSnapshot.inputs, workerSnapshot.statuses, workerSnapshot.reference, settings.NumRefs)
 			if len(alignInputs) < 2 {
 				pt.hide()
 				fyne.Do(func() {
@@ -850,10 +1028,14 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				})
 				return
 			}
-			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, ws.alignmentNumRefs(), alignMode, state.alignmentSettings.SearchRadiusArcsec, mosaic.AlignProgress{
+			results, err := mosaic.AlignInputsByStarsWithMode(alignInputs, alignmentNumRefsFor(workerSnapshot.reference, settings.NumRefs), alignMode, settings.SearchRadiusArcsec, mosaic.AlignProgress{
 				Progress: func(done, total int) { pt.progress("Aligning", done, total) },
 				Ctx:      pt.ctx,
 			})
+			if alignCtx.Err() != nil {
+				pt.hide()
+				return
+			}
 			if errors.Is(err, mosaic.ErrCancelled) {
 				debuglog.Log("starAlign: cancelled by user")
 				pt.hide()
@@ -864,10 +1046,18 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			var rows []alignmentResultRow
 			if err == nil {
 				rows = buildAlignmentResultRowsForStateIndices(results, stateIndices)
+				if len(alignInputs) > 0 {
+					bindAlignmentResultSnapshot(rows, workerSnapshot)
+				}
 			}
 
 			pt.hide()
+			queued = true
 			fyne.Do(func() {
+				finished := finish()
+				if alignCtx.Err() != nil || !finished {
+					return
+				}
 				if err != nil {
 					dialog.ShowError(err, win)
 					return
@@ -880,7 +1070,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 				content := container.NewVBox()
 				checks := make([]*widget.Check, len(rows))
 				for i, r := range rows {
-					name := mosaic.InputLabel(state.inputs[r.stateIdx])
+					name := mosaic.InputLabel(workerSnapshot.inputs[r.stateIdx])
 					if r.result.Applied {
 						rot := 0.0
 						if r.result.HasManualTransform {
@@ -892,6 +1082,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 						chk.SetChecked(true)
 						checks[i] = chk
 						content.Add(chk)
+						content.Add(widget.NewLabel(alignmentDiagnosticsText(r.result)))
+						diagBtn := widget.NewButton("Diagnostics…", func() {
+							showAlignmentDiagnosticsDialog(win, r, name)
+						})
+						content.Add(diagBtn)
 					} else {
 						label := fmt.Sprintf("%s  [failed: %s]", name, r.result.Error)
 						chk := widget.NewCheck(label, nil)
@@ -1087,7 +1282,10 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	clearOffsetsBtn.Importance = widget.DangerImportance
 
 	clearBtn := widget.NewButton("Clear", func() {
+		ws.inputMu.Lock()
 		state.inputs = nil
+		ws.inputGenerations = make(map[string]uint64)
+		ws.inputMu.Unlock()
 		state.statuses = nil
 		ws.activeFilter = ""
 		ws.levelsSet = false
@@ -1309,19 +1507,19 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		ws.zoomFitMode = false
 		s := strings.TrimSuffix(sel, "%")
 		if val, err := strconv.ParseFloat(s, 64); err == nil {
-			ws.zoomLevel = math.Max(math.Min(val/100.0, 16), 1.0/16)
+			ws.zoomLevel = clampMosaicZoom(val / 100.0)
 			ws.updateZoom()
 		}
 	}
 
 	zoomInBtn := widget.NewButton("+", func() {
 		ws.zoomFitMode = false
-		ws.zoomLevel = math.Min(ws.zoomLevel*1.25, 16)
+		ws.zoomLevel = clampMosaicZoom(ws.zoomLevel * 1.25)
 		ws.updateZoom()
 	})
 	zoomOutBtn := widget.NewButton("-", func() {
 		ws.zoomFitMode = false
-		ws.zoomLevel = math.Max(ws.zoomLevel/1.25, 1.0/16)
+		ws.zoomLevel = clampMosaicZoom(ws.zoomLevel / 1.25)
 		ws.updateZoom()
 	})
 
@@ -1356,6 +1554,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 	loadMosaicItem := fyne.NewMenuItem("Load Mosaic Project", ws.loadMosaicProject)
 	saveMosaicItem := fyne.NewMenuItem("Save Mosaic Project", ws.saveMosaicProject)
 
+	ws.gmosCalibrationItem = fyne.NewMenuItem("Gemini GMOS Calibration...", ws.configureGMOSCalibration)
 	settingsMenu := fyne.NewMenu("Mosaic",
 		fyne.NewMenuItem("Drizzle Queue...", ws.openDrizzleQueue),
 		fyne.NewMenuItemSeparator(),
@@ -1363,9 +1562,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 		fyne.NewMenuItem("Alignment Settings", ws.openAlignmentSettings),
 		fyne.NewMenuItem("Skysub Settings", ws.openSkysubSettings),
 		fyne.NewMenuItem("Exposure Normalization", ws.openExposureReview),
+		ws.gmosCalibrationItem,
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Create Artifact Masks...", ws.openArtifactMaskEditor),
 	)
+	ws.gmosMenu = settingsMenu
 	footerBottomPad := canvas.NewRectangle(color.Transparent)
 	footerBottomPad.SetMinSize(fyne.NewSize(1, 20))
 	previewPane := container.NewBorder(previewHeader, container.NewVBox(previewFooter, footerBottomPad), nil, nil, ws.previewSwap)

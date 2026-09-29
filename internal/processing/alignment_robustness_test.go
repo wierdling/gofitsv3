@@ -52,6 +52,20 @@ func TestRANSACIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestRScaleRANSACWithInliersExcludesOutlier(t *testing.T) {
+	pairs := []MatchedPair{{0, 0, 4, -2, 0}, {20, 0, 24, -2, 0}, {0, 20, 4, 18, 0}, {20, 20, 24, 18, 0}, {10, 10, 80, 80, 0}}
+	transform, inliers, err := SolveRScaleTransformationRANSACWithInliers(pairs, 500, 1.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inliers) != 4 {
+		t.Fatalf("inliers=%d, want 4", len(inliers))
+	}
+	if math.Abs(transform.C-4) > 0.1 || math.Abs(transform.F+2) > 0.1 {
+		t.Fatalf("transform=%+v", transform)
+	}
+}
+
 // TestFitCatalogResidualRecoversRScale verifies the catalog-only residual fit
 // (used by the mosaic chain fallback) recovers a small rotation+scale+shift, not
 // just a translation — the correctness upgrade over the old translation-only
@@ -153,6 +167,28 @@ func TestGlobalBundleAdjustReducesResidual(t *testing.T) {
 		if d := math.Hypot(x-grid[i].X, y-grid[i].Y); d > 0.1 {
 			t.Fatalf("frame 2 star %d still %.3f px off after adjustment", i, d)
 		}
+	}
+}
+
+func TestGlobalBundleAdjustShortFixedReturnsNoUpdates(t *testing.T) {
+	updates, ok := GlobalBundleAdjust([][]Star{{{X: 1, Y: 1}}, {{X: 1, Y: 1}}}, []bool{false}, func(a, b int) bool { return true }, "general", 10, 10, 1)
+	if ok || len(updates) != 2 {
+		t.Fatalf("got updates=%d ok=%v", len(updates), ok)
+	}
+	for i, u := range updates {
+		if u != IdentityTransform() {
+			t.Fatalf("update %d = %+v, want identity", i, u)
+		}
+	}
+}
+
+func TestCatalogMatchingExcludesNonFiniteStars(t *testing.T) {
+	bad := Star{X: math.NaN(), Y: 1, Flux: 1}
+	if got := matchIndicesByProximity([]Star{bad}, []Star{{X: 1, Y: 1, Flux: 1}}, 3); len(got) != 0 {
+		t.Fatal("non-finite catalog coordinate matched")
+	}
+	if got := matchStarsByMutualProximity([]Star{{X: 1, Y: 1, Flux: math.Inf(1)}}, []Star{{X: 1, Y: 1, Flux: 1}}, 0, 3, .85); len(got) != 0 {
+		t.Fatal("non-finite catalog flux matched")
 	}
 }
 

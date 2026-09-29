@@ -3,8 +3,12 @@ package processing
 import "math"
 
 func WarpImageToSizeWithMask(targetPixels []float32, srcWidth, srcHeight, outWidth, outHeight int, t AffineTransform) ([]float32, []bool) {
-	out := make([]float32, outWidth*outHeight)
-	valid := make([]bool, outWidth*outHeight)
+	n, ok := rasterSize(outWidth, outHeight)
+	if !ok {
+		return []float32{}, []bool{}
+	}
+	out := make([]float32, n)
+	valid := make([]bool, n)
 	if srcWidth <= 0 || srcHeight <= 0 || len(targetPixels) == 0 {
 		return out, valid
 	}
@@ -20,13 +24,19 @@ func WarpImageToSizeWithMask(targetPixels []float32, srcWidth, srcHeight, outWid
 			srcX := t.A*float64(x) + t.B*float64(y) + t.C
 			srcY := t.D*float64(x) + t.E*float64(y) + t.F
 			outIdx := y*outWidth + x
+			if !isFinite64(srcX) || !isFinite64(srcY) || srcX < 0 || srcY < 0 || srcX > float64(srcWidth-1) || srcY > float64(srcHeight-1) {
+				out[outIdx] = float32(math.NaN())
+				continue
+			}
 			x0 := int(math.Floor(srcX))
 			y0 := int(math.Floor(srcY))
 			x1 := x0 + 1
 			y1 := y0 + 1
-			if x0 < 0 || x1 >= srcWidth || y0 < 0 || y1 >= srcHeight {
-				out[outIdx] = float32(math.NaN())
-				continue
+			if x1 >= srcWidth {
+				x1 = srcWidth - 1
+			}
+			if y1 >= srcHeight {
+				y1 = srcHeight - 1
 			}
 			wx := srcX - float64(x0)
 			wy := srcY - float64(y0)
@@ -34,7 +44,7 @@ func WarpImageToSizeWithMask(targetPixels []float32, srcWidth, srcHeight, outWid
 			p10 := float64(targetPixels[y0*srcWidth+x1])
 			p01 := float64(targetPixels[y1*srcWidth+x0])
 			p11 := float64(targetPixels[y1*srcWidth+x1])
-			if math.IsNaN(p00) || math.IsNaN(p10) || math.IsNaN(p01) || math.IsNaN(p11) {
+			if !isFinite64(p00) || !isFinite64(p10) || !isFinite64(p01) || !isFinite64(p11) {
 				out[outIdx] = float32(math.NaN())
 				continue
 			}

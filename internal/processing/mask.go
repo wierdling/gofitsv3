@@ -113,7 +113,14 @@ func effectiveMaskGeometry(channels [][]float32, width, height int, sigmas []flo
 
 	bgs := make([]float64, channelCount)
 	for i := 0; i < channelCount; i++ {
-		bg, _ := EstimateBackground(channels[i])
+		// Estimate each background over the same effective shared rectangle
+		// used by the mask loops.  Including a longer channel's trailing pixels
+		// shifts the threshold and breaks parity for unequal/truncated inputs.
+		bgPixels := channels[i]
+		if len(bgPixels) > totalPixels {
+			bgPixels = bgPixels[:totalPixels]
+		}
+		bg, _ := EstimateBackground(bgPixels)
 		bgs[i] = bg
 	}
 	return channelCount, totalPixels, height, bgs, true

@@ -101,3 +101,32 @@ func TestAutoLoadOffsetsAppliesMatchingFilterFile(t *testing.T) {
 		t.Fatalf("second input offsets = (%v,%v)", inputs[1].OffsetX, inputs[1].OffsetY)
 	}
 }
+
+func TestLoadOffsetsRejectsNonFiniteLegacyValues(t *testing.T) {
+	for _, content := range []string{"F606W\na.fits\tNaN\t1\n", "F606W\na.fits\t1\tInf\n"} {
+		if _, _, err := loadOffsetsTxt([]byte(content)); err == nil {
+			t.Fatalf("loadOffsetsTxt(%q) succeeded, want error", content)
+		}
+	}
+	if _, _, err := loadOffsetsTxt([]byte("F606W\na.fits 1 2 NaN 0 0 0 1 0\n")); err == nil {
+		t.Fatal("loadOffsetsTxt accepted non-finite affine transform")
+	}
+}
+
+func TestUpdateMasterOffsetsPropagatesCorruptExistingMaster(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, MasterOffsetFile)
+	if err := os.WriteFile(path, []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateMasterOffsets(dir, []Input{{Path: filepath.Join(dir, "a.fits"), OffsetX: 1}}); err == nil {
+		t.Fatal("UpdateMasterOffsets succeeded with corrupt existing master")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "{" {
+		t.Fatalf("corrupt master was overwritten: %q", data)
+	}
+}

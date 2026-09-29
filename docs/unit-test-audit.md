@@ -18,7 +18,7 @@ This document tracks the current quality of unit tests in this repository using 
 
 | Package | Rating | Priority | Notes |
 | --- | --- | --- | --- |
-| `internal/processing` | well covered | medium | Broad behavior coverage now includes the main `processing.go` helper layer, calibration math/background estimation, canonical render paths, and a deterministic save/load/render regression fixture in addition to alignment, masking, compose, cleaning, and WCS |
+| `internal/processing` | well covered | medium | Broad behavior coverage includes the main `processing.go` helper layer, canonical render paths, and deterministic processing fixtures in addition to alignment, masking, compose, cleaning, and WCS |
 | `internal/mosaic` | well covered | medium | Strong scenario coverage for drizzle/input planning, but still worth targeted edge-case additions |
 | `internal/histogram` | well covered | low | Small logic surface and direct branch coverage |
 | `internal/render` | well covered | low | Core rendering helpers are directly tested |
@@ -30,7 +30,6 @@ This document tracks the current quality of unit tests in this repository using 
 | `badpix` | partially covered | medium | Cleaning now covers DQ presence, missing-DQ behavior, bad-bit filtering, and load failures, with only rarer malformed-file edge cases still thin |
 | `internal/fitsio` | partially covered | medium | Synthetic parser/writer tests now cover core branches; a few low-level edge cases still remain |
 | `internal/models` | partially covered | medium | Persistence coverage now includes Compose and Mosaic project/state round-trips, with only backward-compat edge cases still thin |
-| `internal/catalog/gaia` | well covered | medium | Provider/cache tests cover migrations, deduplication, endpoint semantics, retries, cancellation, cache-only misses, and an online-to-cache-only end-to-end fixture |
 | `internal/config` | no direct unit tests | low | Currently small surface; add tests if validation or branching grows |
 | `internal/debuglog` | no direct unit tests | low | Low-risk logging wrapper |
 | `internal/debugtime` | no direct unit tests | low | Low-risk timing helper |
@@ -224,26 +223,6 @@ This document tracks the current quality of unit tests in this repository using 
 3. `internal/mosaic`: add a targeted edge-case pass for malformed headers and bookkeeping/status branches.
 4. `internal/ui`: add only targeted regression cases if project-loop wiring or preview application state starts causing bugs.
 5. `internal/models`: add a backward-compat decode test only if legacy project-file compatibility becomes a real concern.
-
-### Color calibration Phase 1 gate
-
-The Phase 1 calibration suite includes direct tests for instrument metadata
-boundaries, robust background estimation, transform fingerprints and staleness,
-canonical render status handling, overlay-mode separation, and a JSON
-save/load/render fixture. The fixture verifies Off behavior, a valid persisted
-instrument/background result, stale non-application, and repeatable preview
-bytes. UI-only dialogs, visual Before/After inspection, and actual file export
-through platform widgets remain manual acceptance checks.
-
-### Color calibration Phase 2 gate
-
-Gaia provider and SQLite cache behavior now have deterministic mocked HTTP and
-cache-only coverage. Manual acceptance is still required for first online use,
-cancellation at each UI stage, insufficient-star messaging, preview/export
-equality, and project save/reload on a representative workstation. The Gaia
-documentation records network/privacy scope, cache growth/deletion, migration
-behavior, passband limits, quality thresholds, and provenance fields.
-
 ## Validation Notes
 - Existing package tests reviewed during this audit passed for:
   - `./internal/processing`
@@ -258,3 +237,58 @@ behavior, passband limits, quality thresholds, and provenance fields.
 - `internal/models` was expanded after the initial audit with broader project/state persistence round-trip tests, and the findings above reflect that newer state.
 - `internal/badpix` and `badpix` were expanded after the initial audit with fallback, missing-DQ, bad-bit filtering, and load-error coverage, and the findings above reflect that newer state.
 - The audit is based on targeted inspection of production files and current `*_test.go` files rather than numeric coverage alone.
+
+## Star-map addition (2026-09-12)
+
+- `internal/processing/star_map_test.go`: deterministic stellar profiles on a sloping background; extended knots, hot pixels and ridges; clipped-core recovery; saturated extended-source rejection; bounded masks, NaNs, manual overrides, invalid input and cancellation.
+- `internal/mosaic/star_map_test.go`: standard block-aligned FITS and mask/label round trips; catalog/manual-review round trips; stale science rejection; prevention of science-file overwrite and mask-as-science loading; paired SCI/DQ geometry and saturation bits; duplicate observation suppression; distorted placement inversion and raw-to-combined-to-output parity; cancelled-save preservation.
+- `internal/ui/mosaic_star_map_test.go`: edge/NaN-safe cutout rendering with a selection overlay.
+- Real-data developer check: `cmd/starmap/review.py` verifies FITS with Astropy, asserts matching WCS and valid finite masks, and generates every selected source stamp. It is not a ground-truth accuracy benchmark or an ordinary unit test.
+- Remaining coverage/quality work: independent spatially held-out Trifid labels and precision/recall/footprint-leakage measurements; broader instrument/PSF variation; dense blends; UI interaction/cancellation race automation. The experimental detector is not certified to meet the proposed 99% precision target.
+
+## Star-map benchmark addition (2026-09-12)
+
+- `internal/starbench/metrics_test.go`: maximum-cardinality one-to-one matches, duplicate selections, misses, unresolved denominators, automatic-status scoring despite manual overrides, category recovery, incomplete/boundary exclusions, unioned protected areas, external-center footprints, NaNs and invalid inputs.
+- `internal/starbench/model_test.go`: valid detector-independent default partitions, optimistic revisions, retained reveal metadata, edits after reveal, and refusal to change/delete exposed partitions or overlap regions.
+- `internal/starbench/server_test.go`: persistent saves/history and stale-write conflicts, local session/host/origin checks, initially hidden catalogs, reveal audit, frozen report snapshots and validation-split isolation, FITS display orientation and invalid-pixel rendering.
+- Focused package tests and race detection pass. Manual browser smoke coverage includes object labels, tags/notes, autosave/reload, protected rectangles, detection reveal and paired reports on a separate scratch project. A real native-evidence F673N detector replay reproduced 117 accepted and 1,145 uncertain candidates.
+- Remaining work: independently reviewed human truth, richer cross-filter inspection for ambiguous objects, and automated end-to-end browser/cancellation tests. Smoke-test annotations do not count as truth labels.
+
+### Label-positioning addition (2026-09-13)
+
+- `internal/starbench/center_test.go`: subpixel recovery from an offset click on a sloped background, search-radius isolation of a brighter neighbor, symmetric clipped cores, flat/ramp/invalid/edge rejection, and a catalog-free preview endpoint that leaves labels and reveal history untouched.
+- `internal/starbench/label-position.test.cjs`: zero-based FITS coordinate conversion at 50–400% zoom with scrolled/fractional canvas origins, preservation of the drag grab offset, and region-boundary clamping. Run with `node --test internal/starbench/label-position.test.cjs`.
+- Browser smoke checks in a separate scratch project verify preview/cancel/apply and dragging at 200% zoom with label identity, tags and notes preserved. Centering remains a human-reviewed pointing aid, not evidence that the selected feature is a star.
+
+### Benchmark file switching and region drawing (2026-09-13)
+
+- `internal/starbench/project_hub_test.go`: switching between synthetic FITS files restores persisted labels and the initial custom directory; stale browser writes/image requests are rejected; failed, busy and conflicting switches preserve the active workspace; failed loading releases only the lock it acquired; local file browsing requires a session and filters file types.
+- `internal/starbench/label-position.test.cjs`: overview-to-FITS rectangle conversion, upward y direction, reverse drags, fractional bounds and edge clamping. Existing model tests reject overlapping or invalid region bounds.
+- Manual browser smoke checks use separate synthetic files to draw/name/save a region, browse/load a second FITS image and return to the first image with its region restored. Human Trifid annotations are kept separate from smoke-test data.
+
+- Optional benchmark verification: server tests cover default mosaic-only runs with missing native files, persisted choice and FITS evidence mode, and refusal to silently skip requested verification when inputs are missing or unavailable.
+
+- `internal/processing/star_map_saturation_test.go`: mosaic-only clipped-star rescue with diffraction spikes and a missing core pixel; rejection of a spike-free clipped nebular knot, flat/invalid/edge fields; cancellation. Existing star-map tests continue to cover broad knots, hot pixels, ridges, native saturation and mask bounds.
+
+- Saturation regression: full-detector synthetic cases cover suppressed and enhanced cores with/without diffraction spikes, including duplicate suppression and subsequent field-width filtering. M16 source near (4947.18, 3180.41) is an exposed-validation development case, not an independent validation sample for this fix.
+
+- Desktop star-map settings: `TestParseStarMapOptions` covers benchmark-compatible bounds, whitespace, automatic FWHM, and rejection of empty/non-finite/out-of-range values before starting detection.
+
+Star Map Review tests cover source-ID/status/saturation sorting without catalog mutation, navigation in sorted order and at boundaries, empty lists, and dispatch of all four arrow keys.
+
+## Gentler stellar stretch preview (2026-09-15)
+
+- `internal/processing/star_stretch_nebulosity_validation_test.go`: known-background correction bounds for curved rims, a rotated/subpixel rim, an offset knot, a filament and a required-success planar control; nonidentity MTF coverage and identical-observation centered-knot ambiguity. Negative cases must reach preparation with usable initial fits. This demonstrates bounded ordinary-star cases, not universal nebula separation or saturated-background safety.
+- `internal/processing/star_stretch_test.go` and `star_stretch_regression_test.go`: linear stellar/background fitting, bounded feathering, stellar-increment rendering and independent numerical/failure-path regressions. This is a prototype source-grid pipeline, not full RGB application.
+- `internal/processing/star_stretch_safety_test.go`: measured width, bright edge truncation, saturation-tagged wing validation, oversized model handling without dark holes, display-clipped core treatment at the user's MTF settings, radial monotonicity/no hollow core, full mask support through the clipped plateau, neighbor-boundary rejection, unclipped curve monotonicity, invalid masks/models, dimension overflow, cancellation and zero-strength parity for all five supported modes.
+- `internal/processing/star_treatment_wings_test.go` and `star_treatment_wings_independent_test.go`: clipped-core wing validation, integer/half-pixel wide plateaus, insufficient/noisy/asymmetric wings, full core mask support and feathering, invalid core samples and unvalidated saturated models. These exercise appearance reduction without missing-flux reconstruction.
+- `TestSkippedPreviewDoesNotPretendToHaveACorrectedImage` prevents unchanged duplicate/black-mask panels from being presented as successful treatment.
+- `internal/starstretchpreview/preview_test.go`: reviewed-source selection without catalog mutation, invalid settings rejected before file access, zero-strength FITS/map preservation, stale science rejection, safe new report directories, escaped report text and cancelled publication.
+- Saturated preview integration additionally checks successful finite clipped-core treatment, unchanged science/catalog, and zero-strength parity; a NaN core remains an explicit skipped result.
+- Saturated fitting tests also cover cancellation from progress, cancelled background/plateau scans, robust annular outliers and catalogued-neighbor exclusion. Mask coverage includes a core larger than the default feather start.
+- `star_stretch_footprint_validation_test.go` covers subpixel/noisy sloping-background treatment, broad smooth wing support beyond the catalog radius, radial no-ring behavior, explicit blend skips and a known curved-nebula leakage regression. The latter now requires safe rejection with unchanged pixels/fits, or a correction bounded by the true stellar increment. `star_stretch_footprint_guard_test.go` checks directional-knot rejection and symmetric-halo retention. The new guard covers ordinary stars only; symmetric nebulosity and saturated-background ambiguity remain limitations. Developer cutouts and measurements are recorded in `docs/wite-star-footprint-validation.md`.
+- `star_stretch_extended_geometry_test.go` and `star_stretch_extended_validation_test.go` cover support beyond 32 pixels, a finite rotated orthogonal diffraction cross, exact mask/render weight agreement, feather seams, invalid extended geometry, invalid samples outside the core, cancellation and zero-strength parity. See `docs/wite-star-halo-spike-validation.md` for the bounded morphology contract and real-data evidence; neither these tests nor developer cutouts establish a universal PSF or complex-background separation model.
+- UI option tests cover numeric bounds and invalid input before background work.
+- Remaining acceptance work: independently reviewed real-data footprint/background leakage, asymmetric halos/spikes, clipped-core behavior, complete Compose normal/disk application parity and interactive cancellation/window lifecycle checks. Synthetic tests and developer cutouts do not establish those guarantees.
+
+`TestStarReviewListUsesOneRendererAfterResizeAndRefresh` verifies that selection refreshes update displayed rows and resizing updates the displayed scroller; this guards against binding an embedded Fyne list to a second renderer identity.

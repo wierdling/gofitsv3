@@ -22,6 +22,23 @@ import (
 // is a var (not const) so tests can shrink it to force multi-band processing.
 var crModelMemBudget int64 = 256 << 20 // 256 MB
 
+type firstError struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (f *firstError) Store(err error) {
+	if err == nil {
+		return
+	}
+	f.mu.Lock()
+	if f.err == nil {
+		f.err = err
+	}
+	f.mu.Unlock()
+}
+func (f *firstError) Load() error { f.mu.Lock(); defer f.mu.Unlock(); return f.err }
+
 // buildCRMasksDrizzle implements the AstroDrizzle-style separate-drizzle cosmic
 // ray pipeline without holding every per-frame drizzled image in memory at once.
 //
@@ -65,6 +82,7 @@ func buildCRMasksDrizzle(
 	defer os.RemoveAll(tmpDir)
 
 	paths := make([]string, n)
+	progressStage := crPreparationProgressStage(planned, dataPlanned)
 
 	// ---- Phase 1: separate drizzle to temp files ----
 	logMemStats("CR sep-drizzle start")
@@ -72,7 +90,7 @@ func buildCRMasksDrizzle(
 	debuglog.Log(fmt.Sprintf("buildCRMasksDrizzle: sep pass, %d frames, %d workers", n, sepWorkers))
 	var sepWG sync.WaitGroup
 	sepSem := make(chan struct{}, sepWorkers)
-	var sepErr atomic.Value // error
+	var sepErr firstError
 	var sepDone int32
 	for slot, pi := range dataPlanned {
 		if err := opts.cancelled(); err != nil {
@@ -99,12 +117,13 @@ func buildCRMasksDrizzle(
 			}
 			paths[slot] = path
 			done := atomic.AddInt32(&sepDone, 1)
-			opts.reportProgress("Cleaning cosmic rays", int(done), n)
+			opts.reportProgress(progressStage, int(done), n)
 		}(slot, pi)
 	}
 	sepWG.Wait()
-	if e := sepErr.Load(); e != nil {
-		return nil, e.(error)
+	e := sepErr.Load()
+	if e != nil {
+		return nil, e
 	}
 	if err := opts.cancelled(); err != nil {
 		return nil, err
@@ -136,7 +155,7 @@ func buildCRMasksDrizzle(
 	masks := make([]BitMask, n)
 	var maskWG sync.WaitGroup
 	maskSem := make(chan struct{}, maskConcurrency())
-	var maskErr atomic.Value
+	var maskErr firstError
 	for slot, pi := range dataPlanned {
 		if err := opts.cancelled(); err != nil {
 			maskErr.Store(err)
@@ -193,14 +212,30 @@ func buildCRMasksDrizzle(
 		}(slot, pi)
 	}
 	maskWG.Wait()
-	if e := maskErr.Load(); e != nil {
-		return nil, e.(error)
+	e = maskErr.Load()
+	if e != nil {
+		return nil, e
 	}
 	if err := opts.cancelled(); err != nil {
 		return nil, err
 	}
 	logMemStats("CR mask done")
 	return masks, nil
+}
+
+// crPreparationProgressStage avoids implying that Gemini/GMOS inputs contain
+// cosmic rays. The same separate-drizzle pass is still used to prepare the
+// multi-frame model, but its user-facing label is instrument-appropriate.
+func crPreparationProgressStage(planned []plannedInput, dataPlanned []int) string {
+	if len(dataPlanned) == 0 {
+		return "Cleaning cosmic rays"
+	}
+	for _, pi := range dataPlanned {
+		if pi < 0 || pi >= len(planned) || !IsGeminiHeader(planned[pi].input.PrimaryHeader) {
+			return "Cleaning cosmic rays"
+		}
+	}
+	return "Preparing Gemini frames"
 }
 
 // crTempBaseDir picks the directory that holds the CR scratch files. It uses the

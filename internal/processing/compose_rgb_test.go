@@ -79,6 +79,31 @@ func TestComposeRGBWithOverlayHighlightProtectedAdditive(t *testing.T) {
 	}
 }
 
+func TestComposeRGBArtisticThreeChannelRegression(t *testing.T) {
+	header := fitsio.Header{Cards: map[string]string{"DRIZSCAL": "1", "ORIGOFFX": "0", "ORIGOFFY": "0"}}
+	blue := makeLoadedImageForCompose(1, 1, 4, header)
+	green := makeLoadedImageForCompose(1, 1, 6, header)
+	red := makeLoadedImageForCompose(1, 1, 8, header)
+	buf, _, _, _ := ComposeRGB(context.Background(), []*models.LoadedImage{blue, green, red})
+	want := []byte{204, 153, 102, 255}
+	for i, value := range want {
+		if buf[i] != value {
+			t.Fatalf("artistic pixel[%d] = %d, want %d", i, buf[i], value)
+		}
+	}
+}
+
+func TestFloat32RGBToRGBAKeepsFloatDomainUntilConversion(t *testing.T) {
+	rgb := [3][]float32{{0.5019}, {0.1251}, {0.9999}}
+	buf, err := Float32RGBToRGBA(rgb, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := buf[:4], []byte{128, 32, 255, 255}; string(got) != string(want) {
+		t.Fatalf("converted pixel = %v, want %v", got, want)
+	}
+}
+
 func TestStretchForReferenceGridSkipsRewarpForSharedDrizzleGrid(t *testing.T) {
 	header := func(crpix1 string) fitsio.Header {
 		return fitsio.Header{Cards: map[string]string{

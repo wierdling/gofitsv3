@@ -55,6 +55,31 @@ func showFITSOpenDialog(app fyne.App, win fyne.Window, onChosen func([]string)) 
 	}
 }
 
+// showSingleFITSOpenDialog uses the native FITS picker for a one-file action.
+func showSingleFITSOpenDialog(app fyne.App, win fyne.Window, onChosen func(string)) {
+	opts := []gofiledialog.Option{
+		gofiledialog.WithTitle("Open FITS File"),
+		gofiledialog.WithFilters(gofiledialog.Filter{Name: "FITS files", Extensions: []string{".fits", ".fit", ".fts"}}),
+	}
+	if lastDir := app.Preferences().String("lastDir"); lastDir != "" {
+		opts = append(opts, gofiledialog.WithStartDir(lastDir))
+	}
+	if err := gofiledialog.ShowOpen(func(paths []string, err error) {
+		if err != nil {
+			dialog.ShowError(err, win)
+			return
+		}
+		if len(paths) == 0 {
+			return
+		}
+		path := paths[0]
+		app.Preferences().SetString("lastDir", filepath.Dir(path))
+		onChosen(path)
+	}, win, opts...); err != nil {
+		dialog.ShowError(err, win)
+	}
+}
+
 func showBatchFITSResizeDialog(app fyne.App, win fyne.Window, paths []string) {
 	if len(paths) == 0 {
 		dialog.ShowInformation("No FITS Files", "Choose at least one FITS image to resize.", win)

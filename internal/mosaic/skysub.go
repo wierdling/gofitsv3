@@ -1,6 +1,8 @@
 package mosaic
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"runtime"
@@ -200,22 +202,46 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyP
 	// Each worker holds a full loaded frame plus its sky sample buffer, so cap
 	// concurrency to keep peak memory bounded (the loads are I/O-bound anyway).
 	sem := make(chan struct{}, skyConcurrency())
+	cancelledBeforeLaunch := false
 	for i := range planned {
+		if cancelledBeforeLaunch {
+			break
+		}
 		if planned[i].input.ReferenceOnly {
 			continue
 		}
 		wg.Add(1)
-		sem <- struct{}{}
+		if opts.Ctx == nil {
+			sem <- struct{}{}
+		} else {
+			select {
+			case sem <- struct{}{}:
+			case <-opts.Ctx.Done():
+				wg.Done()
+				cancelledBeforeLaunch = true
+				continue
+			}
+		}
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			if opts.cancelled() != nil {
+				return
+			}
 			pixels, _, _, perr := prepareFramePixels(planned[i], opts, 0, skyPlane{})
 			if perr != nil {
 				skyErrMu.Lock()
 				if skyErr == nil {
-					skyErr = fmt.Errorf("load frame for sky estimate %s: %w", InputKey(planned[i].input), perr)
+					if errors.Is(perr, context.Canceled) || errors.Is(perr, ErrCancelled) {
+						skyErr = ErrCancelled
+					} else {
+						skyErr = fmt.Errorf("load frame for sky estimate %s: %w", InputKey(planned[i].input), perr)
+					}
 				}
 				skyErrMu.Unlock()
+				return
+			}
+			if opts.cancelled() != nil {
 				return
 			}
 			sky, serr := estimateSkyValue(pixels, options)
@@ -234,6 +260,9 @@ func planSkysub(planned []plannedInput, opts Options) (skyOffset []float64, skyP
 		}(i)
 	}
 	wg.Wait()
+	if err := opts.cancelled(); err != nil {
+		return nil, nil, nil, nil, err
+	}
 	if skyErr != nil {
 		return nil, nil, nil, nil, skyErr
 	}
@@ -1322,6 +1351,9 @@ func buildOverlapSampleMap(p plannedInput, pixels []float32, options SkysubOptio
 				continue
 			}
 			rx, ry := p.mapPixel(float64(x), float64(y))
+			if !isFiniteSky64(rx) || !isFiniteSky64(ry) {
+				continue
+			}
 			key := overlapCellKey(rx, ry)
 			cur := accum[key]
 			if len(cur.values) >= skyOverlapCellSampleCap {

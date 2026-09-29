@@ -43,17 +43,53 @@ func (ws *mosaicWorkspace) enterStarMode() {
 		return
 	}
 	var refResult *mosaic.Result
+	ref, ok := effectiveMosaicAlignmentReference(ws.state.inputs, ws.state.referenceInput)
+	if !ok {
+		dialog.ShowInformation("No Files", "Load at least one usable FITS file before selecting stars.", ws.win)
+		return
+	}
 	if ws.state.result != nil {
 		refResult = ws.state.result
+	} else if ws.state.referenceInput != nil {
+		refCopy := *ws.state.referenceInput
+		if refCopy.HDU.Data.Pixels == nil {
+			loaded, err := mosaic.LoadInputsFromPath(refCopy.Path)
+			if err != nil || len(loaded) == 0 {
+				if err == nil {
+					err = fmt.Errorf("no image data found")
+				}
+				dialog.ShowError(fmt.Errorf("reload external reference %s: %w", refCopy.Path, err), ws.win)
+				return
+			}
+			if err := assignPixelsFromLoaded(&refCopy, loaded); err != nil {
+				dialog.ShowError(err, ws.win)
+				return
+			}
+		}
+		refResult = &mosaic.Result{Pixels: refCopy.HDU.Data.Pixels, Width: refCopy.HDU.Data.Width, Height: refCopy.HDU.Data.Height}
 	} else {
-		// No drizzle result yet: the reference preview comes from input[0]'s
+		// No drizzle result yet: the reference preview comes from the effective
+		// reference input's
 		// pixels, which may be unloaded (metadata-only load) or freed by a prior
 		// build. Reload only that one frame so the whole dataset stays on disk.
-		if err := ws.ensureInputPixelsLoadedAt(0); err != nil {
+		refIndex := -1
+		for i := range ws.state.inputs {
+			if sameMosaicAlignmentInput(ws.state.inputs[i], ref) {
+				refIndex = i
+				break
+			}
+		}
+		if refIndex < 0 {
+			dialog.ShowError(fmt.Errorf("reference image %s is not loaded in the workspace", mosaic.InputLabel(ref)), ws.win)
+			return
+		}
+		if err := ws.ensureInputPixelsLoadedAt(refIndex); err != nil {
 			dialog.ShowError(err, ws.win)
 			return
 		}
-		ref := ws.state.inputs[0]
+		if loaded, ok := ws.inputSnapshot(refIndex); ok {
+			ref = loaded
+		}
 		refResult = &mosaic.Result{
 			Pixels: ref.HDU.Data.Pixels,
 			Width:  ref.HDU.Data.Width,

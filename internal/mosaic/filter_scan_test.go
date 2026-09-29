@@ -186,6 +186,17 @@ func TestDiscoverFilterFilesTracksObservationDates(t *testing.T) {
 	}
 }
 
+func TestParseDateObsRejectsInvalidCalendarDates(t *testing.T) {
+	for _, raw := range []string{"2023-02-29", "2023-13-01", "2023-00-10", "2023-01-32"} {
+		if got := parseDateObs(raw); got != "" {
+			t.Fatalf("parseDateObs(%q) = %q, want empty", raw, got)
+		}
+	}
+	if got := parseDateObs("2024-02-29T00:00:00"); got != "2024-02-29" {
+		t.Fatalf("parseDateObs leap day = %q", got)
+	}
+}
+
 func TestDiscoverFiltersGroupsRealWFPC2FLTFiles(t *testing.T) {
 	dir := filepath.Join("..", "..", "TestImages", "WFPC2")
 	if _, err := os.Stat(dir); err != nil {

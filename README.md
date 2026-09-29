@@ -119,9 +119,9 @@ go test -v ./...
 
 The application is organized into four tabs, each covering one stage of the workflow:
 
-* **Mosaic** — Add FITS inputs, set a baseline reference frame, star-align the inputs (with RANSAC matching), measure alignment quality, and drizzle/combine the aligned exposures into a mosaic ("Create Mosaic"). Includes a blink viewer for inspecting frames and tools to save/load alignment offsets. The combined result can be sent directly to the Examine tab.
+* **Mosaic** — Add FITS or supported JWST MIRI/NIRCam ASDF inputs, set a baseline reference frame, star-align the inputs (with RANSAC matching), measure alignment quality, and drizzle/combine the aligned exposures into a mosaic ("Create Mosaic"). Native instrument GWCS is evaluated per detector pixel for placement and alignment; the saved mosaic is FITS-output only with a TAN WCS. Unsupported or incomplete GWCS models (including unregistered future instruments such as Roman) remain Examine-only. Includes a blink viewer for inspecting frames and tools to save/load alignment offsets. The combined result can be sent directly to the Examine tab.
 
-* **Examine** — Inspect a single FITS image or a drizzle result, including histogram and basic statistics. The Mosaic tab can hand its output here for review.
+* **Examine** — Inspect supported FITS/ASDF image planes or a drizzle result, including histogram and basic statistics. The Mosaic tab can hand its output here for review.
 
 * **Compose** — Assign filter images to R/G/B channels, stretch each channel independently, and merge them into an RGB composite. Includes "Align to Channel 2" (pixel-space star alignment with a full affine fit), cross-channel cleaning, RGB levels, scale normalization, and Compose project save/load. The composite can be sent to the Edit tab.
 

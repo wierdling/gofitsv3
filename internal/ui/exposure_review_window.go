@@ -31,6 +31,22 @@ func normModeFromName(s string) mosaic.NormalizationMode {
 	return mosaic.NormOff
 }
 
+func exposureInputIdentity(in mosaic.Input) string {
+	return fmt.Sprintf("%s#%dx%d", mosaic.InputKey(in), in.HDU.Data.Width, in.HDU.Data.Height)
+}
+
+func sameExposureInputIdentities(inputs []mosaic.Input, snapshot []string) bool {
+	if len(inputs) != len(snapshot) {
+		return false
+	}
+	for i, in := range inputs {
+		if exposureInputIdentity(in) != snapshot[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // showExposureReviewDialog presents the Exposure Normalization review for the
 // given inputs grouped by filter. It mutates inputs in place on Save (Excluded,
 // NormalizeExposure, ExposureScale) and reports the chosen mode via onApply.
@@ -41,6 +57,7 @@ func showExposureReviewDialog(win fyne.Window, inputs []mosaic.Input, mode mosai
 	}
 
 	n := len(inputs)
+	identities := make([]string, n)
 	use := make([]bool, n)
 	normalize := make([]bool, n)
 	scale := make([]float64, n)
@@ -54,9 +71,11 @@ func showExposureReviewDialog(win fyne.Window, inputs []mosaic.Input, mode mosai
 		}
 	}
 	for i := range inputs {
+		identities[i] = exposureInputIdentity(inputs[i])
 		use[i] = !inputs[i].Excluded
+		normalize[i] = inputs[i].NormalizeExposure
+		scale[i] = inputs[i].ExposureScale
 	}
-	recomputeDefaults(mode)
 
 	// Group input indices by filter name, filters sorted alphabetically.
 	filterOf := func(i int) string {
@@ -227,6 +246,10 @@ func showExposureReviewDialog(win fyne.Window, inputs []mosaic.Input, mode mosai
 
 	d := dialog.NewCustomConfirm("Exposure Normalization", "Apply", "Cancel", content, func(ok bool) {
 		if !ok {
+			return
+		}
+		if !sameExposureInputIdentities(inputs, identities) {
+			dialog.ShowInformation("Inputs Changed", "The loaded inputs changed while this dialog was open. Reopen Exposure Normalization to review the current inputs.", win)
 			return
 		}
 		for i := range inputs {

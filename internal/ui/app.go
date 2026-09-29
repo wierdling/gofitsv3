@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"image"
 	"image/color"
 	"syscall"
 
@@ -83,9 +82,12 @@ func Run() error {
 		editTab,
 	)
 
-	globalExportToEdit = func(img image.Image) {
-		setEditImage(img)
+	globalExportToEdit = func(h editImageHandoff) error {
+		if err := setEditImage(h); err != nil {
+			return err
+		}
 		tabs.Select(editTab)
+		return nil
 	}
 
 	globalSelectComposeTab = func() {
@@ -118,6 +120,14 @@ func Run() error {
 	win.SetContent(fynetooltip.AddWindowToolTipLayer(content, win.Canvas()))
 	win.SetCloseIntercept(func() {
 		stopMemoryMonitor()
+		if globalComposeLargeCleanup != nil {
+			globalComposeLargeCleanup()
+			globalComposeLargeCleanup = nil
+		}
+		if globalEditCleanup != nil {
+			globalEditCleanup()
+			globalEditCleanup = nil
+		}
 		a.Quit()
 	})
 	win.Show()

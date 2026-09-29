@@ -60,11 +60,15 @@ type queueFakeExecutor struct {
 	release   chan struct{}
 	failIndex int
 	order     []int
+	onStart   func(int)
 }
 
 func (f *queueFakeExecutor) Execute(ctx context.Context, job drizzleQueueJob, progress func(string, int, int)) (string, error) {
 	index := len(f.order)
 	f.order = append(f.order, index)
+	if f.onStart != nil {
+		f.onStart(index)
+	}
 	if f.started != nil {
 		f.started <- index
 	}
@@ -93,6 +97,21 @@ func TestDrizzleQueueRunnerContinuesAfterFailure(t *testing.T) {
 	}
 	if len(fake.order) != 2 {
 		t.Fatalf("executed %d jobs, want 2", len(fake.order))
+	}
+}
+
+func TestDrizzleQueueRunnerStopAfterCurrentLeavesLaterJobsPending(t *testing.T) {
+	var runner *drizzleQueueRunner
+	fake := &queueFakeExecutor{failIndex: -1, onStart: func(i int) {
+		if i == 0 {
+			runner.StopAfterCurrent()
+		}
+	}}
+	j := []drizzleQueueJob{{ProjectPath: "one.json"}, {ProjectPath: "two.json"}}
+	runner = &drizzleQueueRunner{executor: fake}
+	runner.Run(context.Background(), j)
+	if len(fake.order) != 1 || j[0].Status != queueSucceeded || j[1].Status != queuePending {
+		t.Fatalf("executed=%v jobs=%+v", fake.order, j)
 	}
 }
 

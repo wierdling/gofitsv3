@@ -2,10 +2,12 @@ package ui
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"gofitsv3/internal/mosaic"
+	"gofitsv3/internal/processing"
 )
 
 func TestBuildAlignmentResultRowsFollowsInputOrder(t *testing.T) {
@@ -40,8 +42,20 @@ func TestWriteAlignmentCSVIncludesNameStatusAndMessage(t *testing.T) {
 	if err := writeAlignmentCSV(&out, rows, inputs); err != nil {
 		t.Fatal(err)
 	}
-	want := "image_name,aligned,message\nok.fits,true,\nbad.fits,false,\"not enough stars, retry\"\n"
-	if strings.ReplaceAll(out.String(), "\r\n", "\n") != want {
-		t.Fatalf("CSV = %q, want %q", out.String(), want)
+	got := strings.ReplaceAll(out.String(), "\r\n", "\n")
+	if !strings.Contains(got, "detected_source,detected_reference,matched,accepted,rejected") || !strings.Contains(got, "ok.fits,true,") || !strings.Contains(got, "bad.fits,false,\"not enough stars, retry\"") {
+		t.Fatalf("CSV = %q, missing enriched alignment fields", got)
+	}
+}
+
+func TestWriteAlignmentResidualCSV(t *testing.T) {
+	var out bytes.Buffer
+	encoded, _ := json.Marshal([]processing.Residual{{X: 2, Y: 3, DX: .25, DY: -.5, Radial: .559}})
+	row := alignmentResultRow{result: mosaic.StarAlignmentResult{Residuals: string(encoded)}}
+	if err := writeAlignmentResidualCSV(&out, row, "frame.fits"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.ReplaceAll(out.String(), "\r\n", "\n"), "frame.fits,2,3,0,0,0.25,-0.5") {
+		t.Fatalf("unexpected residual CSV: %q", out.String())
 	}
 }

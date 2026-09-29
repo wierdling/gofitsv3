@@ -3,6 +3,10 @@ package processing
 import (
 	"math"
 	"testing"
+
+	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/models"
+	"gofitsv3/internal/stretch"
 )
 
 // makeMagicField builds a synthetic field: flat sky + noise pattern, a diffuse
@@ -28,6 +32,56 @@ func makeMagicField(w, h int) []float32 {
 		px[s[1]*w+s[0]] = 5000
 	}
 	return px
+}
+
+func TestApplyMagicLevelsAndMTFUsesRobustResultForPaddedField(t *testing.T) {
+	const w, h = 96, 80
+	px := make([]float32, w*h)
+	for y := 20; y < h-20; y++ {
+		for x := 20; x < w-20; x++ {
+			px[y*w+x] = float32(100 + (x*7+y*11)%5)
+		}
+	}
+	px[(h/2)*w+w/2] = 125
+	for y := 20; y < h-20; y++ {
+		for x := 60; x < w-20; x++ {
+			px[y*w+x] = 150
+		}
+	}
+	// A Gemini-like frame has a majority padded border. The old two-step route
+	// included those zeros in Auto MTF's statistics and drove the real field to
+	// white; the combined operation must keep it at a midtone.
+	old := &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Pixels: append([]float32(nil), px...), Width: w, Height: h}}}
+	ApplyMagicLevels(old, MagicBalanced)
+	AutoMTFMidtone(old)
+	oldStretched, _ := ApplyStretchParallel(old)
+	oldField := float64(oldStretched.Pixels[(h/2)*w+w/2])
+	if oldField < 0.75 {
+		t.Fatalf("legacy representative field output %.3f is not oversaturated", oldField)
+	}
+	t.Logf("legacy representative field output %.3f", oldField)
+	img := &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Pixels: px, Width: w, Height: h}}}
+	res := ApplyMagicLevelsAndMTF(img, MagicBalanced)
+	if res.ValidPixels == 0 || img.Mode != stretch.MTF || !finite(img.MTFMidtone) {
+		t.Fatalf("Magic stretch result = %#v, mode=%v, mtf=%v", res, img.Mode, img.MTFMidtone)
+	}
+	stretched, _ := ApplyStretchParallel(img)
+	field := float64(stretched.Pixels[(h/2)*w+w/2])
+	t.Logf("shared Magic representative field output %.3f", field)
+	if field >= oldField {
+		t.Fatalf("shared Magic MTF output %.3f did not improve over legacy %.3f", field, oldField)
+	}
+	if field >= 0.75 {
+		t.Fatalf("representative field output %.3f is oversaturated; result=%+v", field, res)
+	}
+}
+
+func TestApplyMagicLevelsAndMTFHandlesDegenerateLevels(t *testing.T) {
+	img := &models.LoadedImage{HDU: fitsio.HDU{Data: fitsio.ImageData{Pixels: []float32{5, 5, 5, 5}, Width: 2, Height: 2}}}
+	ApplyMagicLevelsAndMTF(img, MagicBalanced)
+	if !finite(img.MTFMidtone) || img.MTFMidtone <= 0 || img.MTFMidtone > 0.5 {
+		t.Fatalf("degenerate Magic MTF = %v, want finite in (0, .5]", img.MTFMidtone)
+	}
 }
 
 func TestMagicLevelsBlackAndStarExclusion(t *testing.T) {

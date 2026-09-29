@@ -9,6 +9,18 @@ import (
 	"fyne.io/fyne/v2"
 )
 
+const (
+	minMosaicZoom = 1.0 / 16
+	maxMosaicZoom = 16
+)
+
+func clampMosaicZoom(z float64) float64 {
+	if math.IsNaN(z) || math.IsInf(z, 0) {
+		return 1
+	}
+	return math.Max(math.Min(z, maxMosaicZoom), minMosaicZoom)
+}
+
 // setZoomSelectLabel updates the dropdown to reflect the current zoom without
 // triggering OnChanged.
 func (ws *mosaicWorkspace) setZoomSelectLabel(option string) {
@@ -47,6 +59,7 @@ func (ws *mosaicWorkspace) updateZoom() {
 	if ws.zoomFitMode {
 		ws.zoomLevel = ws.fitZoom()
 	}
+	ws.zoomLevel = clampMosaicZoom(ws.zoomLevel)
 	if ws.activeMeasure != nil {
 		ws.activeMeasure.SetZoom(ws.zoomLevel)
 		ws.pickerScroll.Refresh()
@@ -81,12 +94,12 @@ func (ws *mosaicWorkspace) updateZoom() {
 func (ws *mosaicWorkspace) applyCustomZoom() {
 	s := strings.TrimSuffix(strings.TrimSpace(ws.zoomCustomEntry.Text), "%")
 	pct, err := strconv.ParseFloat(s, 64)
-	if err != nil || pct <= 0 {
+	if err != nil || math.IsNaN(pct) || math.IsInf(pct, 0) || pct <= 0 {
 		ws.zoomCustomEntry.SetText("")
 		return
 	}
 	ws.zoomFitMode = false
-	ws.zoomLevel = math.Max(math.Min(pct/100.0, 16), 1.0/16)
+	ws.zoomLevel = clampMosaicZoom(pct / 100.0)
 	ws.zoomCustomEntry.SetText("")
 	ws.updateZoom()
 }

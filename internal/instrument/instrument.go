@@ -4,6 +4,9 @@
 package instrument
 
 import (
+	"sort"
+	"strings"
+
 	"gofitsv3/internal/fitsio"
 )
 
@@ -142,7 +145,7 @@ type ScalePreset struct {
 // drizzle Output Scale menu, ordered finest to coarsest. Values are read from
 // the detector table so it stays the single source of truth.
 func ScalePresets() []ScalePreset {
-	return []ScalePreset{
+	presets := []ScalePreset{
 		{"NIRCam Short", detectors[key{"NIRCAM", "NRCA1"}].PixelScale},
 		{"ACS/HRC", detectors[key{"ACS", "HRC"}].PixelScale},
 		{"WFC3/UVIS", detectors[key{"WFC3", "UVIS"}].PixelScale},
@@ -151,14 +154,21 @@ func ScalePresets() []ScalePreset {
 		{"MIRI", detectors[key{"MIRI", "MIRIMAGE"}].PixelScale},
 		{"WFC3/IR", detectors[key{"WFC3", "IR"}].PixelScale},
 	}
+	sort.SliceStable(presets, func(i, j int) bool {
+		if presets[i].PixelScale == presets[j].PixelScale {
+			return presets[i].Name < presets[j].Name
+		}
+		return presets[i].PixelScale < presets[j].PixelScale
+	})
+	return presets
 }
 
 // FromHeader reads INSTRUME and DETECTOR from the provided FITS header and
 // returns the matching Info. If the combination is not recognised, Default
 // is returned along with ok=false.
 func FromHeader(h fitsio.Header) (Info, bool) {
-	instrume := fitsio.HeaderString(h, "INSTRUME")
-	detector := fitsio.HeaderString(h, "DETECTOR")
+	instrume := strings.ToUpper(strings.TrimSpace(fitsio.HeaderString(h, "INSTRUME")))
+	detector := strings.ToUpper(strings.TrimSpace(fitsio.HeaderString(h, "DETECTOR")))
 	info, ok := detectors[key{instrume, detector}]
 	if !ok {
 		return Default, false

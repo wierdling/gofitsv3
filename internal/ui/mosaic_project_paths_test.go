@@ -1,11 +1,35 @@
 package ui
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"gofitsv3/internal/models"
 )
+
+func TestWriteProjectJSONStagesAndRejectsExisting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "project.json")
+	if err := writeProjectJSON(path, []byte("one"), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeProjectJSON(path, []byte("two"), false); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("second write error = %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "one" {
+		t.Fatalf("destination = %q, err=%v", data, err)
+	}
+	if err := writeProjectJSON(path, []byte("three"), true); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil || string(data) != "three" {
+		t.Fatalf("replacement = %q, err=%v", data, err)
+	}
+}
 
 func TestProjectRelativePathRoundTripKeepsMaskDirPortable(t *testing.T) {
 	projectPath := filepath.Join(t.TempDir(), "project", "mosaic_project.json")

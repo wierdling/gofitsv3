@@ -45,16 +45,24 @@ func deterministicSeed(pairs []MatchedPair) int64 {
 // iterations: typically 2000 for geometric matching.
 // threshold: max pixel distance for a point to be considered an inlier (e.g., 2.0).
 func SolveTransformationRANSAC(pairs []MatchedPair, iterations int, threshold float64) (AffineTransform, error) {
+	t, _, err := SolveTransformationRANSACWithInliers(pairs, iterations, threshold)
+	return t, err
+}
+
+// SolveTransformationRANSACWithInliers returns the exact consensus membership
+// used for the final least-squares refinement.
+func SolveTransformationRANSACWithInliers(pairs []MatchedPair, iterations int, threshold float64) (AffineTransform, []MatchedPair, error) {
 	debuglog.Log("SolveTransformationRANSAC: starting")
 	defer debuglog.Log("SolveTransformationRANSAC: finished")
 	n := len(pairs)
 	if n < 3 {
-		return AffineTransform{}, errors.New("at least 3 matched pairs are required")
+		return AffineTransform{}, nil, errors.New("at least 3 matched pairs are required")
 	}
 
 	// If we only have exactly 3, just do a direct solve without RANSAC
 	if n == 3 {
-		return solveLeastSquares(pairs)
+		t, err := solveLeastSquares(pairs)
+		return t, append([]MatchedPair(nil), pairs...), err
 	}
 
 	rng := rand.New(rand.NewSource(deterministicSeed(pairs)))
@@ -105,11 +113,12 @@ func SolveTransformationRANSAC(pairs []MatchedPair, iterations int, threshold fl
 	}
 
 	if maxInlierCount < 3 {
-		return AffineTransform{}, errors.New("RANSAC failed to find a valid consensus model")
+		return AffineTransform{}, nil, errors.New("RANSAC failed to find a valid consensus model")
 	}
 
 	// 5. Final Least Squares solve using ONLY the confirmed inliers
-	return solveLeastSquares(bestInliers)
+	t, err := solveLeastSquares(bestInliers)
+	return t, bestInliers, err
 }
 
 // solveLeastSquares is your original gonum solver, extracted into a private helper.
@@ -151,15 +160,23 @@ func solveLeastSquares(pairs []MatchedPair) (AffineTransform, error) {
 // iterations: typically a few hundred for post-WCS refinement.
 // threshold: max pixel distance for a point to be considered an inlier.
 func SolveRScaleTransformationRANSAC(pairs []MatchedPair, iterations int, threshold float64) (AffineTransform, error) {
+	t, _, err := SolveRScaleTransformationRANSACWithInliers(pairs, iterations, threshold)
+	return t, err
+}
+
+// SolveRScaleTransformationRANSACWithInliers returns the exact RScale
+// consensus used for the final similarity least-squares refinement.
+func SolveRScaleTransformationRANSACWithInliers(pairs []MatchedPair, iterations int, threshold float64) (AffineTransform, []MatchedPair, error) {
 	debuglog.Log("SolveRScaleTransformationRANSAC: starting")
 	defer debuglog.Log("SolveRScaleTransformationRANSAC: finished")
 	n := len(pairs)
 	if n < 2 {
-		return AffineTransform{}, errors.New("at least 2 matched pairs are required")
+		return AffineTransform{}, nil, errors.New("at least 2 matched pairs are required")
 	}
 
 	if n == 2 {
-		return solveRScaleLeastSquares(pairs)
+		t, err := solveRScaleLeastSquares(pairs)
+		return t, append([]MatchedPair(nil), pairs...), err
 	}
 
 	rng := rand.New(rand.NewSource(deterministicSeed(pairs)))
@@ -209,7 +226,7 @@ func SolveRScaleTransformationRANSAC(pairs []MatchedPair, iterations int, thresh
 	}
 
 	if bestInlierCount < minInliers {
-		return AffineTransform{}, errors.New("RANSAC failed to find a valid consensus model")
+		return AffineTransform{}, nil, errors.New("RANSAC failed to find a valid consensus model")
 	}
 
 	bestInliers := make([]MatchedPair, 0, bestInlierCount)
@@ -225,12 +242,12 @@ func SolveRScaleTransformationRANSAC(pairs []MatchedPair, iterations int, thresh
 
 	finalTransform, err := solveRScaleLeastSquares(bestInliers)
 	if err != nil {
-		return AffineTransform{}, err
+		return AffineTransform{}, nil, err
 	}
 	if rms := rscaleInlierRMS(bestInliers, finalTransform); rms > threshold {
-		return AffineTransform{}, errors.New("RANSAC consensus was too inconsistent for a stable rscale fit")
+		return AffineTransform{}, nil, errors.New("RANSAC consensus was too inconsistent for a stable rscale fit")
 	}
-	return finalTransform, nil
+	return finalTransform, bestInliers, nil
 }
 
 func isDegenerateRScaleSample(pairs []MatchedPair) bool {

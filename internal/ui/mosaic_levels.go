@@ -3,6 +3,7 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -36,11 +37,16 @@ func (ws *mosaicWorkspace) applyLevelsToPreview() {
 	}
 }
 
-func (ws *mosaicWorkspace) autoLevels(pixels []float32) {
+func autoLevelsForPixels(pixels []float32) models.LoadedImage {
 	img := &models.LoadedImage{
 		HDU: fitsio.HDU{Data: fitsio.ImageData{Pixels: pixels}},
 	}
 	processing.AutoScaleLikeFitsLiberator(img)
+	return *img
+}
+
+func (ws *mosaicWorkspace) autoLevels(pixels []float32) {
+	img := autoLevelsForPixels(pixels)
 	ws.blackEntry.SetValue(img.Black)
 	ws.whiteEntry.SetValue(img.White)
 	ws.bgEntry.SetValue(img.Background)
@@ -50,6 +56,9 @@ func (ws *mosaicWorkspace) autoLevels(pixels []float32) {
 }
 
 func (ws *mosaicWorkspace) currentPreviewResult() *mosaic.Result {
+	if ws.activePicker != nil && ws.starModeRefResult != nil {
+		return ws.starModeRefResult
+	}
 	if ws.state.result != nil {
 		return ws.state.result
 	}
@@ -159,7 +168,6 @@ func (ws *mosaicWorkspace) resetPreview() {
 // loadLevelPrefsAndMode loads saved level settings for filter, also updating the
 // mode dropdown. Returns true if saved preferences were found and applied.
 func (ws *mosaicWorkspace) loadLevelPrefsAndMode(filter string) bool {
-	ws.resetMTFMidtone()
 	raw := ws.app.Preferences().String(ws.prefKey(filter))
 	if raw == "" {
 		return false
@@ -168,24 +176,30 @@ func (ws *mosaicWorkspace) loadLevelPrefsAndMode(filter string) bool {
 	if err := json.Unmarshal([]byte(raw), &sl); err != nil {
 		return false
 	}
-	if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.Black), 64); err2 == nil {
-		ws.blackEntry.SetValue(v)
+	parse := func(s string) (float64, bool) {
+		v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+		return v, err == nil && !math.IsNaN(v) && !math.IsInf(v, 0)
 	}
-	if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.White), 64); err2 == nil {
-		ws.whiteEntry.SetValue(v)
+	black, okB := parse(sl.Black)
+	white, okW := parse(sl.White)
+	bg, okBg := parse(sl.Background)
+	peak, okP := parse(sl.Peak)
+	scaled, okS := parse(sl.ScaledPeak)
+	if !(okB && okW && okBg && okP && okS) {
+		return false
 	}
-	if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.Background), 64); err2 == nil {
-		ws.bgEntry.SetValue(v)
+	mtf, okM := parse(sl.MTFMidtone)
+	if okM && !(mtf > 0 && mtf < 1) {
+		okM = false
 	}
-	if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.Peak), 64); err2 == nil {
-		ws.peakEntry.SetValue(v)
-	}
-	if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.ScaledPeak), 64); err2 == nil {
-		ws.scaledPeakEntry.SetValue(v)
-	}
-	if v, err2 := strconv.ParseFloat(strings.TrimSpace(sl.MTFMidtone), 64); err2 == nil && v > 0 && v < 1 {
-		ws.mtfMidtone = v
-		ws.mtfMidtoneEntry.SetValue(v)
+	ws.blackEntry.SetValue(black)
+	ws.whiteEntry.SetValue(white)
+	ws.bgEntry.SetValue(bg)
+	ws.peakEntry.SetValue(peak)
+	ws.scaledPeakEntry.SetValue(scaled)
+	if okM {
+		ws.mtfMidtone = mtf
+		ws.mtfMidtoneEntry.SetValue(mtf)
 	}
 	if sl.Mode != "" {
 		ws.modeSelect.SetSelected(sl.Mode)

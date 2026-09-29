@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -98,6 +99,9 @@ func LoadOffsets(path string) (string, map[string]OffsetRecord, error) {
 		}
 		records := make(map[string]OffsetRecord, len(of.Offsets))
 		for _, r := range of.Offsets {
+			if !finiteOffsetRecord(r) {
+				return "", nil, fmt.Errorf("offset JSON contains non-finite values")
+			}
 			records[r.FileName] = r
 		}
 		return of.Filter, records, nil
@@ -134,12 +138,15 @@ func loadOffsetsTxt(data []byte) (string, map[string]OffsetRecord, error) {
 					affineOk = false
 					break
 				}
+				if !isFinite(v) {
+					return "", nil, fmt.Errorf("invalid affine transform on line %d", lineNo)
+				}
 				affineVals[k] = v
 			}
 			if affineOk {
 				ox, errX := strconv.ParseFloat(parts[len(parts)-8], 64)
 				oy, errY := strconv.ParseFloat(parts[len(parts)-7], 64)
-				if errX != nil || errY != nil {
+				if errX != nil || errY != nil || !isFinite(ox) || !isFinite(oy) {
 					return "", nil, fmt.Errorf("invalid offsets on line %d", lineNo)
 				}
 				name := strings.Join(parts[:len(parts)-8], " ")
@@ -156,7 +163,7 @@ func loadOffsetsTxt(data []byte) (string, map[string]OffsetRecord, error) {
 		}
 		ox, errX := strconv.ParseFloat(parts[len(parts)-2], 64)
 		oy, errY := strconv.ParseFloat(parts[len(parts)-1], 64)
-		if errX != nil || errY != nil {
+		if errX != nil || errY != nil || !isFinite(ox) || !isFinite(oy) {
 			return "", nil, fmt.Errorf("invalid offsets on line %d", lineNo)
 		}
 		name := strings.Join(parts[:len(parts)-2], " ")
@@ -166,6 +173,23 @@ func loadOffsetsTxt(data []byte) (string, map[string]OffsetRecord, error) {
 		return "", nil, err
 	}
 	return filter, records, nil
+}
+
+func isFinite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+
+func finiteOffsetRecord(r OffsetRecord) bool {
+	if !isFinite(r.OffsetX) || !isFinite(r.OffsetY) {
+		return false
+	}
+	if !r.HasManualTransform {
+		return true
+	}
+	for _, v := range []float64{r.ManualTransform.A, r.ManualTransform.B, r.ManualTransform.C, r.ManualTransform.D, r.ManualTransform.E, r.ManualTransform.F} {
+		if !isFinite(v) {
+			return false
+		}
+	}
+	return true
 }
 
 func ApplyOffsetsToInputs(inputs []Input, filter string, records map[string]OffsetRecord) int {
@@ -199,14 +223,18 @@ func UpdateMasterOffsets(dir string, inputs []Input) error {
 
 	records := map[string]OffsetRecord{}
 	if _, err := os.Stat(path); err == nil {
-		if _, existing, err := LoadOffsets(path); err == nil {
+		if _, existing, err := LoadOffsets(path); err != nil {
+			return err
+		} else {
 			records = existing
 		}
 	} else {
 		// Try legacy txt master file.
 		oldPath := filepath.Join(dir, "master_offsets.txt")
 		if _, err2 := os.Stat(oldPath); err2 == nil {
-			if _, existing, err2 := LoadOffsets(oldPath); err2 == nil {
+			if _, existing, err2 := LoadOffsets(oldPath); err2 != nil {
+				return err2
+			} else {
 				records = existing
 			}
 		}

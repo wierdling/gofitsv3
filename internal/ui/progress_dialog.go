@@ -21,27 +21,46 @@ type progressTracker struct {
 	cancel context.CancelFunc
 }
 
-// newProgressTracker builds and shows a progress dialog on the main thread. The
-// returned tracker carries a context that is cancelled when the user taps
-// Cancel; pass tracker.ctx to the long-running operation. Call hide() when the
-// work completes.
+// newProgressTracker builds and shows a progress dialog from a worker
+// goroutine. The returned tracker carries a context that is cancelled when the
+// user taps Cancel; pass tracker.ctx to the long-running operation. Call hide()
+// when the work completes.
 func newProgressTracker(title, initialMessage string, win fyne.Window) *progressTracker {
 	ctx, cancel := context.WithCancel(context.Background())
+	return newProgressTrackerWithContext(title, initialMessage, win, ctx, cancel)
+}
+
+// newProgressTrackerWithContext binds the Cancel button to an already-owned
+// operation context (for example a workspace generation coordinator). It is
+// safe to call from a worker goroutine.
+func newProgressTrackerWithContext(title, initialMessage string, win fyne.Window, ctx context.Context, cancel context.CancelFunc) *progressTracker {
+	var pt *progressTracker
+	fyne.DoAndWait(func() {
+		pt = newProgressTrackerWithContextOnUI(title, initialMessage, win, ctx, cancel)
+	})
+	return pt
+}
+
+// newProgressTrackerWithContextOnUI is for UI event handlers. It must be
+// called on Fyne's UI goroutine; worker goroutines should use
+// newProgressTrackerWithContext instead.
+func newProgressTrackerWithContextOnUI(title, initialMessage string, win fyne.Window, ctx context.Context, cancel context.CancelFunc) *progressTracker {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	pt := &progressTracker{
 		bar:    widget.NewProgressBar(),
 		label:  widget.NewLabel(initialMessage),
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	fyne.DoAndWait(func() {
-		cancelBtn := widget.NewButton("Cancel", func() {
-			pt.cancel()
-			pt.label.SetText("Cancelling...")
-		})
-		content := container.NewVBox(pt.label, pt.bar, cancelBtn)
-		pt.dialog = dialog.NewCustomWithoutButtons(title, content, win)
-		pt.dialog.Show()
+	cancelBtn := widget.NewButton("Cancel", func() {
+		pt.cancel()
+		pt.label.SetText("Cancelling...")
 	})
+	content := container.NewVBox(pt.label, pt.bar, cancelBtn)
+	pt.dialog = dialog.NewCustomWithoutButtons(title, content, win)
+	pt.dialog.Show()
 	return pt
 }
 
