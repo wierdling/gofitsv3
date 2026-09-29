@@ -14,7 +14,7 @@
 - For any user-visible capability, limitation, supported format or instrument, or workspace behavior change, update `docs/feature-list.md`. Purely internal refactors do not require an inventory update.
 
 ## Testing
-- Follow `docs/unit-test-standards.md`; use `docs/unit-test-audit.md` to identify coverage gaps and high-value additions.
+- Follow `docs/unit-test-standards.md`.
 - Add or update tests when behavior changes.
 - Run the narrowest relevant test, build, or lint command first. Run the full repository suite only when warranted or requested.
 - Report validation commands and results briefly, explaining any broader validation.
