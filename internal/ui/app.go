@@ -2,12 +2,10 @@ package ui
 
 import (
 	"image/color"
-	"syscall"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/driver"
 	"fyne.io/fyne/v2/theme"
 
 	fynetooltip "github.com/dweymouth/fyne-tooltip"
@@ -135,22 +133,4 @@ func Run() error {
 
 	a.Run()
 	return nil
-}
-
-// maximizeWindow sends SW_MAXIMIZE to the native Win32 window handle.
-func maximizeWindow(win fyne.Window) {
-	nw, ok := win.(driver.NativeWindow)
-	if !ok {
-		return
-	}
-	nw.RunNative(func(ctx any) {
-		wctx, ok := ctx.(driver.WindowsWindowContext)
-		if !ok {
-			return
-		}
-		const swMaximize = 3
-		user32 := syscall.NewLazyDLL("user32.dll")
-		showWindow := user32.NewProc("ShowWindow")
-		showWindow.Call(wctx.HWND, uintptr(swMaximize))
-	})
 }

@@ -35,7 +35,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev xorg-dev
 
       - name: Install fyne CLI
-        run: go install fyne.io/fyne/v2/cmd/fyne@v2.7.3
+        run: go install fyne.io/tools/cmd/fyne@latest
 
       - name: Package (embeds icon from FyneApp.toml)
         working-directory: cmd

@@ -1,7 +1,7 @@
 Website = "https://example.com"
 
 [Details]
-Icon = "../assets/Icon.png"
+Icon = "../assets/icon.png"
 Name = "GoFitsV3"
 ID = "com.jameslong.gofitsv3"
 Version = "0.1.0"
