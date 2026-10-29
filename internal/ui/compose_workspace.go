@@ -43,9 +43,8 @@ type composeWorkspace struct {
 
 	// --- rendering ---
 	suspendRefresh bool
-	genCancel      context.CancelFunc
-	previewMu      sync.Mutex
-	previewSeq     int
+	renderGen      jobGeneration // supersedes in-flight preview renders
+	projectLoadGen jobGeneration // supersedes in-flight project loads
 	renderMu       sync.Mutex
 	renderCache    []composeRenderCache
 	latestRGBStats [3]histogram.Stats

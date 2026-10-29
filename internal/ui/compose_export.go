@@ -147,7 +147,7 @@ func (ws *composeWorkspace) saveHeader(idx int) {
 }
 
 func (ws *composeWorkspace) exportRGB() {
-	buf, w, h, _, err := ws.composeRGB(context.Background())
+	buf, w, h, _, err := ws.composeRGB(context.Background(), ws.snapshotRenderInput(), nil)
 	if buf == nil {
 		dialog.ShowInformation("Missing", "Load three FITS first", ws.win)
 		return

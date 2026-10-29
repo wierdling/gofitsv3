@@ -526,6 +526,11 @@ func ImageDataForReferenceGridCtx(ctx context.Context, img, ref *models.LoadedIm
 		if err == nil {
 			return fitsio.ImageData{Width: ref.HDU.Data.Width, Height: ref.HDU.Data.Height, Pixels: alignedPixels}
 		}
+		// A cancelled WCS align is not a failed one: stop instead of paying
+		// for the resize/copy fallback the caller will discard.
+		if ctx.Err() != nil {
+			return fitsio.ImageData{}
+		}
 	}
 
 	if img.HDU.Data.Width != ref.HDU.Data.Width || img.HDU.Data.Height != ref.HDU.Data.Height {
@@ -556,6 +561,11 @@ func stretchForReferenceGrid(ctx context.Context, img, ref *models.LoadedImage) 
 		// bilinear interpolation of an already-stretched sample, matching the
 		// disk compositor, which also treats at the sampled source position.
 		treated, err := TreatedStretchForSource(ctx, img)
+		// Cancellation is not a failed treatment; do not fall through to the
+		// full untreated stretch for a superseded render.
+		if ctx.Err() != nil {
+			return fitsio.ImageData{}
+		}
 		if err == nil {
 			if img == ref || sharedDrizzleGrid(img, ref) {
 				return treated

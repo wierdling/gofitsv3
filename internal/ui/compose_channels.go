@@ -44,60 +44,62 @@ func (ws *composeWorkspace) loadChannel(idx int) {
 		progressDialog.Show()
 
 		diskLoad := ws.largeMode
+		slot := fmt.Sprintf("channel-%d", idx)
+		request, session, store := ws.nextLargeLoadGeneration(slot)
 		go func() {
-			slot := fmt.Sprintf("channel-%d", idx)
-			request, session, store := ws.nextLargeLoadGeneration(slot)
 			var img *models.LoadedImage
 			var preview *image.RGBA
 			var artifact composeArtifactDescriptor
 			var loadErr error
 			if diskLoad {
-				if ws.largeStore == nil {
+				if store == nil {
 					loadErr = errors.New("disk-backed Compose store is unavailable")
 				} else {
-					if store == nil {
-						loadErr = errors.New("disk-backed Compose store is unavailable")
-					} else {
-						img, preview, artifact, loadErr = loadLargeComposeImage(path, store, slot)
-					}
+					img, preview, artifact, loadErr = loadLargeComposeImage(path, store, slot)
 				}
 			} else {
 				img, loadErr = loadImageFromPath(path)
 			}
-
-			if loadErr != nil {
-				progressDialog.Hide()
-				dialog.ShowError(loadErr, ws.win)
-				return
-			}
-
-			if diskLoad && !ws.largeLoadStillCurrent(slot, request, session, artifact) {
+			if loadErr == nil && diskLoad && !ws.largeLoadStillCurrent(slot, request, session, artifact) {
 				ws.cleanupLargeArtifactIfCurrent(artifact)
+				fyne.Do(progressDialog.Hide)
 				return
 			}
-			if !diskLoad {
-				replaceComposeChannelImage(ws.imgs, idx, img)
-			}
-			if diskLoad {
-				ws.largeMu.Lock()
-				current, currentOK := store.Descriptor(slot)
-				if ws.largeStore != store || ws.largeSessionGeneration != session || ws.largeLoadGenerations[slot] != request || !currentOK || current.Generation != artifact.Generation || current.Path != artifact.Path {
-					ws.largeMu.Unlock()
-					ws.cleanupLargeArtifactIfCurrent(artifact)
+
+			// Publish on the UI goroutine only, and only for the latest load of
+			// this slot, so an older file cannot win and renders never see a
+			// half-written slot.
+			fyne.Do(func() {
+				progressDialog.Hide()
+				if !ws.loadRequestStillCurrent(slot, request, session) {
+					if loadErr == nil && diskLoad {
+						go ws.cleanupLargeArtifactIfCurrent(artifact)
+					}
 					return
 				}
-				replaceComposeChannelImage(ws.imgs, idx, img)
-				ws.largePreviews[idx] = preview
-				ws.largeArtifacts[idx] = artifact
-				ws.largeMu.Unlock()
-			}
-			clearComposeOrigPixels(&ws.origPixels, idx)
-
-			fyne.Do(func() {
+				if loadErr != nil {
+					dialog.ShowError(loadErr, ws.win)
+					return
+				}
+				if diskLoad {
+					ws.largeMu.Lock()
+					current, currentOK := store.Descriptor(slot)
+					if ws.largeStore != store || ws.largeSessionGeneration != session || ws.largeLoadGenerations[slot] != request || !currentOK || current.Generation != artifact.Generation || current.Path != artifact.Path {
+						ws.largeMu.Unlock()
+						go ws.cleanupLargeArtifactIfCurrent(artifact)
+						return
+					}
+					replaceComposeChannelImage(ws.imgs, idx, img)
+					ws.largePreviews[idx] = preview
+					ws.largeArtifacts[idx] = artifact
+					ws.largeMu.Unlock()
+				} else {
+					replaceComposeChannelImage(ws.imgs, idx, img)
+				}
+				clearComposeOrigPixels(&ws.origPixels, idx)
 				if ws.controlSets != nil {
 					applyChannelState(idx, channelStateFromImage(img), ws.imgs, ws.viewports, ws.controlSets)
 				}
-				progressDialog.Hide()
 				ws.refresh()
 				ws.closeHeaderWindow(idx)
 				ws.updateMenus()
@@ -183,7 +185,7 @@ func (ws *composeWorkspace) compositeImageForEdit() *image.RGBA {
 	// Always render from the save-gated snapshot. The cached composite
 	// viewport may have been produced while a temporary Before/After
 	// comparison override was active and must never leak into Export to Edit.
-	buf, w, h, _, err := ws.composeRGB(context.Background())
+	buf, w, h, _, err := ws.composeRGB(context.Background(), ws.snapshotRenderInput(), nil)
 	if err != nil || buf == nil {
 		return nil
 	}
