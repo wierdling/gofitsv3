@@ -45,6 +45,7 @@ type composeWorkspace struct {
 	suspendRefresh bool
 	renderGen      jobGeneration // supersedes in-flight preview renders
 	projectLoadGen jobGeneration // supersedes in-flight project loads
+	modalJobs      jobGeneration // busy-dialog jobs (align, stretch, load, clean, export)
 	renderMu       sync.Mutex
 	renderCache    []composeRenderCache
 	latestRGBStats [3]histogram.Stats

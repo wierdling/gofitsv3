@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/widget"
 
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
@@ -53,8 +51,8 @@ func (ws *composeWorkspace) alignChannels() {
 	}
 	alignSlots := composeAlignmentSlots(ws.imgs, extraAlignSlots)
 	if ws.largeMode && ws.largeStore != nil {
-		progressDialog := dialog.NewCustom("Aligning", "Extracting star catalogs...", widget.NewProgressBarInfinite(), ws.win)
-		progressDialog.Show()
+		store := ws.largeStore
+		job := startUIJob(&ws.modalJobs, "Aligning", "Extracting star catalogs...", ws.win)
 		go func() {
 			ws.largeMu.RLock()
 			descs := make(map[int]composeArtifactDescriptor, len(alignSlots))
@@ -68,6 +66,9 @@ func (ws *composeWorkspace) alignChannels() {
 			ws.largeMu.RUnlock()
 			var err error
 			for _, idx := range alignSlots {
+				if err = job.ctx.Err(); err != nil {
+					break
+				}
 				d, exists := descs[idx]
 				if !exists {
 					err = fmt.Errorf("missing disk artifact for Channel %d", idx+1)
@@ -107,17 +108,19 @@ func (ws *composeWorkspace) alignChannels() {
 			if err == nil {
 				alignment = coordinateComposeAlignmentWithEligibility(channels, 2, match, composeAlignmentFallbackPairEligible)
 			}
-			fyne.Do(func() {
-				progressDialog.Hide()
+			job.finish(func() {
 				if err != nil {
 					dialog.ShowError(err, ws.win)
+					return
+				}
+				if ws.largeStore != store {
 					return
 				}
 				// Channel 2 is the alignment root.  Do not commit either
 				// fitted result if the reference artifact was replaced while
 				// catalogs were being extracted.
 				refExpected := descs[1]
-				refCurrent, refOK := ws.largeStore.Descriptor(refExpected.Slot)
+				refCurrent, refOK := store.Descriptor(refExpected.Slot)
 				if !refOK || !composeLargeAlignmentReferenceCurrent(refCurrent, refExpected) {
 					return
 				}
@@ -127,8 +130,8 @@ func (ws *composeWorkspace) alignChannels() {
 					}
 					res := alignment.Channels[idx+1]
 					expected := descs[idx]
-					cur, current := ws.largeStore.Descriptor(expected.Slot)
-					if !current || cur.Generation != expected.Generation || cur.Path != expected.Path || !res.Applicable {
+					cur, current := store.Descriptor(expected.Slot)
+					if !current || cur.Generation != expected.Generation || cur.Path != expected.Path || !res.Applicable || idx >= len(ws.imgs) || ws.imgs[idx] == nil {
 						continue
 					}
 					setChannelAlignTransform(ws.imgs[idx], res.Backward)
@@ -141,7 +144,7 @@ func (ws *composeWorkspace) alignChannels() {
 					resetComposeAlignmentOffsets(control)
 				}
 				ws.refresh()
-			})
+			}, nil)
 		}()
 		return
 	}
@@ -153,13 +156,14 @@ func (ws *composeWorkspace) alignChannels() {
 	// time), so the computed offset is absolute. Store it in the Manual Offset
 	// fields (the source of truth); the refresh below renders it.
 	channels := make([]composeAlignmentChannel, 0, len(alignSlots))
+	alignedImgs := make(map[int]*models.LoadedImage, len(alignSlots))
 	for _, idx := range alignSlots {
 		img := ws.imgs[idx]
+		alignedImgs[idx] = img
 		channels = append(channels, composeAlignmentChannel{Index: idx + 1, OriginalPixels: img.HDU.Data.Pixels, Width: img.HDU.Data.Width, Height: img.HDU.Data.Height})
 	}
 
-	progressDialog := dialog.NewCustom("Aligning", "Please wait...", widget.NewProgressBarInfinite(), ws.win)
-	progressDialog.Show()
+	job := startUIJob(&ws.modalJobs, "Aligning", "Please wait...", ws.win)
 
 	go func() {
 		// alignOne returns the backward (output→source) transform that registers
@@ -178,13 +182,24 @@ func (ws *composeWorkspace) alignChannels() {
 		}
 
 		for i := range channels {
+			if job.ctx.Err() != nil {
+				job.finish(nil, nil)
+				return
+			}
 			channels[i].Footprint = composeAlignmentFootprint{MaxX: float64(channels[i].Width), MaxY: float64(channels[i].Height)}
 			channels[i].UsableStars = processing.ExtractStars(channels[i].OriginalPixels, channels[i].Width, channels[i].Height, 4.0, 3)
 		}
 		alignment := coordinateComposeAlignmentWithEligibility(channels, 2, match, composeAlignmentFallbackPairEligible)
 
-		fyne.Do(func() {
-			progressDialog.Hide()
+		job.finish(func() {
+			// The result is only valid for the images that were aligned: skip
+			// a slot that was cleared or reloaded while the job ran.
+			stillAligned := func(idx int) bool {
+				return idx < len(ws.imgs) && ws.imgs[idx] != nil && ws.imgs[idx] == alignedImgs[idx]
+			}
+			if !stillAligned(1) {
+				return
+			}
 
 			// Write the alignment into the Manual Offset fields; the offset is
 			// applied at render time (not baked) by the refresh below.
@@ -230,6 +245,9 @@ func (ws *composeWorkspace) alignChannels() {
 				}
 				result := alignment.Channels[idx+1]
 				name := fmt.Sprintf("Channel %d", idx+1)
+				if !stillAligned(idx) {
+					continue
+				}
 				if result.Applicable {
 					dx, dy, rot := setAndApply(idx, result.Backward)
 					lines = append(lines, fmt.Sprintf("%s:\n  X: %+.2f  Y: %+.2f  Rot: %+.2f°\n  %s", name, dx, dy, rot, resultDetail(result)))
@@ -249,6 +267,6 @@ func (ws *composeWorkspace) alignChannels() {
 			}
 			msg := "Alignment Complete.\n\n" + strings.Join(lines, "\n\n")
 			dialog.ShowInformation("Alignment Data", msg, ws.win)
-		})
+		}, nil)
 	}()
 }

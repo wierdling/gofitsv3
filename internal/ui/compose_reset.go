@@ -1,15 +1,12 @@
 package ui
 
 import (
-	"context"
 	"fmt"
 	"runtime"
 	"runtime/debug"
 	"strings"
 
-	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/widget"
 
 	"gofitsv3/internal/models"
 )
@@ -67,8 +64,7 @@ func (ws *composeWorkspace) resetData() {
 			dialog.ShowInformation("Reset", "No loaded channels to reset.", ws.win)
 			return
 		}
-		progressDialog := dialog.NewCustom("Reset", "Restoring channels from disk…", widget.NewProgressBarInfinite(), ws.win)
-		progressDialog.Show()
+		job := startUIJob(&ws.modalJobs, "Reset", "Restoring channels from disk…", ws.win)
 		go func() {
 			// Never hold largeMu across FITS I/O. Clear Channels and other UI
 			// invalidation paths must be able to advance the generation while
@@ -96,22 +92,24 @@ func (ws *composeWorkspace) resetData() {
 				return true
 			}
 			if !resetStillCurrent() {
-				fyne.Do(func() {
-					progressDialog.Hide()
+				job.finish(func() {
 					dialog.ShowInformation("Reset", "Channels changed before reset started.", ws.win)
-				})
+				}, nil)
 				return
 			}
-			descs, previews, hdus, primaries, err := stageComposeLargeReset(context.Background(), store, selected, expected)
+			descs, previews, hdus, primaries, err := stageComposeLargeReset(job.ctx, store, selected, expected)
 			if err != nil {
-				fyne.Do(func() {
-					progressDialog.Hide()
+				job.finish(func() {
 					dialog.ShowError(err, ws.win)
-				})
+				}, nil)
 				return
 			}
-			fyne.Do(func() {
-				progressDialog.Hide()
+			removeStaged := func() {
+				for _, d := range descs {
+					_, _ = store.RemoveSlotIfCurrent(d)
+				}
+			}
+			job.finish(func() {
 				// Revalidate image identity and artifact generations under the
 				// short publish lock immediately before mutating live state.
 				ws.largeMu.Lock()
@@ -127,9 +125,7 @@ func (ws *composeWorkspace) resetData() {
 				}
 				if !publishCurrent {
 					ws.largeMu.Unlock()
-					for _, d := range descs {
-						_, _ = store.RemoveSlotIfCurrent(d)
-					}
+					go removeStaged()
 					dialog.ShowInformation("Reset", "Channels changed while reset was running.", ws.win)
 					return
 				}
@@ -143,7 +139,7 @@ func (ws *composeWorkspace) resetData() {
 				ws.refresh()
 				ws.restoreViewportStates(savedStates)
 				dialog.ShowInformation("Reset Complete", "Channels restored from disk.", ws.win)
-			})
+			}, func() { go removeStaged() })
 		}()
 		return
 	}

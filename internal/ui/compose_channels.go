@@ -35,13 +35,7 @@ func (ws *composeWorkspace) applyDedicatedL(b []byte, w, h int, settings models.
 func (ws *composeWorkspace) loadChannel(idx int) {
 	showSingleFITSOpenDialog(ws.app, ws.win, func(path string) {
 
-		progressDialog := dialog.NewCustom(
-			fmt.Sprintf("Loading Channel %d", idx+1),
-			"Reading FITS data...",
-			widget.NewProgressBarInfinite(),
-			ws.win,
-		)
-		progressDialog.Show()
+		job := startUIJob(&ws.modalJobs, fmt.Sprintf("Loading Channel %d", idx+1), "Reading FITS data...", ws.win)
 
 		diskLoad := ws.largeMode
 		slot := fmt.Sprintf("channel-%d", idx)
@@ -60,17 +54,21 @@ func (ws *composeWorkspace) loadChannel(idx int) {
 			} else {
 				img, loadErr = loadImageFromPath(path)
 			}
-			if loadErr == nil && diskLoad && !ws.largeLoadStillCurrent(slot, request, session, artifact) {
+			if loadErr == nil && diskLoad && (job.ctx.Err() != nil || !ws.largeLoadStillCurrent(slot, request, session, artifact)) {
 				ws.cleanupLargeArtifactIfCurrent(artifact)
-				fyne.Do(progressDialog.Hide)
+				job.finish(nil, nil)
 				return
+			}
+			dropped := func() {
+				if loadErr == nil && diskLoad {
+					go ws.cleanupLargeArtifactIfCurrent(artifact)
+				}
 			}
 
 			// Publish on the UI goroutine only, and only for the latest load of
-			// this slot, so an older file cannot win and renders never see a
-			// half-written slot.
-			fyne.Do(func() {
-				progressDialog.Hide()
+			// this slot (and only if the dialog was not cancelled), so an older
+			// file cannot win and renders never see a half-written slot.
+			job.finish(func() {
 				if !ws.loadRequestStillCurrent(slot, request, session) {
 					if loadErr == nil && diskLoad {
 						go ws.cleanupLargeArtifactIfCurrent(artifact)
@@ -103,7 +101,7 @@ func (ws *composeWorkspace) loadChannel(idx int) {
 				ws.refresh()
 				ws.closeHeaderWindow(idx)
 				ws.updateMenus()
-			})
+			}, dropped)
 		}()
 
 	})
@@ -127,22 +125,20 @@ func (ws *composeWorkspace) loadDedicatedL() {
 		ws.lrgbGeneration++
 		requestGeneration := ws.lrgbGeneration
 		ws.lrgbMu.Unlock()
-		progressDialog := dialog.NewCustom("Loading Dedicated L", "Reading FITS data...", widget.NewProgressBarInfinite(), ws.win)
-		progressDialog.Show()
+		job := startUIJob(&ws.modalJobs, "Loading Dedicated L", "Reading FITS data...", ws.win)
 		go func() {
 			img, loadErr := loadImageFromPath(path)
 			if loadErr == nil && img.HDU.Data.Width <= 0 || loadErr == nil && img.HDU.Data.Height <= 0 {
 				loadErr = errors.New("dedicated luminance image has invalid dimensions")
 			}
-			if loadErr != nil {
-				fyne.Do(func() { progressDialog.Hide(); dialog.ShowError(loadErr, ws.win) })
-				return
-			}
-			fyne.Do(func() {
+			job.finish(func() {
+				if loadErr != nil {
+					dialog.ShowError(loadErr, ws.win)
+					return
+				}
 				ws.lrgbMu.Lock()
 				if ws.lrgbGeneration != requestGeneration {
 					ws.lrgbMu.Unlock()
-					progressDialog.Hide()
 					return
 				}
 				ws.dedicatedL = img
@@ -153,10 +149,9 @@ func (ws *composeWorkspace) loadDedicatedL() {
 				if ws.controlSets != nil {
 					ws.refresh()
 				}
-				progressDialog.Hide()
 				ws.updateMenus()
 				ws.refresh()
-			})
+			}, nil)
 		}()
 	}, ws.win)
 	fd.SetFilter(storage.NewExtensionFileFilter([]string{".fits", ".fit", ".fts"}))
