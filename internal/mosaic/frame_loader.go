@@ -21,21 +21,17 @@ const (
 	alignStarMinArea        = 3
 )
 
-// extractStarCatalogsForAlignment extracts each input's star catalog, streaming
+// extractStarCatalogsForAlignmentCtx extracts each input's star catalog, streaming
 // pixels from disk when they are not already resident so peak memory stays
 // bounded to roughly the worker count rather than the whole dataset. Catalogs
 // are indexed by input position (deterministic regardless of completion order);
-// excluded inputs and inputs whose pixels cannot be read get a nil catalog.
+// excluded inputs get a nil catalog. The first frame that cannot be read, or the
+// context being cancelled, stops extraction and is returned as the error.
 //
 // When an input already carries in-memory pixels (e.g. the legacy warp-based
 // alignment modes preload them) those are used directly; otherwise the frame is
 // loaded from disk, its catalog extracted, and the pixels dropped before the next
 // frame on that worker.
-func extractStarCatalogsForAlignment(inputs []Input, maxStars int) [][]processing.Star {
-	catalogs, _ := extractStarCatalogsForAlignmentCtx(context.Background(), inputs, maxStars)
-	return catalogs
-}
-
 func extractStarCatalogsForAlignmentCtx(ctx context.Context, inputs []Input, maxStars int) ([][]processing.Star, error) {
 	caps := make([]int, len(inputs))
 	for i := range caps {
@@ -65,6 +61,18 @@ func extractStarCatalogsForAlignmentCapsCtx(ctx context.Context, inputs []Input,
 	var next int64 = -1
 	var firstErr error
 	var errMu sync.Mutex
+	setErr := func(err error) {
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
+	}
+	failed := func() bool {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return firstErr != nil
+	}
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -72,11 +80,10 @@ func extractStarCatalogsForAlignmentCapsCtx(ctx context.Context, inputs []Input,
 			defer wg.Done()
 			for {
 				if err := ctx.Err(); err != nil {
-					errMu.Lock()
-					if firstErr == nil {
-						firstErr = err
-					}
-					errMu.Unlock()
+					setErr(err)
+					return
+				}
+				if failed() {
 					return
 				}
 				i := int(atomic.AddInt64(&next, 1))
@@ -95,15 +102,12 @@ func extractStarCatalogsForAlignmentCapsCtx(ctx context.Context, inputs []Input,
 					sci, w, h, err = loadCleanedSCIForExtraction(inputs[i])
 					if err != nil {
 						debuglog.Log(fmt.Sprintf("extractStarCatalogsForAlignment: input[%d] %s: %v", i, InputKey(inputs[i]), err))
-						continue
+						setErr(fmt.Errorf("load %s for star extraction: %w", InputKey(inputs[i]), err))
+						return
 					}
 				}
 				if err := ctx.Err(); err != nil {
-					errMu.Lock()
-					if firstErr == nil {
-						firstErr = err
-					}
-					errMu.Unlock()
+					setErr(err)
 					return
 				}
 				maxStars := processing.TweakRegCatalogMaxStars
