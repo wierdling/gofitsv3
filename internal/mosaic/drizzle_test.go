@@ -50,19 +50,22 @@ func TestAlignInputsByStarsWithModeHonorsCancellationDuringExtraction(t *testing
 	}
 }
 
-func TestAlignInputsByStarsWithModePropagatesFrameLoadError(t *testing.T) {
+func TestAlignInputsByStarsWithModeReportsFrameLoadErrorPerFrame(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing_flc.fits")
 	target := makeInput(missing, 32, 32, nil, headerWithCRPIX(12, 10))
 	inputs := []Input{
 		makeInput("ref_flc.fits", 32, 32, filledPixels(32, 32, 1), headerWithCRPIX(10, 10)),
 		target,
 	}
-	_, err := AlignInputsByStarsWithMode(inputs, 1, AlignmentModeTweakRegRScale, 2.0)
-	if err == nil {
-		t.Fatal("unreadable frame was silently dropped; want a load error")
+	results, err := AlignInputsByStarsWithMode(inputs, 1, AlignmentModeTweakRegRScale, 2.0)
+	if err != nil {
+		t.Fatalf("one unreadable frame aborted the whole alignment: %v", err)
 	}
-	if errors.Is(err, ErrCancelled) || !strings.Contains(err.Error(), "missing_flc.fits") {
-		t.Fatalf("error = %v, want a load error naming the unreadable frame", err)
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
+	}
+	if r := results[1]; r.Applied || !strings.Contains(r.Error, "missing_flc.fits") {
+		t.Fatalf("result[1] = applied %v, error %q; want an unapplied load error naming the frame", r.Applied, r.Error)
 	}
 }
 
@@ -72,8 +75,13 @@ func TestExtractStarCatalogsForAlignmentReturnsLoadError(t *testing.T) {
 		makeInput("ref_flc.fits", 32, 32, filledPixels(32, 32, 1), headerWithCRPIX(10, 10)),
 		makeInput(missing, 32, 32, nil, headerWithCRPIX(12, 10)),
 	}
-	if _, err := extractStarCatalogsForAlignmentCtx(context.Background(), inputs, 100); err == nil {
-		t.Fatal("extractStarCatalogsForAlignmentCtx returned nil error for an unreadable frame")
+	_, err := extractStarCatalogsForAlignmentCtx(context.Background(), inputs, 100)
+	loadErrs, fatal := splitFrameLoadErrors(err)
+	if fatal != nil || loadErrs == nil {
+		t.Fatalf("err = %v, want only per-frame load errors", err)
+	}
+	if loadErrs.at(0) != nil || loadErrs.at(1) == nil {
+		t.Fatalf("load errors = [%v, %v], want only input 1", loadErrs.at(0), loadErrs.at(1))
 	}
 	inputs[1].Excluded = true
 	if _, err := extractStarCatalogsForAlignmentCtx(context.Background(), inputs, 100); err != nil {

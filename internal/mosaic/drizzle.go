@@ -1546,11 +1546,18 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		ctx = context.Background()
 	}
 	candidateCatalogs, err := extractStarCatalogsForAlignmentCapsCtx(ctx, inputs, caps)
+	// An unreadable frame fails on its own; the rest still align.
+	loadErrs, err := splitFrameLoadErrors(err)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, ErrCancelled
 		}
 		return nil, fmt.Errorf("extract alignment catalogs: %w", err)
+	}
+	for i := range inputs {
+		if e := loadErrs.at(i); e != nil {
+			lastErr[i] = e.Error()
+		}
 	}
 	catalogs := candidateCatalogs
 	if isTweakReg {
@@ -1863,7 +1870,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	// outcome.
 	var toAlign []int
 	for _, i := range ordered {
-		if !aligned[i] && !inputs[i].Excluded {
+		if !aligned[i] && !inputs[i].Excluded && loadErrs.at(i) == nil {
 			toAlign = append(toAlign, i)
 		}
 	}
@@ -1938,7 +1945,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	for progressed := true; progressed; {
 		progressed = false
 		for _, i := range ordered {
-			if aligned[i] || inputs[i].Excluded {
+			if aligned[i] || inputs[i].Excluded || loadErrs.at(i) != nil {
 				continue
 			}
 			if prog.cancelled() {
@@ -2272,6 +2279,8 @@ func AlignInputsBySelectedStarsWithModeCtx(ctx context.Context, inputs []Input, 
 	// user-picked refStars (and their WCS projections), so only the non-reference
 	// targets are extracted here.
 	catalogs, err := extractStarCatalogsForAlignmentCtx(ctx, inputs, processing.TweakRegCatalogMaxStars)
+	// An unreadable frame fails on its own; the rest still align.
+	loadErrs, err := splitFrameLoadErrors(err)
 	if err != nil {
 		return nil, err
 	}
@@ -2282,6 +2291,16 @@ func AlignInputsBySelectedStarsWithModeCtx(ctx context.Context, inputs []Input, 
 			return nil, err
 		}
 		if i < numRefs || inputs[i].Excluded {
+			continue
+		}
+		if e := loadErrs.at(i); e != nil {
+			results[i] = StarAlignmentResult{
+				OffsetX:            inputs[i].OffsetX,
+				OffsetY:            inputs[i].OffsetY,
+				ManualTransform:    inputs[i].ManualTransform,
+				HasManualTransform: inputs[i].HasManualTransform,
+				Error:              e.Error(),
+			}
 			continue
 		}
 
