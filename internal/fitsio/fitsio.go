@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -47,8 +48,13 @@ func LoadFile(path string) (*File, error) {
 	}
 	defer f.Close()
 
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
 	reader := bufio.NewReaderSize(f, 64*1024)
 	var hdus []HDU
+	var pos int64
 
 	for {
 		hdr, headerBytes, err := readHeader(reader)
@@ -58,7 +64,14 @@ func LoadFile(path string) (*File, error) {
 			}
 			return nil, err
 		}
-		_ = headerBytes
+		pos += int64(headerBytes)
+		end, err := dataUnitEnd(hdr, pos, info.Size())
+		if err != nil {
+			if errors.Is(err, errTruncatedDataUnit) && len(hdus) > 0 {
+				break
+			}
+			return nil, err
+		}
 
 		hdu, dataBytes, err := readImage(reader, hdr)
 		if err != nil {
@@ -66,12 +79,15 @@ func LoadFile(path string) (*File, error) {
 		}
 		hdus = append(hdus, hdu)
 
-		if err := skipPadding(reader, dataBytes); err != nil {
+		// Skip the rest of the data unit (later cube planes, table rows and
+		// heap) plus its padding. Missing final padding is tolerated.
+		if _, err := io.CopyN(io.Discard, reader, end-pos-int64(dataBytes)); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
 			return nil, err
 		}
+		pos = end
 	}
 	if len(hdus) == 0 {
 		return nil, fmt.Errorf("no HDUs read from %s", path)
@@ -85,8 +101,8 @@ func LoadFile(path string) (*File, error) {
 // HDU's dimensions and WCS are available without the memory or I/O cost of its
 // pixels. Skipped HDUs carry Width/Height (from NAXISn) but nil Pixels.
 //
-// It walks HDU boundaries exactly as LoadFile does (NAXIS1*NAXIS2*|BITPIX|/8
-// per data unit, padded to 2880), so any file LoadFile parses, this parses too.
+// It walks HDU boundaries exactly as LoadFile does (the full data unit from
+// hduDataBytes, padded to 2880), so any file LoadFile parses, this parses too.
 func LoadFileMetadata(path string) (*File, error) {
 	// Decode data units up to this size (distortion tables are a few KiB); skip
 	// anything larger (the science arrays we want to stream on demand instead).
@@ -127,6 +143,10 @@ func loadFileFilteredIndexed(path string, decode func(index int, hdr Header) boo
 	}
 	defer f.Close()
 
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
 	var hdus []HDU
 	var pos int64
 	for index := 0; ; index++ {
@@ -145,6 +165,13 @@ func loadFileFilteredIndexed(path string, decode func(index int, hdr Header) boo
 		dataBytes, sizeErr := checkedImageDataBytes(hdr)
 		if sizeErr != nil {
 			return nil, sizeErr
+		}
+		end, err := dataUnitEnd(hdr, pos, info.Size())
+		if err != nil {
+			if errors.Is(err, errTruncatedDataUnit) && len(hdus) > 0 {
+				break
+			}
+			return nil, err
 		}
 		if dataBytes > 0 && decode(index, hdr) {
 			if _, err := f.Seek(pos, io.SeekStart); err != nil {
@@ -165,7 +192,7 @@ func loadFileFilteredIndexed(path string, decode func(index int, hdr Header) boo
 			}
 			hdus = append(hdus, hdu)
 		}
-		pos += int64(dataBytes + padding(dataBytes))
+		pos = end
 	}
 	if len(hdus) == 0 {
 		return nil, fmt.Errorf("no HDUs read from %s", path)
@@ -173,10 +200,11 @@ func loadFileFilteredIndexed(path string, decode func(index int, hdr Header) boo
 	return &File{HDUs: hdus}, nil
 }
 
-// imageDataBytes returns the byte size of an HDU's data unit using the same
-// 2-D NAXIS1*NAXIS2*|BITPIX|/8 convention readImage consumes, so LoadFileMetadata
-// stays byte-for-byte aligned with LoadFile. Returns 0 for non-image HDUs and
-// unsupported BITPIX values.
+// imageDataBytes returns the byte size of the first 2-D image plane
+// (NAXIS1*NAXIS2*|BITPIX|/8), which is what readImage decodes. For a BINTABLE
+// that is the main table as raw bytes (the star-map reader relies on this);
+// its heap is not decoded. Returns 0 for NAXIS<2 and unsupported BITPIX values.
+// Walkers advance by hduDataBytes instead, which covers the whole data unit.
 func imageDataBytes(hdr Header) int {
 	bytes, _ := checkedImageDataBytes(hdr)
 	return bytes
@@ -185,6 +213,10 @@ func imageDataBytes(hdr Header) int {
 func checkedImageDataBytes(hdr Header) (int, error) {
 	if parseInt(hdr.Cards["NAXIS"]) < 2 {
 		return 0, nil
+	}
+	total, err := hduDataBytes(hdr)
+	if err != nil {
+		return 0, err
 	}
 	var bpp int
 	switch parseInt(hdr.Cards["BITPIX"]) {
@@ -215,7 +247,100 @@ func checkedImageDataBytes(hdr Header) (int, error) {
 	if dataBytes > maxInt-padding(dataBytes) {
 		return 0, fmt.Errorf("padded image byte size overflow for %dx%d", width, height)
 	}
+	if total < dataBytes {
+		// A zero-length axis beyond NAXIS2 (or GCOUNT=0): no plane to decode.
+		return 0, nil
+	}
 	return dataBytes, nil
+}
+
+// hduDataBytes returns the unpadded size of an HDU's whole data unit (FITS
+// 4.0 §4.4.1): |BITPIX|/8 * GCOUNT * (PCOUNT + NAXIS1*...*NAXISn), so cubes,
+// tables and heaps are skipped correctly. PCOUNT/GCOUNT default to 0/1, as
+// for the primary HDU and IMAGE extensions. Random groups (GROUPS=T,
+// NAXIS1=0) omit NAXIS1 from the product.
+func hduDataBytes(hdr Header) (int, error) {
+	naxis := parseInt(hdr.Cards["NAXIS"])
+	if naxis < 0 || naxis > 999 {
+		return 0, fmt.Errorf("invalid NAXIS %d", naxis)
+	}
+	if naxis == 0 {
+		return 0, nil
+	}
+	bitpix := parseInt(hdr.Cards["BITPIX"])
+	switch bitpix {
+	case 8, 16, 32, 64, -32, -64:
+	default:
+		return 0, fmt.Errorf("invalid BITPIX %d", bitpix)
+	}
+	const maxInt = int(^uint(0) >> 1)
+	first := 1
+	if parseInt(hdr.Cards["NAXIS1"]) == 0 && HeaderString(hdr, "GROUPS") == "T" {
+		first = 2
+	}
+	n := 1
+	for k := first; k <= naxis; k++ {
+		v := parseInt(hdr.Cards["NAXIS"+strconv.Itoa(k)])
+		if v < 0 {
+			return 0, fmt.Errorf("invalid NAXIS%d %d", k, v)
+		}
+		if v != 0 && n > maxInt/v {
+			return 0, fmt.Errorf("data size overflow at NAXIS%d", k)
+		}
+		n *= v
+	}
+	pcount, gcount := parseInt(hdr.Cards["PCOUNT"]), 1
+	if _, ok := hdr.Cards["GCOUNT"]; ok {
+		gcount = parseInt(hdr.Cards["GCOUNT"])
+	}
+	if pcount < 0 || gcount < 0 {
+		return 0, fmt.Errorf("invalid PCOUNT %d / GCOUNT %d", pcount, gcount)
+	}
+	if n > maxInt-pcount {
+		return 0, errors.New("data size overflow at PCOUNT")
+	}
+	n += pcount
+	bpp := abs(bitpix) / 8
+	if gcount != 0 && n > maxInt/gcount/bpp {
+		return 0, errors.New("data size overflow at GCOUNT")
+	}
+	dataBytes := n * gcount * bpp
+	if dataBytes > maxInt-padding(dataBytes) {
+		return 0, errors.New("padded data size overflow")
+	}
+	return dataBytes, nil
+}
+
+// hduDataBytesOrZero is hduDataBytes with invalid headers treated as empty.
+func hduDataBytesOrZero(hdr Header) int {
+	n, _ := hduDataBytes(hdr)
+	return n
+}
+
+// dataUnitEnd returns the offset just past the padded data unit that starts
+// at dataOffset, after checking the unpadded data fits in a file of fileSize
+// bytes. Callers run it before decoding, so a corrupt header cannot request
+// allocations larger than the file could hold.
+func dataUnitEnd(hdr Header, dataOffset, fileSize int64) (int64, error) {
+	unit, err := hduDataBytes(hdr)
+	if err != nil {
+		return 0, err
+	}
+	if int64(unit) > fileSize-dataOffset {
+		return 0, fmt.Errorf("%w: HDU data (%d bytes) exceeds remaining file size (%d bytes)", errTruncatedDataUnit, unit, fileSize-dataOffset)
+	}
+	return dataOffset + int64(unit+padding(unit)), nil
+}
+
+// errTruncatedDataUnit marks an HDU whose data runs past the end of the file.
+// Whole-file walkers keep the complete HDUs before it instead of failing.
+var errTruncatedDataUnit = errors.New("truncated FITS data unit")
+
+func abs(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func (f *File) SelectSCI() []HDU {
@@ -267,7 +392,16 @@ func readHeader(r *bufio.Reader) (Header, int, error) {
 	for {
 		card := make([]byte, 80)
 		if _, err := io.ReadFull(r, card); err != nil {
+			// EOF on a card boundary is a clean end of file only before the
+			// first card; inside a header it means the file was truncated.
+			if cardCount > 0 && errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
 			return Header{}, 0, err
+		}
+		if cardCount == 0 && isFillCard(card) {
+			// Zero or blank fill after the last HDU is not another header.
+			return Header{}, 0, io.EOF
 		}
 		cardCount++
 		text := string(card)
@@ -287,11 +421,23 @@ func readHeader(r *bufio.Reader) (Header, int, error) {
 	headerBytes := cardCount * 80
 	if pad := padding(headerBytes); pad > 0 {
 		if _, err := io.CopyN(io.Discard, r, int64(pad)); err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
 			return Header{}, 0, err
 		}
 		headerBytes += pad
 	}
 	return Header{Cards: cards}, headerBytes, nil
+}
+
+func isFillCard(card []byte) bool {
+	for _, b := range card {
+		if b != 0 && b != ' ' {
+			return false
+		}
+	}
+	return true
 }
 
 func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
@@ -303,6 +449,11 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 	dataBytes, err := checkedImageDataBytes(hdr)
 	if err != nil {
 		return HDU{}, 0, err
+	}
+	if dataBytes == 0 && hduDataBytesOrZero(hdr) == 0 {
+		// An empty data unit (a zero-length axis or GCOUNT=0) has no plane to
+		// decode; return the header alone rather than reading past raw.
+		return HDU{Header: hdr, ExtName: HeaderString(hdr, "EXTNAME")}, 0, nil
 	}
 	width := parseInt(hdr.Cards["NAXIS1"])
 	height := parseInt(hdr.Cards["NAXIS2"])
@@ -327,40 +478,97 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 		return HDU{}, 0, err
 	}
 
+	scale := parseSampleScale(hdr)
 	pixels := make([]float32, total)
-	switch bitpix {
-	case 8:
-		for i, b := range raw {
-			pixels[i] = float32(b)
-		}
-	case 16:
-		for i := 0; i < total; i++ {
-			pixels[i] = float32(int16(binary.BigEndian.Uint16(raw[i*2 : i*2+2])))
-		}
-	case 32:
-		for i := 0; i < total; i++ {
-			pixels[i] = float32(int32(binary.BigEndian.Uint32(raw[i*4 : i*4+4])))
-		}
-	case -32:
-		for i := 0; i < total; i++ {
-			pixels[i] = math.Float32frombits(binary.BigEndian.Uint32(raw[i*4 : i*4+4]))
-		}
-	case -64:
-		for i := 0; i < total; i++ {
-			pixels[i] = float32(math.Float64frombits(binary.BigEndian.Uint64(raw[i*8 : i*8+8])))
-		}
-	}
+	decodeRow(pixels, raw, bitpix, scale)
 
 	data := ImageData{Width: width, Height: height, Pixels: pixels}
 	if bitpix == 32 {
 		data.Int32Pixels = make([]int32, total)
 		for i := range data.Int32Pixels {
-			data.Int32Pixels[i] = int32(binary.BigEndian.Uint32(raw[i*4 : i*4+4]))
+			data.Int32Pixels[i] = scale.exactInt32(raw[i*4:])
 		}
 	}
 	hdu := HDU{Header: hdr, Data: data}
 	hdu.ExtName = HeaderString(hdr, "EXTNAME")
 	return hdu, dataBytes, nil
+}
+
+// sampleScale maps stored integer samples to physical values (FITS 4.0
+// §5.3): physical = BZERO + BSCALE*stored, with BLANK samples mapped to NaN.
+// Floating-point BITPIX is decoded unscaled, exactly as before.
+type sampleScale struct {
+	scale, zero float64
+	blank       int64
+	hasBlank    bool
+}
+
+// parseSampleScale reads BSCALE/BZERO/BLANK once per HDU.
+func parseSampleScale(hdr Header) sampleScale {
+	s := sampleScale{scale: 1}
+	if parseInt(hdr.Cards["BITPIX"]) < 0 {
+		return s
+	}
+	if v, ok := HeaderFloat(hdr, "BSCALE"); ok {
+		s.scale = v
+	}
+	if v, ok := HeaderFloat(hdr, "BZERO"); ok {
+		s.zero = v
+	}
+	if raw, ok := hdr.Cards["BLANK"]; ok {
+		if v, err := strconv.ParseInt(parseCardValue(raw), 10, 64); err == nil {
+			s.blank, s.hasBlank = v, true
+		}
+	}
+	return s
+}
+
+func (s sampleScale) apply(v int64) float32 {
+	if s.hasBlank && v == s.blank {
+		return float32(math.NaN())
+	}
+	if s.scale == 1 && s.zero == 0 {
+		return float32(v)
+	}
+	return float32(float64(v)*s.scale + s.zero)
+}
+
+// exactInt32 returns a BITPIX=32 sample as exact mask bits. Unsigned 32-bit
+// data (BSCALE=1, BZERO=2^31) yields its uint32 bit pattern; any other
+// scaling keeps the stored value.
+func (s sampleScale) exactInt32(raw []byte) int32 {
+	v := binary.BigEndian.Uint32(raw)
+	if s.scale == 1 && s.zero == 1<<31 {
+		v ^= 1 << 31
+	}
+	return int32(v)
+}
+
+// decodeRow decodes len(dst) big-endian samples from raw, applying s to
+// integer BITPIX.
+func decodeRow(dst []float32, raw []byte, bitpix int, s sampleScale) {
+	switch bitpix {
+	case 8:
+		for i := range dst {
+			dst[i] = s.apply(int64(raw[i]))
+		}
+	case 16:
+		for i := range dst {
+			dst[i] = s.apply(int64(int16(binary.BigEndian.Uint16(raw[i*2:]))))
+		}
+	case 32:
+		for i := range dst {
+			dst[i] = s.apply(int64(int32(binary.BigEndian.Uint32(raw[i*4:]))))
+		}
+	case -32:
+		for i := range dst {
+			dst[i] = math.Float32frombits(binary.BigEndian.Uint32(raw[i*4:]))
+		}
+	case -64:
+		for i := range dst {
+			dst[i] = float32(math.Float64frombits(binary.BigEndian.Uint64(raw[i*8:])))
+		}
+	}
 }
 
 func padding(n int) int {
