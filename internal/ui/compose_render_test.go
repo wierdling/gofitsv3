@@ -30,7 +30,7 @@ func TestComposeWithSuspendedRefreshSkipsGeneration(t *testing.T) {
 
 func TestComposeRGBLargeModeRequiresChannels(t *testing.T) {
 	ws := &composeWorkspace{largeMode: true}
-	if _, _, _, _, err := ws.composeRGB(context.Background()); err == nil {
+	if _, _, _, _, err := ws.composeRGB(context.Background(), ws.snapshotRenderInput(), nil); err == nil {
 		t.Fatal("expected an error without a large store and channels")
 	}
 }

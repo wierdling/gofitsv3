@@ -313,3 +313,22 @@ func TestComposeDiskStarTreatmentMatchesNormal(t *testing.T) {
 		t.Fatal("stale star treatment was accepted by the disk compositor")
 	}
 }
+
+// A cancelled render must stop rather than treat cancellation as a failed
+// treatment and fall back to the full untreated stretch.
+func TestStretchForReferenceGridStopsOnCancelledTreatment(t *testing.T) {
+	const w, h = 100, 100
+	pixels, fits := starTreatmentScene(t, w, h, [][4]float64{{50, 50, 1, 1.5}}, starTreatmentTestMeta)
+	model, err := NewStarTreatmentModel(fits, w, h, starTreatmentTestMeta, .5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := starTreatmentTestMeta
+	img.HDU.Data = fitsio.ImageData{Width: w, Height: h, Pixels: pixels}
+	img.StarTreatment = model
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := stretchForReferenceGrid(ctx, &img, &img); len(got.Pixels) != 0 {
+		t.Fatalf("cancelled treatment returned %d pixels, want none", len(got.Pixels))
+	}
+}

@@ -18,23 +18,15 @@ func (ws *composeWorkspace) whiteningReference() *models.LoadedImage {
 // buildStarNeutralizer returns the whitening for a composite of size w x h,
 // nil when whitening is off or its reference model is not prepared yet
 // (the render then proceeds without it and refreshes when the model lands).
+// UI goroutine only; renders use composeRenderInput.buildStarNeutralizer.
 func (ws *composeWorkspace) buildStarNeutralizer(w, h int) (*processing.StarNeutralizer, error) {
-	ref := ws.whiteningReference()
-	if ref == nil || len(ws.imgs) < 2 || ws.imgs[1] == nil {
-		return nil, nil
+	in := &composeRenderInput{offsets: make([]composeRenderOffset, len(ws.imgs))}
+	for i := range ws.imgs {
+		dx, dy, rot, ok := ws.composeChannelOffsetFields(i)
+		in.offsets[i] = composeRenderOffset{dx: dx, dy: dy, rot: rot, ok: ok}
 	}
-	model := ws.starTreatments.modelFor(ref)
-	if model == nil {
-		return nil, nil
-	}
-	idx := -1
-	for i, img := range ws.imgs {
-		if img == ref {
-			idx = i
-		}
-	}
-	dx, dy, rot, _ := ws.composeChannelOffsetFields(idx)
-	return processing.NewStarNeutralizer(model, processing.DiskChannel{Image: *ref, OffsetX: dx, OffsetY: dy, OffsetRot: rot}, *ws.imgs[1], w, h, ws.starWhitening)
+	in.whitening = ws.snapshotWhitening(in)
+	return in.buildStarNeutralizer(w, h)
 }
 
 func (ws *composeWorkspace) composeWeightSources() []composeWeightSource {

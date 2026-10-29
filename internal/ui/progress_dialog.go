@@ -87,3 +87,73 @@ func (pt *progressTracker) hide() {
 		}
 	})
 }
+
+// newBusyTrackerOnUI is newProgressTrackerWithContextOnUI with an
+// indeterminate bar, for jobs that report no progress. The dialog has no
+// dismiss button: Cancel is the only way to close it early, and it cancels
+// ctx. UI goroutine only.
+func newBusyTrackerOnUI(title, message string, win fyne.Window, ctx context.Context, cancel context.CancelFunc) *progressTracker {
+	pt := &progressTracker{
+		bar:    widget.NewProgressBar(),
+		label:  widget.NewLabel(message),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	cancelBtn := widget.NewButton("Cancel", func() {
+		pt.cancel()
+		pt.label.SetText("Cancelling...")
+	})
+	content := container.NewVBox(pt.label, widget.NewProgressBarInfinite(), cancelBtn)
+	pt.dialog = dialog.NewCustomWithoutButtons(title, content, win)
+	pt.dialog.Show()
+	return pt
+}
+
+// uiJob is a cancellable background job started from a UI handler: a busy
+// dialog whose Cancel button cancels ctx, and a generation from a shared
+// jobGeneration so a newer job (or an invalidate on reset) supersedes it.
+type uiJob struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	gen    uint64
+	gens   *jobGeneration
+	pt     *progressTracker
+}
+
+// startUIJob shows the busy dialog and starts a generation in gens. A nil
+// gens gives the job a private generation that only Cancel can end. UI
+// goroutine only.
+func startUIJob(gens *jobGeneration, title, message string, win fyne.Window) *uiJob {
+	if gens == nil {
+		gens = &jobGeneration{}
+	}
+	genCtx, gen := gens.begin(nil)
+	ctx, cancel := context.WithCancel(genCtx)
+	j := &uiJob{ctx: ctx, cancel: cancel, gen: gen, gens: gens}
+	j.pt = newBusyTrackerOnUI(title, message, win, ctx, cancel)
+	return j
+}
+
+// setMessage updates the dialog's stage label. Safe off the UI goroutine.
+func (j *uiJob) setMessage(message string) {
+	j.pt.progress(message, 0, 0)
+}
+
+// finish is called once from the worker. On the UI goroutine it hides the
+// dialog, then runs apply when the job is still current and was not
+// cancelled, or dropped (when non-nil) otherwise, for cleanup of results that
+// will not be applied.
+func (j *uiJob) finish(apply, dropped func()) {
+	if apply == nil {
+		apply = func() {}
+	}
+	fyne.Do(func() {
+		defer j.cancel()
+		if j.pt.dialog != nil {
+			j.pt.dialog.Hide()
+		}
+		if !j.gens.publishIfCurrent(j.ctx, j.gen, apply) && dropped != nil {
+			dropped()
+		}
+	})
+}

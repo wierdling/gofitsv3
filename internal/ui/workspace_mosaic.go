@@ -572,13 +572,11 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 			dir := listable.Path()
 			app.Preferences().SetString("lastDir", dir)
 
-			progressDialog := dialog.NewCustom("Scanning Filters", "Reading primary FITS headers...", widget.NewProgressBarInfinite(), win)
-			progressDialog.Show()
+			job := startUIJob(nil, "Scanning Filters", "Reading primary FITS headers...", win)
 
 			go func() {
 				filesByFilter, scanErr := mosaic.DiscoverFilterFiles(dir)
-				fyne.Do(func() {
-					progressDialog.Hide()
+				job.finish(func() {
 					if scanErr != nil {
 						dialog.ShowError(scanErr, win)
 						return
@@ -957,7 +955,7 @@ func newMosaicWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, *fyne
 					// clipping; the body scrolls vertically below the native actions.
 					confirm.Resize(fyne.NewSize(720, 480))
 					confirm.Show()
-				})
+				}, nil)
 			}()
 		}, win)
 		if last := app.Preferences().String("lastDir"); last != "" {

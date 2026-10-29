@@ -35,7 +35,9 @@ func (ws *composeWorkspace) crossChannelCleanLarge(savedStates []vpState) {
 	cancelButton := widget.NewButton("Cancel", cancelClean)
 	progressLabel := widget.NewLabel("Preparing cleaner…")
 	progressBar := widget.NewProgressBar()
-	progressDialog := dialog.NewCustom("Cleaning", "", container.NewBorder(nil, cancelButton, nil, nil, container.NewVBox(progressLabel, progressBar)), ws.win)
+	// Cancel is the only way to close the dialog early, so dismissal always
+	// cancels the job.
+	progressDialog := dialog.NewCustomWithoutButtons("Cleaning", container.NewBorder(nil, cancelButton, nil, nil, container.NewVBox(progressLabel, progressBar)), ws.win)
 	progressDialog.Show()
 	go func() {
 		defer cancelClean()
@@ -563,10 +565,16 @@ func (ws *composeWorkspace) crossChannelCleanLarge(savedStates []vpState) {
 		})
 		if err == nil {
 			fyne.Do(func() {
+				ws.largeMu.Lock()
 				for i := range next {
 					ws.largeArtifacts[i] = next[i]
 					ws.largePreviews[i] = stagedPreviews[i]
-					ws.imgs[i].HDU.Data.Pixels = nil
+				}
+				ws.largeMu.Unlock()
+				for i := range next {
+					if ws.imgs[i] != nil {
+						ws.imgs[i].HDU.Data.Pixels = nil
+					}
 					clearComposeOrigPixels(&ws.origPixels, i)
 				}
 				progressDialog.Hide()

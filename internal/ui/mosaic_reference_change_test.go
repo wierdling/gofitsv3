@@ -1,16 +1,23 @@
 package ui
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 
 	"gofitsv3/internal/mosaic"
 )
 
+// testWorkPath builds an absolute path under a fixture root with the host's
+// separator, since the code under test uses filepath.Dir.
+func testWorkPath(parts ...string) string {
+	return filepath.Join(append([]string{filepath.FromSlash("/work")}, parts...)...)
+}
+
 func TestConfirmReferenceFrameChangeSetWaitsForConfirmationAndDeletesBeforeApply(t *testing.T) {
-	inputs := []mosaic.Input{{Path: `C:\work\input\image.fits`}}
-	oldReference := &mosaic.Input{Path: `C:\work\old\baseline.fits`}
-	newReference := &mosaic.Input{Path: `C:\work\new\baseline.fits`}
+	inputs := []mosaic.Input{{Path: testWorkPath("input", "image.fits")}}
+	oldReference := &mosaic.Input{Path: testWorkPath("old", "baseline.fits")}
+	newReference := &mosaic.Input{Path: testWorkPath("new", "baseline.fits")}
 	current := oldReference
 	var decide func(bool)
 	var deleted []string
@@ -32,15 +39,15 @@ func TestConfirmReferenceFrameChangeSetWaitsForConfirmationAndDeletesBeforeApply
 	if current != newReference {
 		t.Fatal("reference was not updated after confirmed deletion")
 	}
-	wantDirectories := []string{`C:\work\input`, `C:\work\old`}
+	wantDirectories := []string{testWorkPath("input"), testWorkPath("old")}
 	if !reflect.DeepEqual(deleted, wantDirectories) {
 		t.Fatalf("deleted directories = %#v, want %#v", deleted, wantDirectories)
 	}
 }
 
 func TestConfirmReferenceFrameChangeClearNoRetainsSidecars(t *testing.T) {
-	inputs := []mosaic.Input{{Path: `C:\work\input\image.fits`}}
-	oldReference := &mosaic.Input{Path: `C:\work\old\baseline.fits`}
+	inputs := []mosaic.Input{{Path: testWorkPath("input", "image.fits")}}
+	oldReference := &mosaic.Input{Path: testWorkPath("old", "baseline.fits")}
 	current := oldReference
 	deleted := false
 
@@ -60,9 +67,9 @@ func TestConfirmReferenceFrameChangeClearNoRetainsSidecars(t *testing.T) {
 }
 
 func TestConfirmReferenceFrameChangeCancellationLeavesReferenceUntouched(t *testing.T) {
-	inputs := []mosaic.Input{{Path: `C:\work\input\image.fits`}}
-	oldReference := &mosaic.Input{Path: `C:\work\old\baseline.fits`}
-	newReference := &mosaic.Input{Path: `C:\work\new\baseline.fits`}
+	inputs := []mosaic.Input{{Path: testWorkPath("input", "image.fits")}}
+	oldReference := &mosaic.Input{Path: testWorkPath("old", "baseline.fits")}
+	newReference := &mosaic.Input{Path: testWorkPath("new", "baseline.fits")}
 	current := oldReference
 
 	confirmReferenceFrameChangeWith(inputs, current, newReference, func() { current = newReference }, func(_ string, _ func(bool)) {
@@ -79,25 +86,25 @@ func TestConfirmReferenceFrameChangeCancellationLeavesReferenceUntouched(t *test
 
 func TestMosaicAlignmentSidecarDirectories(t *testing.T) {
 	inputs := []mosaic.Input{
-		{Path: `C:\work\blue\one.fits`},
-		{Path: `C:\work\red\two.fits`},
-		{Path: `C:\work\blue\three.fits`},
+		{Path: testWorkPath("blue", "one.fits")},
+		{Path: testWorkPath("red", "two.fits")},
+		{Path: testWorkPath("blue", "three.fits")},
 	}
-	reference := mosaic.Input{Path: `C:\work\reference\baseline.fits`}
+	reference := mosaic.Input{Path: testWorkPath("reference", "baseline.fits")}
 
 	got := mosaicAlignmentSidecarDirectories(inputs, reference)
-	want := []string{`C:\work\blue`, `C:\work\red`, `C:\work\reference`}
+	want := []string{testWorkPath("blue"), testWorkPath("red"), testWorkPath("reference")}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mosaicAlignmentSidecarDirectories() = %#v, want %#v", got, want)
 	}
 }
 
 func TestMosaicAlignmentSidecarDirectoriesIncludesReferenceDirectoryOnce(t *testing.T) {
-	inputs := []mosaic.Input{{Path: `C:\work\reference\target.fits`}}
-	reference := mosaic.Input{Path: `C:\work\reference\baseline.fits`}
+	inputs := []mosaic.Input{{Path: testWorkPath("reference", "target.fits")}}
+	reference := mosaic.Input{Path: testWorkPath("reference", "baseline.fits")}
 
 	got := mosaicAlignmentSidecarDirectories(inputs, reference)
-	want := []string{`C:\work\reference`}
+	want := []string{testWorkPath("reference")}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mosaicAlignmentSidecarDirectories() = %#v, want %#v", got, want)
 	}

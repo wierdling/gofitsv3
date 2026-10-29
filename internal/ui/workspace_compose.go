@@ -29,8 +29,6 @@ var globalSelectComposeTab func()
 var globalComposeLargeCleanup func()
 var composeLargeModeActive func() bool
 
-type composeLRGBContextKey struct{}
-
 type composeLRGBSnapshot struct {
 	settings   models.LRGBSettings
 	dedicated  *models.LoadedImage
@@ -63,7 +61,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 	// at render time). Forward-declared so refresh/compose can use it; assigned
 	// once controlSets exists.
 	ws.suspendRefresh = false
-	ws.previewSeq = 0
 	ws.blinkSeq = 0
 
 	ws.sharedHistCheck = NewToggle(nil)

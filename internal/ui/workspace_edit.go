@@ -146,6 +146,38 @@ type editWorkspaceState struct {
 	cropMax         image.Point // selection in image pixels (bottom-right)
 	cropHasSel      bool
 	jobGeneration   uint64
+	jobCancel       context.CancelFunc // cancels the job owning jobGeneration
+}
+
+// beginJob supersedes any in-flight Edit job: it cancels that job's context
+// and returns a fresh context, its cancel func and generation. UI goroutine
+// only; workers publish only while es.jobCurrent(ctx, generation).
+func (es *editWorkspaceState) beginJob() (context.Context, context.CancelFunc, uint64) {
+	es.invalidateJobs()
+	ctx, cancel := context.WithCancel(context.Background())
+	es.jobCancel = cancel
+	return ctx, cancel, es.jobGeneration
+}
+
+// invalidateJobs cancels the in-flight Edit job and makes its result stale.
+func (es *editWorkspaceState) invalidateJobs() {
+	if es.jobCancel != nil {
+		es.jobCancel()
+		es.jobCancel = nil
+	}
+	es.jobGeneration++
+}
+
+// jobCurrent reports whether a job's result may still be applied.
+func (es *editWorkspaceState) jobCurrent(ctx context.Context, generation uint64) bool {
+	return ctx.Err() == nil && es.jobGeneration == generation
+}
+
+// showJobError reports a job failure unless it was a cancellation.
+func (es *editWorkspaceState) showJobError(err error) {
+	if err != nil && !errors.Is(err, context.Canceled) {
+		dialog.ShowError(err, es.win)
+	}
 }
 
 func (es *editWorkspaceState) exportOverlays() []export.Overlay {
@@ -157,24 +189,28 @@ func (es *editWorkspaceState) exportOverlays() []export.Overlay {
 
 func (es *editWorkspaceState) applyEdits() {
 	if es.diskSource != nil {
-		if es.diskSource.store == nil {
+		// Capture the source on the UI goroutine; es.diskSource can be cleared
+		// while the render runs.
+		disk := es.diskSource
+		if disk.store == nil {
 			return
 		}
+		store := disk.store
 		recipe := es.diskEditRecipe()
-		generation := es.jobGeneration + 1
-		es.jobGeneration = generation
+		ctx, _, generation := es.beginJob()
 		go func() {
-			result, err := es.diskSource.store.Render(context.Background(), recipe, 1600)
-			if err != nil {
-				return
-			}
+			result, err := store.Render(ctx, recipe, 1600)
 			fyne.Do(func() {
-				if es.diskSource == nil || es.jobGeneration != generation {
+				if es.diskSource != disk || !es.jobCurrent(ctx, generation) {
 					return
 				}
-				planes, _, _, _ := es.diskSource.store.Source()
-				es.diskSource.planes = planes
-				es.diskSource.levels = models.RgbLevels{Max: [3]float64{255, 255, 255}}
+				if err != nil {
+					es.showJobError(err)
+					return
+				}
+				planes, _, _, _ := store.Source()
+				disk.planes = planes
+				disk.levels = models.RgbLevels{Max: [3]float64{255, 255, 255}}
 				es.canvasImg.Image = result.Preview
 				es.canvasImg.Refresh()
 				es.refreshHistograms(result.Preview)
@@ -185,11 +221,9 @@ func (es *editWorkspaceState) applyEdits() {
 	if es.base == nil {
 		return
 	}
-	es.jobGeneration++
-	generation := es.jobGeneration
+	ctx, cancel, generation := es.beginJob()
 	base := es.base
-	prog := dialog.NewCustom("Applying", "Please wait…", widget.NewProgressBarInfinite(), es.win)
-	prog.Show()
+	prog := newBusyTrackerOnUI("Applying", "Please wait…", es.win, ctx, cancel)
 
 	// Snapshot LUTs and slider values on the UI goroutine before handing off.
 	rMin, rMax := es.rMinSlider.Value, es.rMaxSlider.Value
@@ -204,8 +238,8 @@ func (es *editWorkspaceState) applyEdits() {
 		img = processing.SharpenRGBA(img, strength, radius)
 
 		fyne.Do(func() {
-			prog.Hide()
-			if es.jobGeneration != generation || es.base != base || es.diskSource != nil {
+			prog.dialog.Hide()
+			if !es.jobCurrent(ctx, generation) || es.base != base || es.diskSource != nil {
 				return
 			}
 			es.working = img
@@ -294,7 +328,7 @@ func (es *editWorkspaceState) resetWorkingToBase() bool {
 	}
 	es.working = cloneEditRGBA(es.base)
 	es.healUndo = nil
-	es.jobGeneration++
+	es.invalidateJobs()
 	return true
 }
 
@@ -357,15 +391,17 @@ func (es *editWorkspaceState) doHealStroke(srcScreen fyne.Position, dstScreens [
 		if radius < 1 {
 			radius = 1
 		}
-		es.jobGeneration++
-		generation := es.jobGeneration
-		prog := dialog.NewCustom("Healing", "Healing full-resolution disk source...", widget.NewProgressBarInfinite(), es.win)
-		prog.Show()
+		ctx, cancel, generation := es.beginJob()
+		prog := newBusyTrackerOnUI("Healing", "Healing full-resolution disk source...", es.win, ctx, cancel)
 		go func() {
-			result, err := disk.store.Heal(context.Background(), processing.DiskHealStroke{Source: srcPt, Destinations: dsts, Radius: radius}, 1600)
+			result, err := disk.store.Heal(ctx, processing.DiskHealStroke{Source: srcPt, Destinations: dsts, Radius: radius}, 1600)
 			fyne.Do(func() {
-				prog.Hide()
-				if err != nil || es.diskSource != disk || es.jobGeneration != generation {
+				prog.dialog.Hide()
+				if es.diskSource != disk || !es.jobCurrent(ctx, generation) {
+					return
+				}
+				if err != nil {
+					es.showJobError(err)
 					return
 				}
 				planes, w, h, _ := disk.store.Source()
@@ -412,7 +448,7 @@ func (es *editWorkspaceState) doHealStroke(srcScreen fyne.Position, dstScreens [
 	es.working = healed
 	es.commitWorkingToBase()
 	es.resetAdjustmentControls()
-	es.jobGeneration++
+	es.invalidateJobs()
 	es.canvasImg.Image = healed
 	es.canvasImg.Refresh()
 }
@@ -424,12 +460,18 @@ func (es *editWorkspaceState) undoHeal() {
 		if disk.store == nil {
 			return
 		}
-		es.jobGeneration++
-		generation := es.jobGeneration
+		ctx, _, generation := es.beginJob()
 		go func() {
-			result, ok, err := disk.store.UndoHeal(context.Background(), 1600)
+			result, ok, err := disk.store.UndoHeal(ctx, 1600)
 			fyne.Do(func() {
-				if err != nil || !ok || es.diskSource != disk || es.jobGeneration != generation {
+				if es.diskSource != disk || !es.jobCurrent(ctx, generation) {
+					return
+				}
+				if err != nil {
+					es.showJobError(err)
+					return
+				}
+				if !ok {
 					return
 				}
 				planes, w, h, _ := disk.store.Source()
@@ -451,7 +493,7 @@ func (es *editWorkspaceState) undoHeal() {
 	es.commitWorkingToBase()
 	es.resetAdjustmentControls()
 	es.healUndo = nil
-	es.jobGeneration++
+	es.invalidateJobs()
 	es.canvasImg.Refresh()
 }
 
@@ -486,15 +528,17 @@ func (es *editWorkspaceState) applyCrop() {
 		}
 		disk := es.diskSource
 		rect := image.Rectangle{Min: es.cropMin, Max: es.cropMax}.Canon()
-		es.jobGeneration++
-		generation := es.jobGeneration
-		prog := dialog.NewCustom("Cropping", "Cropping full-resolution disk source...", widget.NewProgressBarInfinite(), es.win)
-		prog.Show()
+		ctx, cancel, generation := es.beginJob()
+		prog := newBusyTrackerOnUI("Cropping", "Cropping full-resolution disk source...", es.win, ctx, cancel)
 		go func() {
-			result, w, h, err := disk.store.Crop(context.Background(), rect, 1600)
+			result, w, h, err := disk.store.Crop(ctx, rect, 1600)
 			fyne.Do(func() {
-				prog.Hide()
-				if err != nil || es.diskSource != disk || es.jobGeneration != generation {
+				prog.dialog.Hide()
+				if es.diskSource != disk || !es.jobCurrent(ctx, generation) {
+					return
+				}
+				if err != nil {
+					es.showJobError(err)
 					return
 				}
 				planes, _, _, _ := disk.store.Source()
@@ -679,7 +723,7 @@ func (es *editWorkspaceState) setDiskSource(d *editDiskSource) error {
 	es.diskSource = d
 	es.base = nil
 	es.working = nil
-	es.jobGeneration++
+	es.invalidateJobs()
 	if old != nil && old != d {
 		old.cleanup()
 	}
@@ -824,7 +868,7 @@ func (es *editWorkspaceState) setImageOpts(img image.Image, keepZoomAndScroll, r
 	if replaceBase {
 		es.setLegend(nil)
 	}
-	es.jobGeneration++
+	es.invalidateJobs()
 	if es.editTabs != nil {
 		for i := range es.editTabs.Items {
 			es.editTabs.EnableIndex(i)
@@ -891,16 +935,18 @@ func (es *editWorkspaceState) runColorSpeckClean() {
 		if disk.store == nil {
 			return
 		}
-		es.jobGeneration++
-		generation := es.jobGeneration
+		ctx, cancel, generation := es.beginJob()
 		cfg := processing.ColorSpeckCleanConfigFromSettings(int(math.Round(es.cleanBlobSlider.Value)), es.cleanIntensitySlider.Value)
-		prog := dialog.NewCustom("Cleaning", "Cleaning full-resolution disk source...", widget.NewProgressBarInfinite(), es.win)
-		prog.Show()
+		prog := newBusyTrackerOnUI("Cleaning", "Cleaning full-resolution disk source...", es.win, ctx, cancel)
 		go func() {
-			result, err := disk.store.Clean(context.Background(), cfg, 1600)
+			result, err := disk.store.Clean(ctx, cfg, 1600)
 			fyne.Do(func() {
-				prog.Hide()
-				if err != nil || es.diskSource != disk || es.jobGeneration != generation {
+				prog.dialog.Hide()
+				if es.diskSource != disk || !es.jobCurrent(ctx, generation) {
+					return
+				}
+				if err != nil {
+					es.showJobError(err)
 					return
 				}
 				planes, _, _, _ := disk.store.Source()
@@ -923,21 +969,19 @@ func (es *editWorkspaceState) runColorSpeckClean() {
 		dialog.ShowInformation("Nothing to clean", "Load or compose an image first.", es.win)
 		return
 	}
-	es.jobGeneration++
-	generation := es.jobGeneration
+	ctx, cancel, generation := es.beginJob()
 	source := rgba
 	blobSize := es.cleanBlobSlider.Value
 	intensity := es.cleanIntensitySlider.Value
 
-	prog := dialog.NewCustom("Cleaning", "Removing tiny RGB specks...", widget.NewProgressBarInfinite(), es.win)
-	prog.Show()
+	prog := newBusyTrackerOnUI("Cleaning", "Removing tiny RGB specks...", es.win, ctx, cancel)
 
 	go func() {
 		cfg := processing.ColorSpeckCleanConfigFromSettings(int(math.Round(blobSize)), intensity)
 		cleaned, repaired := processing.CleanColorSpecksRGBA(source, cfg)
 		fyne.Do(func() {
-			prog.Hide()
-			if cleaned == nil || es.jobGeneration != generation || es.working != source || es.diskSource != nil {
+			prog.dialog.Hide()
+			if cleaned == nil || !es.jobCurrent(ctx, generation) || es.working != source || es.diskSource != nil {
 				return
 			}
 
@@ -1380,9 +1424,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 					disk := es.diskSource
 					recipe := es.diskEditRecipe()
 					ctx, cancel := context.WithCancel(context.Background())
-					status := widget.NewLabel("Rendering full-resolution Edit source…")
-					progress := dialog.NewCustom("Saving", "", container.NewBorder(nil, widget.NewButton("Cancel", func() { cancel() }), nil, nil, container.NewVBox(status, widget.NewProgressBarInfinite())), win)
-					progress.Show()
+					progress := newBusyTrackerOnUI("Saving", "Rendering full-resolution Edit source…", win, ctx, cancel)
 					go func() {
 						snapshot, snapshotErr := disk.store.ExportSnapshot(ctx, recipe)
 						if snapshotErr == nil {
@@ -1391,7 +1433,7 @@ func newEditWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, func(ed
 						}
 						fyne.Do(func() {
 							cancel()
-							progress.Hide()
+							progress.dialog.Hide()
 							if snapshotErr != nil && !errors.Is(snapshotErr, context.Canceled) {
 								dialog.ShowError(snapshotErr, win)
 							}

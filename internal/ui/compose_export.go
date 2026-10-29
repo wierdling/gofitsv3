@@ -2,7 +2,9 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -12,6 +14,7 @@ import (
 
 	"gofitsv3/internal/debuglog"
 	"gofitsv3/internal/export"
+	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
 	"gofitsv3/internal/utils"
 )
@@ -147,28 +150,50 @@ func (ws *composeWorkspace) saveHeader(idx int) {
 }
 
 func (ws *composeWorkspace) exportRGB() {
-	buf, w, h, _, err := ws.composeRGB(context.Background())
-	if buf == nil {
+	// Only a missing channel is reported as missing; every other compose
+	// failure (disk artifact, LRGB load, PSF, ...) is shown as itself.
+	if !composeHasAllBaseChannels(ws.imgs) {
 		dialog.ShowInformation("Missing", "Load three FITS first", ws.win)
 		return
 	}
-	if err != nil {
-		dialog.ShowError(err, ws.win)
-		return
-	}
-	var largePaths [3]string
-	if ws.largeMode && ws.largeStore != nil {
-		comp, ok := ws.largeStore.Composite()
-		if !ok {
-			dialog.ShowError(fmt.Errorf("missing disk composite"), ws.win)
-			return
+	in := ws.snapshotRenderInput()
+	levels := in.levels
+	job := startUIJob(&ws.modalJobs, "Exporting", "Composing full-resolution image…", ws.win)
+	go func() {
+		buf, w, h, _, err := ws.composeRGB(job.ctx, in, nil)
+		if err == nil && buf == nil {
+			err = errors.New("compose produced no image")
 		}
-		for i := range comp.Planes {
-			largePaths[i] = comp.Planes[i].Path
+		var largePaths [3]string
+		var finalBuf []byte
+		if err == nil && in.large {
+			comp, ok := in.largeStore.Composite()
+			if !ok {
+				err = fmt.Errorf("missing disk composite")
+			} else {
+				for i := range comp.Planes {
+					largePaths[i] = comp.Planes[i].Path
+				}
+				w, h = comp.Width, comp.Height
+			}
+		} else if err == nil {
+			finalBuf = processing.ApplyRGBLevels(buf, &levels)
 		}
-		w, h = comp.Width, comp.Height
-	}
-	finalBuf := processing.ApplyRGBLevels(buf, ws.levels)
+		job.finish(func() {
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					dialog.ShowError(err, ws.win)
+				}
+				return
+			}
+			ws.saveExportRGB(in.large, finalBuf, largePaths, w, h, levels)
+		}, nil)
+	}()
+}
+
+// saveExportRGB asks for the destination and options, then writes the
+// composed image in the background.
+func (ws *composeWorkspace) saveExportRGB(large bool, finalBuf []byte, largePaths [3]string, w, h int, levels models.RgbLevels) {
 	save := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
 		if err != nil || uc == nil {
 			return
@@ -177,22 +202,28 @@ func (ws *composeWorkspace) exportRGB() {
 		_ = uc.Close()
 		format := ws.detectExportFormat(path)
 		showExportOptionsDialog(format, ws.win, func(opts export.Options) {
-			if ws.largeMode {
-				if format == export.PNG && opts.BitDepth != 16 {
-					opts.BitDepth = 8
-				}
-				if err := export.FromFloat32ArtifactsWithLevels(context.Background(), path, largePaths, w, h, format, opts, ws.levels); err != nil {
-					dialog.ShowError(err, ws.win)
-					return
-				}
-				debuglog.Log(fmt.Sprintf("exportRGB: wrote disk composite %s", path))
-				return
+			if large && format == export.PNG && opts.BitDepth != 16 {
+				opts.BitDepth = 8
 			}
-			if err := export.FromRGBABytes(path, finalBuf, w, h, format, opts); err != nil {
-				dialog.ShowError(err, ws.win)
-				return
-			}
-			debuglog.Log(fmt.Sprintf("exportRGB: wrote composite %s", path))
+			job := startUIJob(&ws.modalJobs, "Exporting", "Writing "+filepath.Base(path)+"…", ws.win)
+			go func() {
+				var err error
+				if large {
+					err = export.FromFloat32ArtifactsWithLevels(job.ctx, path, largePaths, w, h, format, opts, &levels)
+				} else {
+					err = export.FromRGBABytes(path, finalBuf, w, h, format, opts)
+				}
+				if err == nil {
+					debuglog.Log(fmt.Sprintf("exportRGB: wrote composite %s", path))
+				}
+				// Report write errors even after Cancel: the file may be partial.
+				fyne.Do(func() {
+					if err != nil && !errors.Is(err, context.Canceled) {
+						dialog.ShowError(err, ws.win)
+					}
+				})
+				job.finish(nil, nil)
+			}()
 		})
 	}, ws.win)
 	save.SetFileName("composite.png")
