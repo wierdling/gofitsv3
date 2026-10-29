@@ -26,6 +26,10 @@ func StreamHDUByIndex(ctx context.Context, path string, index int, each func(y i
 		return Header{}, HDU{}, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return Header{}, HDU{}, err
+	}
 	var primary Header
 	var pos int64
 	for current := 0; ; current++ {
@@ -50,6 +54,10 @@ func StreamHDUByIndex(ctx context.Context, path string, index int, each func(y i
 		if err != nil {
 			return Header{}, HDU{}, err
 		}
+		end, err := dataUnitEnd(hdr, dataOffset, info.Size())
+		if err != nil {
+			return Header{}, HDU{}, err
+		}
 		if current == index {
 			if dataBytes == 0 {
 				return Header{}, HDU{}, fmt.Errorf("HDU index %d is not a supported image (NAXIS=%d BITPIX=%d)", index, parseInt(hdr.Cards["NAXIS"]), parseInt(hdr.Cards["BITPIX"]))
@@ -59,9 +67,10 @@ func StreamHDUByIndex(ctx context.Context, path string, index int, each func(y i
 				return Header{}, HDU{}, err
 			}
 			reader := bufio.NewReaderSize(f, 64*1024)
+			bitpix, scale := parseInt(hdr.Cards["BITPIX"]), parseSampleScale(hdr)
 			bpp := dataBytes / (width * height)
 			raw, values, exact := make([]byte, width*bpp), make([]float32, width), make([]int32, 0)
-			if parseInt(hdr.Cards["BITPIX"]) == 32 {
+			if bitpix == 32 {
 				exact = make([]int32, width)
 			}
 			for y := 0; y < height; y++ {
@@ -71,10 +80,10 @@ func StreamHDUByIndex(ctx context.Context, path string, index int, each func(y i
 				if _, err := io.ReadFull(reader, raw); err != nil {
 					return Header{}, HDU{}, err
 				}
-				decodeRow(values, raw, parseInt(hdr.Cards["BITPIX"]))
+				decodeRow(values, raw, bitpix, scale)
 				if len(exact) > 0 {
 					for x := range exact {
-						exact[x] = int32(binary.BigEndian.Uint32(raw[x*4:]))
+						exact[x] = scale.exactInt32(raw[x*4:])
 					}
 				}
 				if err := each(y, values, exact); err != nil {
@@ -83,7 +92,7 @@ func StreamHDUByIndex(ctx context.Context, path string, index int, each func(y i
 			}
 			return primary, HDU{Header: hdr, ExtName: HeaderString(hdr, "EXTNAME"), Data: ImageData{Width: width, Height: height}}, nil
 		}
-		pos = dataOffset + int64(dataBytes+padding(dataBytes))
+		pos = end
 	}
 	return primary, HDU{}, fmt.Errorf("HDU index %d not found in %s", index, path)
 }
@@ -133,6 +142,10 @@ func LoadSelectedHDU(path, name, extver string) (Header, HDU, error) {
 		return Header{}, HDU{}, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return Header{}, HDU{}, err
+	}
 
 	var primary Header
 	var selected *HDU
@@ -159,9 +172,12 @@ func LoadSelectedHDU(path, name, extver string) (Header, HDU, error) {
 			nameMatch = strings.HasPrefix(strings.ToUpper(strings.TrimSpace(extName)), "SCI")
 		}
 		match := (name == "" && index == 0) || (name != "" && nameMatch && (extver == "" || HeaderString(hdr, "EXTVER") == strings.TrimSpace(extver)))
-		dataBytes := imageDataBytes(hdr)
-		if parseInt(hdr.Cards["NAXIS"]) >= 2 && dataBytes == 0 {
+		if parseInt(hdr.Cards["NAXIS"]) >= 2 && imageDataBytes(hdr) == 0 {
 			return Header{}, HDU{}, fmt.Errorf("unsupported BITPIX %d", parseInt(hdr.Cards["BITPIX"]))
+		}
+		end, err := dataUnitEnd(hdr, pos, info.Size())
+		if err != nil {
+			return Header{}, HDU{}, err
 		}
 		if match {
 			if _, err := f.Seek(pos, io.SeekStart); err != nil {
@@ -174,7 +190,7 @@ func LoadSelectedHDU(path, name, extver string) (Header, HDU, error) {
 			selected = &got
 			break
 		}
-		pos += int64(dataBytes + padding(dataBytes))
+		pos = end
 		index++
 	}
 	if selected == nil {
@@ -273,6 +289,10 @@ func locateSelectedImage(path, name, extver string) (Header, Header, int64, erro
 		return Header{}, Header{}, 0, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return Header{}, Header{}, 0, err
+	}
 	var primary Header
 	var pos int64
 	for index := 0; ; index++ {
@@ -296,14 +316,17 @@ func locateSelectedImage(path, name, extver string) (Header, Header, int64, erro
 			nameMatch = strings.HasPrefix(strings.ToUpper(strings.TrimSpace(extName)), "SCI")
 		}
 		match := (name == "" && index == 0) || (name != "" && nameMatch && (extver == "" || HeaderString(hdr, "EXTVER") == strings.TrimSpace(extver)))
+		end, err := dataUnitEnd(hdr, dataOffset, info.Size())
+		if err != nil {
+			return Header{}, Header{}, 0, err
+		}
 		if match {
 			return primary, hdr, dataOffset, nil
 		}
-		data := imageDataBytes(hdr)
-		if parseInt(hdr.Cards["NAXIS"]) >= 2 && data == 0 {
+		if parseInt(hdr.Cards["NAXIS"]) >= 2 && imageDataBytes(hdr) == 0 {
 			return Header{}, Header{}, 0, fmt.Errorf("unsupported BITPIX %d", parseInt(hdr.Cards["BITPIX"]))
 		}
-		pos = dataOffset + int64(data+padding(data))
+		pos = end
 	}
 	return primary, Header{}, 0, fmt.Errorf("HDU %q (EXTVER %q) not found in %s", name, extver, path)
 }
@@ -323,6 +346,7 @@ func scanSelectedRows(path string, offset int64, hdr Header, write bool, each fu
 		return 0, 0, errors.New("unsupported image data")
 	}
 	reader := bufio.NewReaderSize(f, 64*1024)
+	bitpix, scale := parseInt(hdr.Cards["BITPIX"]), parseSampleScale(hdr)
 	rowBytes := width * bpp
 	raw := make([]byte, rowBytes)
 	values := make([]float32, width)
@@ -331,7 +355,7 @@ func scanSelectedRows(path string, offset int64, hdr Header, write bool, each fu
 		if _, err := io.ReadFull(reader, raw); err != nil {
 			return 0, 0, err
 		}
-		decodeRow(values, raw, parseInt(hdr.Cards["BITPIX"]))
+		decodeRow(values, raw, bitpix, scale)
 		for _, value := range values {
 			if value < min {
 				min = value
@@ -349,25 +373,10 @@ func scanSelectedRows(path string, offset int64, hdr Header, write bool, each fu
 	return min, max, nil
 }
 
-func decodeRow(dst []float32, raw []byte, bitpix int) {
-	for i := range dst {
-		switch bitpix {
-		case 8:
-			dst[i] = float32(raw[i])
-		case 16:
-			dst[i] = float32(int16(binary.BigEndian.Uint16(raw[i*2:])))
-		case 32:
-			dst[i] = float32(int32(binary.BigEndian.Uint32(raw[i*4:])))
-		case -32:
-			dst[i] = math.Float32frombits(binary.BigEndian.Uint32(raw[i*4:]))
-		case -64:
-			dst[i] = float32(math.Float64frombits(binary.BigEndian.Uint64(raw[i*8:])))
-		}
-	}
-}
-
 const artifactHeaderSize int64 = 16
 const maxArtifactRowBytes uint64 = 64 << 20
+
+var errArtifactClosed = errors.New("float32 artifact is closed")
 
 var artifactMagic = [8]byte{'G', 'F', '3', '2', 'A', 'R', 'T', '1'}
 
@@ -515,14 +524,17 @@ func (a *Float32Artifact) writeHeader() error {
 }
 
 func (a *Float32Artifact) ReadRow(row int, dst []float32) error {
-	if a == nil || a.f == nil {
-		return errors.New("float32 artifact is closed")
+	if a == nil {
+		return errArtifactClosed
 	}
 	if row < 0 || row >= a.Height || len(dst) < a.Width {
 		return fmt.Errorf("row %d or destination length is out of range", row)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.f == nil {
+		return errArtifactClosed
+	}
 	return a.readRowLocked(row, dst)
 }
 
@@ -543,14 +555,17 @@ func (a *Float32Artifact) readRowLocked(row int, dst []float32) error {
 
 // ReadRows reads count contiguous full rows starting at row into dst.
 func (a *Float32Artifact) ReadRows(row, count int, dst []float32) error {
-	if a == nil || a.f == nil {
-		return errors.New("float32 artifact is closed")
+	if a == nil {
+		return errArtifactClosed
 	}
 	if row < 0 || count < 0 || row > a.Height-count || len(dst) < count*a.Width {
 		return errors.New("row range is out of bounds")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.f == nil {
+		return errArtifactClosed
+	}
 	for i := 0; i < count; i++ {
 		if err := a.readRowLocked(row+i, dst[i*a.Width:(i+1)*a.Width]); err != nil {
 			return err
@@ -561,14 +576,17 @@ func (a *Float32Artifact) ReadRows(row, count int, dst []float32) error {
 
 // ReadRange reads the half-open x range from one row into dst.
 func (a *Float32Artifact) ReadRange(row, x0, x1 int, dst []float32) error {
-	if a == nil || a.f == nil {
-		return errors.New("float32 artifact is closed")
+	if a == nil {
+		return errArtifactClosed
 	}
 	if row < 0 || row >= a.Height || x0 < 0 || x1 < x0 || x1 > a.Width || len(dst) < x1-x0 {
 		return errors.New("row range is out of bounds")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.f == nil {
+		return errArtifactClosed
+	}
 	n := (x1 - x0) * 4
 	if cap(a.buf) < n {
 		a.buf = make([]byte, n)
@@ -600,14 +618,17 @@ func (a *Float32Artifact) ReadTile(x0, y0, x1, y1 int, dst []float32) error {
 // ReadRowRotatedCW reads one row of the clockwise-rotated raster. The rotated
 // raster has dimensions Height x Width and the caller supplies Height values.
 func (a *Float32Artifact) ReadRowRotatedCW(row int, dst []float32) error {
-	if a == nil || a.f == nil {
-		return errors.New("float32 artifact is closed")
+	if a == nil {
+		return errArtifactClosed
 	}
 	if row < 0 || row >= a.Width || len(dst) < a.Height {
 		return errors.New("rotated row is out of bounds")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.f == nil {
+		return errArtifactClosed
+	}
 	if cap(a.rowBuf) < a.Width {
 		a.rowBuf = make([]float32, a.Width)
 	}
@@ -622,14 +643,17 @@ func (a *Float32Artifact) ReadRowRotatedCW(row int, dst []float32) error {
 }
 
 func (a *Float32Artifact) WriteRow(row int, src []float32) error {
-	if a == nil || a.f == nil {
-		return errors.New("float32 artifact is closed")
+	if a == nil {
+		return errArtifactClosed
 	}
 	if row < 0 || row >= a.Height || len(src) < a.Width {
 		return fmt.Errorf("row %d or source length is out of range", row)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.f == nil {
+		return errArtifactClosed
+	}
 	if cap(a.buf) < a.Width*4 {
 		a.buf = make([]byte, a.Width*4)
 	}
@@ -646,14 +670,17 @@ func (a *Float32Artifact) WriteRow(row int, src []float32) error {
 // transforms to publish fixed-width interiors without materializing a full
 // image row.
 func (a *Float32Artifact) WriteRange(row, x0, x1 int, src []float32) error {
-	if a == nil || a.f == nil {
-		return errors.New("float32 artifact is closed")
+	if a == nil {
+		return errArtifactClosed
 	}
 	if row < 0 || row >= a.Height || x0 < 0 || x1 < x0 || x1 > a.Width || len(src) < x1-x0 {
 		return errors.New("row range is out of bounds")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.f == nil {
+		return errArtifactClosed
+	}
 	n := (x1 - x0) * 4
 	if cap(a.buf) < n {
 		a.buf = make([]byte, n)
@@ -669,14 +696,17 @@ func (a *Float32Artifact) WriteRange(row, x0, x1 int, src []float32) error {
 
 // WriteRows writes count contiguous full rows starting at row from src.
 func (a *Float32Artifact) WriteRows(row, count int, src []float32) error {
-	if a == nil || a.f == nil {
-		return errors.New("float32 artifact is closed")
+	if a == nil {
+		return errArtifactClosed
 	}
 	if row < 0 || count < 0 || row > a.Height-count || len(src) < count*a.Width {
 		return errors.New("row range is out of bounds")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.f == nil {
+		return errArtifactClosed
+	}
 	for i := 0; i < count; i++ {
 		buf := a.ensureRowBuffer()
 		for x := 0; x < a.Width; x++ {
@@ -698,8 +728,15 @@ func (a *Float32Artifact) ensureRowBuffer() []byte {
 	return buf
 }
 
+// Close is safe to call concurrently with readers and writers, and more than
+// once; accessors called after Close return errArtifactClosed.
 func (a *Float32Artifact) Close() error {
-	if a == nil || a.f == nil {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.f == nil {
 		return nil
 	}
 	err := a.f.Close()
@@ -711,8 +748,13 @@ func (a *Float32Artifact) Close() error {
 // Sync flushes all artifact writes to the underlying file. Transactions use
 // this before exposing staged paths to bounded readers during preparation.
 func (a *Float32Artifact) Sync() error {
-	if a == nil || a.f == nil {
-		return errors.New("float32 artifact is closed")
+	if a == nil {
+		return errArtifactClosed
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.f == nil {
+		return errArtifactClosed
 	}
 	return a.f.Sync()
 }
