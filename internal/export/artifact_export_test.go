@@ -416,3 +416,72 @@ func TestFromFloat32ArtifactsAllExportFormatsUseEditedPixels(t *testing.T) {
 		})
 	}
 }
+
+// truncateArtifactRows drops the last rows of an artifact so later ReadRow
+// calls on them fail after the artifact has been opened and validated.
+func truncateArtifactRows(t *testing.T, path string, width, rows int) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, info.Size()-int64(rows*width*4)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeTestArtifact(t *testing.T, path string, width, height int) {
+	t.Helper()
+	a, err := fitsio.CreateFloat32Artifact(path, width, height)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := make([]float32, width)
+	for i := range row {
+		row[i] = 0.5
+	}
+	for y := 0; y < height; y++ {
+		if err := a.WriteRow(y, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArtifactExportFailsOnReadRowError(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "source.bin")
+	writeTestArtifact(t, src, 4, 4)
+	out := filepath.Join(d, "out.png")
+	if err := os.WriteFile(out, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	gray, err := newGrayArtifactImage(ctx, src, 4, 4, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gray.close()
+	rgb, err := newArtifactImage(ctx, [3]string{src, src, src}, 4, 4, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rgb.close()
+	truncateArtifactRows(t, src, 4, 2)
+
+	if err := writeArtifactExport(ctx, out, gray, &gray.err, PNG, Options{}); err == nil || gray.err == nil {
+		t.Fatalf("gray export err = %v, latched = %v; want read failure", err, gray.err)
+	}
+	if err := writeArtifactExport(ctx, out, rgb, &rgb.err, PNG, Options{}); err == nil || rgb.err == nil {
+		t.Fatalf("rgb export err = %v, latched = %v; want read failure", err, rgb.err)
+	}
+	if got, err := os.ReadFile(out); err != nil || string(got) != "old" {
+		t.Fatalf("destination replaced after read failure: %q, %v", got, err)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(d, ".out.png.tmp-*")); len(leftovers) != 0 {
+		t.Fatalf("temporary files left behind: %v", leftovers)
+	}
+}

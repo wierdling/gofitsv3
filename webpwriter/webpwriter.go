@@ -86,6 +86,15 @@ func WriteImageWebPLosslessFile(path string, img image.Image) error {
 	return WriteRGBAWebPLosslessFile(path, rgba, width, height)
 }
 
+// EncodeImageWebPLossless encodes any Go image into a complete WebP file.
+func EncodeImageWebPLossless(img image.Image) ([]byte, error) {
+	rgba, width, height, err := imageToRGBA(img)
+	if err != nil {
+		return nil, err
+	}
+	return EncodeRGBAWebPLossless(rgba, width, height)
+}
+
 func imageToRGBA(img image.Image) ([]byte, int, int, error) {
 	if img == nil {
 		return nil, 0, 0, errors.New("nil image")

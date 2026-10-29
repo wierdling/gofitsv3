@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
-	"os"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,22 +26,20 @@ type ImageExtension struct {
 
 // WriteFloat32ImageWithExtensions writes a primary-HDU float32 FITS image
 // followed by zero or more float32 IMAGE extensions (e.g. a WHT weight plane).
+// The file is replaced atomically; a failed write leaves path untouched.
 func WriteFloat32ImageWithExtensions(path string, header Header, data ImageData, exts ...ImageExtension) error {
-	if err := validatePrimaryData(data); err != nil {
-		return err
-	}
-	for i, ext := range exts {
-		if err := validateExtensionData(ext.Data); err != nil {
-			return fmt.Errorf("extension %d (%s): %w", i, ext.ExtName, err)
-		}
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+	return WriteFileAtomic(path, func(w io.Writer) error {
+		return EncodeFloat32Image(w, header, data, exts...)
+	})
+}
 
-	bw := bufio.NewWriter(f)
+// EncodeFloat32Image validates data and exts and writes the FITS encoding
+// used by WriteFloat32ImageWithExtensions to w.
+func EncodeFloat32Image(w io.Writer, header Header, data ImageData, exts ...ImageExtension) error {
+	if err := validateImageWithExtensions(data, exts); err != nil {
+		return err
+	}
+	bw := bufio.NewWriter(w)
 	if err := writeHeader(bw, header, data.Width, data.Height); err != nil {
 		return err
 	}
@@ -57,6 +55,18 @@ func WriteFloat32ImageWithExtensions(path string, header Header, data ImageData,
 		}
 	}
 	return bw.Flush()
+}
+
+func validateImageWithExtensions(data ImageData, exts []ImageExtension) error {
+	if err := validatePrimaryData(data); err != nil {
+		return err
+	}
+	for i, ext := range exts {
+		if err := validateExtensionData(ext.Data); err != nil {
+			return fmt.Errorf("extension %d (%s): %w", i, ext.ExtName, err)
+		}
+	}
+	return nil
 }
 
 func validatePrimaryData(data ImageData) error {

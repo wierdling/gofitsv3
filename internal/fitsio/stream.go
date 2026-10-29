@@ -915,19 +915,21 @@ func MaterializeFloat32ArtifactLease(path string) (*MaterializedPlane, error) {
 // WriteNormalizedFloat32Artifact writes normalized [0,1] pixels using bounded
 // row buffers. The source image itself remains in memory for compatibility
 // with existing callers; CopySelectedHDUToFloat32Artifact streams FITS input.
+// The artifact is staged and published only after Commit syncs and closes it.
 func WriteNormalizedFloat32Artifact(path string, img ImageData) error {
-	a, err := CreateFloat32Artifact(path, img.Width, img.Height)
+	tx, err := BeginFloat32ArtifactTransaction(path, img.Width, img.Height)
 	if err != nil {
 		return err
 	}
-	defer a.Close()
+	a := tx.Artifact()
 	norm := img.Normalize()
 	row := make([]float32, img.Width)
 	for y := 0; y < img.Height; y++ {
 		copy(row, norm.Pixels[y*img.Width:(y+1)*img.Width])
 		if err := a.WriteRow(y, row); err != nil {
+			_ = tx.Abort()
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }

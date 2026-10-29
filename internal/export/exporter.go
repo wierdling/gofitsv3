@@ -7,8 +7,9 @@ import (
 	"image/draw"
 	"image/jpeg"
 	"image/png"
-	"os"
+	"io"
 
+	"gofitsv3/internal/fitsio"
 	"gofitsv3/webpwriter"
 	"golang.org/x/image/tiff"
 )
@@ -86,13 +87,10 @@ func FromFloat32Channels(path string, r, g, b []float32, width, height int, form
 			bv := clampToUint16(b[i])
 			img.SetNRGBA64(i%width, i/width, color.NRGBA64{R: rv, G: gv, B: bv, A: 0xffff})
 		}
-		f, err := os.Create(path)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		enc := png.Encoder{CompressionLevel: png.BestSpeed}
-		return enc.Encode(f, img)
+		return fitsio.WriteFileAtomic(path, func(w io.Writer) error {
+			enc := png.Encoder{CompressionLevel: png.BestSpeed}
+			return enc.Encode(w, img)
+		})
 	}
 	// Fall back to 8-bit path.
 	buf := make([]byte, n*4)
@@ -116,33 +114,31 @@ func clampToUint16(v float32) uint16 {
 }
 
 func saveImage(path string, img image.Image, format Format, opt Options) error {
+	return fitsio.WriteFileAtomic(path, func(w io.Writer) error {
+		return encodeImage(w, img, format, opt)
+	})
+}
+
+func encodeImage(w io.Writer, img image.Image, format Format, opt Options) error {
 	switch format {
 	case WEBP:
-		return webpwriter.WriteImageWebPLosslessFile(path, img)
-	case PNG, JPEG, TIFF:
-		// Supported formats are opened below after validation.
-	default:
-		return errors.New("unsupported format")
-	}
-
-	f, err := os.Create(path)
-	if err != nil {
+		data, err := webpwriter.EncodeImageWebPLossless(img)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(data)
 		return err
-	}
-	defer f.Close()
-
-	switch format {
 	case PNG:
 		enc := png.Encoder{CompressionLevel: png.BestSpeed}
-		return enc.Encode(f, img)
+		return enc.Encode(w, img)
 	case JPEG:
 		q := opt.Quality
 		if q == 0 {
 			q = 90
 		}
-		return jpeg.Encode(f, img, &jpeg.Options{Quality: q})
+		return jpeg.Encode(w, img, &jpeg.Options{Quality: q})
 	case TIFF:
-		return tiff.Encode(f, img, &tiff.Options{Compression: tiff.Deflate, Predictor: true})
+		return tiff.Encode(w, img, &tiff.Options{Compression: tiff.Deflate, Predictor: true})
 	default:
 		return errors.New("unsupported format")
 	}
