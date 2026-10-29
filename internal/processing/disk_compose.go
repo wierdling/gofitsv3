@@ -370,7 +370,7 @@ func composeDiskWeighted(ctx context.Context, req DiskComposeRequest, w, h int) 
 	return DiskComposeResult{Preview: preview, PreviewWidth: (w + step - 1) / step, PreviewHeight: (h + step - 1) / step, Width: w, Height: h, Stats: stats}, nil
 }
 
-func streamWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.LoadedImage, acc [3]string, weight models.ComposeMixWeight, w, h int) error {
+func streamWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.LoadedImage, acc [3]string, weight models.ComposeMixWeight, w, h int) (err error) {
 	a, err := fitsio.OpenFloat32ArtifactReadOnly(src.ArtifactPath)
 	if err != nil {
 		return err
@@ -392,7 +392,7 @@ func streamWeightedDiskSource(ctx context.Context, src DiskChannel, ref models.L
 			}
 			return err
 		}
-		defer outs[c].Close()
+		defer closeWritableDiskArtifact(outs[c], &err)
 	}
 	sampler := newArtifactSampler(a)
 	stretchAt, err := diskStretchFunc(src, src.Image, a.Width, a.Height)
@@ -477,10 +477,9 @@ func calibrateWeightedDiskSource(ctx context.Context, src DiskChannel, ref model
 	return 1, cdf, nil
 }
 
-func compressDiskRGB(ctx context.Context, paths [3]string, w, h int) error {
+func compressDiskRGB(ctx context.Context, paths [3]string, w, h int) (err error) {
 	a := [3]*fitsio.Float32Artifact{}
 	for i, p := range paths {
-		var err error
 		a[i], err = fitsio.OpenFloat32Artifact(p)
 		if err != nil {
 			for _, x := range a {
@@ -490,7 +489,7 @@ func compressDiskRGB(ctx context.Context, paths [3]string, w, h int) error {
 			}
 			return err
 		}
-		defer a[i].Close()
+		defer closeWritableDiskArtifact(a[i], &err)
 	}
 	rows := [3][]float32{make([]float32, w), make([]float32, w), make([]float32, w)}
 	for y := 0; y < h; y++ {
@@ -569,12 +568,12 @@ func prepareDiskChannel(ctx context.Context, src DiskChannel, ref, stretchMeta m
 // stretchDiskArtifact applies a stretch in place to a mapped artifact,
 // through a HistEq CDF when one is given. It intentionally uses a
 // bounded row buffer and never materializes the artifact.
-func stretchDiskArtifact(ctx context.Context, path string, meta models.LoadedImage, cdf []float32) error {
+func stretchDiskArtifact(ctx context.Context, path string, meta models.LoadedImage, cdf []float32) (err error) {
 	a, err := fitsio.OpenFloat32Artifact(path)
 	if err != nil {
 		return err
 	}
-	defer a.Close()
+	defer closeWritableDiskArtifact(a, &err)
 	row := make([]float32, a.Width)
 	for y := 0; y < a.Height; y++ {
 		if err := ctx.Err(); err != nil {
@@ -851,7 +850,7 @@ func blendDiskOverlay(ctx context.Context, bases [3]string, overlay string, s mo
 	return blendDiskOverlayScaled(ctx, bases, overlay, s, 1, w, h)
 }
 
-func blendDiskOverlayScaled(ctx context.Context, bases [3]string, overlay string, s models.OrangeLayerState, strength float64, w, h int) error {
+func blendDiskOverlayScaled(ctx context.Context, bases [3]string, overlay string, s models.OrangeLayerState, strength float64, w, h int) (err error) {
 	o, err := fitsio.OpenFloat32ArtifactReadOnly(overlay)
 	if err != nil {
 		return err
@@ -863,7 +862,7 @@ func blendDiskOverlayScaled(ctx context.Context, bases [3]string, overlay string
 		if err != nil {
 			return err
 		}
-		defer rows[i].Close()
+		defer closeWritableDiskArtifact(rows[i], &err)
 	}
 	row, ov := make([]float32, w), make([]float32, w)
 	opacity := math.Max(0, math.Min(1, s.Opacity)) * strength
@@ -892,6 +891,29 @@ func blendDiskOverlayScaled(ctx context.Context, bases [3]string, overlay string
 		}
 	}
 	return nil
+}
+
+// closeWritableDiskArtifact closes an artifact modified in place, reporting a
+// Close failure through errp when nothing failed earlier. Most of these are
+// scratch stages, so they are not fsynced here; publishDiskArtifacts syncs
+// only the final set before it becomes a cache.
+func closeWritableDiskArtifact(a *fitsio.Float32Artifact, errp *error) {
+	if err := a.Close(); *errp == nil {
+		*errp = err
+	}
+}
+
+// syncDiskArtifactFile flushes a closed artifact file to stable storage.
+func syncDiskArtifactFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // publishDiskArtifacts atomically publishes a complete R,G,B artifact set.
@@ -938,6 +960,9 @@ func publishDiskArtifacts(ctx context.Context, src, dst [3]string) (err error) {
 		}
 		if sameDiskPath(src[i], dst[i]) {
 			return fmt.Errorf("artifact source overlaps destination %d", i)
+		}
+		if err := syncDiskArtifactFile(src[i]); err != nil {
+			return err
 		}
 		if e := diskComposeRename(dst[i], backups[i]); e != nil {
 			if !os.IsNotExist(e) {

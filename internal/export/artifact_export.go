@@ -7,9 +7,8 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
 	"math"
-	"os"
-	"path/filepath"
 
 	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/models"
@@ -64,23 +63,7 @@ func FromFloat32Artifact(ctx context.Context, path, artifact string, width, heig
 		return err
 	}
 	defer img.close()
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".export-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	defer os.Remove(tmpPath)
-	if err := saveImage(tmpPath, img, format, opt); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return replaceExportFile(tmpPath, path)
+	return writeArtifactExport(ctx, path, img, &img.err, format, opt)
 }
 
 type grayArtifactImage struct {
@@ -92,6 +75,7 @@ type grayArtifactImage struct {
 	cdf    []float32
 	row    int
 	vals   []float32
+	err    error // first ReadRow failure
 }
 
 func newGrayArtifactImage(ctx context.Context, path string, width, height int, wide bool, meta *models.LoadedImage) (*grayArtifactImage, error) {
@@ -151,11 +135,12 @@ func (g *grayArtifactImage) ColorModel() color.Model {
 }
 func (g *grayArtifactImage) Bounds() image.Rectangle { return g.bounds }
 func (g *grayArtifactImage) At(x, y int) color.Color {
-	if x < 0 || y < 0 || x >= g.bounds.Dx() || y >= g.bounds.Dy() || g.ctx.Err() != nil {
+	if x < 0 || y < 0 || x >= g.bounds.Dx() || y >= g.bounds.Dy() || g.ctx.Err() != nil || g.err != nil {
 		return color.Gray16{}
 	}
 	if g.row != y {
-		if g.art.ReadRow(y, g.vals) != nil {
+		if err := g.art.ReadRow(y, g.vals); err != nil {
+			g.err = err
 			return color.Gray16{}
 		}
 		g.row = y
@@ -259,67 +244,23 @@ func FromFloat32ArtifactsWithLevels(ctx context.Context, path string, artifacts 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".export-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	defer os.Remove(tmpPath)
-	if err := saveImage(tmpPath, img, format, opt); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return replaceExportFile(tmpPath, path)
+	return writeArtifactExport(ctx, path, img, &img.err, format, opt)
 }
 
-// replaceExportFile installs tmpPath while preserving an existing regular
-// destination until the replacement succeeds. A unique backup avoids
-// clobbering unrelated files left by another export.
-func replaceExportFile(tmpPath, path string) error {
-	info, err := os.Lstat(path)
-	hadOld := err == nil
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if hadOld && !info.Mode().IsRegular() {
-		return fmt.Errorf("export destination is not a regular file")
-	}
-	backup := ""
-	if hadOld {
-		f, err := os.CreateTemp(filepath.Dir(path), ".export-backup-*")
-		if err != nil {
+// writeArtifactExport encodes img and publishes path only when encoding
+// succeeded, no artifact row read failed, and ctx was not cancelled.
+// image.Image.At cannot return errors, so row reads latch the first failure
+// into *readErr instead.
+func writeArtifactExport(ctx context.Context, path string, img image.Image, readErr *error, format Format, opt Options) error {
+	return fitsio.WriteFileAtomic(path, func(w io.Writer) error {
+		if err := encodeImage(w, img, format, opt); err != nil {
 			return err
 		}
-		backup = f.Name()
-		if err := f.Close(); err != nil {
-			_ = os.Remove(backup)
-			return err
+		if *readErr != nil {
+			return fmt.Errorf("read artifact row: %w", *readErr)
 		}
-		if err := os.Remove(backup); err != nil {
-			return err
-		}
-		if err := os.Rename(path, backup); err != nil {
-			return err
-		}
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		if hadOld {
-			if rollbackErr := os.Rename(backup, path); rollbackErr != nil {
-				return fmt.Errorf("install export: %w (rollback: %v)", err, rollbackErr)
-			}
-		}
-		return err
-	}
-	if hadOld {
-		_ = os.Remove(backup)
-	}
-	return nil
+		return ctx.Err()
+	})
 }
 
 type artifactImage struct {
@@ -331,6 +272,7 @@ type artifactImage struct {
 	overlays []Overlay
 	row      int
 	vals     [3][]float32
+	err      error // first ReadRow failure
 }
 
 func newArtifactImage(ctx context.Context, paths [3]string, width, height int, wide bool, levels *models.RgbLevels, overlays []Overlay) (*artifactImage, error) {
@@ -367,12 +309,13 @@ func (a *artifactImage) ColorModel() color.Model {
 }
 func (a *artifactImage) Bounds() image.Rectangle { return a.bounds }
 func (a *artifactImage) At(x, y int) color.Color {
-	if x < 0 || y < 0 || x >= a.bounds.Dx() || y >= a.bounds.Dy() || a.ctx.Err() != nil {
+	if x < 0 || y < 0 || x >= a.bounds.Dx() || y >= a.bounds.Dy() || a.ctx.Err() != nil || a.err != nil {
 		return color.NRGBA{}
 	}
 	if a.row != y {
 		for i := range a.arts {
-			if a.arts[i].ReadRow(y, a.vals[i]) != nil {
+			if err := a.arts[i].ReadRow(y, a.vals[i]); err != nil {
+				a.err = err
 				return color.NRGBA{}
 			}
 		}

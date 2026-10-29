@@ -3,6 +3,7 @@ package mosaic
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -183,26 +184,11 @@ func ExportMIRIArtifactMaskAtomic(input Input, dir string, mask []bool, overwrit
 	}
 	header.Cards["DATE"] = "'" + time.Now().UTC().Format(time.RFC3339) + "'"
 
-	temp, err := os.CreateTemp(dir, "."+miriArtifactMaskName(input)+".tmp-*")
-	if err != nil {
-		return "", err
-	}
-	tempPath := temp.Name()
-	if err := temp.Close(); err != nil {
-		_ = os.Remove(tempPath)
-		return "", err
-	}
-	_ = os.Remove(tempPath)
-	if err := fitsio.WriteFloat32Image(tempPath, header, fitsio.ImageData{
+	if err := publishMaskFITS(path, header, fitsio.ImageData{
 		Width:  input.HDU.Data.Width,
 		Height: input.HDU.Data.Height,
 		Pixels: pixels,
-	}); err != nil {
-		_ = os.Remove(tempPath)
-		return "", err
-	}
-	if err := replaceFileAtomically(tempPath, path, overwrite); err != nil {
-		_ = os.Remove(tempPath)
+	}, overwrite); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -253,26 +239,11 @@ func ExportRowDestripeMaskAtomic(input Input, dir string, mask []bool, overwrite
 	}
 	header.Cards["DATE"] = "'" + time.Now().UTC().Format(time.RFC3339) + "'"
 
-	temp, err := os.CreateTemp(dir, "."+name+".tmp-*")
-	if err != nil {
-		return "", err
-	}
-	tempPath := temp.Name()
-	if err := temp.Close(); err != nil {
-		_ = os.Remove(tempPath)
-		return "", err
-	}
-	_ = os.Remove(tempPath)
-	if err := fitsio.WriteFloat32Image(tempPath, header, fitsio.ImageData{
+	if err := publishMaskFITS(path, header, fitsio.ImageData{
 		Width:  input.HDU.Data.Width,
 		Height: input.HDU.Data.Height,
 		Pixels: pixels,
-	}); err != nil {
-		_ = os.Remove(tempPath)
-		return "", err
-	}
-	if err := replaceFileAtomically(tempPath, path, overwrite); err != nil {
-		_ = os.Remove(tempPath)
+	}, overwrite); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -299,29 +270,12 @@ func checkedPixelCount(width, height int) (int, error) {
 	return width * height, nil
 }
 
-func replaceFileAtomically(tempPath, path string, overwrite bool) error {
-	if !overwrite {
-		return os.Rename(tempPath, path)
+// publishMaskFITS publishes a mask atomically. Without overwrite the
+// destination is created exclusively, so an existing mask is never replaced.
+func publishMaskFITS(path string, header fitsio.Header, data fitsio.ImageData, overwrite bool) error {
+	write := func(w io.Writer) error { return fitsio.EncodeFloat32Image(w, header, data) }
+	if overwrite {
+		return fitsio.WriteFileAtomic(path, write)
 	}
-	backup := path + ".bak"
-	_ = os.Remove(backup)
-	hadExisting := false
-	if _, err := os.Stat(path); err == nil {
-		hadExisting = true
-		if err := os.Rename(path, backup); err != nil {
-			return err
-		}
-	} else if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		if hadExisting {
-			_ = os.Rename(backup, path)
-		}
-		return err
-	}
-	if hadExisting {
-		_ = os.Remove(backup)
-	}
-	return nil
+	return fitsio.CreateFileAtomic(path, write)
 }

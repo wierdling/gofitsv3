@@ -65,8 +65,14 @@ func openProject(ctx context.Context, input, mapPaths, dir string) (result *serv
 	if err != nil {
 		return nil, fmt.Errorf("benchmark is locked (%s): %w; if a previous server crashed, verify it has stopped before removing server.lock", lockPath, err)
 	}
-	fmt.Fprintf(lock, "pid=%d\n", os.Getpid())
-	lock.Close()
+	_, err = fmt.Fprintf(lock, "pid=%d\n", os.Getpid())
+	if closeErr := lock.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(lockPath)
+		return nil, fmt.Errorf("write benchmark lock %s: %w", lockPath, err)
+	}
 	release := func() { _ = os.Remove(lockPath) }
 	defer func() {
 		if err != nil {
