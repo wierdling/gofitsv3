@@ -186,18 +186,8 @@ func centroidNearPreview(img *image.RGBA, x, y float64, searchRadius int) (float
 }
 
 func modeNameForMode(m stretch.Mode) string {
-	switch m {
-	case stretch.Linear:
-		return "Linear"
-	case stretch.Log:
-		return "Log"
-	case stretch.Sqrt:
-		return "Sqrt"
-	case stretch.HistEq:
-		return "HistEq"
-	case stretch.MTF:
-		return "MTF"
-	default:
-		return "Asinh"
+	if !m.Valid() || m == stretch.GHS {
+		return stretch.Asinh.String() // Mosaic has no GHS
 	}
+	return m.String()
 }

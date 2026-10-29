@@ -37,7 +37,7 @@ func TestDeriveStarTreatmentFitsBorrowsGeometryAndMeasuresBackground(t *testing.
 		t.Fatal(err)
 	}
 	center := int(cy)*w + int(cx)
-	plain := stretchDiskValue(blue[center], *imgs[2])
+	plain := DiskStretchPreviewValue(blue[center], *imgs[2])
 	if got := model.TreatedStretch(blue[center], cx, cy); got >= plain {
 		t.Fatalf("derived model did not compress the blue core: %v vs %v", got, plain)
 	}

@@ -71,7 +71,7 @@ type grayArtifactImage struct {
 	art    *fitsio.Float32Artifact
 	bounds image.Rectangle
 	wide   bool
-	meta   *models.LoadedImage
+	scalar stretch.Scalar // prepared once; zero metadata means Linear defaults
 	cdf    []float32
 	row    int
 	vals   []float32
@@ -87,7 +87,12 @@ func newGrayArtifactImage(ctx context.Context, path string, width, height int, w
 		_ = a.Close()
 		return nil, errors.New("artifact dimensions mismatch")
 	}
-	g := &grayArtifactImage{ctx: ctx, art: a, bounds: image.Rect(0, 0, width, height), wide: wide, meta: meta, row: -1, vals: make([]float32, width)}
+	g := &grayArtifactImage{ctx: ctx, art: a, bounds: image.Rect(0, 0, width, height), wide: wide, row: -1, vals: make([]float32, width)}
+	var params stretch.Params
+	if meta != nil {
+		params = meta.StretchParams()
+	}
+	g.scalar = stretch.NewScalar(params)
 	if meta != nil && meta.Mode == stretch.HistEq {
 		g.cdf = make([]float32, 256)
 		hist := make([]int, 256)
@@ -104,7 +109,7 @@ func newGrayArtifactImage(ctx context.Context, path string, width, height int, w
 			for _, v := range row {
 				// Match stretch.Apply's binning: truncate the normalized value
 				// after scaling, rather than clamping the scaled value to [0,1].
-				idx := int(clamp01(float64(stretchScalar(v, *meta))) * 255)
+				idx := int(clamp01(float64(g.scalar.Apply(v))) * 255)
 				hist[idx]++
 			}
 		}
@@ -145,12 +150,7 @@ func (g *grayArtifactImage) At(x, y int) color.Color {
 		}
 		g.row = y
 	}
-	v := stretchScalar(g.vals[x], func() models.LoadedImage {
-		if g.meta != nil {
-			return *g.meta
-		}
-		return models.LoadedImage{}
-	}())
+	v := g.scalar.Apply(g.vals[x])
 	if len(g.cdf) == 256 {
 		v = g.cdf[int(clamp01(float64(v))*255)]
 	}
@@ -162,64 +162,6 @@ func (g *grayArtifactImage) At(x, y int) color.Color {
 	// normal in-memory export path. Converting a 16-bit sample with >> 8
 	// instead produces subtly different values (notably for Log stretch).
 	return color.Gray{Y: uint8(clamp01(float64(v)) * 255)}
-}
-
-func stretchScalar(v float32, img models.LoadedImage) float32 {
-	if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-		return 0
-	}
-	bg, peak, scaled := img.Background, img.Peak, img.ScaledPeak
-	if math.IsNaN(bg) || math.IsInf(bg, 0) {
-		bg = 0
-	}
-	if math.IsNaN(peak) || math.IsInf(peak, 0) || peak <= bg {
-		peak = bg + 1
-	}
-	if scaled <= 0 || math.IsNaN(scaled) || math.IsInf(scaled, 0) {
-		scaled = 100
-	}
-	x := (float64(v) - bg) * scaled / (peak - bg)
-	if x < 0 {
-		x = 0
-	}
-	var out float64
-	switch img.Mode {
-	case stretch.Log:
-		out = math.Log1p(x) / math.Log1p(scaled)
-	case stretch.Asinh:
-		b := img.AsinhScale
-		if b <= 0 {
-			b = stretch.DefaultAsinhScale
-		}
-		out = math.Asinh(x/b) / math.Asinh(scaled/b)
-	case stretch.Sqrt:
-		out = math.Sqrt(x) / math.Sqrt(scaled)
-	case stretch.MTF:
-		m := img.MTFMidtone
-		if m <= 0 || m >= 1 {
-			m = stretch.DefaultMTFMidtone
-		}
-		out = stretch.Mtf(m, x/scaled)
-	case stretch.GHS:
-		d := img.GHSStretch
-		if d <= 0 {
-			d = stretch.DefaultGHSStretch
-		}
-		sp := img.GHSSymmetry
-		if sp <= 0 || sp >= 1 {
-			sp = stretch.DefaultGHSSymmetry
-		}
-		out = stretch.NewGHS(d, img.GHSLocal, sp, 0, 1).Eval(x / scaled)
-	default:
-		out = x / scaled
-	}
-	if out < 0 || math.IsNaN(out) || math.IsInf(out, 0) {
-		out = 0
-	}
-	if out > 1 {
-		out = 1
-	}
-	return float32(out)
 }
 
 // FromFloat32ArtifactsWithLevels is the RGB-level aware variant used by

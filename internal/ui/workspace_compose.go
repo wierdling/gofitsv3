@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
@@ -336,20 +335,6 @@ func newComposeWorkspace(app fyne.App, win fyne.Window) (fyne.CanvasObject, []*f
 }
 
 func labelToMode(label string) stretch.Mode {
-	switch strings.ToLower(label) {
-	case "log":
-		return stretch.Log
-	case "asinh":
-		return stretch.Asinh
-	case "sqrt":
-		return stretch.Sqrt
-	case "histeq":
-		return stretch.HistEq
-	case "mtf":
-		return stretch.MTF
-	case "ghs":
-		return stretch.GHS
-	default:
-		return stretch.Linear
-	}
+	m, _ := stretch.ParseMode(label)
+	return m
 }

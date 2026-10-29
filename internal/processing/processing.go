@@ -91,53 +91,9 @@ func ApplyStretchParallel(img *models.LoadedImage) (fitsio.ImageData, []byte) {
 		mask = make([]byte, numPixels)
 	}
 
-	background := img.Background
-	peak := img.Peak
-	scaledPeak := img.ScaledPeak
-
-	if math.IsNaN(background) || math.IsInf(background, 0) {
-		background = 0
-	}
-
-	if math.IsNaN(peak) || math.IsInf(peak, 0) || peak <= background {
-		peak = background + 1
-	}
-
-	if math.IsNaN(scaledPeak) || math.IsInf(scaledPeak, 0) || scaledPeak <= 0 {
-		// 1 is almost linear. For astronomy images, 100 is a better default.
-		scaledPeak = 100
-	}
-
-	denom := peak - background
-	stretchMul := scaledPeak / denom
-
-	invLogPeak := 1.0 / math.Log1p(scaledPeak)
-	invSqrtPeak := 1.0 / math.Sqrt(scaledPeak)
-	invLinearPeak := 1.0 / scaledPeak
-
-	// Resolve stretch-specific parameters, substituting defaults for unset
-	// (zero) values so older projects and freshly loaded images stay sensible.
-	asinhScale := img.AsinhScale
-	if asinhScale <= 0 {
-		asinhScale = stretch.DefaultAsinhScale
-	}
-	// Tunable Asinh: result = asinh(val/beta) / asinh(scaledPeak/beta).
-	invAsinhPeak := 1.0 / math.Asinh(scaledPeak/asinhScale)
-
-	mtfMidtone := img.MTFMidtone
-	if mtfMidtone <= 0 || mtfMidtone >= 1 {
-		mtfMidtone = stretch.DefaultMTFMidtone
-	}
-
-	ghsD := img.GHSStretch
-	if ghsD <= 0 {
-		ghsD = stretch.DefaultGHSStretch
-	}
-	ghsSP := img.GHSSymmetry
-	if ghsSP <= 0 || ghsSP >= 1 {
-		ghsSP = stretch.DefaultGHSSymmetry
-	}
-	ghs := stretch.NewGHS(ghsD, img.GHSLocal, ghsSP, 0, 1)
+	// Levels and per-mode parameters (including GHS coefficients) are
+	// resolved once; unset tuning values fall back to the stretch defaults.
+	scalar := stretch.NewScalar(img.StretchParams())
 
 	mode := img.Mode
 	black := img.Black
@@ -191,33 +147,7 @@ func ApplyStretchParallel(img *models.LoadedImage) (fitsio.ImageData, []byte) {
 					}
 				}
 
-				val := (v - background) * stretchMul
-
-				if val < 0 {
-					val = 0
-				}
-
-				var result float64
-
-				switch mode {
-				case stretch.Log:
-					result = math.Log1p(val) * invLogPeak
-
-				case stretch.Asinh:
-					result = math.Asinh(val/asinhScale) * invAsinhPeak
-
-				case stretch.Sqrt:
-					result = math.Sqrt(val) * invSqrtPeak
-
-				case stretch.MTF:
-					result = stretch.Mtf(mtfMidtone, val*invLinearPeak)
-
-				case stretch.GHS:
-					result = ghs.Eval(val * invLinearPeak)
-
-				default:
-					result = val * invLinearPeak
-				}
+				result := scalar.Eval(v)
 
 				if math.IsNaN(result) || math.IsInf(result, 0) || result < 0 {
 					result = 0
