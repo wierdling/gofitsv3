@@ -2,6 +2,7 @@ package mosaic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"runtime"
@@ -21,21 +22,19 @@ const (
 	alignStarMinArea        = 3
 )
 
-// extractStarCatalogsForAlignment extracts each input's star catalog, streaming
+// extractStarCatalogsForAlignmentCtx extracts each input's star catalog, streaming
 // pixels from disk when they are not already resident so peak memory stays
 // bounded to roughly the worker count rather than the whole dataset. Catalogs
 // are indexed by input position (deterministic regardless of completion order);
-// excluded inputs and inputs whose pixels cannot be read get a nil catalog.
+// excluded inputs get a nil catalog. Cancelling the context stops extraction
+// and returns its error. A frame that cannot be read gets a nil catalog and
+// the others are still extracted; those failures are returned together as a
+// *frameLoadErrors so callers can mark just those frames as failed.
 //
 // When an input already carries in-memory pixels (e.g. the legacy warp-based
 // alignment modes preload them) those are used directly; otherwise the frame is
 // loaded from disk, its catalog extracted, and the pixels dropped before the next
 // frame on that worker.
-func extractStarCatalogsForAlignment(inputs []Input, maxStars int) [][]processing.Star {
-	catalogs, _ := extractStarCatalogsForAlignmentCtx(context.Background(), inputs, maxStars)
-	return catalogs
-}
-
 func extractStarCatalogsForAlignmentCtx(ctx context.Context, inputs []Input, maxStars int) ([][]processing.Star, error) {
 	caps := make([]int, len(inputs))
 	for i := range caps {
@@ -63,20 +62,15 @@ func extractStarCatalogsForAlignmentCapsCtx(ctx context.Context, inputs []Input,
 	debuglog.Log(fmt.Sprintf("extractStarCatalogsForAlignment: %d input(s), %d worker(s)", len(inputs), workers))
 	logMemStats("align: before catalog extraction")
 	var next int64 = -1
-	var firstErr error
-	var errMu sync.Mutex
+	// Each index is written by exactly one worker, so no lock is needed.
+	loadErrs := make([]error, len(inputs))
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
-				if err := ctx.Err(); err != nil {
-					errMu.Lock()
-					if firstErr == nil {
-						firstErr = err
-					}
-					errMu.Unlock()
+				if ctx.Err() != nil {
 					return
 				}
 				i := int(atomic.AddInt64(&next, 1))
@@ -95,15 +89,11 @@ func extractStarCatalogsForAlignmentCapsCtx(ctx context.Context, inputs []Input,
 					sci, w, h, err = loadCleanedSCIForExtraction(inputs[i])
 					if err != nil {
 						debuglog.Log(fmt.Sprintf("extractStarCatalogsForAlignment: input[%d] %s: %v", i, InputKey(inputs[i]), err))
+						loadErrs[i] = fmt.Errorf("load %s for star extraction: %w", InputKey(inputs[i]), err)
 						continue
 					}
 				}
-				if err := ctx.Err(); err != nil {
-					errMu.Lock()
-					if firstErr == nil {
-						firstErr = err
-					}
-					errMu.Unlock()
+				if ctx.Err() != nil {
 					return
 				}
 				maxStars := processing.TweakRegCatalogMaxStars
@@ -117,13 +107,54 @@ func extractStarCatalogsForAlignmentCapsCtx(ctx context.Context, inputs []Input,
 	}
 	wg.Wait()
 	logMemStats("align: after catalog extraction")
-	errMu.Lock()
-	err := firstErr
-	errMu.Unlock()
-	if err == nil {
-		err = ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return catalogs, err
 	}
-	return catalogs, err
+	for _, err := range loadErrs {
+		if err != nil {
+			return catalogs, &frameLoadErrors{errs: loadErrs}
+		}
+	}
+	return catalogs, nil
+}
+
+// frameLoadErrors reports frames whose pixels could not be read for star
+// extraction, indexed by input position. The other frames' catalogs are valid.
+type frameLoadErrors struct {
+	errs []error
+}
+
+func (e *frameLoadErrors) Error() string {
+	n, first := 0, error(nil)
+	for _, err := range e.errs {
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+			n++
+		}
+	}
+	if n == 1 {
+		return first.Error()
+	}
+	return fmt.Sprintf("%d frames could not be read (first: %v)", n, first)
+}
+
+// at returns frame i's load error, or nil. It is safe on a nil receiver.
+func (e *frameLoadErrors) at(i int) error {
+	if e == nil || i < 0 || i >= len(e.errs) {
+		return nil
+	}
+	return e.errs[i]
+}
+
+// splitFrameLoadErrors separates per-frame load failures from fatal errors.
+func splitFrameLoadErrors(err error) (*frameLoadErrors, error) {
+	var loadErrs *frameLoadErrors
+	if errors.As(err, &loadErrs) {
+		return loadErrs, nil
+	}
+	return nil, err
 }
 
 // alignExtractionMemoryBudget caps the transient memory the concurrent catalog

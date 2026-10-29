@@ -145,7 +145,7 @@ func EnsureCombinedExposure(srcPath string, opts CombineOptions) (workingPath st
 	// combined pixels in rate units. Restore them to the source units so BUNIT
 	// stays truthful; the WHT plane is left as the rate-space inverse variance,
 	// which is exactly the per-pixel weight the final drizzle expects. The
-	// condition mirrors drizzlePixelValue's divide (chips are not exposure-
+	// condition mirrors pixelModel.value's divide (chips are not exposure-
 	// normalized, so framePixelsAreRate reduces to bunitIsAlreadyRate).
 	exptime := chips[0].ExposureTime
 	if !bunitIsAlreadyRate(chips[0].BUnit) && exptime > 0 {

@@ -190,6 +190,7 @@ func buildSeamMap(planned []plannedInput, dataPlanned []int, skyOffset []float64
 			mask = crMasks[slot]
 		}
 		w, h := planned[pi].input.HDU.Data.Width, planned[pi].input.HDU.Data.Height
+		pm := newPixelModel(&planned[pi].input, options.WeightingMode)
 		for idx, value := range pixels {
 			if idx >= w*h || !isFinite32(value) || (mask != nil && mask.Get(idx)) {
 				continue
@@ -204,10 +205,10 @@ func buildSeamMap(planned []plannedInput, dataPlanned []int, skyOffset []float64
 			if !isFinite32(out) {
 				continue
 			}
-			value = drizzlePixelValue(planned[pi], idx, value, options.WeightingMode)
+			value = pm.value(value)
 			d := float64(value - out)
 			j := iy*width + ix
-			weight := float64(drizzlePixelWeight(planned[pi], idx, options.WeightingMode))
+			weight := float64(pm.weight(idx))
 			if weight <= 0 || !isFinite64(weight) {
 				continue
 			}
@@ -1540,7 +1541,24 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		// once; each target below selects only its mapped local footprint.
 		caps[0] = 0
 	}
-	candidateCatalogs, _ := extractStarCatalogsForAlignmentCapsCtx(context.Background(), inputs, caps)
+	ctx := prog.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	candidateCatalogs, err := extractStarCatalogsForAlignmentCapsCtx(ctx, inputs, caps)
+	// An unreadable frame fails on its own; the rest still align.
+	loadErrs, err := splitFrameLoadErrors(err)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, ErrCancelled
+		}
+		return nil, fmt.Errorf("extract alignment catalogs: %w", err)
+	}
+	for i := range inputs {
+		if e := loadErrs.at(i); e != nil {
+			lastErr[i] = e.Error()
+		}
+	}
 	catalogs := candidateCatalogs
 	if isTweakReg {
 		// Keep target consensus selection unchanged. For an external multi-tile
@@ -1852,7 +1870,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	// outcome.
 	var toAlign []int
 	for _, i := range ordered {
-		if !aligned[i] && !inputs[i].Excluded {
+		if !aligned[i] && !inputs[i].Excluded && loadErrs.at(i) == nil {
 			toAlign = append(toAlign, i)
 		}
 	}
@@ -1860,28 +1878,31 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 		prog.report(0, len(toAlign))
 		ch := make(chan alignOneResult, len(toAlign))
 		sem := make(chan struct{}, runtime.NumCPU())
-		var wg sync.WaitGroup
-		for _, i := range toAlign {
-			if prog.cancelled() {
-				break
+		// Spawn from a separate goroutine so results are consumed (and progress
+		// reported) as each frame finishes rather than after the whole pass.
+		go func() {
+			var wg sync.WaitGroup
+			for _, i := range toAlign {
+				if prog.cancelled() {
+					break
+				}
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(i int) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					ch <- alignOneToRef(i)
+				}(i)
 			}
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(i int) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				ch <- alignOneToRef(i)
-			}(i)
-		}
-		wg.Wait()
-		close(ch)
-		if prog.cancelled() {
-			return nil, ErrCancelled
-		}
+			wg.Wait()
+			close(ch)
+		}()
 		done := 0
 		for r := range ch {
 			done++
-			prog.report(done, len(toAlign))
+			if !prog.cancelled() {
+				prog.report(done, len(toAlign))
+			}
 			if r.ok {
 				results[r.i] = StarAlignmentResult{
 					OffsetX:             inputs[r.i].OffsetX,
@@ -1903,6 +1924,9 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 				lastErr[r.i] = r.errMsg
 			}
 		}
+		if prog.cancelled() {
+			return nil, ErrCancelled
+		}
 	}
 
 	// --- Chain fallback: frames that did not align directly to a reference are
@@ -1921,7 +1945,7 @@ func AlignInputsByStarsWithMode(inputs []Input, numRefs int, mode AlignmentMode,
 	for progressed := true; progressed; {
 		progressed = false
 		for _, i := range ordered {
-			if aligned[i] || inputs[i].Excluded {
+			if aligned[i] || inputs[i].Excluded || loadErrs.at(i) != nil {
 				continue
 			}
 			if prog.cancelled() {
@@ -2255,6 +2279,8 @@ func AlignInputsBySelectedStarsWithModeCtx(ctx context.Context, inputs []Input, 
 	// user-picked refStars (and their WCS projections), so only the non-reference
 	// targets are extracted here.
 	catalogs, err := extractStarCatalogsForAlignmentCtx(ctx, inputs, processing.TweakRegCatalogMaxStars)
+	// An unreadable frame fails on its own; the rest still align.
+	loadErrs, err := splitFrameLoadErrors(err)
 	if err != nil {
 		return nil, err
 	}
@@ -2265,6 +2291,16 @@ func AlignInputsBySelectedStarsWithModeCtx(ctx context.Context, inputs []Input, 
 			return nil, err
 		}
 		if i < numRefs || inputs[i].Excluded {
+			continue
+		}
+		if e := loadErrs.at(i); e != nil {
+			results[i] = StarAlignmentResult{
+				OffsetX:            inputs[i].OffsetX,
+				OffsetY:            inputs[i].OffsetY,
+				ManualTransform:    inputs[i].ManualTransform,
+				HasManualTransform: inputs[i].HasManualTransform,
+				Error:              e.Error(),
+			}
 			continue
 		}
 
@@ -2840,19 +2876,19 @@ func normalizeAccumulatedImage(sums, weights []float32) {
 func drizzlePlannedInput(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, kernel DrizzleKernel, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	switch kernel {
 	case KernelPoint:
-		drizzlePlannedInputPoint(p, sums, weights, width, height, minX, minY, scale, weightingMode, crMask, pixels, trimX, trimY, diag)
+		drizzlePlannedInputPoint(&p, sums, weights, width, height, minX, minY, scale, weightingMode, crMask, pixels, trimX, trimY, diag)
 	case KernelTurbo:
-		drizzlePlannedInputTurbo(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
+		drizzlePlannedInputTurbo(&p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
 	case KernelGaussian:
-		drizzlePlannedInputGaussian(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
+		drizzlePlannedInputGaussian(&p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
 	case KernelTophat:
-		drizzlePlannedInputTophat(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
+		drizzlePlannedInputTophat(&p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
 	case KernelLanczos2:
-		drizzlePlannedInputLanczos(p, sums, weights, width, height, minX, minY, scale, 2, weightingMode, crMask, pixels, trimX, trimY, diag)
+		drizzlePlannedInputLanczos(&p, sums, weights, width, height, minX, minY, scale, 2, weightingMode, crMask, pixels, trimX, trimY, diag)
 	case KernelLanczos3:
-		drizzlePlannedInputLanczos(p, sums, weights, width, height, minX, minY, scale, 3, weightingMode, crMask, pixels, trimX, trimY, diag)
+		drizzlePlannedInputLanczos(&p, sums, weights, width, height, minX, minY, scale, 3, weightingMode, crMask, pixels, trimX, trimY, diag)
 	default:
-		drizzlePlannedInputSquare(p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
+		drizzlePlannedInputSquare(&p, sums, weights, width, height, minX, minY, scale, dropSize, weightingMode, crMask, pixels, trimX, trimY, diag)
 	}
 }
 
@@ -2952,30 +2988,54 @@ func normalizedPixelsForWeighting(input Input, pixels []float32, weightingMode W
 	return pixels
 }
 
-func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) float32 {
-	exptime := inputExposureTime(p.input)
-	switch weightingMode {
+// pixelModel is a frame's per-pixel value/weight rule resolved once per frame,
+// so the drizzle kernels do not re-evaluate BUNIT and EXPTIME for every source
+// pixel. Its arithmetic matches the per-pixel rules exactly.
+type pixelModel struct {
+	mode WeightingMode
+	// exp is float32(EXPTIME), or 0 when the frame has no usable exposure time.
+	exp float32
+	// isRate reports the frame's pixels are already a rate (framePixelsAreRate).
+	isRate   bool
+	err, wht []float32
+}
+
+func newPixelModel(in *Input, weightingMode WeightingMode) pixelModel {
+	m := pixelModel{
+		mode:   weightingMode,
+		isRate: framePixelsAreRate(*in),
+		err:    in.ERRPixels,
+		wht:    in.WeightPixels,
+	}
+	if exptime := inputExposureTime(*in); exptime > 0 {
+		m.exp = float32(exptime)
+	}
+	return m
+}
+
+func (m *pixelModel) weight(idx int) float32 {
+	switch m.mode {
 	case WeightExposure:
-		if exptime > 0 {
-			return float32(exptime)
+		if m.exp > 0 {
+			return m.exp
 		}
 	case WeightERR:
 		// A combined working frame carries its per-pixel drizzle weight (the
 		// rate-space inverse variance accumulated when the chips were combined)
 		// directly in WeightPixels; use it verbatim rather than re-deriving one
 		// from ERR.
-		if wht := p.input.WeightPixels; wht != nil && idx < len(wht) {
-			if w := wht[idx]; w > 0 && isFinite32(w) {
+		if idx < len(m.wht) {
+			if w := m.wht[idx]; w > 0 && isFinite32(w) {
 				return w
 			}
 		}
-		if errPix := p.input.ERRPixels; errPix != nil && idx < len(errPix) {
-			if e := errPix[idx]; e > 0 && isFinite32(e) {
+		if idx < len(m.err) {
+			if e := m.err[idx]; e > 0 && isFinite32(e) {
 				// When the frame is already a rate (pre-normalized or calibrated
 				// flux), ERR is in the same units, so use it directly. Otherwise
 				// convert the count-based sigma to a rate sigma.
-				if !framePixelsAreRate(p.input) && exptime > 0 {
-					rateErr := e / float32(exptime)
+				if !m.isRate && m.exp > 0 {
+					rateErr := e / m.exp
 					if rateErr > 0 && isFinite32(rateErr) {
 						return 1.0 / (rateErr * rateErr)
 					}
@@ -2987,23 +3047,24 @@ func drizzlePixelWeight(p plannedInput, idx int, weightingMode WeightingMode) fl
 	return 1
 }
 
-func drizzlePixelValue(p plannedInput, idx int, value float32, weightingMode WeightingMode) float32 {
-	if framePixelsAreRate(p.input) {
+func (m *pixelModel) value(value float32) float32 {
+	if m.isRate {
 		// Pixels are already a rate (pre-normalized or calibrated flux units);
 		// do not divide by EXPTIME.
 		return value
 	}
-	switch weightingMode {
+	switch m.mode {
 	case WeightExposure, WeightERR:
-		if exptime := inputExposureTime(p.input); exptime > 0 {
-			return value / float32(exptime)
+		if m.exp > 0 {
+			return value / m.exp
 		}
 	}
 	return value
 }
 
-func drizzlePlannedInputPoint(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
+func drizzlePlannedInputPoint(p *plannedInput, sums, weights []float32, width, height int, minX, minY, scale float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
+	pm := newPixelModel(&p.input, weightingMode)
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
@@ -3018,18 +3079,19 @@ func drizzlePlannedInputPoint(p plannedInput, sums, weights []float32, width, he
 			if crMask != nil && crMask.Get(idx) {
 				continue
 			}
-			value := drizzlePixelValue(p, idx, pixels[idx], weightingMode)
+			value := pm.value(pixels[idx])
 			if !isFinite32(value) {
 				continue
 			}
 			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
-			drizzlePixelPoint(sums, weights, width, height, outX, outY, value, drizzlePixelWeight(p, idx, weightingMode), diag)
+			drizzlePixelPoint(sums, weights, width, height, outX, outY, value, pm.weight(idx), diag)
 		}
 	}
 }
 
-func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
+func drizzlePlannedInputSquare(p *plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
+	pm := newPixelModel(&p.input, weightingMode)
 	half := normalizedDropSize(dropSize) / 2.0
 	const rowInterval = 200
 	extremeCount := 0
@@ -3047,7 +3109,7 @@ func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, h
 			if crMask != nil && crMask.Get(idx) {
 				continue
 			}
-			value := drizzlePixelValue(p, idx, pixels[idx], weightingMode)
+			value := pm.value(pixels[idx])
 			if !isFinite32(value) {
 				continue
 			}
@@ -3062,7 +3124,7 @@ func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, h
 				}
 				continue
 			}
-			drizzlePixelSquarePrepared(sums, weights, width, height, outX, outY, half, value, drizzlePixelWeight(p, idx, weightingMode), diag)
+			drizzlePixelSquarePrepared(sums, weights, width, height, outX, outY, half, value, pm.weight(idx), diag)
 		}
 	}
 	if extremeCount > 0 {
@@ -3070,8 +3132,9 @@ func drizzlePlannedInputSquare(p plannedInput, sums, weights []float32, width, h
 	}
 }
 
-func drizzlePlannedInputTurbo(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
+func drizzlePlannedInputTurbo(p *plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
+	pm := newPixelModel(&p.input, weightingMode)
 	half := normalizedDropSize(dropSize) / 2.0
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
@@ -3087,18 +3150,19 @@ func drizzlePlannedInputTurbo(p plannedInput, sums, weights []float32, width, he
 			if crMask != nil && crMask.Get(idx) {
 				continue
 			}
-			value := drizzlePixelValue(p, idx, pixels[idx], weightingMode)
+			value := pm.value(pixels[idx])
 			if !isFinite32(value) {
 				continue
 			}
 			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
-			drizzlePixelTurboPrepared(sums, weights, width, height, outX, outY, half, value, drizzlePixelWeight(p, idx, weightingMode), diag)
+			drizzlePixelTurboPrepared(sums, weights, width, height, outX, outY, half, value, pm.weight(idx), diag)
 		}
 	}
 }
 
-func drizzlePlannedInputGaussian(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
+func drizzlePlannedInputGaussian(p *plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
+	pm := newPixelModel(&p.input, weightingMode)
 	sigma := normalizedDropSize(dropSize) / (2 * math.Sqrt(2*math.Log(2)))
 	params := gaussianParams{twoSigSq: 2 * sigma * sigma, radius: 3 * sigma}
 	const rowInterval = 200
@@ -3115,18 +3179,19 @@ func drizzlePlannedInputGaussian(p plannedInput, sums, weights []float32, width,
 			if crMask != nil && crMask.Get(idx) {
 				continue
 			}
-			value := drizzlePixelValue(p, idx, pixels[idx], weightingMode)
+			value := pm.value(pixels[idx])
 			if !isFinite32(value) {
 				continue
 			}
 			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
-			drizzlePixelGaussianPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, weightingMode), diag)
+			drizzlePixelGaussianPrepared(sums, weights, width, height, outX, outY, params, value, pm.weight(idx), diag)
 		}
 	}
 }
 
-func drizzlePlannedInputTophat(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
+func drizzlePlannedInputTophat(p *plannedInput, sums, weights []float32, width, height int, minX, minY, scale, dropSize float64, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
+	pm := newPixelModel(&p.input, weightingMode)
 	radius := normalizedDropSize(dropSize) / 2.0
 	params := tophatParams{radius: radius, radSq: radius * radius}
 	const rowInterval = 200
@@ -3143,18 +3208,19 @@ func drizzlePlannedInputTophat(p plannedInput, sums, weights []float32, width, h
 			if crMask != nil && crMask.Get(idx) {
 				continue
 			}
-			value := drizzlePixelValue(p, idx, pixels[idx], weightingMode)
+			value := pm.value(pixels[idx])
 			if !isFinite32(value) {
 				continue
 			}
 			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
-			drizzlePixelTophatPrepared(sums, weights, width, height, outX, outY, params, value, drizzlePixelWeight(p, idx, weightingMode), diag)
+			drizzlePixelTophatPrepared(sums, weights, width, height, outX, outY, params, value, pm.weight(idx), diag)
 		}
 	}
 }
 
-func drizzlePlannedInputLanczos(p plannedInput, sums, weights []float32, width, height int, minX, minY, scale float64, n int, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
+func drizzlePlannedInputLanczos(p *plannedInput, sums, weights []float32, width, height int, minX, minY, scale float64, n int, weightingMode WeightingMode, crMask BitMask, pixels []float32, trimX, trimY int, diag *drizzleDiagnostics) {
 	data := p.input.HDU.Data
+	pm := newPixelModel(&p.input, weightingMode)
 	const rowInterval = 200
 	for y := trimY; y < data.Height-trimY; y++ {
 		if (y-trimY)%rowInterval == 0 {
@@ -3169,12 +3235,12 @@ func drizzlePlannedInputLanczos(p plannedInput, sums, weights []float32, width, 
 			if crMask != nil && crMask.Get(idx) {
 				continue
 			}
-			value := drizzlePixelValue(p, idx, pixels[idx], weightingMode)
+			value := pm.value(pixels[idx])
 			if !isFinite32(value) {
 				continue
 			}
 			outX, outY := p.mapOutputPixel(float64(x), float64(y), minX, minY, scale)
-			drizzlePixelLanczosPrepared(sums, weights, width, height, outX, outY, value, n, drizzlePixelWeight(p, idx, weightingMode), diag)
+			drizzlePixelLanczosPrepared(sums, weights, width, height, outX, outY, value, n, pm.weight(idx), diag)
 		}
 	}
 }

@@ -2,13 +2,17 @@ package mosaic
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
+	"hash/fnv"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	"gofitsv3/internal/fitsio"
@@ -21,6 +25,67 @@ func TestAlignInputsBySelectedStarsWithModeCtxHonorsCancellation(t *testing.T) {
 	_, err := AlignInputsBySelectedStarsWithModeCtx(ctx, nil, []processing.Star{{X: 1, Y: 1}}, 1, AlignmentModeRScale, 0)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestAlignInputsByStarsWithModeHonorsCancellationDuringExtraction(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	inputs := []Input{
+		makeInput("ref_flc.fits", 32, 32, filledPixels(32, 32, 1), headerWithCRPIX(10, 10)),
+		makeInput("other_flc.fits", 32, 32, filledPixels(32, 32, 1), headerWithCRPIX(12, 10)),
+	}
+	reported := false
+	_, err := AlignInputsByStarsWithMode(inputs, 1, AlignmentModeTweakRegRScale, 2.0, AlignProgress{
+		Ctx:      ctx,
+		Progress: func(done, total int) { reported = true },
+	})
+	if !errors.Is(err, ErrCancelled) {
+		t.Fatalf("error = %v, want ErrCancelled", err)
+	}
+	// Catalog extraction must observe the context: a cancelled run returns
+	// before the primary alignment pass starts reporting progress.
+	if reported {
+		t.Fatal("alignment reached the primary pass after cancellation")
+	}
+}
+
+func TestAlignInputsByStarsWithModeReportsFrameLoadErrorPerFrame(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing_flc.fits")
+	target := makeInput(missing, 32, 32, nil, headerWithCRPIX(12, 10))
+	inputs := []Input{
+		makeInput("ref_flc.fits", 32, 32, filledPixels(32, 32, 1), headerWithCRPIX(10, 10)),
+		target,
+	}
+	results, err := AlignInputsByStarsWithMode(inputs, 1, AlignmentModeTweakRegRScale, 2.0)
+	if err != nil {
+		t.Fatalf("one unreadable frame aborted the whole alignment: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
+	}
+	if r := results[1]; r.Applied || !strings.Contains(r.Error, "missing_flc.fits") {
+		t.Fatalf("result[1] = applied %v, error %q; want an unapplied load error naming the frame", r.Applied, r.Error)
+	}
+}
+
+func TestExtractStarCatalogsForAlignmentReturnsLoadError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing_flc.fits")
+	inputs := []Input{
+		makeInput("ref_flc.fits", 32, 32, filledPixels(32, 32, 1), headerWithCRPIX(10, 10)),
+		makeInput(missing, 32, 32, nil, headerWithCRPIX(12, 10)),
+	}
+	_, err := extractStarCatalogsForAlignmentCtx(context.Background(), inputs, 100)
+	loadErrs, fatal := splitFrameLoadErrors(err)
+	if fatal != nil || loadErrs == nil {
+		t.Fatalf("err = %v, want only per-frame load errors", err)
+	}
+	if loadErrs.at(0) != nil || loadErrs.at(1) == nil {
+		t.Fatalf("load errors = [%v, %v], want only input 1", loadErrs.at(0), loadErrs.at(1))
+	}
+	inputs[1].Excluded = true
+	if _, err := extractStarCatalogsForAlignmentCtx(context.Background(), inputs, 100); err != nil {
+		t.Fatalf("excluded unreadable frame should be skipped, got %v", err)
 	}
 }
 
@@ -416,21 +481,24 @@ func TestDrizzlePixelWeightPrefersWeightPixels(t *testing.T) {
 
 	// A present, positive WeightPixels value is used verbatim.
 	p.input.WeightPixels = []float32{5, 0}
-	if got := drizzlePixelWeight(p, 0, WeightERR); got != 5 {
+	pm := newPixelModel(&p.input, WeightERR)
+	if got := pm.weight(0); got != 5 {
 		t.Fatalf("weight[0] with WeightPixels = %v, want 5", got)
 	}
 	// A zero WeightPixels value falls through to the ERR-derived weight.
-	if got := drizzlePixelWeight(p, 1, WeightERR); got != 1.0/16.0 {
+	if got := pm.weight(1); got != 1.0/16.0 {
 		t.Fatalf("weight[1] zero-WHT fallback = %v, want %v", got, 1.0/16.0)
 	}
 	// A non-finite WeightPixels value also falls through.
 	p.input.WeightPixels = []float32{float32(math.NaN()), 4}
-	if got := drizzlePixelWeight(p, 0, WeightERR); got != 1.0/4.0 {
+	pm = newPixelModel(&p.input, WeightERR)
+	if got := pm.weight(0); got != 1.0/4.0 {
 		t.Fatalf("weight[0] NaN-WHT fallback = %v, want %v", got, 1.0/4.0)
 	}
 	// Nil WeightPixels leaves the pure-ERR behavior unchanged.
 	p.input.WeightPixels = nil
-	if got := drizzlePixelWeight(p, 0, WeightERR); got != 1.0/4.0 {
+	pm = newPixelModel(&p.input, WeightERR)
+	if got := pm.weight(0); got != 1.0/4.0 {
 		t.Fatalf("weight[0] nil WeightPixels = %v, want %v", got, 1.0/4.0)
 	}
 }
@@ -1141,5 +1209,125 @@ func TestBuildUsesFirstSuccessfullyPlannedScienceMetadata(t *testing.T) {
 	}
 	if result.Inputs[1].Status != "failed" || result.Inputs[1].Included {
 		t.Fatalf("invalid input status = %+v, want failed and excluded", result.Inputs[1])
+	}
+}
+
+// drizzleGoldenInputs builds a small deterministic three-frame set that exercises
+// every per-pixel weighting branch: count data with EXPTIME, calibrated flux
+// (BUNIT MJy/sr), ERR and WeightPixels planes, and NaN pixels.
+func drizzleGoldenInputs(n int) []Input {
+	pix := func(seed float32) []float32 {
+		p := make([]float32, n*n)
+		for i := range p {
+			p[i] = seed + float32((i*37)%101)*0.25
+		}
+		p[n+3] = float32(math.NaN())
+		return p
+	}
+	errPix := func(seed float32) []float32 {
+		e := make([]float32, n*n)
+		for i := range e {
+			e[i] = seed + float32(i%7)*0.5
+		}
+		e[2] = 0
+		return e
+	}
+	ref := makeInput("ref_flc.fits", n, n, pix(100), headerWithCRPIX(10, 10))
+	ref.ExposureTime = 100
+	ref.ERRPixels = errPix(1)
+
+	counts := makeInput("counts_flc.fits", n, n, pix(150), headerWithCRPIX(10.37, 9.61))
+	counts.ExposureTime = 130
+	counts.PrimaryHeader.Cards["EXPTIME"] = "130"
+	counts.ERRPixels = errPix(2)
+	counts.WeightPixels = make([]float32, n*n)
+	for i := range counts.WeightPixels {
+		if i%3 == 0 {
+			counts.WeightPixels[i] = 0.5 + float32(i%5)
+		}
+	}
+
+	flux := makeInput("flux_cal.fits", n, n, pix(80), headerWithCRPIX(9.42, 10.83))
+	flux.ExposureTime = 90
+	flux.PrimaryHeader.Cards["EXPTIME"] = "90"
+	flux.BUnit = "MJy/sr"
+	flux.ERRPixels = errPix(3)
+	return []Input{ref, counts, flux}
+}
+
+func hashFloat32s(h hash.Hash64, vals []float32) {
+	var b [4]byte
+	for _, v := range vals {
+		binary.LittleEndian.PutUint32(b[:], math.Float32bits(v))
+		h.Write(b[:])
+	}
+}
+
+// TestBuildKernelWeightingGoldenOutput pins the bit-exact output (pixels,
+// weights, seam map) of every drizzle kernel under every weighting mode. The
+// golden hashes were recorded before the per-frame pixel model was introduced,
+// so any change to the per-pixel value/weight arithmetic fails here.
+func TestBuildKernelWeightingGoldenOutput(t *testing.T) {
+	kernels := []DrizzleKernel{KernelSquare, KernelPoint, KernelTurbo, KernelGaussian, KernelTophat, KernelLanczos2, KernelLanczos3}
+	modes := []WeightingMode{WeightUniform, WeightExposure, WeightERR}
+	golden := map[string]uint64{
+		"kernel0/weight0": 0x4f2b1283ca47cc65,
+		"kernel0/weight1": 0xaf631c3ac2609bc,
+		"kernel0/weight2": 0x838a191c96f1c080,
+		"kernel1/weight0": 0x5dab175eee5fc3a0,
+		"kernel1/weight1": 0x5bd0fc226ac601c9,
+		"kernel1/weight2": 0x9b23cb1785b61398,
+		"kernel2/weight0": 0x5dab175eee5fc3a0,
+		"kernel2/weight1": 0x5bd0fc226ac601c9,
+		"kernel2/weight2": 0x9b23cb1785b61398,
+		"kernel3/weight0": 0xaedd2e4dbe6b4699,
+		"kernel3/weight1": 0x1ce697e33f7eae20,
+		"kernel3/weight2": 0xc14e5bc768310eaf,
+		"kernel4/weight0": 0x2d3d5c2fa29917ec,
+		"kernel4/weight1": 0x1ff46ccba74e29b3,
+		"kernel4/weight2": 0x6c7b8e9d222a3096,
+		"kernel5/weight0": 0x866c69af195027b9,
+		"kernel5/weight1": 0xcce55d3e3640e43b,
+		"kernel5/weight2": 0x8ea5362932b0f79c,
+		"kernel6/weight0": 0x6da5205698406723,
+		"kernel6/weight1": 0xaec4117c39276362,
+		"kernel6/weight2": 0x6785bce41b1a3419,
+	}
+	for _, k := range kernels {
+		for _, m := range modes {
+			name := fmt.Sprintf("kernel%d/weight%d", k, m)
+			t.Run(name, func(t *testing.T) {
+				result, err := Build(drizzleGoldenInputs(16), Options{
+					Scale: 1, PixFrac: 0.8, SepKernel: k, FinalKernel: k, WeightingMode: m, DiagnosticProducts: true,
+				})
+				if err != nil {
+					t.Fatalf("Build: %v", err)
+				}
+				h := fnv.New64a()
+				hashFloat32s(h, result.Pixels)
+				hashFloat32s(h, result.Weights)
+				hashFloat32s(h, result.Seam)
+				got := h.Sum64()
+				if want := golden[name]; got != want {
+					t.Fatalf("output hash = %#x, want %#x", got, want)
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkDrizzleKernelWeightERR measures the per-pixel drizzle loop on one
+// 1024x1024 calibrated-flux frame with ERR weighting (the path that evaluates
+// BUNIT and ERR for every source pixel).
+func BenchmarkDrizzleKernelWeightERR(b *testing.B) {
+	const n = 1024
+	in := makeInput("bench_cal.fits", n, n, filledPixels(n, n, 5), headerWithCRPIX(n/2, n/2))
+	in.BUnit = "MJy/sr"
+	in.ERRPixels = filledPixels(n, n, 0.5)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Build([]Input{in}, Options{Scale: 1, PixFrac: 0.8, WeightingMode: WeightERR}); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
