@@ -4,11 +4,10 @@ import (
 	"fmt"
 	"sync"
 
-	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/widget"
 
 	"gofitsv3/internal/fitsio"
+	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
 )
 
@@ -60,8 +59,11 @@ func (ws *composeWorkspace) crossChannelClean() {
 		return
 	}
 
-	progressDialog := dialog.NewCustom("Cleaning", "Building star mask and removing artifacts...", widget.NewProgressBarInfinite(), ws.win)
-	progressDialog.Show()
+	// The worker reads detached copies and returns cleaned pixels; the images
+	// are only updated on the UI goroutine, and only if no slot was replaced.
+	srcImgs := [3]*models.LoadedImage{ws.imgs[0], ws.imgs[1], ws.imgs[2]}
+	srcData := [3]fitsio.ImageData{ws.imgs[0].HDU.Data, ws.imgs[1].HDU.Data, ws.imgs[2].HDU.Data}
+	job := startUIJob(&ws.modalJobs, "Cleaning", "Building star mask and removing artifacts...", ws.win)
 
 	go func() {
 		cropTopLeft := func(data fitsio.ImageData, width, height int) []float32 {
@@ -84,7 +86,7 @@ func (ws *composeWorkspace) crossChannelClean() {
 		channels := make([][]float32, 0, 3)
 		sigmas := make([]float64, 0, 3)
 		for i := 0; i < 3; i++ {
-			cropped := cropTopLeft(ws.imgs[i].HDU.Data, sharedWidth, sharedHeight)
+			cropped := cropTopLeft(srcData[i], sharedWidth, sharedHeight)
 			channels = append(channels, cropped)
 			_, sig := processing.EstimateBackground(cropped)
 			sigmas = append(sigmas, sig)
@@ -104,20 +106,28 @@ func (ws *composeWorkspace) crossChannelClean() {
 		}
 		wg.Wait()
 
+		var outs [3][]float32
 		for i := 0; i < 3; i++ {
-			out := make([]float32, len(ws.imgs[i].HDU.Data.Pixels))
-			copy(out, ws.imgs[i].HDU.Data.Pixels)
-			pasteTopLeft(out, ws.imgs[i].HDU.Data.Width, cleaned[i], sharedWidth, sharedHeight)
-			ws.imgs[i].HDU.Data.Pixels = out
-			clearComposeOrigPixels(&ws.origPixels, i)
+			outs[i] = make([]float32, len(srcData[i].Pixels))
+			copy(outs[i], srcData[i].Pixels)
+			pasteTopLeft(outs[i], srcData[i].Width, cleaned[i], sharedWidth, sharedHeight)
 		}
 
-		fyne.Do(func() {
+		job.finish(func() {
+			for i := 0; i < 3; i++ {
+				if ws.imgs[i] != srcImgs[i] {
+					dialog.ShowInformation("Clean", "Channels changed while cleaning; nothing was applied.", ws.win)
+					return
+				}
+			}
+			for i := 0; i < 3; i++ {
+				ws.imgs[i].HDU.Data.Pixels = outs[i]
+				clearComposeOrigPixels(&ws.origPixels, i)
+			}
 			ws.win.Canvas().Refresh(ws.win.Content())
-			progressDialog.Hide()
 			ws.refresh()
 			ws.restoreViewportStates(savedStates)
 			dialog.ShowInformation("Complete", fmt.Sprintf("Star masks generated and cosmic rays eradicated in the shared %dx%d region.", sharedWidth, sharedHeight), ws.win)
-		})
+		}, nil)
 	}()
 }

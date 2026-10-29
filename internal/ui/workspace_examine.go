@@ -371,8 +371,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 	magicBtn.SetToolTip("Estimate stretch levels using the selected Magic target preset, then apply Auto MTF")
 
 	loadFitsFromPath := func(path string, preserveStretch bool) {
-		progressDialog := dialog.NewCustom("Loading Image", "Reading image data...", widget.NewProgressBarInfinite(), win)
-		progressDialog.Show()
+		job := startUIJob(nil, "Loading Image", "Reading image data...", win)
 		var savedState models.ChannelState
 		selectedExtVer := ""
 		selectedChip := 0
@@ -395,8 +394,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 		go func() {
 			imgs, ids, loadErr := loadExaminePlanesFromPath(path)
 			diagnosticLayers := loadExamineDiagnosticsFromPath(path)
-			fyne.Do(func() {
-				progressDialog.Hide()
+			job.finish(func() {
 				if generation != state.loadGeneration {
 					return
 				}
@@ -460,7 +458,7 @@ func newExamineWorkspace(app fyne.App, win fyne.Window) fyne.CanvasObject {
 				clearMeasurement()
 				headerList.Refresh()
 				refresh()
-			})
+			}, nil)
 		}()
 	}
 

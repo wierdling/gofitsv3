@@ -3,14 +3,15 @@ package ui
 import (
 	"fmt"
 	"image"
+	"maps"
 	"math"
 	"strings"
 
-	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
+	"gofitsv3/internal/fitsio"
 	"gofitsv3/internal/models"
 	"gofitsv3/internal/processing"
 	"gofitsv3/internal/utils"
@@ -24,8 +25,13 @@ func (ws *composeWorkspace) normalizeScale() {
 	if ws.largeMode && ws.largeStore != nil {
 		linesG := utils.FormatHeadersLines(ws.imgs[1].Primary, ws.imgs[1].HDU.Header)
 		targetScale := processing.GetPixelScale(linesG)
-		progressDialog := dialog.NewCustom("Normalizing", "Resampling arrays to match Channel 2 scale...", widget.NewProgressBarInfinite(), ws.win)
-		progressDialog.Show()
+		// Capture everything the worker reads on the UI goroutine.
+		store := ws.largeStore
+		srcImgs := map[int]*models.LoadedImage{0: ws.imgs[0], 2: ws.imgs[2]}
+		ws.largeMu.RLock()
+		descs := maps.Clone(ws.largeArtifacts)
+		ws.largeMu.RUnlock()
+		job := startUIJob(&ws.modalJobs, "Normalizing", "Resampling arrays to match Channel 2 scale...", ws.win)
 		go func() {
 			type result struct {
 				idx, width, height int
@@ -35,12 +41,16 @@ func (ws *composeWorkspace) normalizeScale() {
 			}
 			results := make([]result, 0, 2)
 			for _, idx := range []int{0, 2} {
-				d, ok := ws.largeArtifacts[idx]
+				if job.ctx.Err() != nil {
+					break
+				}
+				d, ok := descs[idx]
 				if !ok {
 					results = append(results, result{idx: idx, err: fmt.Errorf("missing disk artifact for channel %d", idx+1)})
 					continue
 				}
-				lines := utils.FormatHeadersLines(ws.imgs[idx].Primary, ws.imgs[idx].HDU.Header)
+				img := *srcImgs[idx]
+				lines := utils.FormatHeadersLines(img.Primary, img.HDU.Header)
 				sourceScale := processing.GetPixelScale(lines)
 				if targetScale == 0 || math.Abs(sourceScale-targetScale)/targetScale < 0.01 {
 					results = append(results, result{idx: idx, width: d.Width, height: d.Height, d: d})
@@ -48,28 +58,32 @@ func (ws *composeWorkspace) normalizeScale() {
 				}
 				ratio := sourceScale / targetScale
 				newW, newH := int(float64(d.Width)*ratio), int(float64(d.Height)*ratio)
-				nd, err := ws.largeStore.ResizeArtifact(d, newW, newH)
+				nd, err := store.ResizeArtifact(d, newW, newH)
 				var preview *image.RGBA
 				if err == nil {
-					preview, _, _, err = composeLargeStretchedPreview(nd.Path, ws.imgs[idx])
+					preview, _, _, err = composeLargeStretchedPreview(nd.Path, &img)
 				}
 				results = append(results, result{idx: idx, width: newW, height: newH, d: nd, preview: preview, err: err})
 			}
-			fyne.Do(func() {
-				progressDialog.Hide()
+			job.finish(func() {
+				if ws.largeStore != store {
+					return
+				}
 				count := 0
 				for _, r := range results {
 					if r.err != nil {
 						dialog.ShowError(r.err, ws.win)
 						continue
 					}
-					if r.width == 0 {
+					if r.width == 0 || ws.imgs[r.idx] != srcImgs[r.idx] {
 						continue
 					}
+					ws.largeMu.Lock()
 					ws.largeArtifacts[r.idx] = r.d
 					if r.preview != nil {
 						ws.largePreviews[r.idx] = r.preview
 					}
+					ws.largeMu.Unlock()
 					ws.imgs[r.idx].HDU.Data.Width, ws.imgs[r.idx].HDU.Data.Height = r.width, r.height
 					ws.imgs[r.idx].HDU.Data.Pixels = nil
 					clearComposeOrigPixels(&ws.origPixels, r.idx)
@@ -77,7 +91,7 @@ func (ws *composeWorkspace) normalizeScale() {
 				}
 				ws.refresh()
 				dialog.ShowInformation("Complete", fmt.Sprintf("Rescaled %d channel(s) to match Channel 2 pixel scale.", count), ws.win)
-			})
+			}, nil)
 		}()
 		return
 	}
@@ -86,17 +100,28 @@ func (ws *composeWorkspace) normalizeScale() {
 	linesG := utils.FormatHeadersLines(ws.imgs[1].Primary, ws.imgs[1].HDU.Header)
 	targetScale := processing.GetPixelScale(linesG)
 
-	progressDialog := dialog.NewCustom("Normalizing", "Resampling arrays to match Channel 2 scale...", widget.NewProgressBarInfinite(), ws.win)
-	progressDialog.Show()
+	// The worker reads detached copies and returns resized data; the images are
+	// only updated on the UI goroutine, and only if the slot was not replaced.
+	srcImgs := [3]*models.LoadedImage{ws.imgs[0], ws.imgs[1], ws.imgs[2]}
+	srcCopies := [3]models.LoadedImage{*ws.imgs[0], *ws.imgs[1], *ws.imgs[2]}
+	job := startUIJob(&ws.modalJobs, "Normalizing", "Resampling arrays to match Channel 2 scale...", ws.win)
 
 	go func() {
-		resizedCount := 0
+		type resized struct {
+			idx  int
+			data fitsio.ImageData
+		}
+		results := make([]resized, 0, 2)
 		for i := 0; i < 3; i++ {
 			if i == 1 {
 				continue // Channel 2 is the reference
 			}
+			if job.ctx.Err() != nil {
+				break
+			}
+			img := srcCopies[i]
 
-			lines := utils.FormatHeadersLines(ws.imgs[i].Primary, ws.imgs[i].HDU.Header)
+			lines := utils.FormatHeadersLines(img.Primary, img.HDU.Header)
 			sourceScale := processing.GetPixelScale(lines)
 
 			// Skip if scales match within a 1% margin of error to prevent destructive sub-pixel resampling
@@ -105,23 +130,28 @@ func (ws *composeWorkspace) normalizeScale() {
 			}
 
 			ratio := sourceScale / targetScale
-			newW := int(float64(ws.imgs[i].HDU.Data.Width) * ratio)
-			newH := int(float64(ws.imgs[i].HDU.Data.Height) * ratio)
+			newW := int(float64(img.HDU.Data.Width) * ratio)
+			newH := int(float64(img.HDU.Data.Height) * ratio)
 
-			resized := processing.ResizeChannel(ws.imgs[i].HDU.Data.Pixels, ws.imgs[i].HDU.Data.Width, ws.imgs[i].HDU.Data.Height, newW, newH)
-
-			ws.imgs[i].HDU.Data.Pixels = resized
-			ws.imgs[i].HDU.Data.Width = newW
-			ws.imgs[i].HDU.Data.Height = newH
-			clearComposeOrigPixels(&ws.origPixels, i)
-			resizedCount++
+			pixels := processing.ResizeChannel(img.HDU.Data.Pixels, img.HDU.Data.Width, img.HDU.Data.Height, newW, newH)
+			results = append(results, resized{idx: i, data: fitsio.ImageData{Width: newW, Height: newH, Pixels: pixels}})
 		}
 
-		fyne.Do(func() {
-			progressDialog.Hide()
+		job.finish(func() {
+			resizedCount := 0
+			for _, r := range results {
+				if ws.imgs[r.idx] != srcImgs[r.idx] {
+					continue
+				}
+				ws.imgs[r.idx].HDU.Data.Pixels = r.data.Pixels
+				ws.imgs[r.idx].HDU.Data.Width = r.data.Width
+				ws.imgs[r.idx].HDU.Data.Height = r.data.Height
+				clearComposeOrigPixels(&ws.origPixels, r.idx)
+				resizedCount++
+			}
 			ws.refresh()
 			dialog.ShowInformation("Complete", fmt.Sprintf("Rescaled %d channel(s) to match Channel 2 pixel scale.", resizedCount), ws.win)
-		})
+		}, nil)
 	}()
 }
 
@@ -183,11 +213,13 @@ func (ws *composeWorkspace) matchChannelStretch(refIdx int, matchStarCores bool)
 	}
 	refSnapshot := cloneLoadedImageForStretchMatch(ws.imgs[refIdx])
 	targetSnapshots := make([]*models.LoadedImage, 3)
+	targetSources := make([]*models.LoadedImage, 3)
 	targetCount := 0
 	for idx := 0; idx < 3; idx++ {
 		if idx == refIdx || ws.imgs[idx] == nil {
 			continue
 		}
+		targetSources[idx] = ws.imgs[idx]
 		targetSnapshots[idx] = cloneLoadedImageForStretchMatch(ws.imgs[idx])
 		targetCount++
 	}
@@ -196,8 +228,6 @@ func (ws *composeWorkspace) matchChannelStretch(refIdx int, matchStarCores bool)
 		return
 	}
 	if ws.largeMode && ws.largeStore != nil {
-		progressDialog := dialog.NewCustom("Matching Channel Stretch", "Matching channel levels...", widget.NewProgressBarInfinite(), ws.win)
-		progressDialog.Show()
 		ws.largeMu.RLock()
 		refD, ok := ws.largeArtifacts[refIdx]
 		expectedTargets := make(map[int]composeArtifactDescriptor)
@@ -208,10 +238,10 @@ func (ws *composeWorkspace) matchChannelStretch(refIdx int, matchStarCores bool)
 		}
 		ws.largeMu.RUnlock()
 		if !ok {
-			progressDialog.Hide()
 			dialog.ShowError(fmt.Errorf("missing disk artifact for reference channel"), ws.win)
 			return
 		}
+		job := startUIJob(&ws.modalJobs, "Matching Channel Stretch", "Matching channel levels...", ws.win)
 		go func(expected composeArtifactDescriptor) {
 			refSummary, err := largeArtifactStretchSummary(expected.Path, refSnapshot, matchStarCores)
 			type result struct {
@@ -225,6 +255,9 @@ func (ws *composeWorkspace) matchChannelStretch(refIdx int, matchStarCores bool)
 				for idx := range targetSnapshots {
 					if targetSnapshots[idx] == nil {
 						continue
+					}
+					if job.ctx.Err() != nil {
+						break
 					}
 					ws.largeMu.RLock()
 					d, exists := ws.largeArtifacts[idx]
@@ -256,8 +289,7 @@ func (ws *composeWorkspace) matchChannelStretch(refIdx int, matchStarCores bool)
 			if err != nil {
 				results = append(results, result{err: err})
 			}
-			fyne.Do(func() {
-				progressDialog.Hide()
+			job.finish(func() {
 				ws.largeMu.RLock()
 				currentRef, refCurrent := ws.largeArtifacts[refIdx]
 				ws.largeMu.RUnlock()
@@ -273,22 +305,23 @@ func (ws *composeWorkspace) matchChannelStretch(refIdx int, matchStarCores bool)
 					cur, current := ws.largeArtifacts[r.idx]
 					ws.largeMu.RUnlock()
 					expected, expectedOK := expectedTargets[r.idx]
-					if !expectedOK || !current || cur.Generation != expected.Generation || cur.Path != expected.Path {
+					if !expectedOK || !current || cur.Generation != expected.Generation || cur.Path != expected.Path || ws.imgs[r.idx] == nil {
 						continue
 					}
 					applyChannelState(r.idx, r.state, ws.imgs, ws.viewports, ws.controlSets)
 					if r.preview != nil {
+						ws.largeMu.Lock()
 						ws.largePreviews[r.idx] = r.preview
+						ws.largeMu.Unlock()
 					}
 				}
 				ws.refresh()
-			})
+			}, nil)
 		}(refD)
 		return
 	}
 
-	progressDialog := dialog.NewCustom("Matching Channel Stretch", "Matching channel levels...", widget.NewProgressBarInfinite(), ws.win)
-	progressDialog.Show()
+	job := startUIJob(&ws.modalJobs, "Matching Channel Stretch", "Matching channel levels...", ws.win)
 	go func() {
 		type matchResult struct {
 			idx   int
@@ -300,11 +333,13 @@ func (ws *composeWorkspace) matchChannelStretch(refIdx int, matchStarCores bool)
 			if target == nil {
 				continue
 			}
+			if job.ctx.Err() != nil {
+				break
+			}
 			err := matchComposeChannelStretch(refSnapshot, target, matchStarCores)
 			results = append(results, matchResult{idx: idx, state: channelStateFromImage(target), err: err})
 		}
-		fyne.Do(func() {
-			progressDialog.Hide()
+		job.finish(func() {
 			applied := 0
 			failed := make([]string, 0, len(results))
 			ws.withSuspendedRefresh(func() {
@@ -313,7 +348,7 @@ func (ws *composeWorkspace) matchChannelStretch(refIdx int, matchStarCores bool)
 						failed = append(failed, fmt.Sprintf("Channel %d: %v", res.idx+1, res.err))
 						continue
 					}
-					if ws.imgs[res.idx] == nil {
+					if ws.imgs[res.idx] == nil || ws.imgs[res.idx] != targetSources[res.idx] {
 						failed = append(failed, fmt.Sprintf("Channel %d: no longer loaded", res.idx+1))
 						continue
 					}
@@ -329,7 +364,7 @@ func (ws *composeWorkspace) matchChannelStretch(refIdx int, matchStarCores bool)
 			if applied == 0 {
 				dialog.ShowInformation("No Targets", "No channels were matched.", ws.win)
 			}
-		})
+		}, nil)
 	}()
 }
 

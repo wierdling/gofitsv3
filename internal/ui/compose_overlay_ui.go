@@ -152,12 +152,11 @@ func (ws *composeWorkspace) saveLayerGray(l *overlayLayer) {
 
 func (ws *composeWorkspace) loadLayer(l *overlayLayer) {
 	showSingleFITSOpenDialog(ws.app, ws.win, func(path string) {
-		progressDialog := dialog.NewCustom("Loading Layer Image", "Reading FITS data...", widget.NewProgressBarInfinite(), ws.win)
-		progressDialog.Show()
+		job := startUIJob(&ws.modalJobs, "Loading Layer Image", "Reading FITS data...", ws.win)
 		diskLoad := ws.largeMode
+		slot := fmt.Sprintf("overlay-%d", l.idx)
+		request, session, store := ws.nextLargeLoadGeneration(slot)
 		go func() {
-			slot := fmt.Sprintf("overlay-%d", l.idx)
-			request, session, store := ws.nextLargeLoadGeneration(slot)
 			var img *models.LoadedImage
 			var preview *image.RGBA
 			var artifact composeArtifactDescriptor
@@ -171,52 +170,48 @@ func (ws *composeWorkspace) loadLayer(l *overlayLayer) {
 			} else {
 				img, loadErr = loadImageFromPath(path)
 			}
-			if loadErr != nil {
-				fyne.Do(func() {
-					progressDialog.Hide()
-					if ws.loadRequestStillCurrent(slot, request, session) {
-						dialog.ShowError(loadErr, ws.win)
-					}
-				})
-				return
-			}
-			if diskLoad && !ws.largeLoadStillCurrent(slot, request, session, artifact) {
+			if loadErr == nil && diskLoad && (job.ctx.Err() != nil || !ws.largeLoadStillCurrent(slot, request, session, artifact)) {
 				ws.cleanupLargeArtifactIfCurrent(artifact)
+				job.finish(nil, nil)
 				return
 			}
-			if !diskLoad && !ws.loadRequestStillCurrent(slot, request, session) {
-				fyne.Do(func() { progressDialog.Hide() })
-				return
+			dropped := func() {
+				if loadErr == nil && diskLoad {
+					go ws.cleanupLargeArtifactIfCurrent(artifact)
+				}
 			}
-			if diskLoad {
-				ws.largeMu.Lock()
-				current, currentOK := store.Descriptor(slot)
-				if ws.largeStore != store || ws.largeSessionGeneration != session || ws.largeLoadGenerations[slot] != request || !currentOK || current.Generation != artifact.Generation || current.Path != artifact.Path {
-					ws.largeMu.Unlock()
-					ws.cleanupLargeArtifactIfCurrent(artifact)
+			// Publish on the UI goroutine only, for the latest load of the slot.
+			job.finish(func() {
+				if !ws.loadRequestStillCurrent(slot, request, session) {
+					dropped()
 					return
 				}
-				ws.largePreviews[l.idx] = preview
-				ws.largeArtifacts[l.idx] = artifact
-				ws.imgs[l.idx] = img
-				ws.largeMu.Unlock()
-			}
-			fyne.Do(func() {
-				if !diskLoad {
-					if !ws.loadRequestStillCurrent(slot, request, session) {
-						progressDialog.Hide()
+				if loadErr != nil {
+					dialog.ShowError(loadErr, ws.win)
+					return
+				}
+				if diskLoad {
+					ws.largeMu.Lock()
+					current, currentOK := store.Descriptor(slot)
+					if ws.largeStore != store || ws.largeSessionGeneration != session || ws.largeLoadGenerations[slot] != request || !currentOK || current.Generation != artifact.Generation || current.Path != artifact.Path {
+						ws.largeMu.Unlock()
+						dropped()
 						return
 					}
+					ws.largePreviews[l.idx] = preview
+					ws.largeArtifacts[l.idx] = artifact
+					ws.imgs[l.idx] = img
+					ws.largeMu.Unlock()
+				} else {
 					ws.imgs[l.idx] = img
 				}
 				clearComposeOrigPixels(&ws.origPixels, l.idx)
 				if l.control != nil {
 					applyChannelState(l.idx, channelStateFromImage(img), ws.imgs, ws.layerViews(l), ws.layerControls(l))
 				}
-				progressDialog.Hide()
 				ws.refreshLayerPreview(l)
 				ws.updateMenus()
-			})
+			}, dropped)
 		}()
 	})
 }
@@ -529,8 +524,7 @@ func (ws *composeWorkspace) createOverlayLayer(settings models.OrangeLayerState)
 
 func (ws *composeWorkspace) addColoredLayer() {
 	showSingleFITSOpenDialog(ws.app, ws.win, func(path string) {
-		progressDialog := dialog.NewCustom("Loading Layer Image", "Reading FITS data...", widget.NewProgressBarInfinite(), ws.win)
-		progressDialog.Show()
+		job := startUIJob(&ws.modalJobs, "Loading Layer Image", "Reading FITS data...", ws.win)
 		diskLoad := ws.largeMode
 		go func() {
 			// The staging slot is unique per request and becomes the runtime
@@ -552,14 +546,18 @@ func (ws *composeWorkspace) addColoredLayer() {
 			} else {
 				img, loadErr = loadImageFromPath(path)
 			}
-			fyne.Do(func() {
-				progressDialog.Hide()
+			dropped := func() {
+				if loadErr == nil && diskLoad {
+					go ws.cleanupLargeArtifactIfCurrent(artifact)
+				}
+			}
+			job.finish(func() {
 				if loadErr != nil {
 					dialog.ShowError(loadErr, ws.win)
 					return
 				}
 				if diskLoad && !ws.largeLoadStillCurrent(slot, request, session, artifact) {
-					ws.cleanupLargeArtifactIfCurrent(artifact)
+					dropped()
 					return
 				}
 				l, ok := ws.createOverlayLayer(defaultOverlayLayerSettings(len(ws.overlayLayers)))
@@ -585,7 +583,7 @@ func (ws *composeWorkspace) addColoredLayer() {
 				}
 				ws.openOverlayLayerWindow(l)
 				ws.updateMenus()
-			})
+			}, dropped)
 		}()
 	})
 }

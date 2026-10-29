@@ -8,10 +8,17 @@ import (
 	"gofitsv3/internal/mosaic"
 )
 
+// testWorkPath builds an absolute path under a fixture root with the host's
+// separator, since the code under test uses filepath.Dir.
+func testWorkPath(parts ...string) string {
+	return filepath.Join(append([]string{filepath.FromSlash("/work")}, parts...)...)
+}
+
 func TestConfirmReferenceFrameChangeSetWaitsForConfirmationAndDeletesBeforeApply(t *testing.T) {
 	inputs := []mosaic.Input{{Path: testMosaicPath("input", "image.fits")}}
 	oldReference := &mosaic.Input{Path: testMosaicPath("old", "baseline.fits")}
 	newReference := &mosaic.Input{Path: testMosaicPath("new", "baseline.fits")}
+
 	current := oldReference
 	var decide func(bool)
 	var deleted []string

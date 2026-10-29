@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -10,7 +11,6 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/widget"
 	"github.com/wierdling/gofiledialog"
 
 	"gofitsv3/internal/debuglog"
@@ -172,9 +172,6 @@ func (ws *composeWorkspace) loadProject() {
 			globalSelectComposeTab()
 		}
 
-		progressDialog := dialog.NewCustom("Loading Project", "Reading FITS files and restoring saved stretch settings...", widget.NewProgressBarInfinite(), ws.win)
-		progressDialog.Show()
-
 		// Normalize overlay layers: new projects carry OverlayLayers; migrate
 		// legacy Orange/Yellow layers from older projects into the same list.
 		layerStates := append([]models.OrangeLayerState(nil), project.OverlayLayers...)
@@ -232,6 +229,18 @@ func (ws *composeWorkspace) loadProject() {
 			})
 		}
 
+		// The worker only loads; every write to ws.imgs and the large-mode maps
+		// happens on the UI goroutine below so renders and snapshots never race
+		// it. A newer project load supersedes this one.
+		projectCtx, projectGen := ws.projectLoadGen.begin(nil)
+		// Cancel stops the load and rolls back to the previous project; a
+		// newer project load (projectGen) simply drops this one.
+		cancelCtx, cancel := context.WithCancel(projectCtx)
+		progress := newBusyTrackerOnUI("Loading Project", "Reading FITS files and restoring saved stretch settings...", ws.win, cancelCtx, cancel)
+		progressDialog := progress.dialog
+		large := ws.largeMode
+		store := ws.largeStore
+		total := len(ws.imgs)
 		go func() {
 			type loadResult struct {
 				idx      int
@@ -242,7 +251,6 @@ func (ws *composeWorkspace) loadProject() {
 				err      error
 			}
 
-			total := len(ws.imgs)
 			stateForIdx := func(i int) models.ChannelState {
 				if i < 3 {
 					return project.Channels[i]
@@ -251,24 +259,24 @@ func (ws *composeWorkspace) loadProject() {
 			}
 			results := make([]loadResult, 0, total)
 			errors := make([]string, 0, total)
-			if ws.largeMode {
+			if large {
 				// Large-mode project loads are deliberately sequential. Each source is
 				// staged through the artifact transaction before its bounded preview is
 				// generated; no legacy full-pixel loader is used.
 				for i := 0; i < total; i++ {
 					state := stateForIdx(i)
 					res := loadResult{idx: i, state: state}
-					if state.Path != "" {
+					if state.Path != "" && cancelCtx.Err() == nil {
 						slot := fmt.Sprintf("project-%d", i)
-						if ws.largeStore == nil {
+						if store == nil {
 							res.err = fmt.Errorf("disk-backed Compose store is unavailable")
 						} else {
-							img, preview, artifact, loadErr := loadLargeComposeImage(state.Path, ws.largeStore, slot)
+							img, preview, artifact, loadErr := loadLargeComposeImage(state.Path, store, slot)
 							res.img, res.preview, res.artifact, res.err = img, preview, artifact, loadErr
 							if res.err == nil {
 								turns := state.Rotation90 % 4
 								for turns > 0 {
-									artifact, res.err = ws.largeStore.RotateArtifact90CW(artifact)
+									artifact, res.err = store.RotateArtifact90CW(artifact)
 									if res.err != nil {
 										break
 									}
@@ -306,45 +314,81 @@ func (ws *composeWorkspace) loadProject() {
 				}
 			}
 			for _, res := range results {
-				if res.state.Path == "" {
-					ws.imgs[res.idx] = nil
-					continue
-				}
-				if res.err != nil {
+				if res.state.Path != "" && res.err != nil {
 					label := fmt.Sprintf("Channel %d", res.idx+1)
 					if res.idx >= 3 {
 						label = fmt.Sprintf("Layer %d", res.idx-2)
 					}
 					errors = append(errors, fmt.Sprintf("%s: %v", label, res.err))
-					continue
 				}
-				ws.imgs[res.idx] = res.img
-				if ws.largeMode {
-					ws.largeMu.Lock()
-					ws.largeArtifacts[res.idx] = res.artifact
-					ws.largePreviews[res.idx] = res.preview
-					ws.largeMu.Unlock()
-				}
-				clearComposeOrigPixels(&ws.origPixels, res.idx)
 			}
-			if ws.largeMode && len(errors) > 0 {
+			superseded := cancelCtx.Err() != nil || !ws.projectLoadGen.current(projectGen)
+			if large && (len(errors) > 0 || superseded) {
 				// Project replacement is all-or-none in disk mode: discard every
-				// staged artifact when any source fails, including artifacts already
-				// published into the temporary result maps above.
+				// staged artifact when any source fails.
 				for _, res := range results {
 					if res.artifact.Slot != "" {
-						_, _ = ws.largeStore.RemoveSlotIfCurrent(res.artifact)
+						_, _ = store.RemoveSlotIfCurrent(res.artifact)
 					}
-					ws.imgs[res.idx] = nil
-					ws.largeMu.Lock()
-					delete(ws.largeArtifacts, res.idx)
-					delete(ws.largePreviews, res.idx)
-					ws.largeMu.Unlock()
 				}
 			}
 
 			fyne.Do(func() {
-				if ws.largeMode && len(errors) > 0 {
+				defer cancel()
+				if !ws.projectLoadGen.current(projectGen) || len(ws.imgs) != total {
+					debuglog.Log("load compose project: dropped superseded project load")
+					progressDialog.Hide()
+					return
+				}
+				cancelled := cancelCtx.Err() != nil
+				if cancelled && large && !superseded {
+					// Cancelled after the worker finished: discard its staging.
+					go func() {
+						for _, res := range results {
+							if res.artifact.Slot != "" {
+								_, _ = store.RemoveSlotIfCurrent(res.artifact)
+							}
+						}
+					}()
+				}
+				if cancelled && !large {
+					// Roll back in place: channel controls hold the imgs and
+					// origPixels backing arrays, so copy rather than reassign.
+					debuglog.Log("load compose project: cancelled; restoring previous project")
+					ws.imgs = ws.imgs[:len(previousImgs)]
+					copy(ws.imgs, previousImgs)
+					ws.origPixels = ws.origPixels[:len(previousOrig)]
+					copy(ws.origPixels, previousOrig)
+					ws.overlayLayers = previousOverlays
+					for _, l := range previousOverlays {
+						l.win, l.viewport, l.control = nil, nil, nil
+						ws.openOverlayLayerWindow(l)
+					}
+					progressDialog.Hide()
+					ws.updateMenus()
+					ws.refresh()
+					return
+				}
+				if !(large && (len(errors) > 0 || cancelled)) {
+					for _, res := range results {
+						if res.state.Path == "" {
+							ws.imgs[res.idx] = nil
+							continue
+						}
+						if res.err != nil {
+							continue
+						}
+						ws.imgs[res.idx] = res.img
+						if large {
+							ws.largeMu.Lock()
+							ws.largeArtifacts[res.idx] = res.artifact
+							ws.largePreviews[res.idx] = res.preview
+							ws.largeMu.Unlock()
+						}
+						clearComposeOrigPixels(&ws.origPixels, res.idx)
+					}
+				}
+				if large && (len(errors) > 0 || cancelled) {
 					// Restore the detached runtime snapshot before reporting failure.
 					restoreComposeLargeProjectSnapshot(&ws.imgs, &ws.origPixels, &ws.overlayLayers, &ws.largeArtifacts, &ws.largePreviews, previousImgs, previousOrig, previousOverlays, previousArtifacts, previousPreviews)
 					ws.largeMu.Lock()
@@ -366,7 +410,9 @@ func (ws *composeWorkspace) loadProject() {
 					ws.blinkChannels = nil
 					ws.blinkCheck.SetChecked(false)
 					ws.stopBlink()
-					dialog.ShowError(fmt.Errorf("%s", strings.Join(errors, "\n")), ws.win)
+					if len(errors) > 0 && !cancelled {
+						dialog.ShowError(fmt.Errorf("%s", strings.Join(errors, "\n")), ws.win)
+					}
 					progressDialog.Hide()
 					return
 				} else if ws.largeMode {
