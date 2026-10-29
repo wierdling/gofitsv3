@@ -167,3 +167,61 @@ func TestWriteFloat32ImageCloseFailureLeavesNoFile(t *testing.T) {
 	}
 	assertOnlyEntries(t, dir)
 }
+
+func TestCreateFileAtomicFallsBackWithoutHardLinks(t *testing.T) {
+	orig := linkFile
+	linkFile = func(string, string) error { return errors.New("operation not supported") }
+	t.Cleanup(func() { linkFile = orig })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mask.fits")
+	write := func(w io.Writer) error {
+		_, err := w.Write([]byte("new"))
+		return err
+	}
+	if err := CreateFileAtomic(path, write); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "new" {
+		t.Fatalf("destination = %q, want new", got)
+	}
+	if err := CreateFileAtomic(path, write); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("second create err = %v, want ErrExist", err)
+	}
+	assertOnlyEntries(t, dir, "mask.fits")
+}
+
+func TestWriteFileAtomicKeepsModeAndWritesThroughSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.fits")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.fits")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := WriteFileAtomic(link, func(w io.Writer) error {
+		_, err := w.Write([]byte("new"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link replaced by a regular file (%v)", err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "new" {
+		t.Fatalf("target = %q, want new", got)
+	}
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("mode = %v, want %v", after.Mode().Perm(), before.Mode().Perm())
+	}
+}

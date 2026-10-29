@@ -39,7 +39,10 @@ func EncodeFloat32Image(w io.Writer, header Header, data ImageData, exts ...Imag
 	if err := validateImageWithExtensions(data, exts); err != nil {
 		return err
 	}
-	bw := bufio.NewWriter(w)
+	bw, ok := w.(*bufio.Writer)
+	if !ok {
+		bw = bufio.NewWriter(w)
+	}
 	if err := writeHeader(bw, header, data.Width, data.Height); err != nil {
 		return err
 	}

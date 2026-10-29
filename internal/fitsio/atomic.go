@@ -2,7 +2,10 @@ package fitsio
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -35,12 +38,21 @@ func WriteFileAtomic(path string, write func(io.Writer) error) error {
 
 // CreateFileAtomic is WriteFileAtomic for destinations that must not already
 // exist. The completed file is published with a hard link, which fails
-// instead of overwriting an existing path.
+// instead of overwriting an existing path. Where hard links are unsupported
+// (FAT/exFAT, many network shares) it falls back to an existence check and a
+// rename, which can only race with another writer of the same path.
 func CreateFileAtomic(path string, write func(io.Writer) error) error {
 	return writeFileAtomic(path, false, write)
 }
 
+// linkFile is os.Link; tests substitute a failing implementation.
+var linkFile = os.Link
+
 func writeFileAtomic(path string, replace bool, write func(io.Writer) error) (err error) {
+	path, mode, err := resolveAtomicTarget(path)
+	if err != nil {
+		return err
+	}
 	f, err := createAtomicTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
@@ -55,8 +67,8 @@ func writeFileAtomic(path string, replace bool, write func(io.Writer) error) (er
 			_ = os.Remove(tmp)
 		}
 	}()
-	// CreateTemp uses 0600; published outputs keep the os.Create-style mode.
-	if err = f.Chmod(0o644); err != nil {
+	// CreateTemp uses 0600; keep an existing file's mode, else os.Create's.
+	if err = f.Chmod(mode); err != nil {
 		return err
 	}
 	bw := bufio.NewWriter(f)
@@ -76,10 +88,48 @@ func writeFileAtomic(path string, replace bool, write func(io.Writer) error) (er
 	if replace {
 		return os.Rename(tmp, path)
 	}
-	if err = os.Link(tmp, path); err != nil {
+	return publishExclusive(tmp, path)
+}
+
+// resolveAtomicTarget returns the file to replace and the mode to publish it
+// with. A symlink is written through to its target rather than replaced, and
+// an existing file keeps its permissions. Other non-regular paths are refused.
+func resolveAtomicTarget(path string) (string, os.FileMode, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return path, 0o644, nil
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		if path, err = filepath.EvalSymlinks(path); err != nil {
+			return "", 0, err
+		}
+		if info, err = os.Stat(path); err != nil {
+			return "", 0, err
+		}
+	}
+	if !info.Mode().IsRegular() {
+		return "", 0, fmt.Errorf("%s is not a regular file", path)
+	}
+	return path, info.Mode().Perm(), nil
+}
+
+func publishExclusive(tmp, path string) error {
+	err := linkFile(tmp, path)
+	if err == nil {
+		// The destination is published; a leftover temporary name is harmless.
+		_ = os.Remove(tmp)
+		return nil
+	}
+	if errors.Is(err, fs.ErrExist) {
 		return err
 	}
-	// The destination is published; a leftover temporary name is harmless.
-	_ = os.Remove(tmp)
-	return nil
+	if _, statErr := os.Lstat(path); statErr == nil {
+		return &fs.PathError{Op: "create", Path: path, Err: fs.ErrExist}
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return statErr
+	}
+	return os.Rename(tmp, path)
 }

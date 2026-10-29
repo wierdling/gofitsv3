@@ -893,16 +893,27 @@ func blendDiskOverlayScaled(ctx context.Context, bases [3]string, overlay string
 	return nil
 }
 
-// closeWritableDiskArtifact syncs and closes an artifact modified in place,
-// reporting the first failure through errp. Write errors can surface only at
-// Sync or Close, and the artifact may later be published as a valid cache.
+// closeWritableDiskArtifact closes an artifact modified in place, reporting a
+// Close failure through errp when nothing failed earlier. Most of these are
+// scratch stages, so they are not fsynced here; publishDiskArtifacts syncs
+// only the final set before it becomes a cache.
 func closeWritableDiskArtifact(a *fitsio.Float32Artifact, errp *error) {
-	if *errp == nil {
-		*errp = a.Sync()
-	}
 	if err := a.Close(); *errp == nil {
 		*errp = err
 	}
+}
+
+// syncDiskArtifactFile flushes a closed artifact file to stable storage.
+func syncDiskArtifactFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // publishDiskArtifacts atomically publishes a complete R,G,B artifact set.
@@ -949,6 +960,9 @@ func publishDiskArtifacts(ctx context.Context, src, dst [3]string) (err error) {
 		}
 		if sameDiskPath(src[i], dst[i]) {
 			return fmt.Errorf("artifact source overlaps destination %d", i)
+		}
+		if err := syncDiskArtifactFile(src[i]); err != nil {
+			return err
 		}
 		if e := diskComposeRename(dst[i], backups[i]); e != nil {
 			if !os.IsNotExist(e) {
