@@ -37,9 +37,8 @@ func run() error {
 	if *input == "" || *out == "" {
 		return fmt.Errorf("-input and -output are required")
 	}
-	modes := map[string]stretch.Mode{"linear": stretch.Linear, "log": stretch.Log, "asinh": stretch.Asinh, "sqrt": stretch.Sqrt, "mtf": stretch.MTF}
-	m, ok := modes[*mode]
-	if !ok {
+	m, ok := stretch.ParseMode(*mode)
+	if !ok || m == stretch.HistEq || m == stretch.GHS {
 		return fmt.Errorf("unsupported stretch mode %q", *mode)
 	}
 	peakProvided, backgroundProvided := false, false

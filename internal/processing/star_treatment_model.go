@@ -18,6 +18,7 @@ type StarTreatmentModel struct {
 	fits     []StarTreatmentFit
 	usable   int // count of fits actually indexed/rendered; the rest are kept in fits only for diagnostics
 	meta     models.LoadedImage
+	scalar   stretch.Scalar // prepared from meta
 	strength float64
 	w, h     int
 	cell     int
@@ -44,6 +45,7 @@ func NewStarTreatmentModel(fits []StarTreatmentFit, w, h int, meta models.Loaded
 		return nil, fmt.Errorf("star stretch strength must be between 0 and 1")
 	}
 	m := &StarTreatmentModel{meta: scalarStretchMeta(meta), strength: strength, w: w, h: h, cell: starTreatmentIndexCell}
+	m.scalar = stretch.NewScalar(m.meta.StretchParams())
 	m.cols = (w + m.cell - 1) / m.cell
 	m.rows = (h + m.cell - 1) / m.cell
 	m.buckets = make([][]int, m.cols*m.rows)
@@ -114,7 +116,7 @@ func (m *StarTreatmentModel) TreatedStretch(v float32, x, y float64) float32 {
 // editable mask does. Corrections from overlapping stars max-combine so a
 // shared pixel is never treated twice.
 func (m *StarTreatmentModel) stretchAt(v float32, x, y float64, maskWeight float64) float32 {
-	base := stretchDiskValue(v, m.meta)
+	base := m.scalar.Apply(v)
 	if m.strength == 0 || m.usable == 0 || maskWeight == 0 {
 		return base
 	}

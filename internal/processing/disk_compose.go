@@ -575,6 +575,7 @@ func stretchDiskArtifact(ctx context.Context, path string, meta models.LoadedIma
 	}
 	defer closeWritableDiskArtifact(a, &err)
 	row := make([]float32, a.Width)
+	s := stretch.NewScalar(meta.StretchParams())
 	for y := 0; y < a.Height; y++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -584,10 +585,10 @@ func stretchDiskArtifact(ctx context.Context, path string, meta models.LoadedIma
 		}
 		for i, v := range row {
 			if len(cdf) == 256 {
-				x := stretchNormalizedValue(v, meta)
+				x := stretchNormalizedValue(v, &meta)
 				row[i] = cdf[int(clamp01(float64(x))*255)]
 			} else {
-				row[i] = stretchDiskValue(v, meta)
+				row[i] = s.Apply(v)
 			}
 		}
 		if err := a.WriteRow(y, row); err != nil {
@@ -597,7 +598,7 @@ func stretchDiskArtifact(ctx context.Context, path string, meta models.LoadedIma
 	return nil
 }
 
-func stretchNormalizedValue(v float32, img models.LoadedImage) float32 {
+func stretchNormalizedValue(v float32, img *models.LoadedImage) float32 {
 	if !finite(float64(v)) {
 		return 0
 	}
@@ -631,7 +632,7 @@ func diskHistEqCDF(ctx context.Context, path string, meta models.LoadedImage) ([
 			return nil, err
 		}
 		for _, v := range row {
-			hist[int(clamp01(float64(stretchNormalizedValue(v, meta)))*255)]++
+			hist[int(clamp01(float64(stretchNormalizedValue(v, &meta)))*255)]++
 		}
 	}
 	cdf := make([]float32, 256)
@@ -765,7 +766,8 @@ func (s *artifactSampler) sample(x, y float64) float32 {
 func diskStretchFunc(src DiskChannel, meta models.LoadedImage, sw, sh int) (func(v float32, x, y float64) float32, error) {
 	t := src.Image.StarTreatment
 	if t == nil {
-		return func(v float32, _, _ float64) float32 { return stretchDiskValue(v, meta) }, nil
+		s := stretch.NewScalar(meta.StretchParams())
+		return func(v float32, _, _ float64) float32 { return s.Apply(v) }, nil
 	}
 	if !t.MatchesStretch(meta) {
 		return nil, fmt.Errorf("star treatment for %s was prepared for different stretch settings", src.ArtifactPath)
@@ -776,74 +778,13 @@ func diskStretchFunc(src DiskChannel, meta models.LoadedImage, sw, sh int) (func
 	return t.TreatedStretch, nil
 }
 
-func stretchDiskValue(v float32, img models.LoadedImage) float32 {
-	if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-		return 0
-	}
-	bg, peak, scaled := img.Background, img.Peak, img.ScaledPeak
-	if math.IsNaN(bg) || math.IsInf(bg, 0) {
-		bg = 0
-	}
-	if math.IsNaN(peak) || math.IsInf(peak, 0) || peak <= bg {
-		peak = bg + 1
-	}
-	if scaled <= 0 || math.IsNaN(scaled) || math.IsInf(scaled, 0) {
-		scaled = 100
-	}
-	x := (float64(v) - bg) * scaled / (peak - bg)
-	if x < 0 {
-		x = 0
-	}
-	var out float64
-	switch img.Mode {
-	case stretch.HistEq:
-		// Histogram equalisation is applied in a streaming second pass by
-		// callers that need exact CDF parity; this fallback preserves the
-		// normalized value for one-pass consumers.
-		out = x / scaled
-	case stretch.Log:
-		out = math.Log1p(x) / math.Log1p(scaled)
-	case stretch.Asinh:
-		b := img.AsinhScale
-		if b <= 0 {
-			b = stretch.DefaultAsinhScale
-		}
-		out = math.Asinh(x/b) / math.Asinh(scaled/b)
-	case stretch.Sqrt:
-		out = math.Sqrt(x) / math.Sqrt(scaled)
-	case stretch.MTF:
-		m := img.MTFMidtone
-		if m <= 0 || m >= 1 {
-			m = stretch.DefaultMTFMidtone
-		}
-		out = stretch.Mtf(m, x/scaled)
-	case stretch.GHS:
-		d := img.GHSStretch
-		if d <= 0 {
-			d = stretch.DefaultGHSStretch
-		}
-		sp := img.GHSSymmetry
-		if sp <= 0 || sp >= 1 {
-			sp = stretch.DefaultGHSSymmetry
-		}
-		out = stretch.NewGHS(d, img.GHSLocal, sp, 0, 1).Eval(x / scaled)
-	default:
-		out = x / scaled
-	}
-	if out < 0 || math.IsNaN(out) || math.IsInf(out, 0) {
-		out = 0
-	}
-	if out > 1 {
-		out = 1
-	}
-	return float32(out)
-}
-
 // DiskStretchPreviewValue applies the same bounded scalar stretch used by the
 // disk compositor; it intentionally allocates nothing and is safe for UI
-// preview sampling.
+// preview sampling. It prepares the stretch on every call, so per-pixel loops
+// should build a stretch.Scalar once instead.
 func DiskStretchPreviewValue(v float32, img models.LoadedImage) float32 {
-	return stretchDiskValue(v, img)
+	s := stretch.NewScalar(img.StretchParams())
+	return s.Apply(v)
 }
 
 func blendDiskOverlay(ctx context.Context, bases [3]string, overlay string, s models.OrangeLayerState, w, h int) error {

@@ -63,6 +63,13 @@ type LoadedImage struct {
 	StarTreatment StretchTreatment
 }
 
+// StretchParams returns the settings the scalar stretch depends on.
+func (img *LoadedImage) StretchParams() stretch.Params {
+	return stretch.Params{Mode: img.Mode, Background: img.Background, Peak: img.Peak, ScaledPeak: img.ScaledPeak,
+		AsinhScale: img.AsinhScale, MTFMidtone: img.MTFMidtone,
+		GHSStretch: img.GHSStretch, GHSLocal: img.GHSLocal, GHSSymmetry: img.GHSSymmetry}
+}
+
 // StarStretchState is the per-source gentler star stretch setting.
 type StarStretchState struct {
 	Enabled  bool    `json:"enabled"`

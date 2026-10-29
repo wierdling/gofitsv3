@@ -161,22 +161,8 @@ func setStretchParamEntries(control *models.ChannelControl, img *models.LoadedIm
 }
 
 func modeToLabel(m stretch.Mode) string {
-	switch m {
-	case stretch.Linear:
-		return "Linear"
-	case stretch.Log:
-		return "Log"
-	case stretch.Asinh:
-		return "Asinh"
-	case stretch.Sqrt:
-		return "Sqrt"
-	case stretch.HistEq:
-		return "HistEq"
-	case stretch.MTF:
-		return "MTF"
-	case stretch.GHS:
-		return "GHS"
-	default:
-		return "Linear"
+	if !m.Valid() {
+		return stretch.Linear.String()
 	}
+	return m.String()
 }

@@ -71,7 +71,7 @@ func TestStarTreatmentModelIndexMatchesBruteForce(t *testing.T) {
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			v := pixels[y*w+x]
-			base := stretchDiskValue(v, starTreatmentTestMeta)
+			base := DiskStretchPreviewValue(v, starTreatmentTestMeta)
 			correction := 0.
 			for _, f := range model.Fits() {
 				weight := starTreatmentFitWeight(float64(x), float64(y), f)
@@ -118,7 +118,7 @@ func TestStarTreatmentModelZeroStrengthAndOutsideAreOrdinaryStretch(t *testing.T
 	reduced := false
 	for i, v := range pixels {
 		x, y := float64(i%w), float64(i/w)
-		base := stretchDiskValue(v, starTreatmentTestMeta)
+		base := DiskStretchPreviewValue(v, starTreatmentTestMeta)
 		if got := zero.TreatedStretch(v, x, y); got != base {
 			t.Fatalf("strength zero changed pixel %d: %v vs %v", i, got, base)
 		}

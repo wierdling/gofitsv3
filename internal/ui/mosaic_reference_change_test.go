@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -8,9 +9,9 @@ import (
 )
 
 func TestConfirmReferenceFrameChangeSetWaitsForConfirmationAndDeletesBeforeApply(t *testing.T) {
-	inputs := []mosaic.Input{{Path: `C:\work\input\image.fits`}}
-	oldReference := &mosaic.Input{Path: `C:\work\old\baseline.fits`}
-	newReference := &mosaic.Input{Path: `C:\work\new\baseline.fits`}
+	inputs := []mosaic.Input{{Path: testMosaicPath("input", "image.fits")}}
+	oldReference := &mosaic.Input{Path: testMosaicPath("old", "baseline.fits")}
+	newReference := &mosaic.Input{Path: testMosaicPath("new", "baseline.fits")}
 	current := oldReference
 	var decide func(bool)
 	var deleted []string
@@ -32,15 +33,15 @@ func TestConfirmReferenceFrameChangeSetWaitsForConfirmationAndDeletesBeforeApply
 	if current != newReference {
 		t.Fatal("reference was not updated after confirmed deletion")
 	}
-	wantDirectories := []string{`C:\work\input`, `C:\work\old`}
+	wantDirectories := []string{testMosaicPath("input"), testMosaicPath("old")}
 	if !reflect.DeepEqual(deleted, wantDirectories) {
 		t.Fatalf("deleted directories = %#v, want %#v", deleted, wantDirectories)
 	}
 }
 
 func TestConfirmReferenceFrameChangeClearNoRetainsSidecars(t *testing.T) {
-	inputs := []mosaic.Input{{Path: `C:\work\input\image.fits`}}
-	oldReference := &mosaic.Input{Path: `C:\work\old\baseline.fits`}
+	inputs := []mosaic.Input{{Path: testMosaicPath("input", "image.fits")}}
+	oldReference := &mosaic.Input{Path: testMosaicPath("old", "baseline.fits")}
 	current := oldReference
 	deleted := false
 
@@ -60,9 +61,9 @@ func TestConfirmReferenceFrameChangeClearNoRetainsSidecars(t *testing.T) {
 }
 
 func TestConfirmReferenceFrameChangeCancellationLeavesReferenceUntouched(t *testing.T) {
-	inputs := []mosaic.Input{{Path: `C:\work\input\image.fits`}}
-	oldReference := &mosaic.Input{Path: `C:\work\old\baseline.fits`}
-	newReference := &mosaic.Input{Path: `C:\work\new\baseline.fits`}
+	inputs := []mosaic.Input{{Path: testMosaicPath("input", "image.fits")}}
+	oldReference := &mosaic.Input{Path: testMosaicPath("old", "baseline.fits")}
+	newReference := &mosaic.Input{Path: testMosaicPath("new", "baseline.fits")}
 	current := oldReference
 
 	confirmReferenceFrameChangeWith(inputs, current, newReference, func() { current = newReference }, func(_ string, _ func(bool)) {
@@ -79,26 +80,32 @@ func TestConfirmReferenceFrameChangeCancellationLeavesReferenceUntouched(t *test
 
 func TestMosaicAlignmentSidecarDirectories(t *testing.T) {
 	inputs := []mosaic.Input{
-		{Path: `C:\work\blue\one.fits`},
-		{Path: `C:\work\red\two.fits`},
-		{Path: `C:\work\blue\three.fits`},
+		{Path: testMosaicPath("blue", "one.fits")},
+		{Path: testMosaicPath("red", "two.fits")},
+		{Path: testMosaicPath("blue", "three.fits")},
 	}
-	reference := mosaic.Input{Path: `C:\work\reference\baseline.fits`}
+	reference := mosaic.Input{Path: testMosaicPath("reference", "baseline.fits")}
 
 	got := mosaicAlignmentSidecarDirectories(inputs, reference)
-	want := []string{`C:\work\blue`, `C:\work\red`, `C:\work\reference`}
+	want := []string{testMosaicPath("blue"), testMosaicPath("red"), testMosaicPath("reference")}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mosaicAlignmentSidecarDirectories() = %#v, want %#v", got, want)
 	}
 }
 
 func TestMosaicAlignmentSidecarDirectoriesIncludesReferenceDirectoryOnce(t *testing.T) {
-	inputs := []mosaic.Input{{Path: `C:\work\reference\target.fits`}}
-	reference := mosaic.Input{Path: `C:\work\reference\baseline.fits`}
+	inputs := []mosaic.Input{{Path: testMosaicPath("reference", "target.fits")}}
+	reference := mosaic.Input{Path: testMosaicPath("reference", "baseline.fits")}
 
 	got := mosaicAlignmentSidecarDirectories(inputs, reference)
-	want := []string{`C:\work\reference`}
+	want := []string{testMosaicPath("reference")}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mosaicAlignmentSidecarDirectories() = %#v, want %#v", got, want)
 	}
+}
+
+// testMosaicPath builds an absolute path under a fixed root with the host
+// separator, so filepath.Dir splits it on every OS.
+func testMosaicPath(elem ...string) string {
+	return filepath.Join(append([]string{string(filepath.Separator), "work"}, elem...)...)
 }
