@@ -67,6 +67,9 @@ func LoadFile(path string) (*File, error) {
 		pos += int64(headerBytes)
 		end, err := dataUnitEnd(hdr, pos, info.Size())
 		if err != nil {
+			if errors.Is(err, errTruncatedDataUnit) && len(hdus) > 0 {
+				break
+			}
 			return nil, err
 		}
 
@@ -165,6 +168,9 @@ func loadFileFilteredIndexed(path string, decode func(index int, hdr Header) boo
 		}
 		end, err := dataUnitEnd(hdr, pos, info.Size())
 		if err != nil {
+			if errors.Is(err, errTruncatedDataUnit) && len(hdus) > 0 {
+				break
+			}
 			return nil, err
 		}
 		if dataBytes > 0 && decode(index, hdr) {
@@ -305,6 +311,12 @@ func hduDataBytes(hdr Header) (int, error) {
 	return dataBytes, nil
 }
 
+// hduDataBytesOrZero is hduDataBytes with invalid headers treated as empty.
+func hduDataBytesOrZero(hdr Header) int {
+	n, _ := hduDataBytes(hdr)
+	return n
+}
+
 // dataUnitEnd returns the offset just past the padded data unit that starts
 // at dataOffset, after checking the unpadded data fits in a file of fileSize
 // bytes. Callers run it before decoding, so a corrupt header cannot request
@@ -315,10 +327,14 @@ func dataUnitEnd(hdr Header, dataOffset, fileSize int64) (int64, error) {
 		return 0, err
 	}
 	if int64(unit) > fileSize-dataOffset {
-		return 0, fmt.Errorf("HDU data (%d bytes) exceeds remaining file size (%d bytes)", unit, fileSize-dataOffset)
+		return 0, fmt.Errorf("%w: HDU data (%d bytes) exceeds remaining file size (%d bytes)", errTruncatedDataUnit, unit, fileSize-dataOffset)
 	}
 	return dataOffset + int64(unit+padding(unit)), nil
 }
+
+// errTruncatedDataUnit marks an HDU whose data runs past the end of the file.
+// Whole-file walkers keep the complete HDUs before it instead of failing.
+var errTruncatedDataUnit = errors.New("truncated FITS data unit")
 
 func abs(v int) int {
 	if v < 0 {
@@ -433,6 +449,11 @@ func readImage(r *bufio.Reader, hdr Header) (HDU, int, error) {
 	dataBytes, err := checkedImageDataBytes(hdr)
 	if err != nil {
 		return HDU{}, 0, err
+	}
+	if dataBytes == 0 && hduDataBytesOrZero(hdr) == 0 {
+		// An empty data unit (a zero-length axis or GCOUNT=0) has no plane to
+		// decode; return the header alone rather than reading past raw.
+		return HDU{Header: hdr, ExtName: HeaderString(hdr, "EXTNAME")}, 0, nil
 	}
 	width := parseInt(hdr.Cards["NAXIS1"])
 	height := parseInt(hdr.Cards["NAXIS2"])

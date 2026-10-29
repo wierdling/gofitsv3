@@ -151,6 +151,7 @@ func writeHeader(w *bufio.Writer, header Header, width, height int) error {
 	}
 	cards["EXTEND"] = "T"
 	delete(cards, "END")
+	stripScalingCards(cards)
 
 	ordered := []string{"SIMPLE", "BITPIX", "NAXIS"}
 	if width > 0 && height > 0 {
@@ -180,8 +181,19 @@ func writeExtensionHeader(w *bufio.Writer, ext ImageExtension) error {
 	delete(cards, "SIMPLE")
 	delete(cards, "EXTEND")
 	delete(cards, "END")
+	stripScalingCards(cards)
 
 	return emitHeaderCards(w, cards, []string{"XTENSION", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "PCOUNT", "GCOUNT", "EXTNAME"})
+}
+
+// stripScalingCards drops integer sample scaling copied from a source header.
+// The reader already applied BZERO/BSCALE/BLANK, so the data written here is
+// physical floats (or exact int32 mask bits); keeping the cards would make
+// other FITS readers scale it a second time.
+func stripScalingCards(cards map[string]string) {
+	delete(cards, "BZERO")
+	delete(cards, "BSCALE")
+	delete(cards, "BLANK")
 }
 
 // emitHeaderCards writes the required cards (in the given order) followed by any

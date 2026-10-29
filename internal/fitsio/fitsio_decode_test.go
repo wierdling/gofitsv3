@@ -363,3 +363,79 @@ func assertPixels(t *testing.T, label string, got, want []float32) {
 		}
 	}
 }
+
+func TestEmptyCubeDecodesWithoutPanic(t *testing.T) {
+	// NAXIS3=0 makes the data unit empty even though NAXIS1*NAXIS2 > 0.
+	data := headerBlock(
+		cardLine("SIMPLE", "T"),
+		cardLine("BITPIX", "16"),
+		cardLine("NAXIS", "3"),
+		cardLine("NAXIS1", "4"),
+		cardLine("NAXIS2", "4"),
+		cardLine("NAXIS3", "0"),
+	)
+	path := writeTestFITS(t, data)
+	f, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.HDUs) != 1 || f.HDUs[0].Data.Pixels != nil {
+		t.Fatalf("LoadFile = %d HDUs, pixels %v; want 1 header-only HDU", len(f.HDUs), f.HDUs[0].Data.Pixels)
+	}
+	if _, _, err := LoadSelectedHDU(path, "", ""); err != nil {
+		t.Fatalf("LoadSelectedHDU: %v", err)
+	}
+}
+
+func TestLoadFileKeepsHDUsBeforeTruncatedTail(t *testing.T) {
+	data := fitsHDU("SCI", "", 2, 2, []float32{1, 2, 3, 4}, nil)
+	// A trailing extension whose data was cut off entirely.
+	data = append(data, headerBlock(
+		cardLine("XTENSION", "'IMAGE   '"),
+		cardLine("BITPIX", "-32"),
+		cardLine("NAXIS", "2"),
+		cardLine("NAXIS1", "100"),
+		cardLine("NAXIS2", "100"),
+		cardLine("PCOUNT", "0"),
+		cardLine("GCOUNT", "1"),
+	)...)
+	path := writeTestFITS(t, data)
+
+	f, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.HDUs) != 1 {
+		t.Fatalf("LoadFile kept %d HDUs, want 1", len(f.HDUs))
+	}
+	assertPixels(t, "LoadFile", f.HDUs[0].Data.Pixels, []float32{1, 2, 3, 4})
+
+	meta, err := LoadFileMetadata(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.HDUs) != 1 {
+		t.Fatalf("LoadFileMetadata kept %d HDUs, want 1", len(meta.HDUs))
+	}
+}
+
+func TestWriteStripsIntegerScalingCards(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.fits")
+	header := Header{Cards: map[string]string{"BZERO": "32768", "BSCALE": "1", "BLANK": "-32768", "OBJECT": "'M31'"}}
+	if err := WriteFloat32Image(path, header, ImageData{Width: 2, Height: 1, Pixels: []float32{0, 65535}}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"BZERO", "BSCALE", "BLANK"} {
+		if _, ok := f.HDUs[0].Header.Cards[key]; ok {
+			t.Errorf("written header still has %s", key)
+		}
+	}
+	if _, ok := f.HDUs[0].Header.Cards["OBJECT"]; !ok {
+		t.Error("written header lost OBJECT")
+	}
+	assertPixels(t, "round trip", f.HDUs[0].Data.Pixels, []float32{0, 65535})
+}

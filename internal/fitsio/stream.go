@@ -172,7 +172,7 @@ func LoadSelectedHDU(path, name, extver string) (Header, HDU, error) {
 			nameMatch = strings.HasPrefix(strings.ToUpper(strings.TrimSpace(extName)), "SCI")
 		}
 		match := (name == "" && index == 0) || (name != "" && nameMatch && (extver == "" || HeaderString(hdr, "EXTVER") == strings.TrimSpace(extver)))
-		if parseInt(hdr.Cards["NAXIS"]) >= 2 && imageDataBytes(hdr) == 0 {
+		if parseInt(hdr.Cards["NAXIS"]) >= 2 && imageDataBytes(hdr) == 0 && hduDataBytesOrZero(hdr) > 0 {
 			return Header{}, HDU{}, fmt.Errorf("unsupported BITPIX %d", parseInt(hdr.Cards["BITPIX"]))
 		}
 		end, err := dataUnitEnd(hdr, pos, info.Size())
@@ -323,7 +323,7 @@ func locateSelectedImage(path, name, extver string) (Header, Header, int64, erro
 		if match {
 			return primary, hdr, dataOffset, nil
 		}
-		if parseInt(hdr.Cards["NAXIS"]) >= 2 && imageDataBytes(hdr) == 0 {
+		if parseInt(hdr.Cards["NAXIS"]) >= 2 && imageDataBytes(hdr) == 0 && hduDataBytesOrZero(hdr) > 0 {
 			return Header{}, Header{}, 0, fmt.Errorf("unsupported BITPIX %d", parseInt(hdr.Cards["BITPIX"]))
 		}
 		pos = end
