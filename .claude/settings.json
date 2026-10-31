@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -I \"$CLAUDE_PROJECT_DIR/.claude/hooks/gofmt_go.py\"",
+            "timeout": 20,
+            "statusMessage": "gofmt on edited Go file"
+          }
+        ]
+      }
+    ]
+  }
+}

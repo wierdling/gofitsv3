@@ -37,7 +37,10 @@ vendor/
 .DS_Store
 Thumbs.db
 *.zip
-.claude/
+# Claude Code: version skills/agents/hooks/settings, ignore local state
+.claude/worktrees/
+.claude/settings.local.json
+.claude/hooks/__pycache__/
 
 # --- Docs images (not pushed) ---
 docs/Images/
